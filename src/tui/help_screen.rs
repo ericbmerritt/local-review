@@ -25,7 +25,16 @@ Movement
     Home End  g G         top / bottom
     Tab     S-Tab         next / previous file
 
+Comments
+    Enter   c             new comment on current line
+
 Views
     ?                     this help
     q                     quit
+
+In comment composer
+    ^L ^C ^K              scope:    line / change / stack
+    ^1 ^2 ^3              severity: note / suggestion / required
+    ^X                    save
+    Esc                   cancel  (^C inside the composer is captured as scope)
 ";
