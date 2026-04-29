@@ -1,0 +1,6 @@
+/target
+/.direnv
+/.devenv
+/.envrc.local
+/result
+/.jj-review
