@@ -178,7 +178,6 @@ pub(crate) fn handle_composer_key(composer: &mut Composer, key: KeyEvent) -> Com
     ComposerAction::Continue
 }
 
-/// Pure function so Phase 5 can extend with cursor context without touching `Composer`.
 #[must_use]
 pub(crate) fn default_scope_for_cursor() -> ComposerScope {
     ComposerScope::Line

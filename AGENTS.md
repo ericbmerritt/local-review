@@ -21,28 +21,11 @@ Notably:
 ## Code layout
 
 Functional core in the middle, imperative shell at the edges. Pure modules
-take data and return data — no IO, no subprocess, no clock:
+take data and return data — no IO, no subprocess, no clock. Each `.rs` file
+in `src/` carries a module-level doc comment summarising its role; read those
+rather than relying on a list here.
 
-Phase 1 modules (current):
-
-- `src/change_id.rs` — ChangeId/CommitId value types with validated parse
-- `src/diff.rs` — unified diff parser (pure)
-- `src/error.rs` — JjrError enum
-- `src/jj.rs` — subprocess wrapper (shell)
-- `src/lib.rs` — crate root
-- `src/main.rs` — CLI entry point (shell)
-- `src/tui.rs` — terminal UI event loop (shell)
-- `src/tui/diff_view.rs` — diff rendering (pure)
-- `src/tui/help_screen.rs` — help overlay (pure)
-- `src/util.rs` — shared pure utilities (clamp, page_size, truncate)
-
-Future modules (planned in later phases):
-
-- `src/comment.rs`, `src/anchoring.rs`, `src/packet.rs` — comment model and
-  re-anchoring algorithm (pure)
-- `src/stack.rs` — stack/revset resolution (pure)
-- `src/claude.rs`, `src/store.rs`, `src/cursor.rs`, `src/config.rs` — shell
-  layer for Claude handoff, comment storage, cursor, config
+See `specs/jjr-mvp.ladder.md` for current scope and what is still planned.
 
 Layout is flat (`mod_module_files = "deny"`). `tui.rs` is the only module with
 a same-named subdirectory (`tui/`) because the TUI is genuinely multi-file.
@@ -63,14 +46,11 @@ Tests are exempted from `unwrap`/`expect`/`dbg`/`print` denies (see
 
 ## Specs
 
-- `specs/local-stack-review-edd.md` — domain model, comment scopes, prompt
-  format, anchoring algorithm
-- `specs/jjr-tui-design.md` — seven screens, keybind grammar, resize behavior
-- `specs/jjr-mvp.ladder.md` — phase plan; each phase is a vertical slice
-
-Read both specs before implementing anything non-trivial.
+The `specs/` directory contains the engineering design document, the TUI
+design, and the milestone ladder. Read the EDD and TUI design before
+implementing anything non-trivial.
 
 ## Workflow
 
 `pgc` is the ladder management tool used in this monorepo. If `pgc` is not on
-PATH, refer to `specs/jjr-mvp.ladder.md` directly for phase status.
+PATH, refer to `specs/jjr-mvp.ladder.md` directly for milestone progress.

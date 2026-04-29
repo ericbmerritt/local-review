@@ -24,6 +24,7 @@ Movement
     PgUp PgDn             page
     Home End  g G         top / bottom
     Tab     S-Tab         next / previous file
+    n       p             next / previous revision (stack mode)
 
 Comments
     Enter   c             new comment on current line

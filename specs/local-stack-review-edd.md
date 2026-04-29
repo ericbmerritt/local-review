@@ -106,14 +106,16 @@ This tool provides the review surface for that pass.
 ## Primary Workflow
 
 ```
-jjr <revset>
+jjr [<change-id>]
 ```
 
-If no revset is provided, default to the current change `@`.
+If no argument is provided, walk the full stack (`trunk()..@`). Providing a
+change ID or revset expression reviews that single change.
 
 Example invocations:
 
 ```
+jjr
 jjr @
 jjr 'main..@'
 jjr 'ancestors(@) & mutable()'
@@ -215,7 +217,7 @@ Inputs:
 
 - explicit revset from the user
 - default current change `@`
-- `--stack` flag, defined as `roots(trunk()..@)..@` evaluated against the current working copy. This depends on `trunk()` being resolvable (jj's revset alias for the trunk branch, configurable via `revset-aliases.'trunk()'`). If the revset evaluation errors or returns an empty set, fall back to `@` and emit a warning. The exact revset is documented and not inferred dynamically.
+- `--stack` flag, defined as `trunk()..@` evaluated against the current working copy. This depends on `trunk()` being resolvable (jj's revset alias for the trunk branch, configurable via `revset-aliases.'trunk()'`). If the revset evaluation errors or returns an empty set, fall back to `@` and emit a warning. The exact revset is documented and not inferred dynamically.
 
 Each stack entry includes:
 
@@ -249,7 +251,7 @@ State is stored at `.jj-review/cursor.json` keyed by a hash of the resolved revs
 {
   "revsets": {
     "<hash>": {
-      "revset": "roots(trunk()..@)..@",
+      "revset": "trunk()..@",
       "last_change_id": "abc333",
       "updated_at": "2026-04-29T14:22:01Z"
     }
@@ -590,8 +592,9 @@ The format is stable. Downstream tooling (parsers, evals, future inter-cycle dif
 ## CLI Surface
 
 ```
-jjr [revset]                          # open interactive review UI; default @
-jjr --stack                           # open current stack review UI
+jjr                                   # open stack review UI (trunk()..@ by default)
+jjr [revset]                          # open single-change review UI
+jjr --stack                           # open stack review UI (explicit; same as bare jjr)
 jjr export [revset]                   # export comments, default jsonl
 jjr export [revset] --format markdown
 jjr export [revset] --format jsonl
@@ -687,7 +690,7 @@ A Python/Textual prototype would be faster to first screen, but produces a throw
 
 These resolve previously open questions and are not subject to MVP debate:
 
-- **Default stack revset:** `roots(trunk()..@)..@`. Fall back to `@` if empty. Used only by `--stack`. Bare `jjr` defaults to `@`.
+- **Default stack revset:** `trunk()..@`. Fall back to `@` if empty or if `trunk()` is unresolvable. Bare `jjr` defaults to stack mode using this revset; `jjr <change-id>` reviews a single change.
 - **Claude scope:** one change at a time in MVP. Stack-wide later.
 - **Comment commitment:** never. `.jj-review/` is added to `.gitignore` and `.jjignore` on first run.
 - **Commentable lines:** added and removed lines only in MVP. Context lines later.

@@ -183,7 +183,7 @@ fn render_composer_footer(frame: &mut Frame<'_>, area: Rect, editing: bool) {
     frame.render_widget(widget, area);
 }
 
-fn centered_rect(area: Rect, max_width: u16, max_height: u16) -> Rect {
+pub(super) fn centered_rect(area: Rect, max_width: u16, max_height: u16) -> Rect {
     let [horiz] = Layout::horizontal([Constraint::Length(max_width.min(area.width))])
         .flex(Flex::Center)
         .areas(area);

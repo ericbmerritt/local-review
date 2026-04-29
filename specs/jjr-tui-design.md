@@ -65,7 +65,7 @@ This is `jjr`'s home. The diff viewer with stack context.
 │       │ ┃ Consider validating the token isn't expired before signing.           │
 │   209 │     }                                                                   │
 └─────────────────────────────────────────────────────────────────────────────────┘
- ↑↓ line  Tab file  n/p change  Enter comment  s stack  S stale  C → Claude  ?
+ ↑↓ line  Tab file  n/p revision  Enter comment  s stack  S stale  C → Claude  ?
 ```
 
 ### What's doing the work
@@ -213,7 +213,7 @@ transition_screen = "never"  # "auto" | "always" | "never"; "auto" threshold is 
 Press `s` from the main view.
 
 ```
-┌─ Stack: roots(trunk()..@)..@ ───────────────────────────────────────────────────┐
+┌─ Stack: trunk()..@ ─────────────────────────────────────────────────────────────┐
 │                                                                                  │
 │   STACK-LEVEL COMMENTS                                                  ●●  2  │
 │      ● required   Don't introduce new public APIs in this stack.               │
@@ -461,7 +461,7 @@ Below 60 cols the tool refuses to render and prints a message. Reviewing diffs i
 The footer at Screen 1 is the discoverability layer. At 80 cols it fits exactly:
 
 ```
- ↑↓ line  Tab file  n/p change  Enter comment  s stack  S stale  C → Claude  ?
+ ↑↓ line  Tab file  n/p revision  Enter comment  s stack  S stale  C → Claude  ?
 ```
 
 At narrower widths, drop bindings from the right edge with a trailing `…`, in this priority (least essential first):
@@ -471,7 +471,7 @@ At narrower widths, drop bindings from the right edge with a trailing `…`, in 
 3. `S stale`
 4. `s stack`
 
-Always preserve `Enter comment`, `Tab file`, `n/p change`, `↑↓ line`. These are the irreducible surface; without them the reviewer can't do their job. A reviewer in a narrow terminal who needs the dropped bindings consults `?`.
+Always preserve `Enter comment`, `Tab file`, `n/p revision`, `↑↓ line`. These are the irreducible surface; without them the reviewer can't do their job. A reviewer in a narrow terminal who needs the dropped bindings consults `?`.
 
 Stack-overview screen has its own resize rules in Screen 4.
 

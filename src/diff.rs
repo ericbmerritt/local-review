@@ -230,7 +230,7 @@ fn convert_patched_file(pf: &PatchedFile) -> Result<DiffFile> {
             hunks
                 .iter()
                 .all(|h| h.lines.iter().all(|l| l.kind == LineKind::Added)),
-            "Added file must only contain Added lines; Phase 2 will enforce this at the type level"
+            "Added file must only contain Added lines; type-level enforcement is a planned refactor"
         );
         return Ok(DiffFile::Added {
             path: file_path,
@@ -241,7 +241,7 @@ fn convert_patched_file(pf: &PatchedFile) -> Result<DiffFile> {
     if pf.is_removed_file() {
         debug_assert!(
             hunks.iter().all(|h| h.lines.iter().all(|l| l.kind == LineKind::Removed)),
-            "Removed file must only contain Removed lines; Phase 2 will enforce this at the type level"
+            "Removed file must only contain Removed lines; type-level enforcement is a planned refactor"
         );
         return Ok(DiffFile::Removed {
             path: file_path,

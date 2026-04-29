@@ -14,9 +14,13 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::{Frame, Terminal};
 
 use crate::change_id::ChangeId;
-use crate::comment::{Anchor, Comment, LineAnchor, SchemaVersion, Severity, Side, Status};
+use crate::comment::{
+    Anchor, Comment, LineAnchor, SchemaVersion, Severity, Side, Status, CONTEXT_MAX,
+};
+use crate::cursor;
 use crate::error::{JjrError, Result};
 use crate::jj::{self, ChangeDetails};
+use crate::stack::{ResolvedStack, RevsetHash, StackEntry};
 use crate::util::{clamp_with_delta, page_size, truncate};
 
 mod composer;
@@ -39,13 +43,92 @@ const BLOCK_BORDER_COLS: u16 = 2;
 /// real diff area height. Overwritten by `render_main` on every frame.
 const FALLBACK_VIEWPORT_ROWS: u16 = 20;
 
-pub fn run(change_id: &ChangeId) -> Result<()> {
+/// Stack depth at which `transition_screen = "auto"` starts firing. Per spec,
+/// deep stacks get the beat between changes; short ones don't need the pause.
+const AUTO_TRANSITION_THRESHOLD: usize = 8;
+
+/// Width (cells) of the graphical fill in the stack progress bar. Drops to
+/// zero on narrow terminals (see `render_stack_bar`).
+const STACK_PROGRESS_BAR_WIDTH: u16 = 20;
+
+/// Below this column count, the stack bar drops the graphical fill and shows
+/// just the textual `N/M change_id desc...` portion (per the resize ladder).
+const STACK_BAR_MIN_COLS_FOR_FILL: u16 = 80;
+
+/// Width (cells) of the transition modal.
+const TRANSITION_MODAL_WIDTH: u16 = 42;
+
+/// Height (rows) of the transition modal.
+const TRANSITION_MODAL_HEIGHT: u16 = 18;
+
+/// Description budget (chars) inside the transition modal. The modal interior
+/// is ~38 cols after borders + indent, so 36 leaves room for the trailing `…`.
+const TRANSITION_DESC_BUDGET: usize = 36;
+
+/// Maximum number of `●` dots to render per severity in the transition modal.
+/// Beyond this, dots are truncated with a trailing `…`; the numeric count
+/// stays accurate so the user still sees the true total.
+const TRANSITION_DOT_MAX: usize = 5;
+
+pub fn run(change_id: &ChangeId, repo_root: &std::path::Path) -> Result<()> {
     let details = jj::show(change_id)?;
-    let repo_root = std::env::current_dir().map_err(|source| JjrError::Io { source })?;
     let revset = change_id.as_str().to_owned();
 
     let mut terminal = setup_terminal()?;
-    let outcome = run_app(&mut terminal, details, repo_root, revset);
+    let outcome = run_app(&mut terminal, details, repo_root.to_owned(), revset, None);
+    teardown_terminal(&mut terminal)?;
+    outcome
+}
+
+pub fn run_stack(
+    repo_root: &std::path::Path,
+    resolved: &ResolvedStack,
+    restart: bool,
+) -> Result<()> {
+    if resolved.entries.is_empty() {
+        return Err(JjrError::RevsetNoMatch {
+            revset: resolved.revset.clone(),
+        });
+    }
+
+    if restart {
+        cursor::clear(repo_root, resolved.revset_hash)?;
+    }
+
+    let has_comments = |id: &ChangeId| {
+        crate::store::load_change_comments(repo_root, id)
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+    };
+    let start_index = cursor::resume_index(
+        repo_root,
+        resolved.revset_hash,
+        &resolved
+            .entries
+            .iter()
+            .map(|e| e.change_id.clone())
+            .collect::<Vec<_>>(),
+        &has_comments,
+    );
+
+    let entry = &resolved.entries[start_index];
+    let details = jj::show(&entry.change_id)?;
+
+    let stack_ctx = StackContext {
+        entries: resolved.entries.clone(),
+        current_index: start_index,
+        revset: resolved.revset.clone(),
+        revset_hash: resolved.revset_hash,
+    };
+
+    let mut terminal = setup_terminal()?;
+    let outcome = run_app(
+        &mut terminal,
+        details,
+        repo_root.to_owned(),
+        resolved.revset.clone(),
+        Some(stack_ctx),
+    );
     teardown_terminal(&mut terminal)?;
     outcome
 }
@@ -83,6 +166,60 @@ enum Screen {
     Help,
     /// Composer modal is open; variant owns the state.
     Composer(Box<Composer>),
+    /// Between-change transition beat shown when advancing in stack mode.
+    Transition(TransitionState),
+}
+
+/// State for the transition screen shown between changes in stack mode.
+struct TransitionState {
+    /// Index of the change just reviewed.
+    reviewed_index: usize,
+    /// Index of the next change to open.
+    next_index: usize,
+    /// Comment count for the reviewed change. `None` when the comment load
+    /// failed (so the modal can say so honestly instead of lying with `0`).
+    reviewed_comment_count: Option<usize>,
+    /// Severity histogram of the reviewed change's comments, ordered
+    /// `(required, suggestion, note)`. Empty when the count is `None`.
+    severity_histogram: SeverityHistogram,
+}
+
+/// Counts of comments by severity for the reviewed change.
+#[derive(Debug, Default, Clone, Copy)]
+struct SeverityHistogram {
+    required: usize,
+    suggestion: usize,
+    note: usize,
+}
+
+impl SeverityHistogram {
+    fn from_comments(comments: &[Comment]) -> Self {
+        let mut h = Self::default();
+        for c in comments {
+            match c.severity {
+                Severity::Required => h.required += 1,
+                Severity::Suggestion => h.suggestion += 1,
+                Severity::Note => h.note += 1,
+            }
+        }
+        h
+    }
+}
+
+/// Stack navigation context; absent in single-change mode.
+struct StackContext {
+    entries: Vec<StackEntry>,
+    current_index: usize,
+    revset: String,
+    revset_hash: RevsetHash,
+}
+
+/// Which transition behavior is configured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransitionMode {
+    Never,
+    Auto,
+    Always,
 }
 
 struct App {
@@ -109,10 +246,23 @@ struct App {
     last_severity: Option<Severity>,
     /// One-line status message shown at the bottom of the main view.
     status_message: Option<String>,
+    /// Stack navigation state; `None` in single-change mode.
+    stack: Option<StackContext>,
+    /// Transition screen behavior loaded from config.
+    transition_mode: TransitionMode,
+    /// Whether the most recent comment load succeeded. `false` means the
+    /// transition modal should not advertise a comment count.
+    comments_loaded_ok: bool,
 }
 
 impl App {
-    fn new(details: ChangeDetails, repo_root: PathBuf, revset: String) -> Self {
+    fn new(
+        details: ChangeDetails,
+        repo_root: PathBuf,
+        revset: String,
+        stack: Option<StackContext>,
+        transition_mode: TransitionMode,
+    ) -> Self {
         let rendered_per_file: Vec<DiffView> =
             details.diff.files.iter().map(DiffView::from_file).collect();
         let annotated_per_file = rendered_per_file.clone();
@@ -131,6 +281,9 @@ impl App {
             viewport_rows: FALLBACK_VIEWPORT_ROWS,
             last_severity: None,
             status_message: None,
+            stack,
+            transition_mode,
+            comments_loaded_ok: false,
         }
     }
 
@@ -146,10 +299,12 @@ impl App {
         match crate::store::load_change_comments(&self.repo_root, &self.details.change_id) {
             Ok(comments) => {
                 self.loaded_comments = comments;
+                self.comments_loaded_ok = true;
             }
             Err(e) => {
                 self.status_message = Some(format!("warning: could not load comments: {e}"));
                 self.loaded_comments = Vec::new();
+                self.comments_loaded_ok = false;
             }
         }
         self.rebuild_annotated_views();
@@ -242,6 +397,115 @@ impl App {
             self.scroll = line_index_u16.saturating_sub(viewport_rows.saturating_sub(1));
         }
     }
+
+    fn stack_len(&self) -> Option<usize> {
+        self.stack.as_ref().map(|s| s.entries.len())
+    }
+
+    fn stack_index(&self) -> Option<usize> {
+        self.stack.as_ref().map(|s| s.current_index)
+    }
+
+    fn transition_enabled(&self, stack_len: usize) -> bool {
+        match self.transition_mode {
+            TransitionMode::Never => false,
+            TransitionMode::Always => true,
+            TransitionMode::Auto => stack_len >= AUTO_TRANSITION_THRESHOLD,
+        }
+    }
+
+    /// Advance to the next change in stack mode.
+    ///
+    /// If a transition screen is configured for this stack depth, pushes the
+    /// `Transition` screen instead of loading immediately. Otherwise loads the
+    /// next change directly.
+    fn advance_stack(&mut self) -> Result<()> {
+        let Some(ctx) = self.stack.as_ref() else {
+            self.status_message =
+                Some("single-change view — run with --stack to walk a stack".to_owned());
+            return Ok(());
+        };
+
+        let next_index = ctx.current_index + 1;
+        if next_index >= ctx.entries.len() {
+            self.status_message = Some("already at the last change".to_owned());
+            return Ok(());
+        }
+
+        let stack_len = ctx.entries.len();
+        let reviewed_index = ctx.current_index;
+        let (reviewed_comment_count, severity_histogram) = if self.comments_loaded_ok {
+            (
+                Some(self.loaded_comments.len()),
+                SeverityHistogram::from_comments(&self.loaded_comments),
+            )
+        } else {
+            (None, SeverityHistogram::default())
+        };
+
+        if self.transition_enabled(stack_len) {
+            self.screen = Screen::Transition(TransitionState {
+                reviewed_index,
+                next_index,
+                reviewed_comment_count,
+                severity_histogram,
+            });
+            return Ok(());
+        }
+
+        self.load_stack_entry(next_index, true)
+    }
+
+    /// Retreat to the previous change in stack mode.
+    fn retreat_stack(&mut self) -> Result<()> {
+        let Some(ctx) = self.stack.as_ref() else {
+            self.status_message =
+                Some("single-change view — run with --stack to walk a stack".to_owned());
+            return Ok(());
+        };
+
+        let Some(prev_index) = pick_retreat_index(ctx.current_index) else {
+            self.status_message = Some("already at the first change".to_owned());
+            return Ok(());
+        };
+        self.load_stack_entry(prev_index, false)
+    }
+
+    /// Load the stack entry at `idx`. Persists the cursor if `advance` is true.
+    fn load_stack_entry(&mut self, idx: usize, advance: bool) -> Result<()> {
+        let (revset, revset_hash, change_id) = {
+            let Some(ctx) = self.stack.as_ref() else {
+                return Ok(());
+            };
+            (
+                ctx.revset.clone(),
+                ctx.revset_hash,
+                ctx.entries[idx].change_id.clone(),
+            )
+        };
+
+        let details = jj::show(&change_id)?;
+
+        self.rendered_per_file = details.diff.files.iter().map(DiffView::from_file).collect();
+        self.annotated_per_file = self.rendered_per_file.clone();
+        self.details = details;
+        self.file_index = 0;
+        self.line_index = 0;
+        self.scroll = 0;
+        self.status_message = None;
+
+        if let Some(ctx) = self.stack.as_mut() {
+            ctx.current_index = idx;
+        }
+
+        self.refresh_inline_comments();
+
+        if advance {
+            let _ = cursor::record(&self.repo_root, revset_hash, &revset, &change_id);
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -255,8 +519,10 @@ fn run_app(
     details: ChangeDetails,
     repo_root: PathBuf,
     revset: String,
+    stack: Option<StackContext>,
 ) -> Result<()> {
-    let mut app = App::new(details, repo_root, revset);
+    let transition_mode = load_transition_mode(&repo_root);
+    let mut app = App::new(details, repo_root, revset, stack, transition_mode);
     app.refresh_inline_comments();
 
     while !app.should_quit {
@@ -266,11 +532,48 @@ fn run_app(
         handle_event(&mut app)?;
     }
 
+    // Persist the cursor at the last-viewed change so a subsequent run
+    // resumes here. Best-effort: a cursor write failure should not block exit.
+    persist_cursor_on_exit(&app);
+
     Ok(())
 }
 
-// Always draw the main view first; modals (Help, Composer) overlay on top so
-// they sit visually above the diff with the same back-state preserved.
+/// Best-effort cursor write on app exit. Silent on failure — the cursor file
+/// is convenience state, not authoritative.
+fn persist_cursor_on_exit(app: &App) {
+    let Some(ctx) = app.stack.as_ref() else {
+        return;
+    };
+    let change_id = &ctx.entries[ctx.current_index].change_id;
+    let _ = cursor::record(&app.repo_root, ctx.revset_hash, &ctx.revset, change_id);
+}
+
+fn load_transition_mode(repo_root: &std::path::Path) -> TransitionMode {
+    let config_path = repo_root.join(".jj-review").join("config.toml");
+    if !config_path.exists() {
+        return TransitionMode::Never;
+    }
+    let Ok(raw) = std::fs::read_to_string(&config_path) else {
+        return TransitionMode::Never;
+    };
+    let Ok(table) = raw.parse::<toml::Table>() else {
+        return TransitionMode::Never;
+    };
+    let value = table
+        .get("ui")
+        .and_then(|ui| ui.get("transition_screen"))
+        .and_then(toml::Value::as_str)
+        .unwrap_or("never");
+    match value {
+        "auto" => TransitionMode::Auto,
+        "always" => TransitionMode::Always,
+        _ => TransitionMode::Never,
+    }
+}
+
+// Always draw the main view first; modals (Help, Composer, Transition) overlay
+// on top so they sit visually above the diff with the same back-state preserved.
 fn render(frame: &mut Frame<'_>, app: &mut App) {
     render_main(frame, app);
     match &app.screen {
@@ -278,6 +581,9 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
         Screen::Help => help_screen::render(frame),
         Screen::Composer(composer) => {
             composer_overlay::render_composer_overlay(frame, composer, app.current_view());
+        }
+        Screen::Transition(state) => {
+            render_transition(frame, app, state);
         }
     }
 }
@@ -292,7 +598,7 @@ fn render_main(frame: &mut Frame<'_>, app: &mut App) {
     ])
     .split(area);
 
-    render_stack_bar(frame, layout[0], &app.details);
+    render_stack_bar(frame, layout[0], app);
     render_file_header(frame, layout[1], app);
 
     let diff_area = layout[2];
@@ -304,25 +610,68 @@ fn render_main(frame: &mut Frame<'_>, app: &mut App) {
     render_footer(frame, layout[3], app);
 }
 
-fn render_stack_bar(frame: &mut Frame<'_>, area: Rect, details: &ChangeDetails) {
-    let prefix = format!("1/1  {}  ", details.change_id);
-    let prefix_width = prefix.chars().count();
-    let desc_budget =
-        usize::from(area.width.saturating_sub(BLOCK_BORDER_COLS)).saturating_sub(prefix_width);
-    let label = format!("{}{}", prefix, truncate(&details.description, desc_budget));
+fn render_stack_bar(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let (position, total) = match app.stack_index().zip(app.stack_len()) {
+        Some((idx, len)) => (idx + 1, len),
+        None => (1, 1),
+    };
+
+    // On wide-enough terminals, prepend a graphical progress fill. On narrow
+    // terminals (per the resize ladder) drop the fill and keep just the text.
+    let interior_cols = area.width.saturating_sub(BLOCK_BORDER_COLS);
+    let bar_segment = if area.width >= STACK_BAR_MIN_COLS_FOR_FILL && total > 0 {
+        progress_bar_string(position, total, STACK_PROGRESS_BAR_WIDTH)
+    } else {
+        String::new()
+    };
+
+    let text_segment = format!("{position}/{total}  {}  ", app.details.change_id);
+    let used_width = bar_segment.chars().count() + text_segment.chars().count();
+    let desc_budget = usize::from(interior_cols).saturating_sub(used_width);
+    let label = format!(
+        "{}{}{}",
+        bar_segment,
+        text_segment,
+        truncate(&app.details.description, desc_budget)
+    );
     let block = Block::default().borders(Borders::ALL).title("Stack");
     let widget = Paragraph::new(label).block(block);
     frame.render_widget(widget, area);
 }
 
-fn render_file_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
+/// Build a `████░░░░  ` style progress fill of fixed `width` cells, followed
+/// by two spaces. `position` is 1-based; `total` must be non-zero.
+fn progress_bar_string(position: usize, total: usize, width: u16) -> String {
+    let width_usize = usize::from(width);
+    if total == 0 || width_usize == 0 {
+        return String::new();
+    }
+    let position = position.min(total);
+    let filled = (position * width_usize) / total;
+    let empty = width_usize.saturating_sub(filled);
+    let mut s = String::with_capacity(width_usize * 4 + 2);
+    for _ in 0..filled {
+        s.push('█');
+    }
+    for _ in 0..empty {
+        s.push('░');
+    }
+    s.push_str("  ");
+    s
+}
+
+fn file_header_label(app: &App) -> String {
     let total = app.rendered_per_file.len();
     let position = app.file_index.saturating_add(1);
     let path_label = app
         .current_view()
         .map_or_else(|| "(no files)".to_owned(), |v| v.title.clone());
-    let label = format!("{path_label}  ·  {position} of {total}");
-    let block = Block::default().borders(Borders::ALL);
+    format!("{path_label}  ·  {position} of {total}")
+}
+
+fn render_file_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let label = file_header_label(app);
+    let block = Block::default().borders(Borders::ALL).title("File");
     let widget = Paragraph::new(label).block(block);
     frame.render_widget(widget, area);
 }
@@ -418,12 +767,18 @@ fn render_rendered_line(line: &RenderedLine, focused: bool, width: u16) -> TuiLi
     }
 }
 
-fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let (text, style) = if let Some(msg) = app.status_message.as_deref() {
-        (msg, Style::default().fg(Color::Yellow))
+fn footer_text(app: &App) -> (&'static str, Style) {
+    if app.status_message.is_some() {
+        // Status message rendered by caller; return empty sentinel.
+        ("", Style::default().fg(Color::Yellow))
     } else if focused_comment(app).is_some() {
         (
             " ↑↓ line  e edit  d delete  c new comment  ? help  q quit",
+            Style::default(),
+        )
+    } else if app.stack.is_some() {
+        (
+            " ↑↓ line  Tab file  n/p revision  Enter comment  ? help  q quit",
             Style::default(),
         )
     } else {
@@ -431,6 +786,15 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
             " ↑↓ line  Tab file  c comment  ? help  q quit",
             Style::default(),
         )
+    }
+}
+
+fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let (text, style) = if let Some(msg) = app.status_message.as_deref() {
+        (msg.to_owned(), Style::default().fg(Color::Yellow))
+    } else {
+        let (text, style) = footer_text(app);
+        (text.to_owned(), style)
     };
     let widget = Paragraph::new(text).style(style);
     frame.render_widget(widget, area);
@@ -444,9 +808,10 @@ fn handle_event(app: &mut App) -> Result<()> {
         }
         // Match on the screen discriminant to avoid moving out of app.screen.
         match &app.screen {
-            Screen::Main => handle_main_key(app, key),
+            Screen::Main => handle_main_key(app, key)?,
             Screen::Help => handle_help_key(app, key),
             Screen::Composer(_) => handle_composer_event(app, key),
+            Screen::Transition(_) => handle_transition_key(app, key)?,
         }
     }
     Ok(())
@@ -456,7 +821,7 @@ fn handle_event(app: &mut App) -> Result<()> {
     clippy::wildcard_enum_match_arm,
     reason = "unhandled KeyCode variants are intentionally ignored"
 )]
-fn handle_main_key(app: &mut App, key: KeyEvent) {
+fn handle_main_key(app: &mut App, key: KeyEvent) -> Result<()> {
     app.status_message = None;
 
     match key.code {
@@ -473,13 +838,189 @@ fn handle_main_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('c') | KeyCode::Enter => open_composer(app),
         KeyCode::Char('e') => open_composer_for_edit(app),
         KeyCode::Char('d') => delete_focused_comment(app),
+        KeyCode::Char('n') => app.advance_stack()?,
+        KeyCode::Char('p') => app.retreat_stack()?,
         _ => {}
     }
+    Ok(())
 }
 
 fn handle_help_key(app: &mut App, key: KeyEvent) {
     if matches!(key.code, KeyCode::Char('q' | '?') | KeyCode::Esc) {
         app.screen = Screen::Main;
+    }
+}
+
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "unhandled KeyCode variants are intentionally ignored on the transition modal"
+)]
+fn handle_transition_key(app: &mut App, key: KeyEvent) -> Result<()> {
+    let Screen::Transition(ref state) = app.screen else {
+        return Ok(());
+    };
+    let next_index = state.next_index;
+    match key.code {
+        KeyCode::Enter => {
+            app.screen = Screen::Main;
+            app.load_stack_entry(next_index, true)?;
+        }
+        // `p` retreats: closes the transition modal AND moves to the change
+        // before the reviewed one. Same semantics as `p` on the main screen
+        // (previous from current position) — at transition time `current_index`
+        // is still the reviewed change, so `retreat_stack` lands at
+        // `reviewed_index - 1`. To cancel the advance without moving, press Esc.
+        KeyCode::Char('p') => {
+            app.screen = Screen::Main;
+            app.retreat_stack()?;
+        }
+        KeyCode::Esc => {
+            app.screen = Screen::Main;
+        }
+        KeyCode::Char('q') => {
+            app.should_quit = true;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn render_transition(frame: &mut Frame<'_>, app: &App, state: &TransitionState) {
+    use ratatui::layout::{Constraint, Layout};
+    use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
+
+    let area = frame.area();
+    let modal_area =
+        composer_overlay::centered_rect(area, TRANSITION_MODAL_WIDTH, TRANSITION_MODAL_HEIGHT);
+
+    frame.render_widget(Clear, modal_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double);
+    let inner = block.inner(modal_area);
+    frame.render_widget(block, modal_area);
+
+    let Some(ctx) = app.stack.as_ref() else {
+        return;
+    };
+
+    let reviewed = &ctx.entries[state.reviewed_index];
+    let next = &ctx.entries[state.next_index];
+    let stack_len = ctx.entries.len();
+
+    let reviewed_pos = state.reviewed_index + 1;
+    let next_pos = state.next_index + 1;
+
+    let reviewed_desc = truncate(&reviewed.description, TRANSITION_DESC_BUDGET);
+    let next_desc = truncate(&next.description, TRANSITION_DESC_BUDGET);
+
+    let body = format!(
+        "\n  Reviewed\n  {reviewed_pos}/{stack_len}  {}\n  {reviewed_desc}\n\n  ────────────────\n\n  Next\n  {next_pos}/{stack_len}  {}\n  {next_desc}\n",
+        reviewed.change_id,
+        next.change_id,
+    );
+
+    let content_layout = Layout::vertical([
+        Constraint::Min(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .split(inner);
+
+    frame.render_widget(Paragraph::new(body.as_str()), content_layout[0]);
+    render_transition_comment_summary(frame, content_layout[1], state);
+    frame.render_widget(Paragraph::new(TRANSITION_FOOTER_TEXT), content_layout[2]);
+}
+
+/// Footer hint for the transition modal. Kept short enough to fit inside the
+/// modal's interior (`TRANSITION_MODAL_WIDTH - 2` cols for the borders).
+/// Tested in `transition_footer_fits_inside_modal`.
+const TRANSITION_FOOTER_TEXT: &str = "  Enter  p prev  Esc cancel  q quit";
+
+/// Render the `●●● 3 required · ● 1 suggestion` line (or honest fallback when
+/// the comment load failed).
+fn render_transition_comment_summary(frame: &mut Frame<'_>, area: Rect, state: &TransitionState) {
+    let Some(count) = state.reviewed_comment_count else {
+        let widget = Paragraph::new("  comments could not be loaded")
+            .style(Style::default().fg(Color::Yellow));
+        frame.render_widget(widget, area);
+        return;
+    };
+    if count == 0 {
+        // No comments — leave the line blank to avoid noise.
+        return;
+    }
+
+    let h = state.severity_histogram;
+    let mut spans: Vec<Span<'_>> = Vec::with_capacity(8);
+    spans.push(Span::raw("  "));
+    let mut first = true;
+    if h.required > 0 {
+        // `required` uses the dots-only label (no pluralizable English word),
+        // matching the spec's `●●●  3 required` shape.
+        spans.push(Span::styled(
+            render_dots(h.required),
+            Style::default().fg(Color::Red),
+        ));
+        spans.push(Span::raw(format!(" {} required", h.required)));
+        first = false;
+    }
+    if h.suggestion > 0 {
+        if !first {
+            spans.push(Span::raw(" · "));
+        }
+        spans.push(Span::styled(
+            render_dots(h.suggestion),
+            Style::default().fg(Color::Yellow),
+        ));
+        spans.push(Span::raw(format!(
+            " {} {}",
+            h.suggestion,
+            pluralize("suggestion", h.suggestion)
+        )));
+        first = false;
+    }
+    if h.note > 0 {
+        if !first {
+            spans.push(Span::raw(" · "));
+        }
+        spans.push(Span::styled(
+            render_dots(h.note),
+            Style::default().fg(Color::DarkGray),
+        ));
+        spans.push(Span::raw(format!(
+            " {} {}",
+            h.note,
+            pluralize("note", h.note)
+        )));
+    }
+
+    let line = TuiLine::from(spans);
+    frame.render_widget(Paragraph::new(line), area);
+}
+
+/// Render a string of `●` dots for the transition severity summary.
+///
+/// Caps at [`TRANSITION_DOT_MAX`]; any overflow becomes a trailing `…`. The
+/// numeric count next to the dots still tells the truth.
+fn render_dots(count: usize) -> String {
+    if count == 0 {
+        String::new()
+    } else if count <= TRANSITION_DOT_MAX {
+        "●".repeat(count)
+    } else {
+        format!("{}…", "●".repeat(TRANSITION_DOT_MAX))
+    }
+}
+
+/// Append `s` to `word` when `count != 1`. English plurals only; deliberately
+/// simple — the only words this serves are "suggestion" and "note".
+fn pluralize(word: &str, count: usize) -> String {
+    if count == 1 {
+        word.to_owned()
+    } else {
+        format!("{word}s")
     }
 }
 
@@ -582,7 +1123,7 @@ fn open_composer_for_edit(app: &mut App) {
     app.screen = Screen::Composer(Box::new(composer));
 }
 
-/// Single-keystroke delete; no confirmation per Phase 2 spec.
+/// Single-keystroke delete without confirmation.
 fn delete_focused_comment(app: &mut App) {
     let Some(comment) = focused_comment(app).cloned() else {
         app.status_message = Some("cursor is not on a comment".to_owned());
@@ -649,8 +1190,8 @@ fn build_line_target(app: &App) -> BuildTargetResult {
     })
 }
 
-/// Collect up to 3 lines of context before and after `idx` in `lines`,
-/// skipping non-diff lines (hunk headers, separators, inline comments).
+/// Collect up to [`CONTEXT_MAX`] lines of context before and after `idx` in
+/// `lines`, skipping non-diff lines (hunk headers, separators, inline comments).
 fn collect_context(lines: &[RenderedLine], idx: usize) -> (Vec<String>, Vec<String>) {
     let is_content = |k: RenderedLineKind| {
         matches!(
@@ -663,7 +1204,7 @@ fn collect_context(lines: &[RenderedLine], idx: usize) -> (Vec<String>, Vec<Stri
         .iter()
         .rev()
         .filter(|l| is_content(l.kind))
-        .take(3)
+        .take(CONTEXT_MAX)
         .map(|l| l.text.clone())
         .collect::<Vec<_>>()
         .into_iter()
@@ -673,7 +1214,7 @@ fn collect_context(lines: &[RenderedLine], idx: usize) -> (Vec<String>, Vec<Stri
     let after: Vec<String> = lines[idx + 1..]
         .iter()
         .filter(|l| is_content(l.kind))
-        .take(3)
+        .take(CONTEXT_MAX)
         .map(|l| l.text.clone())
         .collect();
 
@@ -696,9 +1237,8 @@ fn build_location_from_composer(app: &App, composer: &Composer) -> (ChangeId, Li
 }
 
 fn save_composer(app: &mut App, composer: &Composer, now: time::OffsetDateTime) -> SaveOutcome {
-    // Phase 2 only persists Line-scope comments; Change/Stack scopes are
-    // selectable in the UI (so the picker reflects the chord state) but their
-    // anchor types land in a later phase.
+    // Change and Stack scopes are selectable in the UI (so the picker reflects
+    // the chord state) but persistence is not yet supported for those scopes.
     match composer.scope {
         ComposerScope::Line => {}
         ComposerScope::Change => {
@@ -822,8 +1362,7 @@ fn delete_via_composer(app: &mut App, composer: &Composer) -> SaveOutcome {
 
     // `delete_comment` keys records by `(anchor, created_at)`. The other
     // `Comment` fields are unused by the store; we still build the full
-    // record because the API requires it (see `prof` / `greybeard` notes:
-    // a `CommentKey` refactor lands with stack-scope in Phase 5).
+    // record because the API requires it.
     let (change_id, location) = build_location_from_composer(app, composer);
     let comment = Comment {
         schema_version: SchemaVersion,
@@ -849,6 +1388,21 @@ fn delete_via_composer(app: &mut App, composer: &Composer) -> SaveOutcome {
             SaveOutcome::Saved
         }
         Err(e) => SaveOutcome::Errored(format!("delete failed: {e}")),
+    }
+}
+
+/// Pick the previous-stack-entry index for a `p` keystroke.
+///
+/// Pure: takes the current 0-based index and returns the new index, or `None`
+/// when already at index 0. Has no side effects — does not read or write the
+/// cursor file. Callers (only `retreat_stack`) are responsible for routing the
+/// resulting index through `load_stack_entry` with `advance=false`, which is
+/// what guarantees the cursor-no-write contract for retreat.
+fn pick_retreat_index(current: usize) -> Option<usize> {
+    if current == 0 {
+        None
+    } else {
+        Some(current - 1)
     }
 }
 
@@ -1018,7 +1572,13 @@ mod tests {
             description: String::new(),
             diff: Diff { files: vec![file] },
         };
-        App::new(details, PathBuf::from("/repo"), "@".to_owned())
+        App::new(
+            details,
+            PathBuf::from("/repo"),
+            "@".to_owned(),
+            None,
+            TransitionMode::Never,
+        )
     }
 
     fn sample_diff_file() -> DiffFile {
@@ -1703,5 +2263,418 @@ mod tests {
         assert_eq!(preserved.severity, original.severity);
         assert_eq!(preserved.created_at, original.created_at);
         assert_eq!(preserved.updated_at, None);
+    }
+
+    // ---- transition_enabled boundary tests (G3) ----
+
+    fn app_with_mode(mode: TransitionMode) -> App {
+        let mut app = make_app_with_single_file(sample_diff_file());
+        app.transition_mode = mode;
+        app
+    }
+
+    #[test]
+    fn transition_enabled_never_always_false() {
+        let app = app_with_mode(TransitionMode::Never);
+        assert!(!app.transition_enabled(0));
+        assert!(!app.transition_enabled(7));
+        assert!(!app.transition_enabled(8));
+        assert!(!app.transition_enabled(1000));
+    }
+
+    #[test]
+    fn transition_enabled_always_always_true() {
+        let app = app_with_mode(TransitionMode::Always);
+        assert!(app.transition_enabled(1));
+        assert!(app.transition_enabled(7));
+        assert!(app.transition_enabled(8));
+    }
+
+    #[test]
+    fn transition_enabled_auto_below_threshold_is_false() {
+        let app = app_with_mode(TransitionMode::Auto);
+        assert!(!app.transition_enabled(7));
+    }
+
+    #[test]
+    fn transition_enabled_auto_at_threshold_is_true() {
+        let app = app_with_mode(TransitionMode::Auto);
+        assert!(app.transition_enabled(8));
+    }
+
+    #[test]
+    fn transition_enabled_auto_above_threshold_is_true() {
+        let app = app_with_mode(TransitionMode::Auto);
+        assert!(app.transition_enabled(9));
+    }
+
+    // ---- load_transition_mode tests (G4) ----
+
+    #[test]
+    fn load_transition_mode_missing_file_is_never() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(load_transition_mode(dir.path()), TransitionMode::Never);
+    }
+
+    fn write_config(dir: &std::path::Path, contents: &str) {
+        let cfg_dir = dir.join(".jj-review");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::write(cfg_dir.join("config.toml"), contents).unwrap();
+    }
+
+    #[test]
+    fn load_transition_mode_explicit_never() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(dir.path(), "[ui]\ntransition_screen = \"never\"\n");
+        assert_eq!(load_transition_mode(dir.path()), TransitionMode::Never);
+    }
+
+    #[test]
+    fn load_transition_mode_auto() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(dir.path(), "[ui]\ntransition_screen = \"auto\"\n");
+        assert_eq!(load_transition_mode(dir.path()), TransitionMode::Auto);
+    }
+
+    #[test]
+    fn load_transition_mode_always() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(dir.path(), "[ui]\ntransition_screen = \"always\"\n");
+        assert_eq!(load_transition_mode(dir.path()), TransitionMode::Always);
+    }
+
+    #[test]
+    fn load_transition_mode_malformed_toml_is_never() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(dir.path(), "[ui\nbroken");
+        assert_eq!(load_transition_mode(dir.path()), TransitionMode::Never);
+    }
+
+    #[test]
+    fn load_transition_mode_invalid_value_is_never() {
+        let dir = tempfile::tempdir().unwrap();
+        write_config(dir.path(), "[ui]\ntransition_screen = \"bogus\"\n");
+        assert_eq!(load_transition_mode(dir.path()), TransitionMode::Never);
+    }
+
+    // ---- progress_bar_string tests (D1) ----
+
+    #[test]
+    fn progress_bar_zero_total_returns_empty() {
+        assert_eq!(progress_bar_string(0, 0, 10), String::new());
+    }
+
+    #[test]
+    fn progress_bar_first_position() {
+        // 1 of 10 with width 10 → exactly 1 filled cell, 9 empty, plus "  ".
+        let s = progress_bar_string(1, 10, 10);
+        assert_eq!(s.matches('█').count(), 1);
+        assert_eq!(s.matches('░').count(), 9);
+        assert!(s.ends_with("  "));
+    }
+
+    #[test]
+    fn progress_bar_full_position() {
+        let s = progress_bar_string(5, 5, 8);
+        assert_eq!(s.matches('█').count(), 8);
+        assert_eq!(s.matches('░').count(), 0);
+    }
+
+    #[test]
+    fn progress_bar_position_clamps_to_total() {
+        // Past-end input shouldn't overflow.
+        let s = progress_bar_string(99, 5, 8);
+        assert_eq!(s.matches('█').count(), 8);
+    }
+
+    #[test]
+    fn progress_bar_zero_width_returns_empty() {
+        assert_eq!(progress_bar_string(2, 5, 0), String::new());
+    }
+
+    // ---- single-change footer does not advertise n/p (H3) ----
+
+    #[test]
+    fn single_change_app_has_no_stack_context() {
+        // The footer logic branches on `app.stack.is_some()`. Confirm a
+        // single-change app starts with `stack = None` so the n/p hint stays
+        // hidden in the footer text path.
+        let app = make_app_with_single_file(sample_diff_file());
+        assert!(app.stack.is_none(), "single-change app must not have stack");
+    }
+
+    // ---- SeverityHistogram (D2) ----
+
+    #[test]
+    fn severity_histogram_counts_by_kind() {
+        let comments = vec![
+            comment_with_severity(Severity::Required),
+            comment_with_severity(Severity::Required),
+            comment_with_severity(Severity::Suggestion),
+            comment_with_severity(Severity::Note),
+        ];
+        let h = SeverityHistogram::from_comments(&comments);
+        assert_eq!(h.required, 2);
+        assert_eq!(h.suggestion, 1);
+        assert_eq!(h.note, 1);
+    }
+
+    fn comment_with_severity(severity: Severity) -> Comment {
+        Comment {
+            schema_version: SchemaVersion,
+            anchor: Anchor::Line {
+                change_id: ChangeId::parse(&"a".repeat(32)).unwrap(),
+                location: LineAnchor {
+                    file: PathBuf::from("foo.txt"),
+                    side: Side::New,
+                    old_line: None,
+                    new_line: Some(1),
+                    hunk_header: "@@ -1 +1 @@".to_owned(),
+                    target_text: "x".to_owned(),
+                    context_before: vec![],
+                    context_after: vec![],
+                },
+            },
+            repo_root: PathBuf::from("/repo"),
+            revset: "@".to_owned(),
+            commit_id: None,
+            body: "b".to_owned(),
+            severity,
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
+            updated_at: None,
+            status: Some(Status::Pending),
+            mismatch_reason: None,
+        }
+    }
+
+    // ---- Cursor persistence on quit (A2) ----
+
+    #[test]
+    fn persist_cursor_on_exit_writes_current_index_for_stack_app() {
+        let dir = tempfile::tempdir().unwrap();
+        let entries = vec![
+            StackEntry {
+                change_id: ChangeId::parse(&"a".repeat(32)).unwrap(),
+                commit_id: CommitId::parse(&"a".repeat(40)).unwrap(),
+                description: "first".to_owned(),
+            },
+            StackEntry {
+                change_id: ChangeId::parse(&"b".repeat(32)).unwrap(),
+                commit_id: CommitId::parse(&"b".repeat(40)).unwrap(),
+                description: "second".to_owned(),
+            },
+            StackEntry {
+                change_id: ChangeId::parse(&"c".repeat(32)).unwrap(),
+                commit_id: CommitId::parse(&"c".repeat(40)).unwrap(),
+                description: "third".to_owned(),
+            },
+        ];
+        let revset = "trunk()..@".to_owned();
+        let revset_hash = RevsetHash::from_revset(&revset);
+
+        let details = ChangeDetails {
+            change_id: entries[1].change_id.clone(),
+            commit_id: entries[1].commit_id.clone(),
+            description: "second".to_owned(),
+            diff: Diff {
+                files: vec![sample_diff_file()],
+            },
+        };
+        let stack_ctx = StackContext {
+            entries: entries.clone(),
+            current_index: 1,
+            revset: revset.clone(),
+            revset_hash,
+        };
+        let app = App::new(
+            details,
+            dir.path().to_owned(),
+            revset.clone(),
+            Some(stack_ctx),
+            TransitionMode::Never,
+        );
+
+        persist_cursor_on_exit(&app);
+
+        let cursor = cursor::load(dir.path()).unwrap();
+        let entry = &cursor.revsets[&revset_hash.hex()];
+        assert_eq!(entry.last_change_id, entries[1].change_id);
+        assert_eq!(entry.revset, revset);
+    }
+
+    #[test]
+    fn persist_cursor_on_exit_no_op_for_single_change_app() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = make_app_with_single_file(sample_diff_file());
+        app.repo_root = dir.path().to_owned();
+        persist_cursor_on_exit(&app);
+        // No cursor file should exist (single-change mode).
+        assert!(!dir.path().join(".jj-review").join("cursor.json").exists());
+    }
+
+    // ---- pick_retreat_index (B) ----
+    //
+    // The pure helper carries the navigation contract for `p`. Side-effect
+    // properties (no cursor write) follow from `retreat_stack` routing the
+    // index through `load_stack_entry(idx, advance=false)`; the helper itself
+    // does not touch any I/O.
+
+    #[test]
+    fn pick_retreat_index_at_zero_returns_none() {
+        assert_eq!(pick_retreat_index(0), None);
+    }
+
+    #[test]
+    fn pick_retreat_index_at_one_returns_zero() {
+        assert_eq!(pick_retreat_index(1), Some(0));
+    }
+
+    #[test]
+    fn pick_retreat_index_in_middle_returns_predecessor() {
+        assert_eq!(pick_retreat_index(5), Some(4));
+    }
+
+    #[test]
+    fn pick_retreat_index_at_large_value() {
+        assert_eq!(pick_retreat_index(usize::MAX), Some(usize::MAX - 1));
+    }
+
+    // ---- transition modal footer fits (A) ----
+
+    #[test]
+    fn transition_footer_fits_inside_modal() {
+        // Modal interior is `TRANSITION_MODAL_WIDTH - 2` cols (border on each
+        // side). Ratatui clips without wrapping, so the footer must fit or the
+        // user loses keybinding hints.
+        let interior = usize::from(TRANSITION_MODAL_WIDTH).saturating_sub(2);
+        assert!(
+            TRANSITION_FOOTER_TEXT.chars().count() <= interior,
+            "footer {:?} ({} chars) does not fit modal interior ({} cols)",
+            TRANSITION_FOOTER_TEXT,
+            TRANSITION_FOOTER_TEXT.chars().count(),
+            interior
+        );
+    }
+
+    // ---- render_dots cap (D) ----
+
+    #[test]
+    fn render_dots_zero_is_empty() {
+        assert_eq!(render_dots(0), "");
+    }
+
+    #[test]
+    fn render_dots_one() {
+        assert_eq!(render_dots(1), "●");
+    }
+
+    #[test]
+    fn render_dots_at_max() {
+        assert_eq!(render_dots(TRANSITION_DOT_MAX), "●●●●●");
+    }
+
+    #[test]
+    fn render_dots_one_over_max_truncates_with_ellipsis() {
+        assert_eq!(render_dots(TRANSITION_DOT_MAX + 1), "●●●●●…");
+    }
+
+    #[test]
+    fn render_dots_far_over_max_still_truncates() {
+        assert_eq!(render_dots(50), "●●●●●…");
+    }
+
+    // ---- pluralize (C) ----
+
+    #[test]
+    fn pluralize_count_one_is_singular() {
+        assert_eq!(pluralize("note", 1), "note");
+        assert_eq!(pluralize("suggestion", 1), "suggestion");
+    }
+
+    #[test]
+    fn pluralize_count_zero_is_plural() {
+        // We only ever call pluralize with count > 0 in practice (we skip the
+        // span when the count is zero), but the rule "anything other than 1
+        // is plural" is the safer default.
+        assert_eq!(pluralize("note", 0), "notes");
+    }
+
+    #[test]
+    fn pluralize_count_two_is_plural() {
+        assert_eq!(pluralize("note", 2), "notes");
+        assert_eq!(pluralize("suggestion", 3), "suggestions");
+    }
+
+    // ---- file_header_label ----
+
+    #[test]
+    fn file_header_label_shows_path_and_position() {
+        let app = make_app_with_single_file(sample_diff_file());
+        let label = file_header_label(&app);
+        assert!(
+            label.contains("foo.txt"),
+            "label should include file path, got: {label:?}"
+        );
+        assert!(
+            label.contains("1 of 1"),
+            "label should show position of total, got: {label:?}"
+        );
+    }
+
+    #[test]
+    fn file_header_label_no_files_shows_placeholder() {
+        use crate::diff::Diff;
+        let details = ChangeDetails {
+            change_id: ChangeId::parse(&"a".repeat(32)).unwrap(),
+            commit_id: CommitId::parse(&"a".repeat(40)).unwrap(),
+            description: String::new(),
+            diff: Diff { files: vec![] },
+        };
+        let app = App::new(
+            details,
+            PathBuf::from("/repo"),
+            "@".to_owned(),
+            None,
+            TransitionMode::Never,
+        );
+        let label = file_header_label(&app);
+        assert!(
+            label.contains("(no files)"),
+            "empty diff should show placeholder, got: {label:?}"
+        );
+    }
+
+    // ---- footer_text ----
+
+    #[test]
+    fn footer_text_stack_mode_contains_revision() {
+        let mut app = make_app_with_single_file(sample_diff_file());
+        let entry = StackEntry {
+            change_id: app.details.change_id.clone(),
+            commit_id: app.details.commit_id.clone(),
+            description: String::new(),
+        };
+        app.stack = Some(StackContext {
+            entries: vec![entry],
+            current_index: 0,
+            revset: "trunk()..@".to_owned(),
+            revset_hash: RevsetHash::from_revset("trunk()..@"),
+        });
+        let (text, _style) = footer_text(&app);
+        assert!(
+            text.contains("n/p revision"),
+            "footer should label n/p as 'revision', got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn footer_text_single_change_mode_has_no_revision_label() {
+        let app = make_app_with_single_file(sample_diff_file());
+        // No stack context → single-change footer branch.
+        let (text, _style) = footer_text(&app);
+        assert!(
+            !text.contains("n/p"),
+            "single-change footer should not mention n/p, got: {text:?}"
+        );
     }
 }
