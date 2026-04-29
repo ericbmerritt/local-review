@@ -27,6 +27,8 @@ Movement
 
 Comments
     Enter   c             new comment on current line
+    e                     edit (cursor on a comment)
+    d                     delete (cursor on a comment)
 
 Views
     ?                     this help
@@ -36,5 +38,6 @@ In comment composer
     ^L ^C ^K              scope:    line / change / stack
     ^1 ^2 ^3              severity: note / suggestion / required
     ^X                    save
+    ^D                    delete (edit mode only)
     Esc                   cancel  (^C inside the composer is captured as scope)
 ";

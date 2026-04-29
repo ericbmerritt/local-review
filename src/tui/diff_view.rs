@@ -42,7 +42,11 @@ pub(crate) enum RenderedLineKind {
     Removed,
     Notice,
     /// Synthetic line injected below a diff line to display a saved comment.
-    InlineCommentMeta,
+    /// Carries the index into `App::loaded_comments` so `e`/`d` can resolve
+    /// the focused comment in O(1) without a separate lookup.
+    InlineCommentMeta {
+        comment_index: usize,
+    },
     /// Continuation line for a multi-line inline comment body.
     InlineCommentBody,
 }
@@ -57,6 +61,8 @@ pub(crate) struct InlineComment {
     pub(crate) age: String,
     /// Comment body lines (already split on `\n`).
     pub(crate) body_lines: Vec<String>,
+    /// Index into `App::loaded_comments` for edit/delete lookup.
+    pub(crate) comment_index: usize,
 }
 
 /// Convert a saved `Comment` to an `InlineComment` for rendering, filtered by
@@ -64,6 +70,7 @@ pub(crate) struct InlineComment {
 /// the given file.
 pub(crate) fn comment_to_inline(
     comment: &Comment,
+    comment_index: usize,
     file_path: Option<&std::path::Path>,
     now: time::OffsetDateTime,
 ) -> Option<InlineComment> {
@@ -89,6 +96,7 @@ pub(crate) fn comment_to_inline(
         severity: comment.severity,
         age,
         body_lines,
+        comment_index,
     })
 }
 
@@ -229,7 +237,9 @@ fn inject_comment_lines(output: &mut Vec<RenderedLine>, comment: &InlineComment)
     // distinguish severity by reading the label.
     let meta = format!("┃ ● {label} · {}", comment.age);
     output.push(RenderedLine {
-        kind: RenderedLineKind::InlineCommentMeta,
+        kind: RenderedLineKind::InlineCommentMeta {
+            comment_index: comment.comment_index,
+        },
         text: meta,
         source_line: None,
         target_line: None,
@@ -412,13 +422,17 @@ mod tests {
             severity: Severity::Required,
             age: "just now".to_owned(),
             body_lines: vec!["Fix this.".to_owned()],
+            comment_index: 0,
         };
         let augmented = view.with_inline_comments(&[comment]);
         // Original: [HunkHeader, Context, Added, Removed] = 4 lines
         // After Added (target_line=2) we inject meta + 1 body = 2 extra lines
         assert_eq!(augmented.lines.len(), 6);
         assert_eq!(augmented.lines[2].kind, RenderedLineKind::Added);
-        assert_eq!(augmented.lines[3].kind, RenderedLineKind::InlineCommentMeta);
+        assert!(matches!(
+            augmented.lines[3].kind,
+            RenderedLineKind::InlineCommentMeta { .. }
+        ));
         assert!(augmented.lines[3].text.contains("required"));
         assert!(augmented.lines[3].text.contains("just now"));
         assert_eq!(
@@ -443,6 +457,7 @@ mod tests {
             severity: Severity::Note,
             age: "just now".to_owned(),
             body_lines: vec!["No match.".to_owned()],
+            comment_index: 0,
         };
         let augmented = view.with_inline_comments(&[comment]);
         assert_eq!(augmented.lines.len(), original_len);
@@ -465,12 +480,16 @@ mod tests {
             severity: Severity::Suggestion,
             age: "1 min ago".to_owned(),
             body_lines: vec!["Old line comment.".to_owned()],
+            comment_index: 0,
         };
         let augmented = view.with_inline_comments(&[comment]);
         // Removed line is at index 3 (src=2), after it we inject 2 lines
         assert_eq!(augmented.lines.len(), 6);
         assert_eq!(augmented.lines[3].kind, RenderedLineKind::Removed);
-        assert_eq!(augmented.lines[4].kind, RenderedLineKind::InlineCommentMeta);
+        assert!(matches!(
+            augmented.lines[4].kind,
+            RenderedLineKind::InlineCommentMeta { .. }
+        ));
     }
 
     fn make_line_comment(file: &str, severity: Severity) -> Comment {
@@ -505,19 +524,20 @@ mod tests {
     fn comment_to_inline_returns_some_for_matching_file() {
         let comment = make_line_comment("foo.txt", Severity::Required);
         let now = time::OffsetDateTime::UNIX_EPOCH;
-        let inline = comment_to_inline(&comment, Some(std::path::Path::new("foo.txt")), now);
+        let inline = comment_to_inline(&comment, 3, Some(std::path::Path::new("foo.txt")), now);
         let inline = inline.expect("matching file path should yield Some");
         assert_eq!(inline.severity, Severity::Required);
         assert_eq!(inline.target_line, Some(2));
         assert_eq!(inline.source_line, None);
         assert_eq!(inline.body_lines, vec!["hello".to_owned()]);
+        assert_eq!(inline.comment_index, 3);
     }
 
     #[test]
     fn comment_to_inline_returns_none_for_file_mismatch() {
         let comment = make_line_comment("foo.txt", Severity::Note);
         let now = time::OffsetDateTime::UNIX_EPOCH;
-        let inline = comment_to_inline(&comment, Some(std::path::Path::new("bar.txt")), now);
+        let inline = comment_to_inline(&comment, 0, Some(std::path::Path::new("bar.txt")), now);
         assert!(inline.is_none());
     }
 
@@ -525,7 +545,56 @@ mod tests {
     fn comment_to_inline_returns_none_when_file_path_is_none() {
         let comment = make_line_comment("foo.txt", Severity::Note);
         let now = time::OffsetDateTime::UNIX_EPOCH;
-        let inline = comment_to_inline(&comment, None, now);
+        let inline = comment_to_inline(&comment, 0, None, now);
         assert!(inline.is_none());
+    }
+
+    #[test]
+    fn comment_to_inline_carries_comment_index() {
+        let comment = make_line_comment("foo.txt", Severity::Note);
+        let now = time::OffsetDateTime::UNIX_EPOCH;
+        let inline = comment_to_inline(&comment, 7, Some(std::path::Path::new("foo.txt")), now)
+            .expect("matching file should produce Some");
+        assert_eq!(inline.comment_index, 7);
+    }
+
+    #[test]
+    fn inject_produces_meta_line_with_comment_index() {
+        let view = DiffView::from_file(&sample_modified());
+        let comment = InlineComment {
+            source_line: None,
+            target_line: Some(2),
+            severity: Severity::Note,
+            age: "just now".to_owned(),
+            body_lines: vec!["note".to_owned()],
+            comment_index: 5,
+        };
+        let augmented = view.with_inline_comments(&[comment]);
+        let meta = augmented
+            .lines
+            .iter()
+            .find(|l| matches!(l.kind, RenderedLineKind::InlineCommentMeta { .. }))
+            .expect("meta line should exist");
+        match meta.kind {
+            RenderedLineKind::InlineCommentMeta { comment_index } => {
+                assert_eq!(comment_index, 5);
+            }
+            RenderedLineKind::HunkHeader
+            | RenderedLineKind::HunkSeparator
+            | RenderedLineKind::Context
+            | RenderedLineKind::Added
+            | RenderedLineKind::Removed
+            | RenderedLineKind::Notice
+            | RenderedLineKind::InlineCommentBody => {
+                panic!("expected InlineCommentMeta")
+            }
+        }
+        // Body lines are not the carrier of the index; they have a different kind.
+        let body = augmented
+            .lines
+            .iter()
+            .find(|l| l.kind == RenderedLineKind::InlineCommentBody)
+            .expect("body line should exist");
+        assert_eq!(body.kind, RenderedLineKind::InlineCommentBody);
     }
 }

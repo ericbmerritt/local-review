@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use time::OffsetDateTime;
 use tui_textarea::TextArea;
 
 use crate::comment::Severity;
@@ -38,15 +39,25 @@ pub(crate) struct LineTarget {
 }
 
 /// State for Screen 2 — Comment composer modal.
-///
-/// Phase 2 supports new-comment creation only. Task 2.3 will extend this with
-/// an edit mode (pre-populated body, `Edit(created_at)` variant in a new
-/// `ComposerMode` enum, and `^D delete` in the footer).
 pub(crate) struct Composer {
     pub(crate) target: LineTarget,
     pub(crate) scope: ComposerScope,
     pub(crate) severity: Severity,
     pub(crate) body: TextArea<'static>,
+    /// When `Some(created_at)`, the composer is in edit mode and `^X` will
+    /// call `update_comment` instead of `save_comment`. The timestamp
+    /// identifies the record on disk.
+    pub(crate) editing: Option<OffsetDateTime>,
+}
+
+/// Bundle of fields drawn from a single `Comment` to seed an edit-mode
+/// composer. Constructing this in the caller keeps `severity`, `body`, and
+/// the `identity` timestamp from drifting apart at the `for_edit` boundary.
+pub(crate) struct EditedComment {
+    pub(crate) target: LineTarget,
+    pub(crate) severity: Severity,
+    pub(crate) body: String,
+    pub(crate) identity: OffsetDateTime,
 }
 
 impl Composer {
@@ -56,10 +67,28 @@ impl Composer {
             scope: default_scope_for_cursor(),
             severity,
             body: TextArea::default(),
+            editing: None,
         }
     }
 
-    /// e.g. `Comment · src/client.rs:142`
+    pub(crate) fn for_edit(edited: EditedComment) -> Self {
+        let mut textarea = TextArea::default();
+        for (i, line) in edited.body.lines().enumerate() {
+            if i > 0 {
+                textarea.insert_newline();
+            }
+            textarea.insert_str(line);
+        }
+        Self {
+            target: edited.target,
+            scope: ComposerScope::Line,
+            severity: edited.severity,
+            body: textarea,
+            editing: Some(edited.identity),
+        }
+    }
+
+    /// Modal title, reflecting edit vs. new-comment mode.
     pub(crate) fn title(&self) -> String {
         let file = self.target.file.display();
         let line = self
@@ -67,7 +96,11 @@ impl Composer {
             .target_line
             .or(self.target.source_line)
             .unwrap_or(0);
-        format!("Comment · {file}:{line}")
+        if self.editing.is_some() {
+            format!("Edit comment · {file}:{line}")
+        } else {
+            format!("Comment · {file}:{line}")
+        }
     }
 
     pub(crate) fn body_text(&self) -> String {
@@ -84,6 +117,9 @@ pub(crate) enum ComposerAction {
     Save,
     /// `Esc` pressed; caller should discard and close.
     Cancel,
+    /// `^D` pressed while in edit mode; caller should delete the original
+    /// comment and close the composer.
+    Delete,
 }
 
 /// Handle a key event inside the composer.
@@ -127,6 +163,9 @@ pub(crate) fn handle_composer_key(composer: &mut Composer, key: KeyEvent) -> Com
             KeyCode::Char('x') => {
                 return ComposerAction::Save;
             }
+            KeyCode::Char('d') if composer.editing.is_some() => {
+                return ComposerAction::Delete;
+            }
             _ => {}
         }
     }
@@ -155,7 +194,7 @@ pub(crate) fn default_severity(last: Option<Severity>) -> Severity {
 }
 
 #[must_use]
-pub(crate) fn format_age(now: time::OffsetDateTime, created_at: time::OffsetDateTime) -> String {
+pub(crate) fn format_age(now: OffsetDateTime, created_at: OffsetDateTime) -> String {
     let secs = (now - created_at).whole_seconds().max(0);
     format_age_secs(secs)
 }
@@ -350,5 +389,51 @@ mod tests {
     fn composer_title_new_mode() {
         let c = Composer::new(make_target(), Severity::Suggestion);
         assert_eq!(c.title(), "Comment · src/client.rs:142");
+    }
+
+    #[test]
+    fn composer_title_edit_mode() {
+        let c = Composer::for_edit(EditedComment {
+            target: make_target(),
+            severity: Severity::Required,
+            body: "existing body".to_owned(),
+            identity: OffsetDateTime::UNIX_EPOCH,
+        });
+        assert_eq!(c.title(), "Edit comment · src/client.rs:142");
+    }
+
+    #[test]
+    fn for_edit_prepopulates_body_and_severity() {
+        let c = Composer::for_edit(EditedComment {
+            target: make_target(),
+            severity: Severity::Required,
+            body: "line one\nline two".to_owned(),
+            identity: OffsetDateTime::UNIX_EPOCH,
+        });
+        assert_eq!(c.body_text(), "line one\nline two");
+        assert_eq!(c.severity, Severity::Required);
+        assert_eq!(c.editing, Some(OffsetDateTime::UNIX_EPOCH));
+        assert_eq!(c.scope, ComposerScope::Line);
+    }
+
+    #[test]
+    fn ctrl_d_in_edit_mode_returns_delete() {
+        let mut c = Composer::for_edit(EditedComment {
+            target: make_target(),
+            severity: Severity::Note,
+            body: "body".to_owned(),
+            identity: OffsetDateTime::UNIX_EPOCH,
+        });
+        let key = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
+        let action = handle_composer_key(&mut c, key);
+        assert_eq!(action, ComposerAction::Delete);
+    }
+
+    #[test]
+    fn ctrl_d_outside_edit_mode_forwarded_to_textarea() {
+        let mut c = Composer::new(make_target(), Severity::Suggestion);
+        let key = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
+        let action = handle_composer_key(&mut c, key);
+        assert_eq!(action, ComposerAction::Continue);
     }
 }

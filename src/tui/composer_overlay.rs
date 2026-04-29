@@ -59,7 +59,7 @@ pub(super) fn render_composer_overlay(
     render_scope_picker(frame, chunks[1], composer);
     render_severity_picker(frame, chunks[2], composer);
     render_body_editor(frame, chunks[3], composer);
-    render_composer_footer(frame, chunks[4]);
+    render_composer_footer(frame, chunks[4], composer.editing.is_some());
 }
 
 fn render_composer_context(
@@ -172,10 +172,13 @@ fn render_body_editor(frame: &mut Frame<'_>, area: Rect, composer: &Composer) {
     frame.render_widget(&composer.body, area);
 }
 
-fn render_composer_footer(frame: &mut Frame<'_>, area: Rect) {
-    // Split across two lines: a 70-col chunk truncates the single-line form.
+fn render_composer_footer(frame: &mut Frame<'_>, area: Rect, editing: bool) {
     let line1 = TuiLine::from("  ^L line  ^C change  ^K stack");
-    let line2 = TuiLine::from("  ^1 note  ^2 suggestion  ^3 required        ^X save  Esc");
+    let line2 = if editing {
+        TuiLine::from("  ^1 note  ^2 suggestion  ^3 required   ^D delete  ^X save  Esc")
+    } else {
+        TuiLine::from("  ^1 note  ^2 suggestion  ^3 required        ^X save  Esc")
+    };
     let widget = Paragraph::new(Text::from(vec![line1, line2]));
     frame.render_widget(widget, area);
 }
