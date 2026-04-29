@@ -56,4 +56,22 @@ pub enum JjrError {
 
     #[snafu(display("terminal is too short: {} rows (minimum 10)", rows))]
     TerminalTooShort { rows: u16 },
+
+    #[snafu(display(
+        "schema version mismatch: file has {found}, expected {expected}; \
+         delete .jj-review/comments/<change-id>.jsonl to drop incompatible records"
+    ))]
+    SchemaVersionMismatch { found: String, expected: String },
+
+    #[snafu(display("two comments share created_at {timestamp}; cannot uniquely identify"))]
+    DuplicateCommentTimestamp { timestamp: String },
+
+    #[snafu(display(
+        "comment with created_at {timestamp} not found in {}",
+        file.display()
+    ))]
+    CommentNotFound { file: PathBuf, timestamp: String },
+
+    #[snafu(display("line-scoped comment requires at least one of old_line or new_line"))]
+    LineAnchorMissingLineNumber,
 }

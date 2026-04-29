@@ -77,7 +77,7 @@ ratatui = "0.29"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 snafu = "0.8"
-time = { version = "0.3", features = ["serde", "formatting"] }
+time = { version = "0.3", features = ["serde", "formatting", "parsing", "macros"] }
 toml = "0.8"
 unidiff = "0.4"
 
