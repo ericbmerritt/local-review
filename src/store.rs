@@ -22,9 +22,9 @@ fn change_file(repo_root: &Path, change_id: &ChangeId) -> PathBuf {
 
 fn anchor_file(repo_root: &Path, comment: &Comment) -> PathBuf {
     match &comment.anchor {
-        Anchor::Line { change_id, .. } | Anchor::Change { change_id } => {
-            change_file(repo_root, change_id)
-        }
+        Anchor::Line { change_id, .. }
+        | Anchor::Change { change_id }
+        | Anchor::Description { change_id, .. } => change_file(repo_root, change_id),
         Anchor::Stack { .. } => comments_dir(repo_root).join(STACK_FILENAME),
     }
 }
@@ -101,7 +101,7 @@ pub fn load_stack_comments(repo_root: &Path, revset_hash: &RevsetHash) -> Result
                     result.push(comment);
                 }
             }
-            Anchor::Line { .. } | Anchor::Change { .. } => {
+            Anchor::Line { .. } | Anchor::Change { .. } | Anchor::Description { .. } => {
                 return Err(JjrError::StackFileCorruption { path: path.clone() });
             }
         }
@@ -152,10 +152,6 @@ pub fn update_comment(repo_root: &Path, comment: &Comment) -> Result<()> {
     write_file(&path, &updated)
 }
 
-/// Removes the record identified by `created_at` from the JSONL file resolved
-/// from `comment`'s anchor (line and change scope route to the change file;
-/// stack scope routes to `_stack.jsonl`).
-///
 /// Taking `&Comment` rather than `&ChangeId` ensures stack-scoped comments —
 /// which have no `change_id` — can be deleted via the same entry point.
 pub fn delete_comment(repo_root: &Path, comment: &Comment) -> Result<()> {
@@ -215,12 +211,9 @@ fn parse_record(line: &str, path: &Path) -> Result<Comment> {
         source: io::Error::other(format!("JSON parse error in {}: {e}", path.display())),
     })?;
 
-    // Schema version is checked manually before delegating to serde so that
-    // a wrong-version record returns the typed `SchemaVersionMismatch` error
-    // (a hard error, propagated up to fail the load) instead of a generic
-    // serde parse failure (which would be logged and the line skipped). A
-    // record with no `schema_version` field at all is also a mismatch — not
-    // a malformed line — because the spec requires the field to be present.
+    // Manual schema-version check so a mismatch returns typed
+    // `SchemaVersionMismatch` (hard error) rather than a generic parse failure
+    // (which would be silently skipped). Missing field is also a mismatch.
     match raw.get("schema_version").and_then(|v| v.as_str()) {
         Some(v) if v == SCHEMA_VERSION_VALUE => {}
         Some(other) => {
@@ -309,13 +302,8 @@ fn delete_by_timestamp(existing: Vec<Comment>, key: &str, path: &Path) -> Result
     }
 }
 
-/// Write `comments` to `path` atomically.
-///
-/// `NamedTempFile::persist` writes to a randomized sibling in the same
-/// directory and renames into place — so a crash mid-write cannot corrupt
-/// the existing file, and the temp file is cleaned up on drop if `persist`
-/// is never called. Same-directory placement guarantees the rename stays on
-/// one filesystem (cross-device renames would fail).
+/// Write `comments` to `path` atomically via a same-directory temp file;
+/// same-directory placement ensures the rename stays on one filesystem.
 fn write_file(path: &Path, comments: &[Comment]) -> Result<()> {
     let dir = path.parent().ok_or_else(|| JjrError::Io {
         source: io::Error::other(format!("path has no parent directory: {}", path.display())),
@@ -475,7 +463,7 @@ pub fn clear_all_for_stack(repo_root: &Path, stack: &ResolvedStack) -> Result<Cl
             .into_iter()
             .filter(|c| match &c.anchor {
                 Anchor::Stack { revset_hash } => revset_hash != &stack.revset_hash,
-                Anchor::Line { .. } | Anchor::Change { .. } => true,
+                Anchor::Line { .. } | Anchor::Change { .. } | Anchor::Description { .. } => true,
             })
             .collect();
         let removed = total - kept.len();
@@ -1690,5 +1678,103 @@ mod tests {
         assert!(load_stack_comments(dir.path(), &stack_hash)
             .unwrap()
             .is_empty());
+    }
+
+    fn make_description_comment(
+        change_id: ChangeId,
+        created_at: OffsetDateTime,
+        body: &str,
+    ) -> Comment {
+        use crate::comment::DescriptionAnchor;
+        Comment {
+            schema_version: SchemaVersion,
+            anchor: Anchor::Description {
+                change_id,
+                location: DescriptionAnchor {
+                    display_line: Some(3),
+                    target_text: "Fix the off-by-one error".to_owned(),
+                    context_before: vec!["Refactor retry logic".to_owned()],
+                    context_after: vec![],
+                },
+            },
+            repo_root: PathBuf::new(),
+            revset: "@".to_owned(),
+            commit_id: None,
+            body: body.to_owned(),
+            severity: Severity::Note,
+            created_at,
+            updated_at: None,
+            status: Some(Status::Pending),
+            mismatch_reason: None,
+        }
+    }
+
+    #[test]
+    fn description_comment_save_and_load_via_load_change_comments() {
+        let dir = tmp();
+        let id = cid("abc12345");
+        let comment = rooted(
+            make_description_comment(id.clone(), datetime!(2026-04-29 15:00:00 UTC), "desc body"),
+            dir.path(),
+        );
+        save_comment(dir.path(), &comment).unwrap();
+        let loaded = load_change_comments(dir.path(), &id).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert!(matches!(loaded[0].anchor, Anchor::Description { .. }));
+        assert_eq!(loaded[0].body, "desc body");
+    }
+
+    #[test]
+    fn description_comment_stored_alongside_line_comment_in_same_file() {
+        let dir = tmp();
+        let id = cid("abc12345");
+        let line_c = rooted(
+            make_line_comment(id.clone(), datetime!(2026-04-29 15:00:00 UTC), "line body"),
+            dir.path(),
+        );
+        let desc_c = rooted(
+            make_description_comment(id.clone(), datetime!(2026-04-29 15:01:00 UTC), "desc body"),
+            dir.path(),
+        );
+        save_comment(dir.path(), &line_c).unwrap();
+        save_comment(dir.path(), &desc_c).unwrap();
+        let loaded = load_change_comments(dir.path(), &id).unwrap();
+        assert_eq!(loaded.len(), 2);
+    }
+
+    #[test]
+    fn description_comment_update_by_created_at() {
+        let dir = tmp();
+        let id = cid("abc12345");
+        let ts = datetime!(2026-04-29 15:00:00 UTC);
+        let original = rooted(
+            make_description_comment(id.clone(), ts, "original"),
+            dir.path(),
+        );
+        save_comment(dir.path(), &original).unwrap();
+
+        let updated = Comment {
+            body: "updated".to_owned(),
+            ..original
+        };
+        update_comment(dir.path(), &updated).unwrap();
+
+        let loaded = load_change_comments(dir.path(), &id).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].body, "updated");
+    }
+
+    #[test]
+    fn description_comment_delete_by_created_at() {
+        let dir = tmp();
+        let id = cid("abc12345");
+        let comment = rooted(
+            make_description_comment(id.clone(), datetime!(2026-04-29 15:00:00 UTC), "to delete"),
+            dir.path(),
+        );
+        save_comment(dir.path(), &comment).unwrap();
+        delete_comment(dir.path(), &comment).unwrap();
+        let loaded = load_change_comments(dir.path(), &id).unwrap();
+        assert!(loaded.is_empty());
     }
 }

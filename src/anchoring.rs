@@ -1,19 +1,36 @@
-//! Pure line-anchoring algorithm: given a saved [`LineAnchor`] and the current
-//! parsed [`Diff`] for the same change, decide whether the comment can be
-//! re-anchored cleanly or must be marked stale (and why).
+//! Pure anchoring algorithm.
+//!
+//! An *anchor* is the saved coordinates of a comment: the file, line, hunk
+//! header, target text, and surrounding context lines (for line anchors); or
+//! the description-line text and its neighbours (for description anchors).
+//! Coordinates drift across review cycles as the agent edits the change, so
+//! every reload must reconcile the saved anchor against the current state of
+//! the change before the comment can be displayed.
+//!
+//! Given a saved anchor and the current state of the change (diff for line
+//! anchors, description text for description anchors), the algorithm decides
+//! whether the comment can be re-anchored cleanly or must be marked stale
+//! (and why).
 
-use crate::comment::{Anchor, Comment, LineAnchor, MismatchReason, Side, Status};
+use crate::comment::{
+    Anchor, Comment, DescriptionAnchor, LineAnchor, MismatchReason, Side, Status,
+};
 use crate::diff::{Diff, DiffFile, Hunk};
 
-/// Outcome of attempting to re-anchor a saved line comment against the
-/// current diff. The wiring layer translates this into a Comment status
-/// update + persistence.
+/// Outcome of attempting to re-anchor a saved comment.
+///
+/// The type parameter `A` is the anchor type returned on success:
+/// [`LineAnchor`] for diff-line comments, [`DescriptionAnchor`] for
+/// description-scoped comments. Using a single generic enum avoids two
+/// parallel enums that would otherwise drift.
+///
+/// The wiring layer translates this into a Comment status update + persistence.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AnchorOutcome {
-    /// Exact match found. The returned [`LineAnchor`] has updated line numbers
-    /// and `hunk_header`; the textual fields (`target_text`, `context_before`,
-    /// `context_after`) are unchanged.
-    ReAnchored(LineAnchor),
+pub enum AnchorOutcome<A> {
+    /// Exact match found. The returned anchor has updated position fields;
+    /// the textual fields (`target_text`, `context_before`, `context_after`)
+    /// are unchanged.
+    ReAnchored(A),
 
     /// No exact match. The anchor is now stale; the variant carries the most
     /// informative [`MismatchReason`] the algorithm can determine.
@@ -21,7 +38,7 @@ pub enum AnchorOutcome {
 }
 
 /// Stack-membership / orphaned status is checked elsewhere.
-pub fn match_anchor(anchor: &LineAnchor, diff: &Diff) -> AnchorOutcome {
+pub fn match_anchor(anchor: &LineAnchor, diff: &Diff) -> AnchorOutcome<LineAnchor> {
     let Some(diff_file) = diff
         .files
         .iter()
@@ -44,27 +61,63 @@ pub fn match_anchor(anchor: &LineAnchor, diff: &Diff) -> AnchorOutcome {
     }
 }
 
-/// Reconcile a saved comment's anchor against the current diff.
+/// An empty `description` is treated as "description not present" and returns
+/// `Stale(AnchorNotFound)`.
+pub fn match_description_anchor(
+    anchor: &DescriptionAnchor,
+    description: &str,
+) -> AnchorOutcome<DescriptionAnchor> {
+    if description.is_empty() {
+        return AnchorOutcome::Stale(MismatchReason::AnchorNotFound);
+    }
+
+    let lines: Vec<&str> = description.lines().collect();
+
+    let exact_matches: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(idx, _)| desc_is_exact_match(&lines, *idx, anchor))
+        .map(|(idx, _)| idx)
+        .collect();
+
+    match exact_matches.len() {
+        0 => desc_fuzzy_match(&lines, anchor),
+        1 => AnchorOutcome::ReAnchored(desc_build_updated_anchor(anchor, exact_matches[0])),
+        _ => desc_resolve_multiple_exact(anchor, &exact_matches),
+    }
+}
+
+/// Reconcile a saved comment's anchor against the current diff and description.
 ///
 /// Returns `None` when the comment is already correct (no write needed).
 /// Returns `Some(updated)` when the anchor location, status, or mismatch
-/// reason needs to change. Change-scoped and stack-scoped comments are always
-/// returned as `None` — anchoring is line-only.
-pub fn reanchor_comment(comment: &Comment, diff: &Diff) -> Option<Comment> {
-    let Anchor::Line {
-        change_id,
-        location,
-    } = &comment.anchor
-    else {
-        return None;
-    };
+/// reason needs to change.
+///
+/// Callers that have no description text should pass `""`, which causes
+/// description anchors to return `Stale(AnchorNotFound)`.
+pub fn reanchor_comment(comment: &Comment, diff: &Diff, description: &str) -> Option<Comment> {
+    match &comment.anchor {
+        Anchor::Line {
+            change_id,
+            location,
+        } => reanchor_line(comment, change_id, location, diff),
+        Anchor::Description {
+            change_id,
+            location,
+        } => reanchor_description(comment, change_id, location, description),
+        Anchor::Change { .. } | Anchor::Stack { .. } => None,
+    }
+}
 
+fn reanchor_line(
+    comment: &Comment,
+    change_id: &crate::change_id::ChangeId,
+    location: &LineAnchor,
+    diff: &Diff,
+) -> Option<Comment> {
     match match_anchor(location, diff) {
         AnchorOutcome::ReAnchored(new_anchor) => {
-            let anchor_moved = new_anchor != *location;
-            let was_stale = comment.status == Some(Status::Stale);
-            let status_unset = comment.status.is_none();
-            if !anchor_moved && !was_stale && !status_unset {
+            if !needs_reanchor_update(comment, &new_anchor != location) {
                 return None;
             }
             Some(Comment {
@@ -77,19 +130,56 @@ pub fn reanchor_comment(comment: &Comment, diff: &Diff) -> Option<Comment> {
                 ..comment.clone()
             })
         }
-        AnchorOutcome::Stale(reason) => {
-            let already_stale_with_same_reason =
-                comment.status == Some(Status::Stale) && comment.mismatch_reason == Some(reason);
-            if already_stale_with_same_reason {
+        AnchorOutcome::Stale(reason) => stale_update(comment, reason),
+    }
+}
+
+fn reanchor_description(
+    comment: &Comment,
+    change_id: &crate::change_id::ChangeId,
+    location: &DescriptionAnchor,
+    description: &str,
+) -> Option<Comment> {
+    match match_description_anchor(location, description) {
+        AnchorOutcome::ReAnchored(new_anchor) => {
+            if !needs_reanchor_update(comment, &new_anchor != location) {
                 return None;
             }
             Some(Comment {
-                status: Some(Status::Stale),
-                mismatch_reason: Some(reason),
+                anchor: Anchor::Description {
+                    change_id: change_id.clone(),
+                    location: new_anchor,
+                },
+                status: Some(Status::Pending),
+                mismatch_reason: None,
                 ..comment.clone()
             })
         }
+        AnchorOutcome::Stale(reason) => stale_update(comment, reason),
     }
+}
+
+/// Whether a re-anchored comment needs its on-disk record rewritten. Skips the
+/// write when the anchor didn't move and the comment was already pending; we
+/// only need to touch the record when something actually changed (location
+/// shifted, transitioning out of stale, or status was unset on a v1 record).
+fn needs_reanchor_update(comment: &Comment, anchor_moved: bool) -> bool {
+    let was_stale = comment.status == Some(Status::Stale);
+    let status_unset = comment.status.is_none();
+    anchor_moved || was_stale || status_unset
+}
+
+fn stale_update(comment: &Comment, reason: MismatchReason) -> Option<Comment> {
+    let already_stale_with_same_reason =
+        comment.status == Some(Status::Stale) && comment.mismatch_reason == Some(reason);
+    if already_stale_with_same_reason {
+        return None;
+    }
+    Some(Comment {
+        status: Some(Status::Stale),
+        mismatch_reason: Some(reason),
+        ..comment.clone()
+    })
 }
 
 /// A hunk header has the form `@@ -N,N +N,N @@ <function-context>`.
@@ -170,10 +260,8 @@ pub(crate) fn gather_context_after(hunk: &Hunk, line_idx: usize, n: usize) -> Ve
         .collect()
 }
 
-/// Match the gathered window against the stored context. When `stored` is
-/// non-empty but no surrounding lines are available (hunk boundary), this
-/// returns `false` rather than vacuously accepting — at a true boundary the
-/// stored signal cannot be confirmed by content, so the match fails.
+/// At a hunk boundary the stored context cannot be confirmed, so we
+/// return `false` rather than vacuously accepting the match.
 fn context_window_matches(available: &[&str], stored: &[String]) -> bool {
     if stored.is_empty() {
         return true;
@@ -188,7 +276,10 @@ fn context_window_matches(available: &[&str], stored: &[String]) -> bool {
     available == stored[..n].iter().map(String::as_str).collect::<Vec<_>>()
 }
 
-fn resolve_multiple_exact(anchor: &LineAnchor, matches: &[(&Hunk, usize)]) -> AnchorOutcome {
+fn resolve_multiple_exact(
+    anchor: &LineAnchor,
+    matches: &[(&Hunk, usize)],
+) -> AnchorOutcome<LineAnchor> {
     let reference_line = match anchor.side {
         Side::New => anchor.new_line,
         Side::Old => anchor.old_line,
@@ -275,7 +366,7 @@ fn build_updated_anchor(anchor: &LineAnchor, hunk: &Hunk, line_idx: usize) -> Li
     .normalized()
 }
 
-fn fuzzy_match(candidates: &[&Hunk], anchor: &LineAnchor) -> AnchorOutcome {
+fn fuzzy_match(candidates: &[&Hunk], anchor: &LineAnchor) -> AnchorOutcome<LineAnchor> {
     if let Some(reason) = check_body_changed(candidates, anchor) {
         return AnchorOutcome::Stale(reason);
     }
@@ -334,6 +425,142 @@ fn check_context_drifted(candidates: &[&Hunk], anchor: &LineAnchor) -> Option<Mi
     }
 }
 
+fn desc_context_before<'a>(lines: &[&'a str], line_idx: usize, n: usize) -> Vec<&'a str> {
+    lines[..line_idx]
+        .iter()
+        .rev()
+        .take(n)
+        .copied()
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect()
+}
+
+fn desc_context_after<'a>(lines: &[&'a str], line_idx: usize, n: usize) -> Vec<&'a str> {
+    lines[line_idx + 1..].iter().take(n).copied().collect()
+}
+
+fn desc_is_exact_match(lines: &[&str], line_idx: usize, anchor: &DescriptionAnchor) -> bool {
+    if lines[line_idx] != anchor.target_text {
+        return false;
+    }
+    let before = desc_context_before(lines, line_idx, anchor.context_before.len());
+    let after = desc_context_after(lines, line_idx, anchor.context_after.len());
+    context_window_matches(&before, &anchor.context_before)
+        && context_window_matches(&after, &anchor.context_after)
+}
+
+fn desc_build_updated_anchor(anchor: &DescriptionAnchor, line_idx: usize) -> DescriptionAnchor {
+    DescriptionAnchor {
+        display_line: u32::try_from(line_idx + 1).ok(),
+        target_text: anchor.target_text.clone(),
+        context_before: anchor.context_before.clone(),
+        context_after: anchor.context_after.clone(),
+    }
+    .normalized()
+}
+
+fn desc_resolve_multiple_exact(
+    anchor: &DescriptionAnchor,
+    matches: &[usize],
+) -> AnchorOutcome<DescriptionAnchor> {
+    let Some(ref_line) = anchor.display_line else {
+        return AnchorOutcome::Stale(MismatchReason::AnchorNotFound);
+    };
+
+    let mut best_dist: Option<u32> = None;
+    let mut best_idx: Option<usize> = None;
+    let mut tied = false;
+
+    for &line_idx in matches {
+        let candidate_line = u32::try_from(line_idx + 1).unwrap_or(u32::MAX);
+        let dist = ref_line.abs_diff(candidate_line);
+        match best_dist {
+            None => {
+                best_dist = Some(dist);
+                best_idx = Some(line_idx);
+                tied = false;
+            }
+            Some(d) if dist < d => {
+                best_dist = Some(dist);
+                best_idx = Some(line_idx);
+                tied = false;
+            }
+            Some(d) if dist == d => {
+                tied = true;
+            }
+            _ => {}
+        }
+    }
+
+    if tied {
+        return AnchorOutcome::Stale(MismatchReason::AnchorNotFound);
+    }
+    match best_idx {
+        Some(idx) => AnchorOutcome::ReAnchored(desc_build_updated_anchor(anchor, idx)),
+        None => AnchorOutcome::Stale(MismatchReason::AnchorNotFound),
+    }
+}
+
+fn desc_fuzzy_match(
+    lines: &[&str],
+    anchor: &DescriptionAnchor,
+) -> AnchorOutcome<DescriptionAnchor> {
+    if let Some(reason) = desc_check_body_changed(lines, anchor) {
+        return AnchorOutcome::Stale(reason);
+    }
+    if let Some(reason) = desc_check_context_drifted(lines, anchor) {
+        return AnchorOutcome::Stale(reason);
+    }
+    AnchorOutcome::Stale(MismatchReason::AnchorNotFound)
+}
+
+fn desc_check_body_changed(lines: &[&str], anchor: &DescriptionAnchor) -> Option<MismatchReason> {
+    if anchor.context_before.is_empty() && anchor.context_after.is_empty() {
+        return None;
+    }
+    for (line_idx, _) in lines.iter().enumerate() {
+        let before = desc_context_before(lines, line_idx, anchor.context_before.len());
+        let after = desc_context_after(lines, line_idx, anchor.context_after.len());
+        let before_ok = context_window_matches(&before, &anchor.context_before);
+        let after_ok = context_window_matches(&after, &anchor.context_after);
+        let text_differs = lines[line_idx] != anchor.target_text;
+        if before_ok && after_ok && text_differs {
+            return Some(MismatchReason::TargetTextChanged);
+        }
+    }
+    None
+}
+
+fn desc_check_context_drifted(
+    lines: &[&str],
+    anchor: &DescriptionAnchor,
+) -> Option<MismatchReason> {
+    let matching: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| **l == anchor.target_text)
+        .map(|(i, _)| i)
+        .collect();
+
+    if matching.len() != 1 {
+        return None;
+    }
+
+    let line_idx = matching[0];
+    let before = desc_context_before(lines, line_idx, anchor.context_before.len());
+    let after = desc_context_after(lines, line_idx, anchor.context_after.len());
+    let before_ok = context_window_matches(&before, &anchor.context_before);
+    let after_ok = context_window_matches(&after, &anchor.context_after);
+
+    match (before_ok, after_ok) {
+        (true, false) => Some(MismatchReason::ContextAfterChanged),
+        (false, true) => Some(MismatchReason::ContextBeforeChanged),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -343,7 +570,8 @@ mod tests {
     use super::*;
     use crate::change_id::ChangeId;
     use crate::comment::{
-        Anchor, Comment, LineAnchor, MismatchReason, SchemaVersion, Severity, Side, Status,
+        Anchor, Comment, DescriptionAnchor, LineAnchor, MismatchReason, SchemaVersion, Severity,
+        Side, Status,
     };
     use crate::diff::{Diff, DiffFile, Hunk, Line, LineKind};
 
@@ -1139,7 +1367,7 @@ mod tests {
         );
         let hunk = make_hunk("@@ -0,0 +1,1 @@", None, vec![added_line("target", 1)]);
         let diff = make_diff(vec![modified_file("foo.rs", vec![hunk])]);
-        assert!(reanchor_comment(&comment, &diff).is_none());
+        assert!(reanchor_comment(&comment, &diff, "").is_none());
     }
 
     #[test]
@@ -1173,7 +1401,7 @@ mod tests {
         );
         let diff = make_diff(vec![modified_file("foo.rs", vec![hunk])]);
         let updated =
-            reanchor_comment(&comment, &diff).expect("should return Some for moved anchor");
+            reanchor_comment(&comment, &diff, "").expect("should return Some for moved anchor");
         let Anchor::Line { location, .. } = &updated.anchor else {
             panic!("expected Line anchor");
         };
@@ -1213,7 +1441,7 @@ mod tests {
         );
         let diff = make_diff(vec![modified_file("foo.rs", vec![hunk])]);
         let updated =
-            reanchor_comment(&comment, &diff).expect("should return Some when going stale");
+            reanchor_comment(&comment, &diff, "").expect("should return Some when going stale");
         assert_eq!(updated.status, Some(Status::Stale));
         assert_eq!(
             updated.mismatch_reason,
@@ -1242,7 +1470,8 @@ mod tests {
             ],
         );
         let diff = make_diff(vec![modified_file("foo.rs", vec![hunk])]);
-        let updated = reanchor_comment(&comment, &diff).expect("stale->pending should return Some");
+        let updated =
+            reanchor_comment(&comment, &diff, "").expect("stale->pending should return Some");
         assert_eq!(updated.status, Some(Status::Pending));
         assert!(updated.mismatch_reason.is_none());
     }
@@ -1277,7 +1506,7 @@ mod tests {
             ],
         );
         let diff = make_diff(vec![modified_file("foo.rs", vec![hunk])]);
-        assert!(reanchor_comment(&comment, &diff).is_none());
+        assert!(reanchor_comment(&comment, &diff, "").is_none());
     }
 
     #[test]
@@ -1310,7 +1539,8 @@ mod tests {
             ],
         );
         let diff = make_diff(vec![modified_file("foo.rs", vec![hunk])]);
-        let updated = reanchor_comment(&comment, &diff).expect("reason change should return Some");
+        let updated =
+            reanchor_comment(&comment, &diff, "").expect("reason change should return Some");
         assert_eq!(updated.status, Some(Status::Stale));
         assert_eq!(
             updated.mismatch_reason,
@@ -1328,7 +1558,7 @@ mod tests {
             None,
         );
         let diff = make_diff(vec![modified_file("foo.rs", vec![])]);
-        assert!(reanchor_comment(&comment, &diff).is_none());
+        assert!(reanchor_comment(&comment, &diff, "").is_none());
     }
 
     #[test]
@@ -1341,7 +1571,7 @@ mod tests {
             None,
         );
         let diff = make_diff(vec![modified_file("foo.rs", vec![])]);
-        assert!(reanchor_comment(&comment, &diff).is_none());
+        assert!(reanchor_comment(&comment, &diff, "").is_none());
     }
 
     #[test]
@@ -1365,9 +1595,248 @@ mod tests {
             ],
         );
         let diff = make_diff(vec![modified_file("foo.rs", vec![hunk])]);
-        let updated = reanchor_comment(&comment, &diff)
+        let updated = reanchor_comment(&comment, &diff, "")
             .expect("legacy no-status comment with exact match should return pending");
         assert_eq!(updated.status, Some(Status::Pending));
         assert!(updated.mismatch_reason.is_none());
+    }
+
+    fn make_desc_anchor(
+        target: &str,
+        display_line: Option<u32>,
+        before: Vec<&str>,
+        after: Vec<&str>,
+    ) -> DescriptionAnchor {
+        DescriptionAnchor {
+            display_line,
+            target_text: target.to_owned(),
+            context_before: before.into_iter().map(str::to_owned).collect(),
+            context_after: after.into_iter().map(str::to_owned).collect(),
+        }
+    }
+
+    fn desc_comment(
+        anchor: DescriptionAnchor,
+        status: Option<Status>,
+        reason: Option<MismatchReason>,
+    ) -> Comment {
+        make_comment(
+            Anchor::Description {
+                change_id: change_id(),
+                location: anchor,
+            },
+            status,
+            reason,
+        )
+    }
+
+    fn empty_diff() -> Diff {
+        make_diff(vec![])
+    }
+
+    #[test]
+    fn desc_exact_match_unique_returns_reanchored_with_updated_display_line() {
+        let description = "First line\nTarget line\nThird line";
+        let anchor = make_desc_anchor(
+            "Target line",
+            Some(2),
+            vec!["First line"],
+            vec!["Third line"],
+        );
+        let outcome = match_description_anchor(&anchor, description);
+        let AnchorOutcome::ReAnchored(updated) = outcome else {
+            panic!("expected ReAnchored");
+        };
+        assert_eq!(updated.display_line, Some(2));
+        assert_eq!(updated.target_text, "Target line");
+    }
+
+    #[test]
+    fn desc_exact_match_on_first_line() {
+        let description = "Target line\nSecond line\nThird line";
+        let anchor = make_desc_anchor("Target line", Some(1), vec![], vec!["Second line"]);
+        let outcome = match_description_anchor(&anchor, description);
+        assert!(matches!(outcome, AnchorOutcome::ReAnchored(_)));
+        let AnchorOutcome::ReAnchored(updated) = outcome else {
+            unreachable!()
+        };
+        assert_eq!(updated.display_line, Some(1));
+    }
+
+    #[test]
+    fn desc_exact_match_shorter_context_at_description_start() {
+        let description = "A\nB\nTarget\nD\nE";
+        // anchor was saved with 3-line context_before; at re-anchor time only 2 lines
+        // are before target. The algorithm checks stored[..available.len()], so the
+        // available lines ("A","B") must be the leading entries of stored, with the
+        // third entry ("pre-A") trailing.
+        let anchor = make_desc_anchor("Target", Some(3), vec!["A", "B", "pre-A"], vec!["D"]);
+        let outcome = match_description_anchor(&anchor, description);
+        assert!(
+            matches!(outcome, AnchorOutcome::ReAnchored(_)),
+            "shorter available context should still match"
+        );
+    }
+
+    #[test]
+    fn desc_multiple_exact_matches_closest_by_display_line_wins() {
+        let description = "target\nfiller\nfiller2\ntarget\nfiller3";
+        let anchor = make_desc_anchor("target", Some(1), vec![], vec![]);
+        let AnchorOutcome::ReAnchored(updated) = match_description_anchor(&anchor, description)
+        else {
+            panic!("expected ReAnchored");
+        };
+        assert_eq!(updated.display_line, Some(1));
+    }
+
+    #[test]
+    fn desc_multiple_exact_matches_no_display_line_returns_anchor_not_found() {
+        let description = "target\nfiller\ntarget";
+        let anchor = make_desc_anchor("target", None, vec![], vec![]);
+        assert_eq!(
+            match_description_anchor(&anchor, description),
+            AnchorOutcome::Stale(MismatchReason::AnchorNotFound)
+        );
+    }
+
+    #[test]
+    fn desc_multiple_exact_matches_equal_distance_returns_anchor_not_found() {
+        let description = "target\nref\ntarget";
+        // display_line=2 (the "ref" line index+1) is equidistant from lines 1 and 3
+        let anchor = make_desc_anchor("target", Some(2), vec![], vec![]);
+        assert_eq!(
+            match_description_anchor(&anchor, description),
+            AnchorOutcome::Stale(MismatchReason::AnchorNotFound)
+        );
+    }
+
+    #[test]
+    fn desc_fuzzy_body_changed_context_matches() {
+        let description = "before\nnew body\nafter";
+        let anchor = make_desc_anchor("old body", Some(2), vec!["before"], vec!["after"]);
+        assert_eq!(
+            match_description_anchor(&anchor, description),
+            AnchorOutcome::Stale(MismatchReason::TargetTextChanged)
+        );
+    }
+
+    #[test]
+    fn desc_fuzzy_target_moved_context_before_differs() {
+        let description = "different_before\ntarget\nsame_after";
+        let anchor = make_desc_anchor(
+            "target",
+            Some(2),
+            vec!["original_before"],
+            vec!["same_after"],
+        );
+        assert_eq!(
+            match_description_anchor(&anchor, description),
+            AnchorOutcome::Stale(MismatchReason::ContextBeforeChanged)
+        );
+    }
+
+    #[test]
+    fn desc_fuzzy_target_moved_context_after_differs() {
+        let description = "same_before\ntarget\ndifferent_after";
+        let anchor = make_desc_anchor(
+            "target",
+            Some(2),
+            vec!["same_before"],
+            vec!["original_after"],
+        );
+        assert_eq!(
+            match_description_anchor(&anchor, description),
+            AnchorOutcome::Stale(MismatchReason::ContextAfterChanged)
+        );
+    }
+
+    #[test]
+    fn desc_empty_description_returns_anchor_not_found() {
+        let anchor = make_desc_anchor("target", Some(1), vec![], vec![]);
+        assert_eq!(
+            match_description_anchor(&anchor, ""),
+            AnchorOutcome::Stale(MismatchReason::AnchorNotFound)
+        );
+    }
+
+    #[test]
+    fn desc_target_text_newlines_flattened_by_normalized() {
+        let anchor = DescriptionAnchor {
+            display_line: Some(1),
+            target_text: "foo\nbar".to_owned(),
+            context_before: vec![],
+            context_after: vec![],
+        }
+        .normalized();
+        assert_eq!(anchor.target_text, "foo bar");
+    }
+
+    #[test]
+    fn reanchor_pending_desc_exact_match_unchanged_returns_none() {
+        let anchor = make_desc_anchor("target", Some(1), vec![], vec![]);
+        let comment = desc_comment(anchor, Some(Status::Pending), None);
+        let description = "target";
+        let diff = empty_diff();
+        assert!(reanchor_comment(&comment, &diff, description).is_none());
+    }
+
+    #[test]
+    fn reanchor_pending_desc_exact_match_new_line_returns_updated() {
+        let anchor = make_desc_anchor("target", Some(1), vec![], vec!["second"]);
+        let comment = desc_comment(anchor, Some(Status::Pending), None);
+        let description = "preamble\ntarget\nsecond";
+        let diff = empty_diff();
+        let updated =
+            reanchor_comment(&comment, &diff, description).expect("moved line should return Some");
+        let Anchor::Description { location, .. } = &updated.anchor else {
+            panic!("expected Description anchor");
+        };
+        assert_eq!(location.display_line, Some(2));
+        assert_eq!(updated.status, Some(Status::Pending));
+        assert!(updated.mismatch_reason.is_none());
+    }
+
+    #[test]
+    fn reanchor_pending_desc_fuzzy_returns_stale() {
+        let anchor = make_desc_anchor("old body", Some(2), vec!["before"], vec!["after"]);
+        let comment = desc_comment(anchor, Some(Status::Pending), None);
+        let description = "before\nnew body\nafter";
+        let diff = empty_diff();
+        let updated = reanchor_comment(&comment, &diff, description)
+            .expect("fuzzy mismatch should return Some");
+        assert_eq!(updated.status, Some(Status::Stale));
+        assert_eq!(
+            updated.mismatch_reason,
+            Some(MismatchReason::TargetTextChanged)
+        );
+    }
+
+    #[test]
+    fn reanchor_stale_desc_now_exact_match_returns_pending() {
+        let anchor = make_desc_anchor("target", Some(1), vec![], vec![]);
+        let comment = desc_comment(
+            anchor,
+            Some(Status::Stale),
+            Some(MismatchReason::TargetTextChanged),
+        );
+        let description = "target";
+        let diff = empty_diff();
+        let updated = reanchor_comment(&comment, &diff, description)
+            .expect("stale->pending should return Some");
+        assert_eq!(updated.status, Some(Status::Pending));
+        assert!(updated.mismatch_reason.is_none());
+    }
+
+    #[test]
+    fn reanchor_stale_desc_same_reason_returns_none() {
+        let anchor = make_desc_anchor("old body", Some(2), vec!["before"], vec!["after"]);
+        let comment = desc_comment(
+            anchor,
+            Some(Status::Stale),
+            Some(MismatchReason::TargetTextChanged),
+        );
+        let description = "before\nnew body\nafter";
+        let diff = empty_diff();
+        assert!(reanchor_comment(&comment, &diff, description).is_none());
     }
 }

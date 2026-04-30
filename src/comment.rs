@@ -198,11 +198,15 @@ impl<'de> Deserialize<'de> for MismatchReason {
     }
 }
 
-/// Where a comment is attached: a specific line, a whole change, or the
-/// entire stack. Serialized to the wire format with the `"scope"` discriminator.
+/// Where a comment is attached: a specific diff line, a whole change, the
+/// entire stack, or a specific line in the change description. Serialized to
+/// the wire format with the `"scope"` discriminator.
 ///
 /// Stack-scoped records carry the `revset_hash` so `_stack.jsonl` can host
 /// comments from multiple stacks and be filtered per-session.
+///
+/// Description-scoped records live alongside line- and change-scoped records
+/// in `<change-id>.jsonl`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Anchor {
     Line {
@@ -214,6 +218,10 @@ pub enum Anchor {
     },
     Stack {
         revset_hash: RevsetHash,
+    },
+    Description {
+        change_id: ChangeId,
+        location: DescriptionAnchor,
     },
 }
 
@@ -255,6 +263,36 @@ impl LineAnchor {
     }
 }
 
+/// Durable anchor for a description-scoped comment — survives small edits via
+/// text matching, the same as [`LineAnchor`].
+///
+/// Descriptions have only one version (no old/new diff sides) and are not
+/// divided into hunks, so neither `side` nor `hunk_header` are carried.
+/// Construct via struct literal and call [`DescriptionAnchor::normalized`] to
+/// enforce the spec limits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DescriptionAnchor {
+    /// 1-based line number in the description at save time. Used as a
+    /// tie-breaker when multiple identical lines match.
+    pub display_line: Option<u32>,
+    pub target_text: String,
+    pub context_before: Vec<String>,
+    pub context_after: Vec<String>,
+}
+
+impl DescriptionAnchor {
+    /// Apply the same spec constraints as [`LineAnchor::normalized`].
+    #[must_use]
+    pub fn normalized(self) -> Self {
+        Self {
+            target_text: truncate_target_text(&self.target_text),
+            context_before: cap_context(self.context_before),
+            context_after: cap_context(self.context_after),
+            ..self
+        }
+    }
+}
+
 /// Format an `OffsetDateTime` as an RFC 3339 string, mapping any formatting
 /// failure into `JjrError::Io`. Used as the canonical key for identifying
 /// comments by `created_at` across save / update / delete paths.
@@ -274,12 +312,9 @@ fn truncate_with_ellipsis(s: String, max_chars: usize) -> String {
 }
 
 fn truncate_target_text(s: &str) -> String {
-    // Flatten any embedded newlines/carriage returns to spaces before
-    // truncating. `target_text` is rendered as a single line in the packet
-    // format (`    {target_text}` and `>>> {target_text}` lines); a literal
-    // `\n` would break the byte-stable output the spec promises. Strip at the
-    // trust boundary — both serialize-time and deserialize-time call this via
-    // `LineAnchor::normalized()` — so the renderer never sees newlines.
+    // `target_text` is rendered as a single line in the packet format; a
+    // literal `\n` would break the byte-stable output downstream tooling
+    // depends on. Strip at the trust boundary so the renderer never sees them.
     let oneline: String = s
         .chars()
         .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
@@ -366,6 +401,9 @@ struct CommentDto {
     new_line: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     hunk_header: Option<String>,
+    /// 1-based display line for `scope = "description"`; absent for line/change/stack.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    display_line: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     target_text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -419,9 +457,27 @@ impl CommentDto {
             old_line: fields.line.as_ref().and_then(|f| f.old_line),
             new_line: fields.line.as_ref().and_then(|f| f.new_line),
             hunk_header: fields.line.as_ref().map(|f| f.hunk_header.clone()),
-            target_text: fields.line.as_ref().map(|f| f.target_text.clone()),
-            context_before: fields.line.as_ref().map(|f| f.context_before.clone()),
-            context_after: fields.line.as_ref().map(|f| f.context_after.clone()),
+            display_line: fields.description.as_ref().and_then(|d| d.display_line),
+            target_text: fields
+                .line
+                .as_ref()
+                .map(|f| f.target_text.clone())
+                .or_else(|| fields.description.as_ref().map(|d| d.target_text.clone())),
+            context_before: fields
+                .line
+                .as_ref()
+                .map(|f| f.context_before.clone())
+                .or_else(|| {
+                    fields
+                        .description
+                        .as_ref()
+                        .map(|d| d.context_before.clone())
+                }),
+            context_after: fields
+                .line
+                .as_ref()
+                .map(|f| f.context_after.clone())
+                .or_else(|| fields.description.as_ref().map(|d| d.context_after.clone())),
             body: truncate_body(c.body.clone()),
             severity: c.severity,
             created_at,
@@ -454,13 +510,13 @@ impl CommentDto {
             self.old_line,
             self.new_line,
             self.hunk_header,
+            self.display_line,
             self.target_text,
             self.context_before,
             self.context_after,
         )?;
-        // Defense in depth: enforce LineAnchor constraints on the read path so
-        // a hand-edited JSONL file with a 500MB target_text or 10k-entry
-        // context cannot smuggle oversized state into memory.
+        // A hand-edited JSONL file must not be able to smuggle oversized
+        // fields past the read boundary.
         let anchor = normalize_anchor(anchor);
 
         Ok(Comment {
@@ -479,14 +535,19 @@ impl CommentDto {
     }
 }
 
-/// Apply [`LineAnchor::normalized`] to the location of a Line anchor, leaving
-/// Change and Stack anchors untouched (they have no normalizable fields).
 fn normalize_anchor(anchor: Anchor) -> Anchor {
     match anchor {
         Anchor::Line {
             change_id,
             location,
         } => Anchor::Line {
+            change_id,
+            location: location.normalized(),
+        },
+        Anchor::Description {
+            change_id,
+            location,
+        } => Anchor::Description {
             change_id,
             location: location.normalized(),
         },
@@ -505,11 +566,19 @@ struct LineFields {
     context_after: Vec<String>,
 }
 
+struct DescriptionFields {
+    display_line: Option<u32>,
+    target_text: String,
+    context_before: Vec<String>,
+    context_after: Vec<String>,
+}
+
 struct AnchorDtoFields {
     scope: String,
     change_id: Option<ChangeId>,
     revset_hash_hex: Option<String>,
     line: Option<LineFields>,
+    description: Option<DescriptionFields>,
 }
 
 fn anchor_to_dto_fields(anchor: &Anchor) -> Result<AnchorDtoFields> {
@@ -539,6 +608,7 @@ fn anchor_to_dto_fields(anchor: &Anchor) -> Result<AnchorDtoFields> {
                     context_before: location.context_before.clone(),
                     context_after: location.context_after.clone(),
                 }),
+                description: None,
             })
         }
         Anchor::Change { change_id } => Ok(AnchorDtoFields {
@@ -546,12 +616,29 @@ fn anchor_to_dto_fields(anchor: &Anchor) -> Result<AnchorDtoFields> {
             change_id: Some(change_id.clone()),
             revset_hash_hex: None,
             line: None,
+            description: None,
         }),
         Anchor::Stack { revset_hash } => Ok(AnchorDtoFields {
             scope: "stack".to_owned(),
             change_id: None,
             revset_hash_hex: Some(revset_hash.hex()),
             line: None,
+            description: None,
+        }),
+        Anchor::Description {
+            change_id,
+            location,
+        } => Ok(AnchorDtoFields {
+            scope: "description".to_owned(),
+            change_id: Some(change_id.clone()),
+            revset_hash_hex: None,
+            line: None,
+            description: Some(DescriptionFields {
+                display_line: location.display_line,
+                target_text: location.target_text.clone(),
+                context_before: location.context_before.clone(),
+                context_after: location.context_after.clone(),
+            }),
         }),
     }
 }
@@ -569,6 +656,7 @@ fn dto_fields_to_anchor(
     old_line: Option<u32>,
     new_line: Option<u32>,
     hunk_header: Option<String>,
+    display_line: Option<u32>,
     target_text: Option<String>,
     context_before: Option<Vec<String>>,
     context_after: Option<Vec<String>>,
@@ -626,6 +714,23 @@ fn dto_fields_to_anchor(
                 )),
             })?;
             Ok(Anchor::Stack { revset_hash })
+        }
+        "description" => {
+            let change_id = change_id.ok_or_else(|| JjrError::Io {
+                source: std::io::Error::other("scope=description requires change_id"),
+            })?;
+            let target_text = target_text.ok_or_else(|| JjrError::Io {
+                source: std::io::Error::other("scope=description requires target_text"),
+            })?;
+            Ok(Anchor::Description {
+                change_id,
+                location: DescriptionAnchor {
+                    display_line,
+                    target_text,
+                    context_before: context_before.unwrap_or_default(),
+                    context_after: context_after.unwrap_or_default(),
+                },
+            })
         }
         other => Err(JjrError::Io {
             source: std::io::Error::other(format!("unknown scope \"{other}\"")),
@@ -1055,8 +1160,6 @@ mod tests {
         assert_eq!(anchor.context_after, after);
     }
 
-    // -- E4 boundary tests: target_text and context just past / at limits --
-
     #[test]
     fn target_text_with_embedded_newline_is_flattened() {
         // `target_text` is rendered verbatim into a single line of the packet
@@ -1166,8 +1269,6 @@ mod tests {
         assert_eq!(restored, comment);
     }
 
-    // -- A: wire format uses `comment` (not `body`) --
-
     #[test]
     fn wire_format_uses_comment_field_not_body() {
         let c = sample_line_comment();
@@ -1179,8 +1280,6 @@ mod tests {
             "wire format must not emit a `body` field; spec says `comment`"
         );
     }
-
-    // -- I: BODY_MAX cap --
 
     #[test]
     fn oversized_body_is_truncated_at_serialize_time() {
@@ -1205,8 +1304,6 @@ mod tests {
         assert_eq!(c.body.chars().count(), BODY_MAX + 1);
         assert!(c.body.ends_with(TRUNCATION_SUFFIX));
     }
-
-    // -- D1: oversized fields on read-time path are normalized --
 
     #[test]
     fn oversized_target_text_in_jsonl_is_normalized_on_read() {
@@ -1236,8 +1333,6 @@ mod tests {
         assert_eq!(location.context_before.len(), CONTEXT_MAX);
     }
 
-    // -- D2: at least one of old_line / new_line is required for line scope --
-
     #[test]
     fn line_scope_with_neither_line_number_errors() {
         let json = r#"{"schema_version":"diff-comment/v2","scope":"line","change_id":"abc12345","repo_root":"/w","revset":"@","file":"f.rs","side":"new","hunk_header":"@@","target_text":"x","comment":"b","severity":"note","created_at":"2026-04-29T14:22:01Z"}"#;
@@ -1256,8 +1351,6 @@ mod tests {
         let c: Comment = serde_json::from_str(json).unwrap();
         assert!(matches!(c.anchor, Anchor::Line { .. }));
     }
-
-    // -- E6: error branches for dto_fields_to_anchor and unknown variants --
 
     #[test]
     fn line_scope_missing_change_id_errors() {
@@ -1361,5 +1454,154 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("unknown mismatch_reason"), "got: {err}");
+    }
+
+    fn sample_description_anchor() -> DescriptionAnchor {
+        DescriptionAnchor {
+            display_line: Some(4),
+            target_text: "Fix the off-by-one error in loop bounds".to_owned(),
+            context_before: vec![
+                "Refactor retry logic".to_owned(),
+                String::new(),
+                "This change extracts the retry helper into its own module.".to_owned(),
+            ],
+            context_after: vec![String::new(), "Co-authored-by: Alice".to_owned()],
+        }
+    }
+
+    fn sample_description_comment() -> Comment {
+        Comment {
+            schema_version: SchemaVersion,
+            anchor: Anchor::Description {
+                change_id: sample_change_id(),
+                location: sample_description_anchor(),
+            },
+            repo_root: PathBuf::from("/workspace/project"),
+            revset: "@".to_owned(),
+            commit_id: None,
+            body: "This line describes the wrong fix.".to_owned(),
+            severity: Severity::Note,
+            created_at: datetime!(2026-04-29 14:22:01 UTC),
+            updated_at: None,
+            status: Some(Status::Pending),
+            mismatch_reason: None,
+        }
+    }
+
+    #[test]
+    fn description_comment_roundtrips_through_serde() {
+        let original = sample_description_comment();
+        let json = serde_json::to_string(&original).unwrap();
+        let restored: Comment = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, original);
+    }
+
+    #[test]
+    fn description_comment_wire_shape() {
+        let c = sample_description_comment();
+        let v: serde_json::Value = serde_json::to_value(&c).unwrap();
+        assert_eq!(v["scope"], "description");
+        assert_eq!(v["change_id"], "abc12345");
+        assert_eq!(v["display_line"], 4);
+        assert_eq!(v["target_text"], "Fix the off-by-one error in loop bounds");
+        assert!(v.get("file").is_none());
+        assert!(v.get("side").is_none());
+        assert!(v.get("hunk_header").is_none());
+        assert!(v.get("revset_hash").is_none());
+    }
+
+    #[test]
+    fn description_comment_wire_shape_byte_stable() {
+        let c = sample_description_comment();
+        let json = serde_json::to_string(&c).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let json2 =
+            serde_json::to_string(&serde_json::from_str::<Comment>(&json).unwrap()).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&json).unwrap(),
+            serde_json::from_str::<serde_json::Value>(&json2).unwrap(),
+            "round-trip must be byte-stable"
+        );
+        assert_eq!(v["scope"], "description");
+    }
+
+    #[test]
+    fn description_scope_missing_change_id_errors() {
+        let json = r#"{"schema_version":"diff-comment/v2","scope":"description","repo_root":"/w","revset":"@","target_text":"x","comment":"b","severity":"note","created_at":"2026-04-29T14:22:01Z"}"#;
+        let err = serde_json::from_str::<Comment>(json)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("scope=description requires change_id"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn description_scope_missing_target_text_errors() {
+        let json = r#"{"schema_version":"diff-comment/v2","scope":"description","change_id":"abc12345","repo_root":"/w","revset":"@","comment":"b","severity":"note","created_at":"2026-04-29T14:22:01Z"}"#;
+        let err = serde_json::from_str::<Comment>(json)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("scope=description requires target_text"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn description_anchor_target_text_newlines_flattened_by_normalized() {
+        let anchor = DescriptionAnchor {
+            display_line: Some(1),
+            target_text: "foo\nbar\r\nbaz".to_owned(),
+            context_before: vec![],
+            context_after: vec![],
+        }
+        .normalized();
+        assert_eq!(anchor.target_text, "foo bar  baz");
+    }
+
+    #[test]
+    fn description_anchor_context_capped_by_normalized() {
+        let many: Vec<String> = (0..10).map(|i| format!("line {i}")).collect();
+        let anchor = DescriptionAnchor {
+            display_line: None,
+            target_text: "target".to_owned(),
+            context_before: many.clone(),
+            context_after: many,
+        }
+        .normalized();
+        assert_eq!(anchor.context_before.len(), CONTEXT_MAX);
+        assert_eq!(anchor.context_after.len(), CONTEXT_MAX);
+    }
+
+    #[test]
+    fn description_anchor_display_line_zero_roundtrips() {
+        let c = Comment {
+            schema_version: SchemaVersion,
+            anchor: Anchor::Description {
+                change_id: sample_change_id(),
+                location: DescriptionAnchor {
+                    display_line: Some(0),
+                    target_text: "first line".to_owned(),
+                    context_before: vec![],
+                    context_after: vec![],
+                },
+            },
+            repo_root: PathBuf::from("/w"),
+            revset: "@".to_owned(),
+            commit_id: None,
+            body: "b".to_owned(),
+            severity: Severity::Note,
+            created_at: datetime!(2026-04-29 14:22:01 UTC),
+            updated_at: None,
+            status: None,
+            mismatch_reason: None,
+        };
+        let json = serde_json::to_string(&c).unwrap();
+        let restored: Comment = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, c);
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["display_line"], 0);
     }
 }

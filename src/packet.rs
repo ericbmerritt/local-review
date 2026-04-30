@@ -210,7 +210,7 @@ fn render_change_comment_block(comment: &Comment) -> String {
     );
     let change_id = match &comment.anchor {
         Anchor::Change { change_id } => change_id.as_str().to_owned(),
-        Anchor::Line { .. } | Anchor::Stack { .. } => String::new(),
+        Anchor::Line { .. } | Anchor::Stack { .. } | Anchor::Description { .. } => String::new(),
     };
     let mut out = String::new();
     let _ = writeln!(
@@ -377,7 +377,7 @@ fn partition_by_scope(comments: Vec<Comment>) -> (Vec<Comment>, Vec<Comment>) {
         match &c.anchor {
             Anchor::Change { .. } => change_comments.push(c),
             Anchor::Line { .. } => line_comments.push(c),
-            Anchor::Stack { .. } => {}
+            Anchor::Stack { .. } | Anchor::Description { .. } => {}
         }
     }
     (change_comments, line_comments)
@@ -398,7 +398,9 @@ fn line_comment_sort_key(comment: &Comment) -> (PathBuf, u32) {
             let line = location.new_line.or(location.old_line).unwrap_or(0);
             (location.file.clone(), line)
         }
-        Anchor::Change { .. } | Anchor::Stack { .. } => (PathBuf::new(), 0),
+        Anchor::Change { .. } | Anchor::Stack { .. } | Anchor::Description { .. } => {
+            (PathBuf::new(), 0)
+        }
     }
 }
 

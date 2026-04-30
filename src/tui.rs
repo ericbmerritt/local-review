@@ -388,8 +388,8 @@ impl App {
         let mut errors: Vec<String> = Vec::new();
         let reconciled: Vec<Comment> = comments
             .into_iter()
-            .map(
-                |comment| match crate::anchoring::reanchor_comment(&comment, &self.details.diff) {
+            .map(|comment| {
+                match crate::anchoring::reanchor_comment(&comment, &self.details.diff, "") {
                     None => comment,
                     Some(updated) => {
                         match crate::store::update_comment(&self.repo_root, &updated) {
@@ -400,8 +400,8 @@ impl App {
                             }
                         }
                     }
-                },
-            )
+                }
+            })
             .collect();
         if let Some(last) = errors.into_iter().last() {
             self.status_message = Some(last);
@@ -687,6 +687,16 @@ fn format_persist_error(comment: &Comment, err: &JjrError) -> String {
         ),
         Anchor::Change { change_id } => change_id.as_str().to_owned(),
         Anchor::Stack { .. } => "stack".to_owned(),
+        Anchor::Description {
+            change_id,
+            location,
+        } => format!(
+            "description:{}:{}",
+            change_id.as_str(),
+            location
+                .display_line
+                .map_or_else(|| "?".to_owned(), |n| n.to_string()),
+        ),
     };
     let location = sanitize_for_status(&raw_location);
     let err = sanitize_for_status(&err.to_string());
@@ -1791,7 +1801,7 @@ fn open_meta_comment_editor(app: &mut App, comment: &Comment) {
     let scope = match &comment.anchor {
         Anchor::Change { .. } => ComposerScope::Change,
         Anchor::Stack { .. } => ComposerScope::Stack,
-        Anchor::Line { .. } => ComposerScope::Line,
+        Anchor::Line { .. } | Anchor::Description { .. } => ComposerScope::Line,
     };
 
     let line_target = match build_line_target(app) {
@@ -1819,7 +1829,9 @@ fn open_meta_comment_editor(app: &mut App, comment: &Comment) {
     // change. The composer overlay's title and the build_comment path read
     // from `composer.contexts.change.change_id`.
     let target_change_id = match &comment.anchor {
-        Anchor::Change { change_id } | Anchor::Line { change_id, .. } => change_id.clone(),
+        Anchor::Change { change_id }
+        | Anchor::Line { change_id, .. }
+        | Anchor::Description { change_id, .. } => change_id.clone(),
         Anchor::Stack { .. } => app.details.change_id.clone(),
     };
     let contexts = composer_contexts_for_change(app, line_target, target_change_id);
@@ -3078,7 +3090,7 @@ mod tests {
             } => {
                 assert_eq!(*persisted, revset_hash, "persisted hash should match");
             }
-            Anchor::Line { .. } | Anchor::Change { .. } => {
+            Anchor::Line { .. } | Anchor::Change { .. } | Anchor::Description { .. } => {
                 panic!("expected Stack anchor; got {:?}", loaded[0].anchor)
             }
         }
@@ -5050,7 +5062,7 @@ mod tests {
         assert_eq!(loaded_b[0].body, "new on B");
         match &loaded_b[0].anchor {
             Anchor::Change { change_id } => assert_eq!(change_id, &id_b),
-            other @ (Anchor::Line { .. } | Anchor::Stack { .. }) => {
+            other @ (Anchor::Line { .. } | Anchor::Stack { .. } | Anchor::Description { .. }) => {
                 panic!("expected Anchor::Change targeting B; got {other:?}")
             }
         }
