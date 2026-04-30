@@ -60,6 +60,11 @@ pub fn show(change_id: &ChangeId) -> Result<ChangeDetails> {
     })
 }
 
+/// Fetch the unified diff for a single change.
+pub fn diff_for_change(change_id: &ChangeId) -> Result<Diff> {
+    show_diff(change_id)
+}
+
 struct LogMetadata {
     change_id: ChangeId,
     commit_id: CommitId,

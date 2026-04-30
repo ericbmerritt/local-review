@@ -5,6 +5,7 @@ pub mod cursor;
 pub mod diff;
 pub mod error;
 pub mod jj;
+pub mod packet;
 pub mod stack;
 pub mod store;
 pub mod tui;

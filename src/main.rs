@@ -1,10 +1,12 @@
 use std::io::Write;
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
 use jjr::error::JjrError;
 use jjr::jj;
+use jjr::packet;
 use jjr::store;
 use jjr::tui;
 use jjr::util::pluralize;
@@ -49,6 +51,20 @@ enum Command {
         #[arg(long)]
         stale: bool,
     },
+
+    /// Generate a Claude prompt from the review comments for the given revset.
+    Packet {
+        /// Revset to package. Defaults to `trunk()..@` (the full stack).
+        revset: Option<String>,
+
+        /// Write to file instead of stdout.
+        #[arg(short = 'o', long)]
+        output: Option<PathBuf>,
+
+        /// Include comments marked stale. Orphaned comments are never included.
+        #[arg(long)]
+        include_stale: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -56,6 +72,14 @@ fn main() -> ExitCode {
 
     let result = match cli.command {
         Some(Command::Clear { revset, stale }) => run_clear(&revset, stale),
+        Some(Command::Packet {
+            revset,
+            output,
+            include_stale,
+        }) => {
+            let effective = revset.unwrap_or_else(|| jj::DEFAULT_STACK_REVSET.to_owned());
+            return run_packet(&effective, output.as_deref(), include_stale);
+        }
         None => match cli.change {
             None => run_stack(jj::DEFAULT_STACK_REVSET, cli.restart),
             Some(ref revset) => run_single(revset),
@@ -64,6 +88,42 @@ fn main() -> ExitCode {
 
     match result {
         Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            print_error(&err);
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_packet(revset: &str, output: Option<&std::path::Path>, include_stale: bool) -> ExitCode {
+    let result = (|| -> Result<(), JjrError> {
+        let repo_root = std::env::current_dir().map_err(|source| JjrError::Io { source })?;
+        let resolved = jj::resolve_stack(revset)?;
+        let pkt = packet::build_packet(
+            &repo_root,
+            revset,
+            &resolved,
+            include_stale,
+            jj::diff_for_change,
+        )?;
+        let prompt = packet::render_prompt(&pkt);
+        if let Some(path) = output {
+            std::fs::write(path, &prompt).map_err(|source| JjrError::Io { source })
+        } else {
+            let mut stdout = std::io::stdout().lock();
+            stdout
+                .write_all(prompt.as_bytes())
+                .map_err(|source| JjrError::Io { source })
+        }
+    })();
+
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(JjrError::EmptyPacket { .. }) => {
+            let mut stderr = std::io::stderr().lock();
+            let _ = writeln!(stderr, "no comments to send");
+            ExitCode::from(2)
+        }
         Err(err) => {
             print_error(&err);
             ExitCode::FAILURE

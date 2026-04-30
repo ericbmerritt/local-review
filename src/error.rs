@@ -83,4 +83,7 @@ pub enum JjrError {
         path.display()
     ))]
     StackFileCorruption { path: PathBuf },
+
+    #[snafu(display("no comments to send for revset {revset}"))]
+    EmptyPacket { revset: String },
 }

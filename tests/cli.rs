@@ -532,3 +532,101 @@ fn jj_log_reversed_returns_stack_oldest_first() {
         "stack should walk oldest-to-newest with --reversed"
     );
 }
+
+/// `jjr packet @` against a fixture with a pending comment produces output
+/// containing the canonical prelude and the comment body.
+#[test]
+fn packet_with_pending_comment_writes_to_stdout() {
+    if !jj_on_path() {
+        eprintln!("jj not on PATH; skipping packet_with_pending_comment_writes_to_stdout");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = build_fixture_named(&tmp, "single_change_with_pending.sh");
+
+    Command::cargo_bin("jjr")
+        .unwrap()
+        .current_dir(&repo)
+        .args(["packet", "@"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "You are editing a local jj working copy.",
+        ))
+        .stdout(predicate::str::contains("pending comment"));
+}
+
+/// `jjr packet @ -o <file>` writes the prompt to the file and produces no stdout.
+#[test]
+fn packet_output_flag_writes_to_file() {
+    if !jj_on_path() {
+        eprintln!("jj not on PATH; skipping packet_output_flag_writes_to_file");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = build_fixture_named(&tmp, "single_change_with_pending.sh");
+    let out_path = tmp.path().join("packet.txt");
+
+    Command::cargo_bin("jjr")
+        .unwrap()
+        .current_dir(&repo)
+        .args(["packet", "@", "-o", out_path.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+
+    let contents = std::fs::read_to_string(&out_path).unwrap();
+    assert!(
+        contents.contains("You are editing a local jj working copy."),
+        "output file should contain the prelude; got: {contents}"
+    );
+    assert!(
+        contents.contains("pending comment"),
+        "output file should contain the comment body; got: {contents}"
+    );
+}
+
+/// `jjr packet --include-stale @` against the stale+pending fixture includes
+/// the stale comment that would be excluded by default.
+#[test]
+fn packet_include_stale_flag_includes_stale_comments() {
+    if !jj_on_path() {
+        eprintln!("jj not on PATH; skipping packet_include_stale_flag_includes_stale_comments");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = build_fixture_named(&tmp, "single_change_with_stale.sh");
+
+    Command::cargo_bin("jjr")
+        .unwrap()
+        .current_dir(&repo)
+        .args(["packet", "--include-stale", "@"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("stale comment"))
+        .stdout(predicate::str::contains("pending comment"));
+}
+
+/// `jjr packet @` against a fixture with no comments exits with code 2 and
+/// emits "no comments to send" on stderr.
+#[test]
+fn packet_no_comments_exits_2_with_message() {
+    if !jj_on_path() {
+        eprintln!("jj not on PATH; skipping packet_no_comments_exits_2_with_message");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = build_fixture_named(&tmp, "single_change.sh");
+
+    Command::cargo_bin("jjr")
+        .unwrap()
+        .current_dir(&repo)
+        .args(["packet", "@"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("no comments to send"));
+}

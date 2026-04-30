@@ -247,7 +247,7 @@ impl LineAnchor {
     #[must_use]
     pub fn normalized(self) -> Self {
         Self {
-            target_text: truncate_target_text(self.target_text),
+            target_text: truncate_target_text(&self.target_text),
             context_before: cap_context(self.context_before),
             context_after: cap_context(self.context_after),
             ..self
@@ -273,8 +273,18 @@ fn truncate_with_ellipsis(s: String, max_chars: usize) -> String {
     truncated
 }
 
-fn truncate_target_text(s: String) -> String {
-    truncate_with_ellipsis(s, TARGET_TEXT_MAX)
+fn truncate_target_text(s: &str) -> String {
+    // Flatten any embedded newlines/carriage returns to spaces before
+    // truncating. `target_text` is rendered as a single line in the packet
+    // format (`    {target_text}` and `>>> {target_text}` lines); a literal
+    // `\n` would break the byte-stable output the spec promises. Strip at the
+    // trust boundary — both serialize-time and deserialize-time call this via
+    // `LineAnchor::normalized()` — so the renderer never sees newlines.
+    let oneline: String = s
+        .chars()
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .collect();
+    truncate_with_ellipsis(oneline, TARGET_TEXT_MAX)
 }
 
 fn truncate_body(s: String) -> String {
@@ -1046,6 +1056,26 @@ mod tests {
     }
 
     // -- E4 boundary tests: target_text and context just past / at limits --
+
+    #[test]
+    fn target_text_with_embedded_newline_is_flattened() {
+        // `target_text` is rendered verbatim into a single line of the packet
+        // format. Newlines in the source must be neutralized at the trust
+        // boundary so a malicious or malformed JSONL record cannot break the
+        // byte-stable output downstream tooling depends on.
+        let anchor = LineAnchor {
+            file: PathBuf::from("f.rs"),
+            side: Side::New,
+            old_line: None,
+            new_line: Some(1),
+            hunk_header: "@@".to_owned(),
+            target_text: "foo\nbar\r\nbaz".to_owned(),
+            context_before: vec![],
+            context_after: vec![],
+        }
+        .normalized();
+        assert_eq!(anchor.target_text, "foo bar  baz");
+    }
 
     #[test]
     fn target_text_one_over_limit_truncates_to_limit_plus_ellipsis() {
