@@ -233,9 +233,9 @@ fn render_body_editor(frame: &mut Frame<'_>, area: Rect, composer: &Composer) {
 fn render_composer_footer(frame: &mut Frame<'_>, area: Rect, editing: bool) {
     let line1 = TuiLine::from("  ^L line  ^C change  ^K stack");
     let line2 = if editing {
-        TuiLine::from("  ^1 note  ^2 suggestion  ^3 required   ^D delete  ^X save  Esc")
+        TuiLine::from("  M-r required  M-s suggestion  M-n note   ^D delete  ^X save  Esc")
     } else {
-        TuiLine::from("  ^1 note  ^2 suggestion  ^3 required        ^X save  Esc")
+        TuiLine::from("  M-r required  M-s suggestion  M-n note        ^X save  Esc")
     };
     let widget = Paragraph::new(Text::from(vec![line1, line2]));
     frame.render_widget(widget, area);

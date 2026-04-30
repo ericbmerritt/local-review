@@ -187,9 +187,13 @@ pub(crate) enum ComposerAction {
 
 /// Handle a key event inside the composer.
 ///
-/// Ctrl-chord keys (`^L`, `^C`, `^K`, `^1`–`^3`, `^X`) are intercepted before
-/// being passed to tui-textarea. Everything else is forwarded to the textarea
-/// so multi-line editing, arrows, backspace, and word-wrap work naturally.
+/// Scope chords (`^L`, `^C`, `^K`) and save/delete (`^X`, `^D`) are Ctrl-
+/// chorded; severity chords (`Alt+R`, `Alt+S`, `Alt+N`) are Alt-chorded
+/// because `Ctrl+digit` is unreliable across terminals (Ctrl+3 = ESC,
+/// Ctrl+2 = NUL) and Ctrl-letter chords for severity collide with Sublime/
+/// VS Code-style "save" interception (Ctrl+S) and tui-textarea's next-line
+/// binding (Ctrl+N). All intercepted keys are consumed before being passed
+/// to tui-textarea; everything else flows through.
 ///
 /// `^C` is captured as scope=Change — NOT as SIGINT.
 #[expect(
@@ -211,23 +215,29 @@ pub(crate) fn handle_composer_key(composer: &mut Composer, key: KeyEvent) -> Com
                 composer.scope = ComposerScope::Stack;
                 return ComposerAction::Continue;
             }
-            KeyCode::Char('1') => {
-                composer.severity = Severity::Note;
-                return ComposerAction::Continue;
-            }
-            KeyCode::Char('2') => {
-                composer.severity = Severity::Suggestion;
-                return ComposerAction::Continue;
-            }
-            KeyCode::Char('3') => {
-                composer.severity = Severity::Required;
-                return ComposerAction::Continue;
-            }
             KeyCode::Char('x') => {
                 return ComposerAction::Save;
             }
             KeyCode::Char('d') if composer.editing.is_some() => {
                 return ComposerAction::Delete;
+            }
+            _ => {}
+        }
+    }
+
+    if key.modifiers == KeyModifiers::ALT {
+        match key.code {
+            KeyCode::Char('r' | 'R') => {
+                composer.severity = Severity::Required;
+                return ComposerAction::Continue;
+            }
+            KeyCode::Char('s' | 'S') => {
+                composer.severity = Severity::Suggestion;
+                return ComposerAction::Continue;
+            }
+            KeyCode::Char('n' | 'N') => {
+                composer.severity = Severity::Note;
+                return ComposerAction::Continue;
             }
             _ => {}
         }
@@ -423,27 +433,37 @@ mod tests {
     }
 
     #[test]
-    fn handle_composer_key_ctrl_1_sets_note() {
-        let mut c = make_composer(Severity::Required);
-        let key = KeyEvent::new(KeyCode::Char('1'), KeyModifiers::CONTROL);
+    fn handle_composer_key_alt_r_sets_required() {
+        let mut c = make_composer(Severity::Note);
+        let key = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT);
         let action = handle_composer_key(&mut c, key);
         assert_eq!(action, ComposerAction::Continue);
-        assert_eq!(c.severity, Severity::Note);
+        assert_eq!(c.severity, Severity::Required);
     }
 
     #[test]
-    fn handle_composer_key_ctrl_2_sets_suggestion() {
+    fn handle_composer_key_alt_s_sets_suggestion() {
         let mut c = make_composer(Severity::Required);
-        let key = KeyEvent::new(KeyCode::Char('2'), KeyModifiers::CONTROL);
+        let key = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::ALT);
         let action = handle_composer_key(&mut c, key);
         assert_eq!(action, ComposerAction::Continue);
         assert_eq!(c.severity, Severity::Suggestion);
     }
 
     #[test]
-    fn handle_composer_key_ctrl_3_sets_required() {
+    fn handle_composer_key_alt_n_sets_note() {
+        let mut c = make_composer(Severity::Required);
+        let key = KeyEvent::new(KeyCode::Char('n'), KeyModifiers::ALT);
+        let action = handle_composer_key(&mut c, key);
+        assert_eq!(action, ComposerAction::Continue);
+        assert_eq!(c.severity, Severity::Note);
+    }
+
+    #[test]
+    fn handle_composer_key_alt_uppercase_r_also_sets_required() {
+        // Some terminals send Alt+Shift+letter as uppercase; accept both.
         let mut c = make_composer(Severity::Note);
-        let key = KeyEvent::new(KeyCode::Char('3'), KeyModifiers::CONTROL);
+        let key = KeyEvent::new(KeyCode::Char('R'), KeyModifiers::ALT);
         let action = handle_composer_key(&mut c, key);
         assert_eq!(action, ComposerAction::Continue);
         assert_eq!(c.severity, Severity::Required);

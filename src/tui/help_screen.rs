@@ -30,8 +30,13 @@ Comments
     Enter   c             new comment on current line
     e                     edit (cursor on a comment)
     d                     delete (cursor on a comment)
+    1                     filter to required only (press again to clear)
+    2                     filter to suggestion only (press again to clear)
+    3                     filter to note only (press again to clear)
 
 Views
+    f                     file picker — jump to a file in the change
+    r                     refresh diff and comments for current change
     s                     stack overview (stack mode only)
     S                     stale comments view
     ?                     this help
@@ -67,7 +72,7 @@ Send to Claude  (press C from main view)
 
 In comment composer
     ^L ^C ^K              scope:    line / change / stack
-    ^1 ^2 ^3              severity: note / suggestion / required
+    M-r M-s M-n           severity: required / suggestion / note  (Alt + r/s/n)
     ^X                    save
     ^D                    delete (edit mode only)
     Esc                   cancel  (^C inside the composer is captured as scope)

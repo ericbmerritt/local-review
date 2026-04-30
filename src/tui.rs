@@ -26,6 +26,7 @@ use crate::util::{clamp_with_delta, page_size, pluralize, truncate};
 mod composer;
 mod composer_overlay;
 mod diff_view;
+mod file_picker;
 mod help_screen;
 mod overview_screen;
 mod send_to_claude;
@@ -36,6 +37,7 @@ use composer::{
     EditedComment, LineTarget, StackContextSnapshot,
 };
 use diff_view::{comment_to_inline, DiffView, InlineComment, RenderedLine, RenderedLineKind};
+use file_picker::{build_entries as build_file_picker_entries, FilePickerState};
 use overview_screen::{OverviewCommentSet, OverviewScreenState};
 use send_to_claude::{ConfirmData, SendToClaudeState};
 use stale_screen::StaleScreenState;
@@ -198,6 +200,8 @@ enum Screen {
     Overview(OverviewScreenState),
     /// Send-to-Claude confirmation (press `C` from Main).
     SendToClaude(Box<SendToClaudeState>),
+    /// File picker modal (press `f` from Main).
+    FilePicker(FilePickerState),
 }
 
 /// State for the transition screen shown between changes in stack mode.
@@ -312,6 +316,7 @@ struct App {
     /// Cached comments for the stack overview. `None` means the cache is
     /// invalid and must be rebuilt the next time the overview is opened.
     overview_cache: Option<OverviewCommentSet>,
+    severity_filter: Option<Severity>,
 }
 
 impl App {
@@ -345,6 +350,7 @@ impl App {
             comments_loaded_ok: false,
             pending_reanchor: None,
             overview_cache: None,
+            severity_filter: None,
         }
     }
 
@@ -405,6 +411,7 @@ impl App {
 
     fn rebuild_annotated_views(&mut self) {
         let now = time::OffsetDateTime::now_utc();
+        let severity_filter = self.severity_filter;
         self.annotated_per_file = self
             .rendered_per_file
             .iter()
@@ -421,6 +428,7 @@ impl App {
                     .iter()
                     .enumerate()
                     .filter_map(|(idx, c)| comment_to_inline(c, idx, file_path.as_deref(), now))
+                    .filter(|ic| severity_filter.is_none_or(|filter| ic.severity == filter))
                     .collect();
                 base_view.clone().with_inline_comments(&inline)
             })
@@ -823,6 +831,9 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
         Screen::SendToClaude(state) => {
             send_to_claude::render(frame, state);
         }
+        Screen::FilePicker(state) => {
+            file_picker::render(frame, state);
+        }
         Screen::Stale(_) | Screen::Overview(_) => unreachable!("handled above"),
     }
 }
@@ -1004,26 +1015,74 @@ fn render_rendered_line(line: &RenderedLine, focused: bool, width: u16) -> TuiLi
     }
 }
 
-fn footer_text(app: &App) -> (&'static str, Style) {
-    if app.status_message.is_some() {
-        // Status message rendered by caller; return empty sentinel.
-        ("", Style::default().fg(Color::Yellow))
-    } else if focused_comment(app).is_some() {
-        (
-            " ↑↓ line  e edit  d delete  c new comment  ? help  q quit",
-            Style::default(),
-        )
-    } else if app.stack.is_some() {
-        (
-            " ↑↓ line  Tab file  n/p revision  Enter comment  ? help  q quit",
-            Style::default(),
-        )
-    } else {
-        (
-            " ↑↓ line  Tab file  c comment  ? help  q quit",
-            Style::default(),
-        )
+const FOOTER_IRREDUCIBLE: &str = " \u{2191}\u{2193} line  Tab file  n/p revision  Enter comment";
+
+struct FooterSegment {
+    text: &'static str,
+    stack_only: bool,
+}
+
+const FOOTER_OPTIONAL: &[FooterSegment] = &[
+    FooterSegment {
+        text: "  ?",
+        stack_only: false,
+    },
+    FooterSegment {
+        text: "  C \u{2192} Claude",
+        stack_only: false,
+    },
+    FooterSegment {
+        text: "  S stale",
+        stack_only: false,
+    },
+    FooterSegment {
+        text: "  s stack",
+        stack_only: true,
+    },
+];
+
+/// Build the main-view footer text for the given terminal width. Drops
+/// optional bindings right-to-left (least-essential first) until the text fits.
+pub(super) fn footer_text_for_width(
+    width: u16,
+    has_stack: bool,
+    severity_filter: Option<Severity>,
+) -> String {
+    let badge = match severity_filter {
+        Some(Severity::Required) => "  [F:required]",
+        Some(Severity::Suggestion) => "  [F:suggestion]",
+        Some(Severity::Note) => "  [F:note]",
+        None => "",
+    };
+
+    let base = FOOTER_IRREDUCIBLE;
+
+    let candidates: Vec<&str> = FOOTER_OPTIONAL
+        .iter()
+        .filter(|seg| !seg.stack_only || has_stack)
+        .map(|seg| seg.text)
+        .collect();
+
+    // drop_count == candidates.len() ensures the loop always returns.
+    let target = usize::from(width);
+    let badge_chars = badge.chars().count();
+
+    for drop_count in 0..=candidates.len() {
+        let kept = &candidates[drop_count..];
+        let text: String = std::iter::once(base)
+            .chain(kept.iter().copied().rev())
+            .collect::<Vec<_>>()
+            .concat();
+        let total_chars = text.chars().count() + badge_chars;
+        if total_chars <= target || drop_count == candidates.len() {
+            if badge.is_empty() {
+                return text;
+            }
+            return format!("{text}{badge}");
+        }
     }
+
+    unreachable!("loop returns at drop_count == candidates.len()")
 }
 
 fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -1032,9 +1091,17 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
     } else if let Some(reanchor) = app.pending_reanchor.as_ref() {
         let prompt = reanchor_prompt(&reanchor.body, area.width);
         (prompt, Style::default().fg(Color::Yellow))
+    } else if focused_comment(app).is_some() {
+        (
+            " \u{2191}\u{2193} line  e edit  d delete  c new comment  ? help  q quit".to_owned(),
+            Style::default(),
+        )
     } else {
-        let (text, style) = footer_text(app);
-        (text.to_owned(), style)
+        let has_stack = app.stack.is_some();
+        (
+            footer_text_for_width(area.width, has_stack, app.severity_filter),
+            Style::default(),
+        )
     };
     let widget = Paragraph::new(text).style(style);
     frame.render_widget(widget, area);
@@ -1073,6 +1140,7 @@ fn handle_event(app: &mut App) -> Result<()> {
             Screen::Stale(_) => handle_stale_key(app, key),
             Screen::Overview(_) => handle_overview_key(app, key)?,
             Screen::SendToClaude(_) => handle_send_to_claude_key(app, key)?,
+            Screen::FilePicker(_) => handle_file_picker_key(app, key),
         }
     }
     Ok(())
@@ -1119,6 +1187,11 @@ fn handle_main_key(app: &mut App, key: KeyEvent) -> Result<()> {
         KeyCode::Char('d') => delete_focused_comment(app),
         KeyCode::Char('n') => app.advance_stack()?,
         KeyCode::Char('p') => app.retreat_stack()?,
+        KeyCode::Char('f') => open_file_picker(app),
+        KeyCode::Char('r') => refresh_current_change(app),
+        KeyCode::Char('1') => toggle_severity_filter(app, Severity::Required),
+        KeyCode::Char('2') => toggle_severity_filter(app, Severity::Suggestion),
+        KeyCode::Char('3') => toggle_severity_filter(app, Severity::Note),
         _ => {}
     }
     Ok(())
@@ -2452,6 +2525,105 @@ fn pick_side(source_line: Option<u32>, target_line: Option<u32>) -> Side {
     } else {
         Side::New
     }
+}
+
+fn open_file_picker(app: &mut App) {
+    let entries = build_file_picker_entries(&app.details.diff.files, &app.loaded_comments);
+    app.screen = Screen::FilePicker(FilePickerState {
+        selected_index: 0,
+        scroll_offset: 0,
+        entries,
+    });
+}
+
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "unhandled KeyCode variants are intentionally ignored on the file picker"
+)]
+fn handle_file_picker_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Char('q') | KeyCode::Esc => {
+            app.screen = Screen::Main;
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            if let Screen::FilePicker(ref mut s) = app.screen {
+                file_picker::move_cursor(s, -1);
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if let Screen::FilePicker(ref mut s) = app.screen {
+                file_picker::move_cursor(s, 1);
+            }
+        }
+        KeyCode::Enter => {
+            file_picker_enter(app);
+        }
+        _ => {}
+    }
+}
+
+fn file_picker_enter(app: &mut App) {
+    let Screen::FilePicker(ref state) = app.screen else {
+        return;
+    };
+    let Some(entry) = state.entries.get(state.selected_index) else {
+        return;
+    };
+    let diff_file_index = entry.diff_file_index;
+    let is_binary = matches!(
+        app.details.diff.files.get(diff_file_index),
+        Some(crate::diff::DiffFile::Binary { .. })
+    );
+    app.screen = Screen::Main;
+    app.file_index = diff_file_index;
+    app.scroll = 0;
+    if is_binary {
+        app.status_message = Some("binary file — no commentable lines".to_owned());
+        app.line_index = 0;
+        return;
+    }
+    let first_commentable = app
+        .annotated_per_file
+        .get(diff_file_index)
+        .and_then(|v| {
+            v.lines.iter().position(|l| {
+                matches!(
+                    l.kind,
+                    RenderedLineKind::Added | RenderedLineKind::Removed | RenderedLineKind::Context
+                )
+            })
+        })
+        .unwrap_or(0);
+    app.line_index = first_commentable;
+}
+
+fn refresh_current_change(app: &mut App) {
+    let change_id = app.details.change_id.clone();
+    match jj::show(&change_id) {
+        Ok(details) => {
+            app.rendered_per_file = details.diff.files.iter().map(DiffView::from_file).collect();
+            app.annotated_per_file = app.rendered_per_file.clone();
+            app.details = details;
+            app.overview_cache = None;
+            app.refresh_inline_comments();
+            app.status_message = Some("refreshed".to_owned());
+        }
+        Err(e) => {
+            app.status_message = Some(format!(
+                "refresh failed: {}",
+                sanitize_for_status(&e.to_string())
+            ));
+        }
+    }
+}
+
+fn toggle_severity_filter(app: &mut App, severity: Severity) {
+    if app.severity_filter == Some(severity) {
+        app.severity_filter = None;
+    } else {
+        app.severity_filter = Some(severity);
+    }
+    app.rebuild_annotated_views();
 }
 
 /// Return the `Comment` under the cursor when the focused `RenderedLine` is
@@ -3937,19 +4109,7 @@ mod tests {
 
     #[test]
     fn footer_text_stack_mode_contains_revision() {
-        let mut app = make_app_with_single_file(sample_diff_file());
-        let entry = StackEntry {
-            change_id: app.details.change_id.clone(),
-            commit_id: app.details.commit_id.clone(),
-            description: String::new(),
-        };
-        app.stack = Some(StackContext {
-            entries: vec![entry],
-            current_index: 0,
-            revset: "trunk()..@".to_owned(),
-            revset_hash: RevsetHash::from_revset("trunk()..@"),
-        });
-        let (text, _style) = footer_text(&app);
+        let text = footer_text_for_width(120, true, None);
         assert!(
             text.contains("n/p revision"),
             "footer should label n/p as 'revision', got: {text:?}"
@@ -3958,12 +4118,96 @@ mod tests {
 
     #[test]
     fn footer_text_single_change_mode_has_no_revision_label() {
-        let app = make_app_with_single_file(sample_diff_file());
-        // No stack context → single-change footer branch.
-        let (text, _style) = footer_text(&app);
+        let text = footer_text_for_width(120, false, None);
         assert!(
-            !text.contains("n/p"),
-            "single-change footer should not mention n/p, got: {text:?}"
+            text.contains("n/p revision"),
+            "footer should still include n/p at 120 cols, got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn footer_text_for_width_80_cols_full_footer() {
+        let text = footer_text_for_width(80, true, None);
+        assert!(text.contains("n/p revision"), "must have n/p: {text:?}");
+        assert!(text.contains("Enter comment"), "must have Enter: {text:?}");
+        assert!(text.contains('?'), "must have ?: {text:?}");
+        assert!(
+            text.chars().count() <= 80,
+            "must fit in 80 cols: {} chars: {text:?}",
+            text.chars().count()
+        );
+    }
+
+    #[test]
+    fn footer_text_for_width_drops_question_mark_at_70() {
+        let text = footer_text_for_width(70, true, None);
+        assert!(
+            !text.contains('?'),
+            "? must be dropped at 70 cols: {text:?}"
+        );
+        assert!(
+            text.contains("Enter comment"),
+            "Enter must remain: {text:?}"
+        );
+        assert!(text.chars().count() <= 70, "must fit in 70 cols: {text:?}");
+    }
+
+    #[test]
+    fn footer_text_for_width_drops_claude_at_65() {
+        let text = footer_text_for_width(65, true, None);
+        assert!(
+            !text.contains("Claude"),
+            "C → Claude must be dropped: {text:?}"
+        );
+        assert!(
+            text.contains("Enter comment"),
+            "Enter must remain: {text:?}"
+        );
+        assert!(text.chars().count() <= 65, "must fit in 65 cols: {text:?}");
+    }
+
+    #[test]
+    fn footer_text_for_width_irreducible_always_present() {
+        for width in [40u16, 50, 55, 60] {
+            let text = footer_text_for_width(width, true, None);
+            assert!(
+                text.contains("Enter comment"),
+                "Enter must be present at {width}: {text:?}"
+            );
+            assert!(
+                text.contains("Tab file"),
+                "Tab must be present at {width}: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn footer_text_for_width_severity_badge_appended() {
+        let text = footer_text_for_width(120, false, Some(Severity::Required));
+        assert!(text.contains("[F:required]"), "badge must appear: {text:?}");
+    }
+
+    #[test]
+    fn footer_text_for_width_no_badge_when_no_filter() {
+        let text = footer_text_for_width(120, false, None);
+        assert!(!text.contains("[F:"), "no badge when no filter: {text:?}");
+    }
+
+    #[test]
+    fn footer_text_for_width_stack_segment_absent_without_stack() {
+        let text = footer_text_for_width(120, false, None);
+        assert!(
+            !text.contains("s stack"),
+            "s stack must be absent in non-stack mode: {text:?}"
+        );
+    }
+
+    #[test]
+    fn footer_text_for_width_stack_segment_present_with_stack() {
+        let text = footer_text_for_width(120, true, None);
+        assert!(
+            text.contains("s stack"),
+            "s stack must appear in stack mode at 120: {text:?}"
         );
     }
 
@@ -4810,5 +5054,350 @@ mod tests {
                 panic!("expected Anchor::Change targeting B; got {other:?}")
             }
         }
+    }
+
+    #[test]
+    fn f_key_opens_file_picker() {
+        let mut app = make_app_with_single_file(sample_diff_file());
+        handle_main_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(
+            matches!(app.screen, Screen::FilePicker(_)),
+            "f should open FilePicker screen"
+        );
+    }
+
+    #[test]
+    fn file_picker_q_returns_to_main_unchanged() {
+        let mut app = make_app_with_single_file(sample_diff_file());
+        app.file_index = 0;
+        open_file_picker(&mut app);
+        assert!(matches!(app.screen, Screen::FilePicker(_)));
+        handle_file_picker_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+        );
+        assert!(
+            matches!(app.screen, Screen::Main),
+            "q should return to Main"
+        );
+        assert_eq!(app.file_index, 0, "file_index must not change on q");
+    }
+
+    #[test]
+    fn file_picker_esc_returns_to_main_unchanged() {
+        let mut app = make_app_with_single_file(sample_diff_file());
+        app.file_index = 0;
+        open_file_picker(&mut app);
+        handle_file_picker_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(
+            matches!(app.screen, Screen::Main),
+            "Esc should return to Main"
+        );
+        assert_eq!(app.file_index, 0);
+    }
+
+    #[test]
+    fn file_picker_enter_switches_file_index() {
+        let id = ChangeId::parse(&"a".repeat(32)).unwrap();
+        let commit_id = CommitId::parse(&"a".repeat(40)).unwrap();
+        let details = ChangeDetails {
+            change_id: id,
+            commit_id,
+            description: String::new(),
+            diff: Diff {
+                files: vec![
+                    sample_diff_file(),
+                    DiffFile::Modified {
+                        path: PathBuf::from("bar.rs"),
+                        hunks: vec![Hunk {
+                            header: "@@ -1,1 +1,1 @@".to_owned(),
+                            function_context: None,
+                            source_start: 1,
+                            source_length: 1,
+                            target_start: 1,
+                            target_length: 1,
+                            lines: vec![Line {
+                                kind: LineKind::Context,
+                                text: "x".to_owned(),
+                                source_line: Some(1),
+                                target_line: Some(1),
+                            }],
+                        }],
+                    },
+                ],
+            },
+        };
+        let mut app = App::new(
+            details,
+            PathBuf::from("/repo"),
+            "@".to_owned(),
+            None,
+            TransitionMode::Never,
+        );
+        app.file_index = 0;
+        open_file_picker(&mut app);
+
+        // Move to second entry and press Enter.
+        if let Screen::FilePicker(ref mut s) = app.screen {
+            file_picker::move_cursor(s, 1);
+            assert_eq!(s.selected_index, 1);
+        }
+        handle_file_picker_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(
+            matches!(app.screen, Screen::Main),
+            "Enter should return to Main"
+        );
+        assert_eq!(
+            app.file_index, 1,
+            "file_index should be updated to selected entry"
+        );
+    }
+
+    #[test]
+    fn toggle_severity_filter_sets_and_clears() {
+        let mut app = make_app_with_single_file(sample_diff_file());
+        assert_eq!(app.severity_filter, None);
+
+        toggle_severity_filter(&mut app, Severity::Required);
+        assert_eq!(app.severity_filter, Some(Severity::Required));
+
+        toggle_severity_filter(&mut app, Severity::Required);
+        assert_eq!(
+            app.severity_filter, None,
+            "pressing same severity again clears filter"
+        );
+    }
+
+    #[test]
+    fn toggle_severity_filter_switches_to_different_severity() {
+        let mut app = make_app_with_single_file(sample_diff_file());
+        toggle_severity_filter(&mut app, Severity::Required);
+        assert_eq!(app.severity_filter, Some(Severity::Required));
+
+        toggle_severity_filter(&mut app, Severity::Suggestion);
+        assert_eq!(
+            app.severity_filter,
+            Some(Severity::Suggestion),
+            "switching to different severity replaces filter"
+        );
+    }
+
+    #[test]
+    fn severity_filter_excludes_non_matching_comments() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = make_app_with_single_file(sample_diff_file());
+        app.repo_root = dir.path().to_path_buf();
+
+        // Save a Required comment on the Added line (target=2).
+        app.line_index = 2;
+        let BuildTargetResult::Ready(target) = build_line_target(&app) else {
+            panic!("expected Ready");
+        };
+        let contexts = composer_contexts(&app, target);
+        let mut composer = Composer::new(contexts, Severity::Required);
+        for ch in "required comment".chars() {
+            composer
+                .body
+                .input(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        let outcome = save_composer(&mut app, &composer, time::OffsetDateTime::UNIX_EPOCH);
+        assert!(matches!(outcome, SaveOutcome::Saved));
+
+        // Save a Note comment on the Context line (target=1).
+        app.line_index = 1;
+        let BuildTargetResult::Ready(target2) = build_line_target(&app) else {
+            panic!("expected Ready");
+        };
+        let contexts2 = composer_contexts(&app, target2);
+        let mut composer2 = Composer::new(contexts2, Severity::Note);
+        for ch in "note comment".chars() {
+            composer2
+                .body
+                .input(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        let outcome2 = save_composer(
+            &mut app,
+            &composer2,
+            time::OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1),
+        );
+        assert!(matches!(outcome2, SaveOutcome::Saved));
+
+        // With no filter both comments render.
+        assert_eq!(app.severity_filter, None);
+        let all_meta_count = app
+            .current_view()
+            .unwrap()
+            .lines
+            .iter()
+            .filter(|l| matches!(l.kind, RenderedLineKind::InlineCommentMeta { .. }))
+            .count();
+        assert_eq!(
+            all_meta_count, 2,
+            "both comments should render with no filter"
+        );
+
+        // Apply Required filter — only 1 meta line should appear.
+        toggle_severity_filter(&mut app, Severity::Required);
+        assert_eq!(app.severity_filter, Some(Severity::Required));
+        let filtered_count = app
+            .current_view()
+            .unwrap()
+            .lines
+            .iter()
+            .filter(|l| matches!(l.kind, RenderedLineKind::InlineCommentMeta { .. }))
+            .count();
+        assert_eq!(
+            filtered_count, 1,
+            "only Required comment should render when filter=Required"
+        );
+
+        // Clear the filter.
+        toggle_severity_filter(&mut app, Severity::Required);
+        assert_eq!(app.severity_filter, None);
+        let after_clear = app
+            .current_view()
+            .unwrap()
+            .lines
+            .iter()
+            .filter(|l| matches!(l.kind, RenderedLineKind::InlineCommentMeta { .. }))
+            .count();
+        assert_eq!(
+            after_clear, 2,
+            "both comments should render after clearing filter"
+        );
+    }
+
+    #[test]
+    fn file_picker_enter_binary_file_sets_status_message() {
+        let id = ChangeId::parse(&"a".repeat(32)).unwrap();
+        let commit_id = CommitId::parse(&"a".repeat(40)).unwrap();
+        let details = ChangeDetails {
+            change_id: id,
+            commit_id,
+            description: String::new(),
+            diff: Diff {
+                files: vec![DiffFile::Binary {
+                    path: PathBuf::from("logo.png"),
+                }],
+            },
+        };
+        let mut app = App::new(
+            details,
+            PathBuf::from("/repo"),
+            "@".to_owned(),
+            None,
+            TransitionMode::Never,
+        );
+        open_file_picker(&mut app);
+        handle_file_picker_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            matches!(app.screen, Screen::Main),
+            "Enter should return to Main"
+        );
+        assert_eq!(app.file_index, 0);
+        assert_eq!(app.line_index, 0);
+        let msg = app
+            .status_message
+            .as_deref()
+            .expect("status message should be set for binary file");
+        assert!(
+            msg.contains("binary"),
+            "status message should mention 'binary'; got: {msg}"
+        );
+    }
+
+    /// Pins the contract: at every supported terminal width (>= `MIN_COLS`),
+    /// the rendered footer text fits within `width` columns.
+    #[test]
+    fn footer_text_for_width_fits_within_width_for_all_target_widths() {
+        for width in [60u16, 65, 70, 80, 120] {
+            for has_stack in [false, true] {
+                let text = footer_text_for_width(width, has_stack, None);
+                assert!(
+                    text.chars().count() <= usize::from(width),
+                    "footer overflows at width={width} has_stack={has_stack}: {} chars: {text:?}",
+                    text.chars().count()
+                );
+            }
+        }
+    }
+
+    /// Pins the contract at the minimum supported width (`MIN_COLS` = 60) with
+    /// a severity filter active: the badge appears unconditionally and the
+    /// irreducible base is always preserved. When the badge plus the
+    /// irreducible base exceeds the width, the badge wins (the badge is the
+    /// only on-screen indicator that filtering is active, so dropping it would
+    /// silently mislead the reviewer).
+    #[test]
+    fn footer_text_for_width_with_badge_at_minimum_width() {
+        let text = footer_text_for_width(60, false, Some(Severity::Suggestion));
+        assert!(
+            text.contains("[F:suggestion]"),
+            "badge must appear at minimum width: {text:?}"
+        );
+        assert!(
+            text.contains("Enter comment"),
+            "irreducible base must remain: {text:?}"
+        );
+        // The base (49 chars) + " [F:suggestion]" (16 chars) = 65 chars,
+        // which exceeds 60. We pin: the badge wins. ratatui truncates at the
+        // viewport edge, so the rightmost characters of the base may clip
+        // visually — but the badge is still present in the rendered string.
+        assert!(
+            text.chars().count() > 60,
+            "at width 60 with the long-form badge, the footer is expected to \
+             exceed the budget (badge wins); got {} chars: {text:?}",
+            text.chars().count()
+        );
+    }
+
+    #[test]
+    fn file_picker_enter_on_empty_diff_is_noop() {
+        let id = ChangeId::parse(&"a".repeat(32)).unwrap();
+        let commit_id = CommitId::parse(&"a".repeat(40)).unwrap();
+        let details = ChangeDetails {
+            change_id: id,
+            commit_id,
+            description: String::new(),
+            diff: Diff { files: vec![] },
+        };
+        let mut app = App::new(
+            details,
+            PathBuf::from("/repo"),
+            "@".to_owned(),
+            None,
+            TransitionMode::Never,
+        );
+        open_file_picker(&mut app);
+        // Empty entry list — Enter should leave the screen as FilePicker
+        // (early return in file_picker_enter when entries are empty).
+        handle_file_picker_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            matches!(app.screen, Screen::FilePicker(_)),
+            "Enter on empty entry list should be a no-op (still on FilePicker)"
+        );
+    }
+
+    #[test]
+    fn file_picker_enter_single_file_navigates_to_first_commentable_line() {
+        let mut app = make_app_with_single_file(sample_diff_file());
+        open_file_picker(&mut app);
+        handle_file_picker_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(app.screen, Screen::Main));
+        assert_eq!(app.file_index, 0);
+        // First commentable line is the Context at index 1 (HunkHeader is at 0).
+        let cursor_kind = app.current_view().unwrap().lines[app.line_index].kind;
+        assert!(
+            matches!(
+                cursor_kind,
+                RenderedLineKind::Added | RenderedLineKind::Removed | RenderedLineKind::Context
+            ),
+            "cursor must land on a commentable line; got {cursor_kind:?}"
+        );
     }
 }

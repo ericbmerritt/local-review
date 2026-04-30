@@ -128,7 +128,7 @@ When the reviewer presses `Enter` or `c`. Renders as a centered modal over a dim
        ║   └─────────────────────────────────────────────────────────────┘ ║    
        ║                                                                     ║    
        ╠═════════════════════════════════════════════════════════════════════╣    
-       ║  ^L line  ^C change  ^K stack    ^1 note  ^2 suggestion  ^3 required║    
+       ║  ^L line  ^C change  ^K stack  M-r required  M-s suggestion  M-n note ║    
        ║                                                       ^X save  Esc  ║    
        ╚═════════════════════════════════════════════════════════════════════╝    
                                                                                   
@@ -140,7 +140,7 @@ When the reviewer presses `Enter` or `c`. Renders as a centered modal over a dim
 
 **The default scope follows the cursor.** Press `c` on a diff line: scope defaults to *line* and the line context shows three lines around the target with `▶` marking it. Press `c` on a change row in the stack overview: scope defaults to *change* and the context block shows the change ID and description. Press `c` on the stack-level header in the stack overview: scope defaults to *stack* and the context shows the revset. Flipping scope inside the composer swaps the context block to match.
 
-**Severity is a radio in the chrome, not in the body.** Picked with `^1` / `^2` / `^3`. The active selection is `[x]`, others `[ ]`. Default on first comment of a session is `suggestion`; subsequent comments default to whatever the reviewer last picked.
+**Severity is a radio in the chrome, not in the body.** Picked with `Alt+R` / `Alt+S` / `Alt+N` (Required / Suggestion / Note — written `M-r`/`M-s`/`M-n` in the footer per emacs/readline convention). The active selection is `[x]`, others `[ ]`. Default on first comment of a session is `suggestion`; subsequent comments default to whatever the reviewer last picked.
 
 **Scope is also a radio.** Picked with `^L` / `^C` / `^K` — single keystroke per option, no toggling. The chord family avoids `^S` (POSIX flow control) and `^Tab` (eaten by some terminals); see Keybind notes below.
 
@@ -153,7 +153,8 @@ When the reviewer presses `Enter` or `c`. Renders as a centered modal over a dim
 ### Keybind notes
 
 - **`^X` for save**, not `^S`. POSIX terminals eat `^S` for XOFF flow control unless `stty -ixon` is set. `^X` ("eXit + write," Emacs `^X^S` cousin) doesn't carry that hazard.
-- **`^L`/`^C`/`^K` for scope**, not `^Tab`. `^Tab` is remapped or eaten by tmux configs, kitty without explicit mapping, and some Windows terminals. Single-keystroke radios match the severity grammar (`^1`/`^2`/`^3`), so the reviewer learns one chord pattern.
+- **`^L`/`^C`/`^K` for scope**, not `^Tab`. `^Tab` is remapped or eaten by tmux configs, kitty without explicit mapping, and some Windows terminals.
+- **`Alt+R`/`Alt+S`/`Alt+N` (a.k.a. `M-r`/`M-s`/`M-n`) for severity**, not `^1`/`^2`/`^3` and not `^R`/`^S`/`^N`. The Ctrl+digit space is mangled across terminals: Ctrl+3 sends ESC (collides with Cancel), Ctrl+2 sends NUL. Ctrl+letter is risky too: Ctrl+S is intercepted by some IDE-embedded terminals (Sublime, VS Code) for Save, and Ctrl+N collides with tui-textarea's next-line binding. Alt-as-Meta is the standard config across xterm/iTerm/Terminal.app/Alacritty/ghostty/kitty/foot, passes cleanly through tmux, and doesn't collide with any of the above. Both lowercase and uppercase letter codes are accepted (some terminals send Alt+Shift+letter as `Alt+R`).
 - **No collision risk.** `^L` (terminal "redraw screen") and `^K` ("kill to end of line") are readline conventions; in a TUI modal that captures keys, neither default fires. `^C` inside a modal is captured as the scope key, not as SIGINT — `Esc` is the cancel/exit path. This is a deliberate departure from shell convention and worth calling out in the help screen.
 
 ### Editing existing comments
@@ -400,7 +401,7 @@ Press `?` from any view. Overlay.
 │                                                                                  │
 │  In comment composer                                                             │
 │      ^L ^C ^K              scope:    line / change / stack                      │
-│      ^1 ^2 ^3              severity: note / suggestion / required               │
+│      M-r M-s M-n           severity: required / suggestion / note  (Alt+r/s/n)  │
 │      ^X                    save                                                 │
 │      Esc                   cancel  (^C inside the composer is captured as scope)│
 │                                                                                  │
@@ -471,7 +472,7 @@ At narrower widths, drop bindings from the right edge with a trailing `…`, in 
 3. `S stale`
 4. `s stack`
 
-Always preserve `Enter comment`, `Tab file`, `n/p revision`, `↑↓ line`. These are the irreducible surface; without them the reviewer can't do their job. A reviewer in a narrow terminal who needs the dropped bindings consults `?`.
+Always preserve `Enter comment`, `Tab file`, `n/p revision`, `↑↓ line`. These are the irreducible surface; without them the reviewer can't do their job. The footer shows `Tab` (forward) only; `Shift-Tab` (backward) is documented in `?` help. A reviewer in a narrow terminal who needs the dropped bindings consults `?`.
 
 Stack-overview screen has its own resize rules in Screen 4.
 
