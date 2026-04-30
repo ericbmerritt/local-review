@@ -324,27 +324,60 @@ fn clear_stale_removes_stale_comment_and_emits_summary() {
     );
 }
 
-/// `jjr clear @` (without any filter flag) exits non-zero and prints the
-/// "at least one filter flag is required" error message.
+/// Bare `jjr clear @` with `n` on stdin aborts and exits non-zero.
 #[test]
-fn clear_without_filter_flag_exits_nonzero() {
+fn clear_bare_with_n_stdin_aborts() {
     if !jj_on_path() {
-        eprintln!("jj not on PATH; skipping clear_without_filter_flag_exits_nonzero");
+        eprintln!("jj not on PATH; skipping clear_bare_with_n_stdin_aborts");
         return;
     }
 
     let tmp = tempfile::tempdir().unwrap();
-    let repo = build_fixture_named(&tmp, "single_change.sh");
+    let repo = build_fixture_named(&tmp, "single_change_with_pending.sh");
 
     Command::cargo_bin("jjr")
         .unwrap()
         .current_dir(&repo)
         .args(["clear", "@"])
+        .write_stdin("n\n")
         .assert()
         .failure()
-        .stderr(predicate::str::contains(
-            "at least one filter flag is required",
-        ));
+        .stderr(predicate::str::contains("clear aborted"));
+}
+
+/// Bare `jjr clear @` with `y` on stdin clears all comments.
+#[test]
+fn clear_bare_with_y_stdin_clears_all() {
+    if !jj_on_path() {
+        eprintln!("jj not on PATH; skipping clear_bare_with_y_stdin_clears_all");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = build_fixture_named(&tmp, "single_change_with_pending.sh");
+    let ids = resolve_stack_change_ids(&repo);
+    assert!(!ids.is_empty());
+
+    Command::cargo_bin("jjr")
+        .unwrap()
+        .current_dir(&repo)
+        .args(["clear", "@"])
+        .write_stdin("y\n")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("cleared"));
+
+    let comments_dir = repo.join(".jj-review").join("comments");
+    for id in &ids {
+        let path = comments_dir.join(format!("{id}.jsonl"));
+        if path.exists() {
+            let content = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                content.trim().is_empty(),
+                "all comments must be removed; got: {content}"
+            );
+        }
+    }
 }
 
 /// `jjr clear --stale @` against a fixture with no stale comments exits 0
@@ -392,6 +425,38 @@ fn append_pending_jsonl(comments_dir: &Path, repo: &Path, change_id: &str, ts: &
         repo = repo.display()
     );
     let path = comments_dir.join(format!("{change_id}.jsonl"));
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .unwrap();
+    writeln!(f, "{line}").unwrap();
+}
+
+/// Inputs for `append_stack_jsonl`. `revset_hash_hex` must match
+/// `RevsetHash::from_revset(revset).hex()` for the stack the test resolves;
+/// tests compute it via the public library API.
+#[cfg(test)]
+struct StackJsonlRecord<'a> {
+    comments_dir: &'a Path,
+    repo: &'a Path,
+    revset: &'a str,
+    revset_hash_hex: &'a str,
+    body: &'a str,
+    created_at: &'a str,
+}
+
+#[cfg(test)]
+fn append_stack_jsonl(rec: &StackJsonlRecord<'_>) {
+    let line = format!(
+        r#"{{"schema_version":"diff-comment/v2","scope":"stack","revset_hash":"{hash}","repo_root":"{repo}","revset":"{revset}","comment":"{body}","severity":"note","created_at":"{ts}"}}"#,
+        hash = rec.revset_hash_hex,
+        repo = rec.repo.display(),
+        revset = rec.revset,
+        body = rec.body,
+        ts = rec.created_at,
+    );
+    let path = rec.comments_dir.join("_stack.jsonl");
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -652,6 +717,184 @@ fn claude_no_comments_exits_2_with_message() {
         .stderr(predicate::str::contains("no comments to send"));
 }
 
+/// `jjr clear @ --yes` against a fixture with a pending comment removes all
+/// comments without prompting and exits 0.
+#[test]
+fn clear_yes_flag_skips_prompt_and_clears_all() {
+    if !jj_on_path() {
+        eprintln!("jj not on PATH; skipping clear_yes_flag_skips_prompt_and_clears_all");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = build_fixture_named(&tmp, "single_change_with_pending.sh");
+    let ids = resolve_stack_change_ids(&repo);
+    assert!(!ids.is_empty());
+
+    Command::cargo_bin("jjr")
+        .unwrap()
+        .current_dir(&repo)
+        .args(["clear", "@", "--yes"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("cleared"));
+
+    let comments_dir = repo.join(".jj-review").join("comments");
+    for id in &ids {
+        let path = comments_dir.join(format!("{id}.jsonl"));
+        if path.exists() {
+            let content = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                content.trim().is_empty(),
+                "all comments must be removed after --yes; got: {content}"
+            );
+        }
+    }
+}
+
+/// `jjr clear trunk()..@ --orphaned` removes the orphan JSONL file and leaves
+/// the in-stack change's file intact.
+#[test]
+fn clear_orphaned_removes_orphan_file_leaves_in_stack() {
+    if !jj_on_path() {
+        eprintln!("jj not on PATH; skipping clear_orphaned_removes_orphan_file_leaves_in_stack");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = build_fixture_named(&tmp, "stack_with_orphan.sh");
+
+    let comments_dir = repo.join(".jj-review").join("comments");
+    let orphan_path = comments_dir.join("aabbccddeeff0011.jsonl");
+    assert!(orphan_path.exists(), "orphan file must exist before clear");
+
+    Command::cargo_bin("jjr")
+        .unwrap()
+        .current_dir(&repo)
+        .args(["clear", "trunk()..@", "--orphaned"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("cleared"));
+
+    assert!(
+        !orphan_path.exists(),
+        "orphan file must be removed after --orphaned clear"
+    );
+
+    // In-stack file must still exist.
+    let ids = resolve_stack_change_ids(&repo);
+    assert!(!ids.is_empty());
+    let in_stack_path = comments_dir.join(format!("{}.jsonl", ids[0]));
+    assert!(
+        in_stack_path.exists(),
+        "in-stack change file must not be touched"
+    );
+}
+
+/// `jjr export @` against a fixture with a pending comment writes JSONL to
+/// stdout and each line parses as a valid comment.
+#[test]
+fn export_jsonl_pending_comment_produces_parseable_output() {
+    if !jj_on_path() {
+        eprintln!(
+            "jj not on PATH; skipping export_jsonl_pending_comment_produces_parseable_output"
+        );
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = build_fixture_named(&tmp, "single_change_with_pending.sh");
+
+    let output = Command::cargo_bin("jjr")
+        .unwrap()
+        .current_dir(&repo)
+        .args(["export", "@"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "export should succeed; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.trim().is_empty(), "stdout must not be empty");
+
+    for line in stdout.lines() {
+        let v: serde_json::Value = serde_json::from_str(line)
+            .unwrap_or_else(|e| panic!("line must be valid JSON: {e}\nline: {line}"));
+        assert!(
+            v.get("schema_version").is_some(),
+            "each line must have schema_version"
+        );
+    }
+
+    assert!(
+        stdout.contains("pending comment"),
+        "output must contain the pending comment body; got: {stdout}"
+    );
+}
+
+/// `jjr export @ --format markdown` against a fixture with a pending comment
+/// writes a Markdown document with expected structure.
+#[test]
+fn export_markdown_pending_comment_produces_markdown_output() {
+    if !jj_on_path() {
+        eprintln!(
+            "jj not on PATH; skipping export_markdown_pending_comment_produces_markdown_output"
+        );
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = build_fixture_named(&tmp, "single_change_with_pending.sh");
+
+    let output = Command::cargo_bin("jjr")
+        .unwrap()
+        .current_dir(&repo)
+        .args(["export", "@", "--format", "markdown"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "export --format markdown should succeed; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.starts_with("# Review export —"),
+        "must start with markdown header; got: {stdout}"
+    );
+    assert!(
+        stdout.contains("pending comment"),
+        "must contain the pending comment body; got: {stdout}"
+    );
+}
+
+/// `jjr export @` against a fixture with no comments exits with code 2 and
+/// emits "no comments to export" on stderr.
+#[test]
+fn export_no_comments_exits_2_with_message() {
+    if !jj_on_path() {
+        eprintln!("jj not on PATH; skipping export_no_comments_exits_2_with_message");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = build_fixture_named(&tmp, "single_change.sh");
+
+    Command::cargo_bin("jjr")
+        .unwrap()
+        .current_dir(&repo)
+        .args(["export", "@"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("no comments to export"));
+}
+
 /// `jjr claude @` with no `claude` binary on PATH exits non-zero and emits a
 /// message naming the missing binary.
 ///
@@ -681,4 +924,125 @@ fn claude_missing_binary_exits_nonzero_with_clear_message() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("claude").or(predicate::str::contains("PATH")));
+}
+
+/// Bare `jjr clear @ --yes` against a fixture with both per-change and
+/// stack-scoped comments removes both. Pins the contract that bare clear
+/// includes `_stack.jsonl` records (matching the stack's `revset_hash`) — not
+/// only per-change files.
+#[test]
+fn clear_bare_removes_stack_scoped_and_per_change() {
+    if !jj_on_path() {
+        eprintln!("jj not on PATH; skipping clear_bare_removes_stack_scoped_and_per_change");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = build_fixture_named(&tmp, "single_change_with_pending.sh");
+    let comments_dir = repo.join(".jj-review").join("comments");
+
+    // Inject a stack-scoped comment for the `@` revset.
+    let revset = "@";
+    let hash_hex = jjr::stack::RevsetHash::from_revset(revset).hex();
+    append_stack_jsonl(&StackJsonlRecord {
+        comments_dir: &comments_dir,
+        repo: &repo,
+        revset,
+        revset_hash_hex: &hash_hex,
+        body: "stack-scoped concern",
+        created_at: "2026-04-29T11:00:00Z",
+    });
+
+    let stack_path = comments_dir.join("_stack.jsonl");
+    assert!(stack_path.exists(), "stack file must be set up");
+
+    Command::cargo_bin("jjr")
+        .unwrap()
+        .current_dir(&repo)
+        .args(["clear", "@", "--yes"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("cleared 2"));
+
+    // Per-change file emptied.
+    let ids = resolve_stack_change_ids(&repo);
+    assert!(!ids.is_empty());
+    for id in &ids {
+        let path = comments_dir.join(format!("{id}.jsonl"));
+        if path.exists() {
+            let content = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                content.trim().is_empty(),
+                "per-change comments must be removed; got: {content}"
+            );
+        }
+    }
+
+    // Stack file no longer contains the matching record.
+    let stack_after = std::fs::read_to_string(&stack_path).unwrap();
+    assert!(
+        !stack_after.contains("stack-scoped concern"),
+        "stack-scoped comment must be removed; got: {stack_after}"
+    );
+}
+
+/// Bare `jjr clear @` against a fixture with no comments exits 0 with
+/// "no comments to clear" and emits no prompt. Pins the zero-comment
+/// short-circuit at the top of the bare-clear path.
+#[test]
+fn clear_bare_no_comments_exits_zero_with_message() {
+    if !jj_on_path() {
+        eprintln!("jj not on PATH; skipping clear_bare_no_comments_exits_zero_with_message");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = build_fixture_named(&tmp, "single_change.sh");
+
+    Command::cargo_bin("jjr")
+        .unwrap()
+        .current_dir(&repo)
+        .args(["clear", "@"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("no comments to clear"))
+        .stderr(predicate::str::contains("Clear ").not());
+}
+
+/// `jjr clear @ --stale --orphaned` is rejected by clap before any work runs.
+/// Pins the `conflicts_with` contract: the user must pick exactly one filter.
+#[test]
+fn clear_stale_and_orphaned_combined_is_rejected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path();
+    Command::cargo_bin("jjr")
+        .unwrap()
+        .current_dir(repo)
+        .args(["clear", "@", "--stale", "--orphaned"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot be used with"));
+}
+
+/// `jjr clear --orphaned 'trunk()..@'` against a fixture with no orphan files
+/// exits 0 and reports zero. Symmetric to the `--stale` zero case.
+#[test]
+fn clear_orphaned_no_orphans_exits_zero_with_zero_summary() {
+    if !jj_on_path() {
+        eprintln!(
+            "jj not on PATH; skipping clear_orphaned_no_orphans_exits_zero_with_zero_summary"
+        );
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = build_fixture_named(&tmp, "three_change_stack.sh");
+
+    Command::cargo_bin("jjr")
+        .unwrap()
+        .current_dir(&repo)
+        .args(["clear", "--orphaned", "trunk()..@"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("cleared 0 orphaned comments"));
 }

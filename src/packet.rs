@@ -181,7 +181,7 @@ pub fn render_prompt(packet: &Packet) -> String {
     out
 }
 
-fn severity_label(s: Severity) -> &'static str {
+pub(crate) fn severity_label(s: Severity) -> &'static str {
     match s {
         Severity::Required => "REQUIRED",
         Severity::Suggestion => "SUGGESTION",

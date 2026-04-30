@@ -1,3 +1,4 @@
+use std::fmt::Display;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -6,12 +7,13 @@ use clap::{Parser, Subcommand};
 
 use jjr::claude::{self, ClaudeOutcome};
 use jjr::error::JjrError;
+use jjr::export::{self, ExportFormat};
 use jjr::jj;
 use jjr::packet;
 use jjr::stack::{ResolvedStack, RevsetHash, StackEntry};
 use jjr::store;
 use jjr::tui;
-use jjr::util::pluralize;
+use jjr::util::{confirm_response, pluralize};
 use jjr::working_copy_guard::WorkingCopyGuard;
 
 #[derive(Parser)]
@@ -43,16 +45,39 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Export all comments for the resolved revset to stdout.
+    Export {
+        /// Revset to export. Defaults to `trunk()..@`.
+        revset: Option<String>,
+
+        /// Output format.
+        #[arg(long, default_value_t = ExportFormat::Jsonl)]
+        format: ExportFormat,
+    },
+
     /// Remove comments matching the given filter from the resolved revset.
+    ///
+    /// With no filter flag, clears ALL comments for the revset (with a
+    /// confirmation prompt unless `--yes` is passed).
     Clear {
         /// Revset to operate on. Accepts any jj revset (`@`, `@-`, branch
         /// names, `trunk()..@`, etc.).
         revset: String,
 
         /// Clear line-scoped comments whose anchoring failed (status=stale).
-        /// At least one filter flag is required.
-        #[arg(long)]
+        /// Mutually exclusive with `--orphaned`.
+        #[arg(long, conflicts_with = "orphaned")]
         stale: bool,
+
+        /// Clear comments for change IDs not present in the resolved revset
+        /// (orphaned changes left behind after abandon/rebase). Mutually
+        /// exclusive with `--stale`.
+        #[arg(long)]
+        orphaned: bool,
+
+        /// Skip the confirmation prompt when clearing all comments.
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
 
     /// Generate a Claude prompt from the review comments for the given revset.
@@ -88,7 +113,16 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
 
     let result = match cli.command {
-        Some(Command::Clear { revset, stale }) => run_clear(&revset, stale),
+        Some(Command::Export { revset, format }) => {
+            let effective = revset.unwrap_or_else(|| jj::DEFAULT_STACK_REVSET.to_owned());
+            return run_export(&effective, format);
+        }
+        Some(Command::Clear {
+            revset,
+            stale,
+            orphaned,
+            yes,
+        }) => run_clear(&revset, stale, orphaned, yes),
         Some(Command::Packet {
             revset,
             output,
@@ -112,6 +146,45 @@ fn main() -> ExitCode {
 
     match result {
         Ok(()) => ExitCode::SUCCESS,
+        Err(JjrError::ClearAborted) => {
+            let mut stderr = std::io::stderr().lock();
+            let _ = writeln!(stderr, "clear aborted");
+            ExitCode::from(1)
+        }
+        Err(err) => {
+            print_error(&err);
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_export(revset: &str, format: ExportFormat) -> ExitCode {
+    let result = (|| -> Result<(), JjrError> {
+        let repo_root = std::env::current_dir().map_err(|source| JjrError::Io { source })?;
+        let resolved = jj::resolve_stack(revset)?;
+        let data = export::collect_export_data(&repo_root, &resolved)?;
+        if export::is_empty(&data) {
+            return Err(JjrError::NoCommentsToExport {
+                revset: revset.to_owned(),
+            });
+        }
+        let output = match format {
+            ExportFormat::Jsonl => export::render_export_jsonl(&data)?,
+            ExportFormat::Markdown => export::render_export_markdown(&data),
+        };
+        let mut stdout = std::io::stdout().lock();
+        stdout
+            .write_all(output.as_bytes())
+            .map_err(|source| JjrError::Io { source })
+    })();
+
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(JjrError::NoCommentsToExport { .. }) => {
+            let mut stderr = std::io::stderr().lock();
+            let _ = writeln!(stderr, "no comments to export");
+            ExitCode::from(2)
+        }
         Err(err) => {
             print_error(&err);
             ExitCode::FAILURE
@@ -220,26 +293,88 @@ fn run_stack(revset: &str, restart: bool) -> Result<(), JjrError> {
     tui::run_stack(&repo_root, &resolved, restart)
 }
 
-fn run_clear(revset: &str, stale: bool) -> Result<(), JjrError> {
-    if !stale {
-        return Err(JjrError::NoFilterSpecified);
-    }
+fn run_clear(revset: &str, stale: bool, orphaned: bool, yes: bool) -> Result<(), JjrError> {
     let repo_root = std::env::current_dir().map_err(|source| JjrError::Io { source })?;
     let resolved = jj::resolve_stack(revset)?;
-    let stats = store::clear_stale_for_stack(&repo_root, &resolved)?;
-    let mut stderr = std::io::stderr().lock();
-    let _ = writeln!(
-        stderr,
-        "cleared {} stale {} across {} {}",
-        stats.comments_removed,
-        pluralize("comment", stats.comments_removed),
-        stats.changes_touched,
-        pluralize("change", stats.changes_touched),
-    );
+
+    if stale {
+        let stats = store::clear_stale_for_stack(&repo_root, &resolved)?;
+        print_clear_summary(stats.comments_removed, Some("stale"), stats.changes_touched);
+        return Ok(());
+    }
+
+    if orphaned {
+        let stats = store::clear_orphaned_for_revset(&repo_root, &resolved)?;
+        print_clear_summary(
+            stats.comments_removed,
+            Some("orphaned"),
+            stats.changes_touched,
+        );
+        return Ok(());
+    }
+
+    // Bare clear — confirm unless --yes.
+    let total = store::count_all_for_stack(&repo_root, &resolved)?;
+    if total == 0 {
+        let mut stderr = std::io::stderr().lock();
+        let _ = writeln!(stderr, "no comments to clear");
+        return Ok(());
+    }
+    if !yes {
+        let mut stderr = std::io::stderr().lock();
+        let _ = writeln!(
+            stderr,
+            "Clear {} {}? [y/N]",
+            total,
+            pluralize("comment", total)
+        );
+        drop(stderr);
+
+        let mut line = String::new();
+        std::io::stdin()
+            .read_line(&mut line)
+            .map_err(|source| JjrError::Io { source })?;
+        if !confirm_response(&line) {
+            return Err(JjrError::ClearAborted);
+        }
+    }
+
+    let stats = store::clear_all_for_stack(&repo_root, &resolved)?;
+    print_clear_summary(stats.comments_removed, None, stats.changes_touched);
     Ok(())
 }
 
-fn print_error(err: &JjrError) {
+/// Print a summary line to stderr: "cleared N stale comments across M changes".
+///
+/// `qualifier` is `Some("stale")`, `Some("orphaned")`, or `None` for bare clear.
+fn print_clear_summary(removed: usize, qualifier: Option<&str>, changes_touched: usize) {
+    let mut stderr = std::io::stderr().lock();
+    match qualifier {
+        None => {
+            let _ = writeln!(
+                stderr,
+                "cleared {} {} across {} {}",
+                removed,
+                pluralize("comment", removed),
+                changes_touched,
+                pluralize("change", changes_touched),
+            );
+        }
+        Some(q) => {
+            let _ = writeln!(
+                stderr,
+                "cleared {} {} {} across {} {}",
+                removed,
+                q,
+                pluralize("comment", removed),
+                changes_touched,
+                pluralize("change", changes_touched),
+            );
+        }
+    }
+}
+
+fn print_error(err: &dyn Display) {
     let mut stderr = std::io::stderr().lock();
     let _ = writeln!(stderr, "\x1b[1;31merror\x1b[0m {err}");
 }

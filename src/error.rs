@@ -59,7 +59,7 @@ pub enum JjrError {
 
     #[snafu(display(
         "schema version mismatch: file has {found}, expected {expected}; \
-         delete .jj-review/comments/<change-id>.jsonl to drop incompatible records"
+         run `jjr clear <revset>` to remove and re-author incompatible records"
     ))]
     SchemaVersionMismatch { found: String, expected: String },
 
@@ -75,9 +75,6 @@ pub enum JjrError {
     #[snafu(display("line-scoped comment requires at least one of old_line or new_line"))]
     LineAnchorMissingLineNumber,
 
-    #[snafu(display("clear: at least one filter flag is required (try --stale)"))]
-    NoFilterSpecified,
-
     #[snafu(display(
         "{} contains a non-stack-scoped record; file is meant to be stack-scope-only",
         path.display()
@@ -86,6 +83,12 @@ pub enum JjrError {
 
     #[snafu(display("no comments to send for revset {revset}"))]
     EmptyPacket { revset: String },
+
+    #[snafu(display("no comments to export for revset {revset}"))]
+    NoCommentsToExport { revset: String },
+
+    #[snafu(display("clear aborted"))]
+    ClearAborted,
 
     #[snafu(display(
         "claude is not on PATH; install Claude CLI (https://docs.anthropic.com/en/docs/claude-code)"

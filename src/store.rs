@@ -415,6 +415,20 @@ pub fn clear_stale_for_change(repo_root: &Path, change_id: &ChangeId) -> Result<
     Ok(removed)
 }
 
+/// Remove all comments for `change_id` regardless of status.
+///
+/// Returns the number of records removed. Zero when the file does not exist.
+pub fn clear_all_for_change(repo_root: &Path, change_id: &ChangeId) -> Result<usize> {
+    let path = change_file(repo_root, change_id);
+    let all = load_file_for_rewrite(&path)?;
+    let total = all.len();
+    if total == 0 {
+        return Ok(0);
+    }
+    write_file(&path, &[])?;
+    Ok(total)
+}
+
 pub fn clear_stale_for_stack(repo_root: &Path, stack: &ResolvedStack) -> Result<ClearStats> {
     let mut changes_touched = 0;
     let mut comments_removed = 0;
@@ -429,6 +443,98 @@ pub fn clear_stale_for_stack(repo_root: &Path, stack: &ResolvedStack) -> Result<
         changes_touched,
         comments_removed,
     })
+}
+
+/// Remove all comments for every change in the resolved stack, plus all
+/// stack-scoped comments matching `stack.revset_hash`.
+///
+/// `changes_touched` counts per-change files only (not `_stack.jsonl`);
+/// `comments_removed` counts every record removed across both per-change files
+/// and `_stack.jsonl`. Stack-scoped comments for OTHER revsets in the same
+/// `_stack.jsonl` file are preserved — only records matching the stack's hash
+/// are deleted.
+pub fn clear_all_for_stack(repo_root: &Path, stack: &ResolvedStack) -> Result<ClearStats> {
+    let mut changes_touched = 0;
+    let mut comments_removed = 0;
+    for entry in &stack.entries {
+        let removed = clear_all_for_change(repo_root, &entry.change_id)?;
+        if removed > 0 {
+            changes_touched += 1;
+            comments_removed += removed;
+        }
+    }
+
+    // Stack-scoped: rewrite `_stack.jsonl` keeping only records whose
+    // revset_hash differs from the current stack. Same-hash records are
+    // dropped. The file is left intact even if no records are removed.
+    let stack_path = comments_dir(repo_root).join(STACK_FILENAME);
+    if stack_path.exists() {
+        let all = load_file_for_rewrite(&stack_path)?;
+        let total = all.len();
+        let kept: Vec<Comment> = all
+            .into_iter()
+            .filter(|c| match &c.anchor {
+                Anchor::Stack { revset_hash } => revset_hash != &stack.revset_hash,
+                Anchor::Line { .. } | Anchor::Change { .. } => true,
+            })
+            .collect();
+        let removed = total - kept.len();
+        if removed > 0 {
+            write_file(&stack_path, &kept)?;
+            comments_removed += removed;
+        }
+    }
+
+    Ok(ClearStats {
+        changes_touched,
+        comments_removed,
+    })
+}
+
+/// Remove comment files for change IDs that are on disk but NOT in `stack`.
+///
+/// "Orphaned" means the change left the resolved revset (abandoned, rebased
+/// away, etc.) but its JSONL file was never cleaned up. The file is deleted
+/// outright — orphan intent is "this change is gone; drop its review trail."
+///
+/// Returns stats over the orphaned-file set only; the in-stack changes are
+/// not touched.
+pub fn clear_orphaned_for_revset(repo_root: &Path, stack: &ResolvedStack) -> Result<ClearStats> {
+    use std::collections::HashSet;
+
+    let in_stack: HashSet<_> = stack.entries.iter().map(|e| &e.change_id).collect();
+    let on_disk = list_change_ids_with_comments(repo_root)?;
+
+    let mut changes_touched = 0;
+    let mut comments_removed = 0;
+
+    for orphan_id in on_disk.iter().filter(|id| !in_stack.contains(id)) {
+        let path = change_file(repo_root, orphan_id);
+        let count = load_file_for_rewrite(&path)?.len();
+        std::fs::remove_file(&path).map_err(|source| JjrError::Io { source })?;
+        changes_touched += 1;
+        comments_removed += count;
+    }
+
+    Ok(ClearStats {
+        changes_touched,
+        comments_removed,
+    })
+}
+
+/// Count total comments across all changes in the resolved stack, including
+/// stack-scoped comments for the current `revset_hash`.
+///
+/// Used to populate the confirmation prompt for bare `jjr clear <revset>`.
+pub fn count_all_for_stack(repo_root: &Path, stack: &ResolvedStack) -> Result<usize> {
+    let mut total = 0;
+    for entry in &stack.entries {
+        let path = change_file(repo_root, &entry.change_id);
+        let comments = load_file_for_rewrite(&path)?;
+        total += comments.len();
+    }
+    total += load_stack_comments(repo_root, &stack.revset_hash)?.len();
+    Ok(total)
 }
 
 #[cfg(test)]
@@ -1462,5 +1568,127 @@ mod tests {
             ids.is_empty(),
             "ambiguous-decode filename must be skipped silently, got {ids:?}"
         );
+    }
+
+    #[test]
+    fn count_all_for_stack_includes_stack_scoped_for_matching_hash() {
+        let dir = tmp();
+        let id = cid("abc12345");
+        let ts1 = datetime!(2026-04-29 14:00:00 UTC);
+        let ts2 = datetime!(2026-04-29 14:01:00 UTC);
+
+        let pending = rooted(make_line_comment(id.clone(), ts1, "pending"), dir.path());
+        save_comment(dir.path(), &pending).unwrap();
+
+        let hash = sample_revset_hash();
+        let mut stack_c = make_stack_comment_with_hash(hash, ts2, "stack note");
+        stack_c.repo_root = dir.path().to_owned();
+        save_comment(dir.path(), &stack_c).unwrap();
+
+        let stack = ResolvedStack {
+            revset: "main..@".to_owned(),
+            revset_hash: hash,
+            entries: vec![crate::stack::StackEntry {
+                change_id: id,
+                commit_id: CommitId::parse("aabbccdd11223344").unwrap(),
+                description: "first".to_owned(),
+            }],
+        };
+        let total = count_all_for_stack(dir.path(), &stack).unwrap();
+        assert_eq!(total, 2, "must include both per-change and stack-scoped");
+    }
+
+    #[test]
+    fn count_all_for_stack_excludes_stack_scoped_for_other_hash() {
+        let dir = tmp();
+        let other_hash = RevsetHash::from_revset("trunk()..@");
+        let stack_hash = sample_revset_hash();
+        let ts = datetime!(2026-04-29 14:00:00 UTC);
+
+        let mut other = make_stack_comment_with_hash(other_hash, ts, "other-revset stack note");
+        other.repo_root = dir.path().to_owned();
+        save_comment(dir.path(), &other).unwrap();
+
+        let stack = ResolvedStack {
+            revset: "main..@".to_owned(),
+            revset_hash: stack_hash,
+            entries: vec![],
+        };
+        let total = count_all_for_stack(dir.path(), &stack).unwrap();
+        assert_eq!(
+            total, 0,
+            "stack-scoped comment for a different revset_hash must not count"
+        );
+    }
+
+    #[test]
+    fn clear_all_for_stack_removes_stack_scoped_for_matching_hash() {
+        let dir = tmp();
+        let id = cid("abc12345");
+        let ts1 = datetime!(2026-04-29 14:00:00 UTC);
+        let ts2 = datetime!(2026-04-29 14:01:00 UTC);
+
+        let pending = rooted(make_line_comment(id.clone(), ts1, "pending"), dir.path());
+        save_comment(dir.path(), &pending).unwrap();
+
+        let hash = sample_revset_hash();
+        let mut stack_c = make_stack_comment_with_hash(hash, ts2, "stack note");
+        stack_c.repo_root = dir.path().to_owned();
+        save_comment(dir.path(), &stack_c).unwrap();
+
+        let stack = ResolvedStack {
+            revset: "main..@".to_owned(),
+            revset_hash: hash,
+            entries: vec![crate::stack::StackEntry {
+                change_id: id.clone(),
+                commit_id: CommitId::parse("aabbccdd11223344").unwrap(),
+                description: "first".to_owned(),
+            }],
+        };
+        let stats = clear_all_for_stack(dir.path(), &stack).unwrap();
+        assert_eq!(
+            stats.comments_removed, 2,
+            "removed count must include per-change and stack-scoped"
+        );
+        assert_eq!(
+            stats.changes_touched, 1,
+            "changes_touched counts per-change files only"
+        );
+        assert!(load_change_comments(dir.path(), &id).unwrap().is_empty());
+        assert!(load_stack_comments(dir.path(), &hash).unwrap().is_empty());
+    }
+
+    #[test]
+    fn clear_all_for_stack_preserves_stack_scoped_for_other_hash() {
+        let dir = tmp();
+        let other_hash = RevsetHash::from_revset("trunk()..@");
+        let stack_hash = sample_revset_hash();
+        let ts1 = datetime!(2026-04-29 14:00:00 UTC);
+        let ts2 = datetime!(2026-04-29 14:01:00 UTC);
+
+        let mut other = make_stack_comment_with_hash(other_hash, ts1, "preserved");
+        other.repo_root = dir.path().to_owned();
+        save_comment(dir.path(), &other).unwrap();
+
+        let mut current = make_stack_comment_with_hash(stack_hash, ts2, "removed");
+        current.repo_root = dir.path().to_owned();
+        save_comment(dir.path(), &current).unwrap();
+
+        let stack = ResolvedStack {
+            revset: "main..@".to_owned(),
+            revset_hash: stack_hash,
+            entries: vec![],
+        };
+        let stats = clear_all_for_stack(dir.path(), &stack).unwrap();
+        assert_eq!(stats.comments_removed, 1);
+
+        // The other-hash stack comment must remain.
+        let remaining = load_stack_comments(dir.path(), &other_hash).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].body, "preserved");
+        // Current-hash stack comments are gone.
+        assert!(load_stack_comments(dir.path(), &stack_hash)
+            .unwrap()
+            .is_empty());
     }
 }

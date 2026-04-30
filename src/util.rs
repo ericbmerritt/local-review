@@ -1,3 +1,12 @@
+/// Parse a confirmation response from the user.
+///
+/// Returns `true` for any casing of `y` or `yes`. Anything else — including
+/// an empty string — is treated as rejection and returns `false`.
+#[must_use]
+pub fn confirm_response(input: &str) -> bool {
+    matches!(input.trim().to_lowercase().as_str(), "y" | "yes")
+}
+
 /// Clamp `value + delta` to `[0, max]`, saturating at each bound.
 pub(crate) fn clamp_with_delta(value: usize, delta: isize, max: usize) -> usize {
     let signed_value: isize = isize::try_from(value).unwrap_or(isize::MAX);
@@ -131,5 +140,43 @@ mod tests {
     fn pluralize_count_two_is_plural() {
         assert_eq!(pluralize("note", 2), "notes");
         assert_eq!(pluralize("suggestion", 3), "suggestions");
+    }
+
+    #[test]
+    fn confirm_response_accepts_y() {
+        assert!(confirm_response("y"));
+        assert!(confirm_response("Y"));
+    }
+
+    #[test]
+    fn confirm_response_accepts_yes() {
+        assert!(confirm_response("yes"));
+        assert!(confirm_response("YES"));
+        assert!(confirm_response("Yes"));
+    }
+
+    #[test]
+    fn confirm_response_rejects_empty() {
+        assert!(!confirm_response(""));
+    }
+
+    #[test]
+    fn confirm_response_rejects_no() {
+        assert!(!confirm_response("n"));
+        assert!(!confirm_response("no"));
+    }
+
+    #[test]
+    fn confirm_response_rejects_anything_else() {
+        assert!(!confirm_response("nope"));
+        assert!(!confirm_response("sure"));
+        assert!(!confirm_response("1"));
+    }
+
+    #[test]
+    fn confirm_response_trims_surrounding_whitespace() {
+        assert!(confirm_response("  y  "));
+        assert!(confirm_response("  yes\n"));
+        assert!(!confirm_response("  n  "));
     }
 }

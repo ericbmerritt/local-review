@@ -5,6 +5,7 @@ pub mod comment;
 pub mod cursor;
 pub mod diff;
 pub mod error;
+pub mod export;
 pub mod jj;
 pub mod packet;
 pub mod stack;
@@ -19,5 +20,6 @@ pub use comment::{
 };
 pub use diff::{Diff, DiffFile, Hunk, Line, LineKind};
 pub use error::{JjrError, Result};
+pub use export::ExportFormat;
 pub use jj::ChangeDetails;
 pub use stack::{ResolvedStack, RevsetHash, StackEntry};
