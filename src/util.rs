@@ -25,6 +25,17 @@ pub(crate) fn truncate(input: &str, max: usize) -> String {
     result
 }
 
+/// Append `s` to `word` when `count != 1`. English plurals only; deliberately
+/// simple — the only words this serves are short, regular nouns ("comment",
+/// "change", "suggestion", "note").
+pub fn pluralize(word: &str, count: usize) -> String {
+    if count == 1 {
+        word.to_owned()
+    } else {
+        format!("{word}s")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -91,5 +102,25 @@ mod tests {
     fn truncate_max_zero_produces_ellipsis() {
         let result = truncate("hi", 0);
         assert_eq!(result, "…");
+    }
+
+    #[test]
+    fn pluralize_count_one_is_singular() {
+        assert_eq!(pluralize("note", 1), "note");
+        assert_eq!(pluralize("suggestion", 1), "suggestion");
+    }
+
+    #[test]
+    fn pluralize_count_zero_is_plural() {
+        // We only ever call pluralize with count > 0 in practice (we skip the
+        // span when the count is zero), but the rule "anything other than 1
+        // is plural" is the safer default.
+        assert_eq!(pluralize("note", 0), "notes");
+    }
+
+    #[test]
+    fn pluralize_count_two_is_plural() {
+        assert_eq!(pluralize("note", 2), "notes");
+        assert_eq!(pluralize("suggestion", 3), "suggestions");
     }
 }

@@ -74,4 +74,7 @@ pub enum JjrError {
 
     #[snafu(display("line-scoped comment requires at least one of old_line or new_line"))]
     LineAnchorMissingLineNumber,
+
+    #[snafu(display("clear: at least one filter flag is required (try --stale)"))]
+    NoFilterSpecified,
 }

@@ -1,11 +1,13 @@
 use std::io::Write;
 use std::process::ExitCode;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 
 use jjr::error::JjrError;
 use jjr::jj;
+use jjr::store;
 use jjr::tui;
+use jjr::util::pluralize;
 
 #[derive(Parser)]
 #[command(name = "jjr")]
@@ -29,14 +31,35 @@ struct Cli {
     /// Only meaningful with `--stack`.
     #[arg(long, requires = "stack")]
     restart: bool,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Remove comments matching the given filter from the resolved revset.
+    Clear {
+        /// Revset to operate on. Accepts any jj revset (`@`, `@-`, branch
+        /// names, `trunk()..@`, etc.).
+        revset: String,
+
+        /// Clear line-scoped comments whose anchoring failed (status=stale).
+        /// At least one filter flag is required.
+        #[arg(long)]
+        stale: bool,
+    },
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
-    let result = match cli.change {
-        None => run_stack(jj::DEFAULT_STACK_REVSET, cli.restart),
-        Some(ref revset) => run_single(revset),
+    let result = match cli.command {
+        Some(Command::Clear { revset, stale }) => run_clear(&revset, stale),
+        None => match cli.change {
+            None => run_stack(jj::DEFAULT_STACK_REVSET, cli.restart),
+            Some(ref revset) => run_single(revset),
+        },
     };
 
     match result {
@@ -58,6 +81,25 @@ fn run_stack(revset: &str, restart: bool) -> Result<(), JjrError> {
     let repo_root = std::env::current_dir().map_err(|source| JjrError::Io { source })?;
     let resolved = jj::resolve_stack(revset)?;
     tui::run_stack(&repo_root, &resolved, restart)
+}
+
+fn run_clear(revset: &str, stale: bool) -> Result<(), JjrError> {
+    if !stale {
+        return Err(JjrError::NoFilterSpecified);
+    }
+    let repo_root = std::env::current_dir().map_err(|source| JjrError::Io { source })?;
+    let resolved = jj::resolve_stack(revset)?;
+    let stats = store::clear_stale_for_stack(&repo_root, &resolved)?;
+    let mut stderr = std::io::stderr().lock();
+    let _ = writeln!(
+        stderr,
+        "cleared {} stale {} across {} {}",
+        stats.comments_removed,
+        pluralize("comment", stats.comments_removed),
+        stats.changes_touched,
+        pluralize("change", stats.changes_touched),
+    );
+    Ok(())
 }
 
 fn print_error(err: &JjrError) {

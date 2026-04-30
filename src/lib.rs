@@ -8,7 +8,7 @@ pub mod jj;
 pub mod stack;
 pub mod store;
 pub mod tui;
-pub(crate) mod util;
+pub mod util;
 
 pub use change_id::{ChangeId, CommitId};
 pub use comment::{

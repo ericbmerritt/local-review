@@ -1,3 +1,5 @@
+use std::io::Write as _;
+use std::path::Path;
 use std::process::Command as StdCommand;
 
 use assert_cmd::Command;
@@ -275,6 +277,206 @@ fn stack_revset_as_positional_arg_fails_with_revset_ambiguous() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("matched multiple changes"));
+}
+
+/// `jjr clear --stale @` removes the stale comment from a fixture that has one
+/// stale and one pending comment, leaves the pending comment on disk, exits 0,
+/// and emits a summary to stderr.
+#[test]
+fn clear_stale_removes_stale_comment_and_emits_summary() {
+    if !jj_on_path() {
+        eprintln!("jj not on PATH; skipping clear_stale_removes_stale_comment_and_emits_summary");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = build_fixture_named(&tmp, "single_change_with_stale.sh");
+
+    Command::cargo_bin("jjr")
+        .unwrap()
+        .current_dir(&repo)
+        .args(["clear", "--stale", "@"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("cleared 1 stale comment"));
+
+    let comments_dir = repo.join(".jj-review").join("comments");
+    let jsonl: Vec<_> = std::fs::read_dir(&comments_dir)
+        .unwrap()
+        .filter_map(|e| {
+            let entry = e.unwrap();
+            if entry.path().extension().is_some_and(|x| x == "jsonl") {
+                Some(std::fs::read_to_string(entry.path()).unwrap())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let all_content = jsonl.join("\n");
+    assert!(
+        !all_content.contains("\"stale\""),
+        "stale comment must be removed; got: {all_content}"
+    );
+    assert!(
+        all_content.contains("pending comment"),
+        "pending comment must remain; got: {all_content}"
+    );
+}
+
+/// `jjr clear @` (without any filter flag) exits non-zero and prints the
+/// "at least one filter flag is required" error message.
+#[test]
+fn clear_without_filter_flag_exits_nonzero() {
+    if !jj_on_path() {
+        eprintln!("jj not on PATH; skipping clear_without_filter_flag_exits_nonzero");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = build_fixture_named(&tmp, "single_change.sh");
+
+    Command::cargo_bin("jjr")
+        .unwrap()
+        .current_dir(&repo)
+        .args(["clear", "@"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "at least one filter flag is required",
+        ));
+}
+
+/// `jjr clear --stale @` against a fixture with no stale comments exits 0
+/// and emits "cleared 0 stale comments".
+#[test]
+fn clear_stale_no_stale_comments_exits_zero_with_zero_summary() {
+    if !jj_on_path() {
+        eprintln!(
+            "jj not on PATH; skipping clear_stale_no_stale_comments_exits_zero_with_zero_summary"
+        );
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = build_fixture_named(&tmp, "single_change.sh");
+
+    Command::cargo_bin("jjr")
+        .unwrap()
+        .current_dir(&repo)
+        .args(["clear", "--stale", "@"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("cleared 0 stale comments"));
+}
+
+#[cfg(test)]
+fn append_stale_jsonl(comments_dir: &Path, repo: &Path, change_id: &str, ts: &str) {
+    let line = format!(
+        r#"{{"schema_version":"diff-comment/v2","scope":"line","change_id":"{change_id}","repo_root":"{repo}","revset":"@","file":"file.txt","side":"new","new_line":1,"hunk_header":"@@ -0,0 +1 @@","target_text":"one","context_before":[],"context_after":[],"comment":"stale","severity":"note","created_at":"{ts}","status":"stale","mismatch_reason":"anchor not found"}}"#,
+        repo = repo.display()
+    );
+    let path = comments_dir.join(format!("{change_id}.jsonl"));
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .unwrap();
+    writeln!(f, "{line}").unwrap();
+}
+
+#[cfg(test)]
+fn append_pending_jsonl(comments_dir: &Path, repo: &Path, change_id: &str, ts: &str) {
+    let line = format!(
+        r#"{{"schema_version":"diff-comment/v2","scope":"line","change_id":"{change_id}","repo_root":"{repo}","revset":"@","file":"file.txt","side":"new","new_line":1,"hunk_header":"@@ -0,0 +1 @@","target_text":"one","context_before":[],"context_after":[],"comment":"pending","severity":"note","created_at":"{ts}","status":"pending"}}"#,
+        repo = repo.display()
+    );
+    let path = comments_dir.join(format!("{change_id}.jsonl"));
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .unwrap();
+    writeln!(f, "{line}").unwrap();
+}
+
+#[cfg(test)]
+fn resolve_stack_change_ids(repo: &Path) -> Vec<String> {
+    let log_out = StdCommand::new("jj")
+        .current_dir(repo)
+        .args([
+            "log",
+            "-r",
+            "trunk()..@",
+            "--reversed",
+            "--no-graph",
+            "--color=never",
+            "-T",
+            r#"change_id ++ "\n""#,
+        ])
+        .output()
+        .unwrap();
+    assert!(log_out.status.success());
+    String::from_utf8_lossy(&log_out.stdout)
+        .lines()
+        .map(|l| l.trim().to_owned())
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
+/// `jjr clear --stale 'trunk()..@'` against the three-change stack removes
+/// stale comments written directly into the JSONL files for two of the three
+/// changes, leaves the pending comment intact, and reports the correct counts.
+#[test]
+fn clear_stale_across_three_change_stack() {
+    if !jj_on_path() {
+        eprintln!("jj not on PATH; skipping clear_stale_across_three_change_stack");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = build_fixture_named(&tmp, "three_change_stack.sh");
+    let ids = resolve_stack_change_ids(&repo);
+    assert_eq!(ids.len(), 3, "expected three changes; got: {ids:?}");
+
+    let comments_dir = repo.join(".jj-review").join("comments");
+    std::fs::create_dir_all(&comments_dir).unwrap();
+
+    // id[0]: stale only; id[1]: stale + pending; id[2]: pending only.
+    append_stale_jsonl(&comments_dir, &repo, &ids[0], "2026-04-29T10:00:00Z");
+    append_stale_jsonl(&comments_dir, &repo, &ids[1], "2026-04-29T10:01:00Z");
+    append_pending_jsonl(&comments_dir, &repo, &ids[1], "2026-04-29T10:02:00Z");
+    append_pending_jsonl(&comments_dir, &repo, &ids[2], "2026-04-29T10:03:00Z");
+
+    Command::cargo_bin("jjr")
+        .unwrap()
+        .current_dir(&repo)
+        .args(["clear", "--stale", "trunk()..@"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("cleared 2 stale comments"))
+        .stderr(predicate::str::contains("across 2 changes"));
+
+    let id0_content =
+        std::fs::read_to_string(comments_dir.join(format!("{}.jsonl", ids[0]))).unwrap_or_default();
+    assert!(
+        !id0_content.contains("\"stale\""),
+        "id[0] stale must be gone; got: {id0_content}"
+    );
+
+    let id1_content =
+        std::fs::read_to_string(comments_dir.join(format!("{}.jsonl", ids[1]))).unwrap_or_default();
+    assert!(
+        !id1_content.contains("\"stale\"") && id1_content.contains("pending"),
+        "id[1]: stale gone, pending kept; got: {id1_content}"
+    );
+
+    let id2_content =
+        std::fs::read_to_string(comments_dir.join(format!("{}.jsonl", ids[2]))).unwrap_or_default();
+    assert!(
+        id2_content.contains("pending"),
+        "id[2] pending must remain; got: {id2_content}"
+    );
 }
 
 /// Pins the oldest-first ordering of `resolve_stack`. The 3-change fixture

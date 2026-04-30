@@ -1,9 +1,12 @@
 use std::io::{self, BufRead, Write as _};
 use std::path::{Path, PathBuf};
 
+use tempfile::NamedTempFile;
+
 use crate::change_id::ChangeId;
-use crate::comment::{format_rfc3339, Anchor, Comment, SCHEMA_VERSION_VALUE};
+use crate::comment::{format_rfc3339, Anchor, Comment, Status, SCHEMA_VERSION_VALUE};
 use crate::error::{JjrError, Result};
+use crate::stack::ResolvedStack;
 
 /// Filename reserved for stack-scoped comments. jj change IDs never start with
 /// `_`, so there is no collision risk.
@@ -77,8 +80,6 @@ pub fn load_change_comments(repo_root: &Path, change_id: &ChangeId) -> Result<Ve
     load_jsonl_file(&path)
 }
 
-/// Also calls `ensure_review_dir` and `ensure_ignored` (idempotent).
-///
 /// Performs a pre-write uniqueness check on `created_at`: if any existing
 /// record in the target file shares the same timestamp,
 /// `DuplicateCommentTimestamp` is returned and nothing is written. Catching
@@ -279,20 +280,29 @@ fn delete_by_timestamp(existing: Vec<Comment>, key: &str, path: &Path) -> Result
     }
 }
 
+/// Write `comments` to `path` atomically.
+///
+/// `NamedTempFile::persist` writes to a randomized sibling in the same
+/// directory and renames into place — so a crash mid-write cannot corrupt
+/// the existing file, and the temp file is cleaned up on drop if `persist`
+/// is never called. Same-directory placement guarantees the rename stays on
+/// one filesystem (cross-device renames would fail).
 fn write_file(path: &Path, comments: &[Comment]) -> Result<()> {
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(path)
-        .map_err(|source| JjrError::Io { source })?;
+    let dir = path.parent().ok_or_else(|| JjrError::Io {
+        source: io::Error::other(format!("path has no parent directory: {}", path.display())),
+    })?;
 
+    let mut tmp = NamedTempFile::new_in(dir).map_err(|source| JjrError::Io { source })?;
     for comment in comments {
         let line = serde_json::to_string(comment).map_err(|e| JjrError::Io {
             source: io::Error::other(e),
         })?;
-        writeln!(file, "{line}").map_err(|source| JjrError::Io { source })?;
+        writeln!(tmp, "{line}").map_err(|source| JjrError::Io { source })?;
     }
+    tmp.flush().map_err(|source| JjrError::Io { source })?;
+    tmp.persist(path).map_err(|e| JjrError::Io {
+        source: io::Error::other(e),
+    })?;
     Ok(())
 }
 
@@ -300,6 +310,45 @@ fn log_warning(msg: &str) {
     let stderr = io::stderr();
     let mut handle = stderr.lock();
     let _ = writeln!(handle, "warning: {msg}");
+}
+
+/// Aggregate result of a stale-comment clear pass.
+pub struct ClearStats {
+    pub changes_touched: usize,
+    pub comments_removed: usize,
+}
+
+/// `_stack.jsonl` is not touched.
+pub fn clear_stale_for_change(repo_root: &Path, change_id: &ChangeId) -> Result<usize> {
+    let path = change_file(repo_root, change_id);
+    let all = load_file_for_rewrite(&path)?;
+    let total = all.len();
+    let kept: Vec<Comment> = all
+        .into_iter()
+        .filter(|c| c.status != Some(Status::Stale))
+        .collect();
+    let removed = total - kept.len();
+    if removed == 0 {
+        return Ok(0);
+    }
+    write_file(&path, &kept)?;
+    Ok(removed)
+}
+
+pub fn clear_stale_for_stack(repo_root: &Path, stack: &ResolvedStack) -> Result<ClearStats> {
+    let mut changes_touched = 0;
+    let mut comments_removed = 0;
+    for entry in &stack.entries {
+        let removed = clear_stale_for_change(repo_root, &entry.change_id)?;
+        if removed > 0 {
+            changes_touched += 1;
+            comments_removed += removed;
+        }
+    }
+    Ok(ClearStats {
+        changes_touched,
+        comments_removed,
+    })
 }
 
 #[cfg(test)]
@@ -481,8 +530,6 @@ mod tests {
         assert!(matches!(result, Err(JjrError::CommentNotFound { .. })));
     }
 
-    // -- B: Stack-scoped delete routes to _stack.jsonl --
-
     fn make_stack_comment(created_at: OffsetDateTime, body: &str) -> Comment {
         Comment {
             schema_version: SchemaVersion,
@@ -558,8 +605,6 @@ mod tests {
         ));
     }
 
-    // -- C2: missing schema_version is a hard error, not a silent skip --
-
     #[test]
     fn missing_schema_version_returns_hard_error() {
         let dir = tmp();
@@ -579,8 +624,6 @@ mod tests {
         }
     }
 
-    // -- E5: store-level v1 backward compatibility (no `scope` field) --
-
     #[test]
     fn v1_record_without_scope_loads_via_store() {
         let dir = tmp();
@@ -595,8 +638,6 @@ mod tests {
         assert!(matches!(loaded[0].anchor, Anchor::Line { .. }));
         assert_eq!(loaded[0].body, "v1 body");
     }
-
-    // -- E1: DuplicateCommentTimestamp is reachable on update and delete --
 
     #[test]
     fn update_with_duplicate_timestamp_in_file_errors() {
@@ -640,8 +681,6 @@ mod tests {
             Err(JjrError::DuplicateCommentTimestamp { .. })
         ));
     }
-
-    // -- H: pre-save uniqueness check fires DuplicateCommentTimestamp --
 
     #[test]
     fn save_with_duplicate_timestamp_errors_before_writing() {
@@ -729,8 +768,6 @@ mod tests {
         assert!(content.contains("/.jj-review"));
     }
 
-    // -- E6: ensure_entry_in_file's newline-guard branch --
-
     #[test]
     fn ensure_ignored_inserts_separator_when_file_lacks_trailing_newline() {
         let dir = tmp();
@@ -781,6 +818,299 @@ mod tests {
         assert_eq!(
             v["change_id"], "abc11111/1",
             "canonical change_id must be preserved in JSON"
+        );
+    }
+
+    fn make_stale_comment(change_id: ChangeId, created_at: OffsetDateTime, body: &str) -> Comment {
+        Comment {
+            status: Some(Status::Stale),
+            ..make_line_comment(change_id, created_at, body)
+        }
+    }
+
+    fn make_orphaned_comment(
+        change_id: ChangeId,
+        created_at: OffsetDateTime,
+        body: &str,
+    ) -> Comment {
+        Comment {
+            status: Some(Status::Orphaned),
+            ..make_line_comment(change_id, created_at, body)
+        }
+    }
+
+    fn make_change_scoped_comment(
+        change_id: &ChangeId,
+        created_at: OffsetDateTime,
+        body: &str,
+    ) -> Comment {
+        Comment {
+            schema_version: SchemaVersion,
+            anchor: Anchor::Change {
+                change_id: change_id.clone(),
+            },
+            repo_root: PathBuf::new(),
+            revset: "@".to_owned(),
+            commit_id: None,
+            body: body.to_owned(),
+            severity: Severity::Note,
+            created_at,
+            updated_at: None,
+            status: Some(Status::Pending),
+            mismatch_reason: None,
+        }
+    }
+
+    #[test]
+    fn clear_stale_no_jsonl_returns_zero() {
+        let dir = tmp();
+        let id = cid("abc12345");
+        let removed = clear_stale_for_change(dir.path(), &id).unwrap();
+        assert_eq!(removed, 0);
+    }
+
+    #[test]
+    fn clear_stale_no_stale_comments_returns_zero() {
+        let dir = tmp();
+        let id = cid("abc12345");
+        let ts = datetime!(2026-04-29 14:00:00 UTC);
+        let comment = rooted(make_line_comment(id.clone(), ts, "pending"), dir.path());
+        save_comment(dir.path(), &comment).unwrap();
+
+        let removed = clear_stale_for_change(dir.path(), &id).unwrap();
+        assert_eq!(removed, 0);
+
+        let remaining = load_change_comments(dir.path(), &id).unwrap();
+        assert_eq!(remaining.len(), 1);
+    }
+
+    #[test]
+    fn clear_stale_all_stale_removes_all() {
+        let dir = tmp();
+        let id = cid("abc12345");
+        let ts1 = datetime!(2026-04-29 14:00:00 UTC);
+        let ts2 = datetime!(2026-04-29 14:01:00 UTC);
+        let c1 = rooted(make_stale_comment(id.clone(), ts1, "stale1"), dir.path());
+        let c2 = rooted(make_stale_comment(id.clone(), ts2, "stale2"), dir.path());
+        save_comment(dir.path(), &c1).unwrap();
+        save_comment(dir.path(), &c2).unwrap();
+
+        let removed = clear_stale_for_change(dir.path(), &id).unwrap();
+        assert_eq!(removed, 2);
+
+        let remaining = load_change_comments(dir.path(), &id).unwrap();
+        assert!(remaining.is_empty());
+    }
+
+    #[test]
+    fn clear_stale_mixed_removes_only_stale_preserves_order() {
+        let dir = tmp();
+        let id = cid("abc12345");
+        let ts1 = datetime!(2026-04-29 14:00:00 UTC);
+        let ts2 = datetime!(2026-04-29 14:01:00 UTC);
+        let ts3 = datetime!(2026-04-29 14:02:00 UTC);
+        let pending = rooted(make_line_comment(id.clone(), ts1, "pending"), dir.path());
+        let stale = rooted(make_stale_comment(id.clone(), ts2, "stale"), dir.path());
+        let pending2 = rooted(make_line_comment(id.clone(), ts3, "pending2"), dir.path());
+        save_comment(dir.path(), &pending).unwrap();
+        save_comment(dir.path(), &stale).unwrap();
+        save_comment(dir.path(), &pending2).unwrap();
+
+        let removed = clear_stale_for_change(dir.path(), &id).unwrap();
+        assert_eq!(removed, 1);
+
+        let remaining = load_change_comments(dir.path(), &id).unwrap();
+        assert_eq!(remaining.len(), 2);
+        assert_eq!(remaining[0].body, "pending");
+        assert_eq!(remaining[1].body, "pending2");
+    }
+
+    #[test]
+    fn clear_stale_preserves_orphaned_and_change_scoped() {
+        let dir = tmp();
+        let id = cid("abc12345");
+        let ts1 = datetime!(2026-04-29 14:00:00 UTC);
+        let ts2 = datetime!(2026-04-29 14:01:00 UTC);
+        let ts3 = datetime!(2026-04-29 14:02:00 UTC);
+        let stale = rooted(make_stale_comment(id.clone(), ts1, "stale"), dir.path());
+        let orphaned = rooted(
+            make_orphaned_comment(id.clone(), ts2, "orphaned"),
+            dir.path(),
+        );
+        let change_scoped = rooted(
+            make_change_scoped_comment(&id, ts3, "change-level"),
+            dir.path(),
+        );
+        save_comment(dir.path(), &stale).unwrap();
+        save_comment(dir.path(), &orphaned).unwrap();
+        save_comment(dir.path(), &change_scoped).unwrap();
+
+        let removed = clear_stale_for_change(dir.path(), &id).unwrap();
+        assert_eq!(removed, 1);
+
+        let remaining = load_change_comments(dir.path(), &id).unwrap();
+        assert_eq!(remaining.len(), 2);
+        let bodies: Vec<&str> = remaining.iter().map(|c| c.body.as_str()).collect();
+        assert!(bodies.contains(&"orphaned"));
+        assert!(bodies.contains(&"change-level"));
+    }
+
+    fn make_resolved_stack(entries: Vec<(&str, &str)>) -> ResolvedStack {
+        use crate::change_id::CommitId;
+        use crate::stack::{RevsetHash, StackEntry};
+        ResolvedStack {
+            revset: "@".to_owned(),
+            revset_hash: RevsetHash::from_revset("@"),
+            entries: entries
+                .into_iter()
+                .map(|(cid_str, desc)| StackEntry {
+                    change_id: ChangeId::parse(cid_str).unwrap(),
+                    commit_id: CommitId::parse("aabbccdd11223344").unwrap(),
+                    description: desc.to_owned(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn clear_stale_for_stack_empty_stack_returns_zero_stats() {
+        let dir = tmp();
+        let stack = make_resolved_stack(vec![]);
+        let stats = clear_stale_for_stack(dir.path(), &stack).unwrap();
+        assert_eq!(stats.changes_touched, 0);
+        assert_eq!(stats.comments_removed, 0);
+    }
+
+    #[test]
+    fn clear_stale_for_stack_one_change_with_stale() {
+        let dir = tmp();
+        let id = cid("abc12345");
+        let ts = datetime!(2026-04-29 14:00:00 UTC);
+        let stale = rooted(make_stale_comment(id.clone(), ts, "stale"), dir.path());
+        save_comment(dir.path(), &stale).unwrap();
+
+        let stack = make_resolved_stack(vec![("abc12345", "first")]);
+        let stats = clear_stale_for_stack(dir.path(), &stack).unwrap();
+        assert_eq!(stats.changes_touched, 1);
+        assert_eq!(stats.comments_removed, 1);
+
+        assert!(load_change_comments(dir.path(), &id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn clear_stale_for_stack_multiple_changes_partial_stale() {
+        let dir = tmp();
+        let id1 = cid("abc11111");
+        let id2 = cid("abc22222");
+        let id3 = cid("abc33333");
+        let ts1 = datetime!(2026-04-29 14:00:00 UTC);
+        let ts2 = datetime!(2026-04-29 14:01:00 UTC);
+        let ts3 = datetime!(2026-04-29 14:02:00 UTC);
+
+        let pending1 = rooted(make_line_comment(id1.clone(), ts1, "pending"), dir.path());
+        save_comment(dir.path(), &pending1).unwrap();
+
+        let stale2 = rooted(make_stale_comment(id2.clone(), ts2, "stale"), dir.path());
+        save_comment(dir.path(), &stale2).unwrap();
+
+        let stale3a = rooted(make_stale_comment(id3.clone(), ts3, "stale3a"), dir.path());
+        let ts3b = datetime!(2026-04-29 14:03:00 UTC);
+        let pending3b = rooted(
+            make_line_comment(id3.clone(), ts3b, "pending3b"),
+            dir.path(),
+        );
+        save_comment(dir.path(), &stale3a).unwrap();
+        save_comment(dir.path(), &pending3b).unwrap();
+
+        let stack = make_resolved_stack(vec![
+            ("abc11111", "first"),
+            ("abc22222", "second"),
+            ("abc33333", "third"),
+        ]);
+        let stats = clear_stale_for_stack(dir.path(), &stack).unwrap();
+        assert_eq!(stats.changes_touched, 2);
+        assert_eq!(stats.comments_removed, 2);
+
+        assert_eq!(
+            load_change_comments(dir.path(), &id1).unwrap().len(),
+            1,
+            "pending on id1 preserved"
+        );
+        assert!(
+            load_change_comments(dir.path(), &id2).unwrap().is_empty(),
+            "id2 stale removed"
+        );
+        let id3_remaining = load_change_comments(dir.path(), &id3).unwrap();
+        assert_eq!(id3_remaining.len(), 1);
+        assert_eq!(id3_remaining[0].body, "pending3b");
+    }
+
+    /// Atomic-rewrite guarantee: every `write_file` caller (here exercised via
+    /// `clear_stale_for_change`, `update_comment`, `delete_comment`) must leave
+    /// the comments directory free of leftover sibling tempfiles after a
+    /// successful operation. `NamedTempFile::persist` removes the temp on
+    /// rename, and `Drop` removes it on early exit. A leak here would mean we
+    /// regressed back to the truncate-and-overwrite pattern.
+    #[test]
+    fn write_file_leaves_no_temp_files_in_comments_dir() {
+        let dir = tmp();
+        let id = cid("abc12345");
+        let ts1 = datetime!(2026-04-29 14:00:00 UTC);
+        let ts2 = datetime!(2026-04-29 14:01:00 UTC);
+        let stale = rooted(make_stale_comment(id.clone(), ts1, "stale"), dir.path());
+        let pending = rooted(make_line_comment(id.clone(), ts2, "pending"), dir.path());
+        save_comment(dir.path(), &stale).unwrap();
+        save_comment(dir.path(), &pending).unwrap();
+
+        // Exercise all three write_file callers.
+        let updated = Comment {
+            body: "updated".to_owned(),
+            ..pending.clone()
+        };
+        update_comment(dir.path(), &updated).unwrap();
+        clear_stale_for_change(dir.path(), &id).unwrap();
+        delete_comment(dir.path(), &updated).unwrap();
+
+        let comments_dir = dir.path().join(".jj-review").join("comments");
+        let leftovers: Vec<_> = std::fs::read_dir(&comments_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| {
+                Path::new(n)
+                    .extension()
+                    .is_none_or(|ext| !ext.eq_ignore_ascii_case("jsonl"))
+            })
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "expected only .jsonl files in comments dir; found: {leftovers:?}"
+        );
+    }
+
+    /// If `write_file`'s atomic rename never completes (here simulated by an
+    /// unwritable destination via a missing parent path), the original file
+    /// must be untouched. This is the load-bearing crash-safety property.
+    #[test]
+    fn write_file_failure_leaves_original_file_intact() {
+        let dir = tmp();
+        let id = cid("abc12345");
+        let ts = datetime!(2026-04-29 14:00:00 UTC);
+        let comment = rooted(make_line_comment(id.clone(), ts, "original"), dir.path());
+        save_comment(dir.path(), &comment).unwrap();
+        let path = change_file(dir.path(), &id);
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        // Force write_file to fail by passing a path whose parent does not
+        // exist. NamedTempFile::new_in will reject the missing directory and
+        // the function must return an Err without disturbing the real file.
+        let bogus = dir.path().join("does/not/exist/sentinel.jsonl");
+        let err = write_file(&bogus, std::slice::from_ref(&comment));
+        assert!(err.is_err(), "expected Io error from missing parent dir");
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            before, after,
+            "real file must be untouched when write_file errors"
         );
     }
 }

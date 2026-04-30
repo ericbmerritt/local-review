@@ -21,7 +21,7 @@ use crate::cursor;
 use crate::error::{JjrError, Result};
 use crate::jj::{self, ChangeDetails};
 use crate::stack::{ResolvedStack, RevsetHash, StackEntry};
-use crate::util::{clamp_with_delta, page_size, truncate};
+use crate::util::{clamp_with_delta, page_size, pluralize, truncate};
 
 mod composer;
 mod composer_overlay;
@@ -1324,16 +1324,6 @@ fn render_dots(count: usize) -> String {
         "●".repeat(count)
     } else {
         format!("{}…", "●".repeat(TRANSITION_DOT_MAX))
-    }
-}
-
-/// Append `s` to `word` when `count != 1`. English plurals only; deliberately
-/// simple — the only words this serves are "suggestion" and "note".
-fn pluralize(word: &str, count: usize) -> String {
-    if count == 1 {
-        word.to_owned()
-    } else {
-        format!("{word}s")
     }
 }
 
@@ -3108,28 +3098,6 @@ mod tests {
     #[test]
     fn render_dots_far_over_max_still_truncates() {
         assert_eq!(render_dots(50), "●●●●●…");
-    }
-
-    // ---- pluralize (C) ----
-
-    #[test]
-    fn pluralize_count_one_is_singular() {
-        assert_eq!(pluralize("note", 1), "note");
-        assert_eq!(pluralize("suggestion", 1), "suggestion");
-    }
-
-    #[test]
-    fn pluralize_count_zero_is_plural() {
-        // We only ever call pluralize with count > 0 in practice (we skip the
-        // span when the count is zero), but the rule "anything other than 1
-        // is plural" is the safer default.
-        assert_eq!(pluralize("note", 0), "notes");
-    }
-
-    #[test]
-    fn pluralize_count_two_is_plural() {
-        assert_eq!(pluralize("note", 2), "notes");
-        assert_eq!(pluralize("suggestion", 3), "suggestions");
     }
 
     // ---- file_header_label ----
