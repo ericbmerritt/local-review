@@ -2,7 +2,7 @@
 //! parsed [`Diff`] for the same change, decide whether the comment can be
 //! re-anchored cleanly or must be marked stale (and why).
 
-use crate::comment::{LineAnchor, MismatchReason, Side};
+use crate::comment::{Anchor, Comment, LineAnchor, MismatchReason, Side, Status};
 use crate::diff::{Diff, DiffFile, Hunk};
 
 /// Outcome of attempting to re-anchor a saved line comment against the
@@ -20,8 +20,7 @@ pub enum AnchorOutcome {
     Stale(MismatchReason),
 }
 
-/// Re-anchor `anchor` against `diff`. Stack-membership / orphaned status is
-/// checked elsewhere.
+/// Stack-membership / orphaned status is checked elsewhere.
 pub fn match_anchor(anchor: &LineAnchor, diff: &Diff) -> AnchorOutcome {
     let Some(diff_file) = diff
         .files
@@ -42,6 +41,54 @@ pub fn match_anchor(anchor: &LineAnchor, diff: &Diff) -> AnchorOutcome {
             exact_matches[0].1,
         )),
         _ => resolve_multiple_exact(anchor, &exact_matches),
+    }
+}
+
+/// Reconcile a saved comment's anchor against the current diff.
+///
+/// Returns `None` when the comment is already correct (no write needed).
+/// Returns `Some(updated)` when the anchor location, status, or mismatch
+/// reason needs to change. Change-scoped and stack-scoped comments are always
+/// returned as `None` — anchoring is line-only.
+pub fn reanchor_comment(comment: &Comment, diff: &Diff) -> Option<Comment> {
+    let Anchor::Line {
+        change_id,
+        location,
+    } = &comment.anchor
+    else {
+        return None;
+    };
+
+    match match_anchor(location, diff) {
+        AnchorOutcome::ReAnchored(new_anchor) => {
+            let anchor_moved = new_anchor != *location;
+            let was_stale = comment.status == Some(Status::Stale);
+            let status_unset = comment.status.is_none();
+            if !anchor_moved && !was_stale && !status_unset {
+                return None;
+            }
+            Some(Comment {
+                anchor: Anchor::Line {
+                    change_id: change_id.clone(),
+                    location: new_anchor,
+                },
+                status: Some(Status::Pending),
+                mismatch_reason: None,
+                ..comment.clone()
+            })
+        }
+        AnchorOutcome::Stale(reason) => {
+            let already_stale_with_same_reason =
+                comment.status == Some(Status::Stale) && comment.mismatch_reason == Some(reason);
+            if already_stale_with_same_reason {
+                return None;
+            }
+            Some(Comment {
+                status: Some(Status::Stale),
+                mismatch_reason: Some(reason),
+                ..comment.clone()
+            })
+        }
     }
 }
 
@@ -239,6 +286,7 @@ fn fuzzy_match(candidates: &[&Hunk], anchor: &LineAnchor) -> AnchorOutcome {
 }
 
 fn check_body_changed(candidates: &[&Hunk], anchor: &LineAnchor) -> Option<MismatchReason> {
+    // Without context brackets the body-changed signal is unconfirmable.
     if anchor.context_before.is_empty() && anchor.context_after.is_empty() {
         return None;
     }
@@ -257,7 +305,6 @@ fn check_body_changed(candidates: &[&Hunk], anchor: &LineAnchor) -> Option<Misma
     None
 }
 
-/// Target text is present exactly once but context drifted on exactly one side.
 fn check_context_drifted(candidates: &[&Hunk], anchor: &LineAnchor) -> Option<MismatchReason> {
     let matching_lines: Vec<(&Hunk, usize)> = candidates
         .iter()
@@ -291,8 +338,13 @@ fn check_context_drifted(candidates: &[&Hunk], anchor: &LineAnchor) -> Option<Mi
 mod tests {
     use std::path::PathBuf;
 
+    use time::macros::datetime;
+
     use super::*;
-    use crate::comment::{LineAnchor, MismatchReason, Side};
+    use crate::change_id::ChangeId;
+    use crate::comment::{
+        Anchor, Comment, LineAnchor, MismatchReason, SchemaVersion, Severity, Side, Status,
+    };
     use crate::diff::{Diff, DiffFile, Hunk, Line, LineKind};
 
     fn make_line(kind: LineKind, text: &str, src: Option<u32>, tgt: Option<u32>) -> Line {
@@ -357,7 +409,7 @@ mod tests {
         old_line: Option<u32>,
         new_line: Option<u32>,
         hunk_header: &'a str,
-        target: &'a str,
+        target_text: &'a str,
         before: Vec<&'a str>,
         after: Vec<&'a str>,
     }
@@ -370,7 +422,7 @@ mod tests {
                 old_line: self.old_line,
                 new_line: self.new_line,
                 hunk_header: self.hunk_header.to_owned(),
-                target_text: self.target.to_owned(),
+                target_text: self.target_text.to_owned(),
                 context_before: self.before.into_iter().map(str::to_owned).collect(),
                 context_after: self.after.into_iter().map(str::to_owned).collect(),
             }
@@ -454,7 +506,7 @@ mod tests {
             old_line: None,
             new_line: Some(5),
             hunk_header: "@@ -1 +1 @@",
-            target: "target",
+            target_text: "target",
             before: vec![],
             after: vec![],
         }
@@ -474,7 +526,7 @@ mod tests {
             old_line: None,
             new_line: Some(1),
             hunk_header: "@@ -1 +1 @@",
-            target: "target",
+            target_text: "target",
             before: vec![],
             after: vec![],
         }
@@ -504,7 +556,7 @@ mod tests {
             old_line: Some(12),
             new_line: Some(12),
             hunk_header: "@@ -10,4 +10,4 @@ impl Foo",
-            target: "target line",
+            target_text: "target line",
             before: vec!["before1", "before2"],
             after: vec!["after1"],
         }
@@ -536,7 +588,7 @@ mod tests {
             old_line: Some(5),
             new_line: None,
             hunk_header: "@@ -5,3 +5,2 @@",
-            target: "removed target",
+            target_text: "removed target",
             before: vec!["before"],
             after: vec!["after"],
         }
@@ -568,7 +620,7 @@ mod tests {
             old_line: None,
             new_line: Some(3),
             hunk_header: "@@ -1,5 +1,5 @@",
-            target: "target",
+            target_text: "target",
             before: vec!["a", "b", "older-than-hunk"],
             after: vec!["after1", "after2"],
         }
@@ -599,7 +651,7 @@ mod tests {
             old_line: None,
             new_line: Some(3),
             hunk_header: "@@ -1,5 +1,5 @@",
-            target: "target",
+            target_text: "target",
             before: vec!["before1", "before2"],
             after: vec!["a", "b", "newer-than-hunk"],
         }
@@ -630,7 +682,7 @@ mod tests {
             old_line: None,
             new_line: Some(6),
             hunk_header: "@@ -1,5 +1,5 @@",
-            target: "target",
+            target_text: "target",
             before: vec![],
             after: vec![],
         }
@@ -655,7 +707,7 @@ mod tests {
             old_line: None,
             new_line: None,
             hunk_header: "@@ -0,0 +1,2 @@",
-            target: "target",
+            target_text: "target",
             before: vec![],
             after: vec![],
         }
@@ -686,7 +738,7 @@ mod tests {
             old_line: None,
             new_line: Some(5),
             hunk_header: "@@ -3,5 +3,5 @@",
-            target: "target",
+            target_text: "target",
             before: vec![],
             after: vec![],
         }
@@ -715,7 +767,7 @@ mod tests {
             old_line: None,
             new_line: Some(2),
             hunk_header: "@@ -1,3 +1,3 @@",
-            target: "old body",
+            target_text: "old body",
             before: vec!["before"],
             after: vec!["after"],
         }
@@ -744,7 +796,7 @@ mod tests {
             old_line: None,
             new_line: Some(2),
             hunk_header: "@@ -1,3 +1,3 @@",
-            target: "target",
+            target_text: "target",
             before: vec!["original_before"],
             after: vec!["same_after"],
         }
@@ -773,7 +825,7 @@ mod tests {
             old_line: None,
             new_line: Some(2),
             hunk_header: "@@ -1,3 +1,3 @@",
-            target: "target",
+            target_text: "target",
             before: vec!["same_before"],
             after: vec!["original_after"],
         }
@@ -802,7 +854,7 @@ mod tests {
             old_line: None,
             new_line: Some(2),
             hunk_header: "@@ -1,3 +1,3 @@",
-            target: "target",
+            target_text: "target",
             before: vec!["original_before"],
             after: vec!["original_after"],
         }
@@ -832,7 +884,7 @@ mod tests {
             old_line: None,
             new_line: Some(10),
             hunk_header: "@@ -10,2 +10,2 @@ fn beta",
-            target: "target",
+            target_text: "target",
             before: vec![],
             after: vec!["other2"],
         }
@@ -857,7 +909,7 @@ mod tests {
             old_line: None,
             new_line: Some(1),
             hunk_header: "@@ -1,2 +1,2 @@ fn nonexistent",
-            target: "target line",
+            target_text: "target line",
             before: vec![],
             after: vec!["other"],
         }
@@ -879,7 +931,7 @@ mod tests {
             old_line: None,
             new_line: Some(20),
             hunk_header: "@@ -20,1 +20,1 @@",
-            target: "target",
+            target_text: "target",
             before: vec![],
             after: vec![],
         }
@@ -901,7 +953,7 @@ mod tests {
             old_line: None,
             new_line: Some(1),
             hunk_header: "@@ -1,1 +1,1 @@",
-            target: "target",
+            target_text: "target",
             before: vec![],
             after: vec![],
         }
@@ -930,7 +982,7 @@ mod tests {
             old_line: None,
             new_line: Some(21),
             hunk_header: "@@ -5,3 +5,3 @@ fn old_location",
-            target: "target",
+            target_text: "target",
             before: vec!["before"],
             after: vec!["after"],
         }
@@ -955,7 +1007,7 @@ mod tests {
             old_line: None,
             new_line: Some(5),
             hunk_header: "@@ -1,2 +0,0 @@",
-            target: "target",
+            target_text: "target",
             before: vec![],
             after: vec![],
         }
@@ -980,7 +1032,7 @@ mod tests {
             old_line: None,
             new_line: Some(2),
             hunk_header: "@@ -1,2 +1,2 @@",
-            target: "old body",
+            target_text: "old body",
             before: vec!["before"],
             after: vec![],
         }
@@ -1010,7 +1062,7 @@ mod tests {
             old_line: None,
             new_line: Some(48),
             hunk_header: "@@ -50,1 +50,1 @@ fn shared",
-            target: "target",
+            target_text: "target",
             before: vec![],
             after: vec![],
         }
@@ -1026,5 +1078,290 @@ mod tests {
         let available = vec!["a", "b", "c", "d"];
         let stored = vec!["a".to_owned(), "b".to_owned()];
         assert!(!context_window_matches(&available, &stored));
+    }
+
+    fn make_comment(
+        anchor: Anchor,
+        status: Option<Status>,
+        reason: Option<MismatchReason>,
+    ) -> Comment {
+        Comment {
+            schema_version: SchemaVersion,
+            anchor,
+            repo_root: PathBuf::from("/repo"),
+            revset: "@".to_owned(),
+            commit_id: None,
+            body: "test comment".to_owned(),
+            severity: Severity::Note,
+            created_at: datetime!(2026-04-29 14:00:00 UTC),
+            updated_at: None,
+            status,
+            mismatch_reason: reason,
+        }
+    }
+
+    fn line_anchor(file: &str, target: &str, new_line: u32) -> LineAnchor {
+        LineAnchor {
+            file: PathBuf::from(file),
+            side: Side::New,
+            old_line: None,
+            new_line: Some(new_line),
+            hunk_header: "@@ -1,3 +1,3 @@".to_owned(),
+            target_text: target.to_owned(),
+            context_before: vec![],
+            context_after: vec![],
+        }
+    }
+
+    fn change_id() -> ChangeId {
+        ChangeId::parse("abc12345").unwrap()
+    }
+
+    #[test]
+    fn reanchor_pending_exact_match_unchanged_location_returns_none() {
+        let anchor = LineAnchor {
+            file: PathBuf::from("foo.rs"),
+            side: Side::New,
+            old_line: None,
+            new_line: Some(1),
+            hunk_header: "@@ -0,0 +1,1 @@".to_owned(),
+            target_text: "target".to_owned(),
+            context_before: vec![],
+            context_after: vec![],
+        };
+        let comment = make_comment(
+            Anchor::Line {
+                change_id: change_id(),
+                location: anchor,
+            },
+            Some(Status::Pending),
+            None,
+        );
+        let hunk = make_hunk("@@ -0,0 +1,1 @@", None, vec![added_line("target", 1)]);
+        let diff = make_diff(vec![modified_file("foo.rs", vec![hunk])]);
+        assert!(reanchor_comment(&comment, &diff).is_none());
+    }
+
+    #[test]
+    fn reanchor_pending_exact_match_moved_location_returns_updated_anchor() {
+        let anchor = LineAnchor {
+            file: PathBuf::from("foo.rs"),
+            side: Side::New,
+            old_line: None,
+            new_line: Some(2),
+            hunk_header: "@@ -1,3 +1,3 @@".to_owned(),
+            target_text: "target".to_owned(),
+            context_before: vec!["before".to_owned()],
+            context_after: vec!["after".to_owned()],
+        };
+        let comment = make_comment(
+            Anchor::Line {
+                change_id: change_id(),
+                location: anchor,
+            },
+            Some(Status::Pending),
+            None,
+        );
+        let hunk = make_hunk(
+            "@@ -5,3 +5,3 @@",
+            None,
+            vec![
+                ctx_line("before", 5, 5),
+                ctx_line("target", 6, 6),
+                ctx_line("after", 7, 7),
+            ],
+        );
+        let diff = make_diff(vec![modified_file("foo.rs", vec![hunk])]);
+        let updated =
+            reanchor_comment(&comment, &diff).expect("should return Some for moved anchor");
+        let Anchor::Line { location, .. } = &updated.anchor else {
+            panic!("expected Line anchor");
+        };
+        assert_eq!(location.new_line, Some(6));
+        assert_eq!(updated.status, Some(Status::Pending));
+        assert!(updated.mismatch_reason.is_none());
+    }
+
+    #[test]
+    fn reanchor_pending_fuzzy_match_returns_stale_with_reason() {
+        let anchor = LineAnchor {
+            file: PathBuf::from("foo.rs"),
+            side: Side::New,
+            old_line: None,
+            new_line: Some(2),
+            hunk_header: "@@ -1,3 +1,3 @@".to_owned(),
+            target_text: "old body".to_owned(),
+            context_before: vec!["before".to_owned()],
+            context_after: vec!["after".to_owned()],
+        };
+        let comment = make_comment(
+            Anchor::Line {
+                change_id: change_id(),
+                location: anchor,
+            },
+            Some(Status::Pending),
+            None,
+        );
+        let hunk = make_hunk(
+            "@@ -1,3 +1,3 @@",
+            None,
+            vec![
+                ctx_line("before", 1, 1),
+                ctx_line("new body", 2, 2),
+                ctx_line("after", 3, 3),
+            ],
+        );
+        let diff = make_diff(vec![modified_file("foo.rs", vec![hunk])]);
+        let updated =
+            reanchor_comment(&comment, &diff).expect("should return Some when going stale");
+        assert_eq!(updated.status, Some(Status::Stale));
+        assert_eq!(
+            updated.mismatch_reason,
+            Some(MismatchReason::TargetTextChanged)
+        );
+    }
+
+    #[test]
+    fn reanchor_stale_now_exact_match_returns_pending() {
+        let anchor = line_anchor("foo.rs", "target", 2);
+        let comment = make_comment(
+            Anchor::Line {
+                change_id: change_id(),
+                location: anchor.clone(),
+            },
+            Some(Status::Stale),
+            Some(MismatchReason::TargetTextChanged),
+        );
+        let hunk = make_hunk(
+            "@@ -1,3 +1,3 @@",
+            None,
+            vec![
+                ctx_line("before", 1, 1),
+                ctx_line("target", 2, 2),
+                ctx_line("after", 3, 3),
+            ],
+        );
+        let diff = make_diff(vec![modified_file("foo.rs", vec![hunk])]);
+        let updated = reanchor_comment(&comment, &diff).expect("stale->pending should return Some");
+        assert_eq!(updated.status, Some(Status::Pending));
+        assert!(updated.mismatch_reason.is_none());
+    }
+
+    #[test]
+    fn reanchor_stale_same_reason_returns_none() {
+        let anchor = LineAnchor {
+            file: PathBuf::from("foo.rs"),
+            side: Side::New,
+            old_line: None,
+            new_line: Some(2),
+            hunk_header: "@@ -1,3 +1,3 @@".to_owned(),
+            target_text: "old body".to_owned(),
+            context_before: vec!["before".to_owned()],
+            context_after: vec!["after".to_owned()],
+        };
+        let comment = make_comment(
+            Anchor::Line {
+                change_id: change_id(),
+                location: anchor,
+            },
+            Some(Status::Stale),
+            Some(MismatchReason::TargetTextChanged),
+        );
+        let hunk = make_hunk(
+            "@@ -1,3 +1,3 @@",
+            None,
+            vec![
+                ctx_line("before", 1, 1),
+                ctx_line("new body", 2, 2),
+                ctx_line("after", 3, 3),
+            ],
+        );
+        let diff = make_diff(vec![modified_file("foo.rs", vec![hunk])]);
+        assert!(reanchor_comment(&comment, &diff).is_none());
+    }
+
+    #[test]
+    fn reanchor_stale_reason_changes_returns_updated_reason() {
+        let anchor = LineAnchor {
+            file: PathBuf::from("foo.rs"),
+            side: Side::New,
+            old_line: None,
+            new_line: Some(2),
+            hunk_header: "@@ -1,3 +1,3 @@".to_owned(),
+            target_text: "target".to_owned(),
+            context_before: vec!["current_before".to_owned()],
+            context_after: vec!["original_after".to_owned()],
+        };
+        let comment = make_comment(
+            Anchor::Line {
+                change_id: change_id(),
+                location: anchor,
+            },
+            Some(Status::Stale),
+            Some(MismatchReason::ContextBeforeChanged),
+        );
+        let hunk = make_hunk(
+            "@@ -1,3 +1,3 @@",
+            None,
+            vec![
+                ctx_line("current_before", 1, 1),
+                ctx_line("target", 2, 2),
+                ctx_line("new_after", 3, 3),
+            ],
+        );
+        let diff = make_diff(vec![modified_file("foo.rs", vec![hunk])]);
+        let updated = reanchor_comment(&comment, &diff).expect("reason change should return Some");
+        assert_eq!(updated.status, Some(Status::Stale));
+        assert_eq!(
+            updated.mismatch_reason,
+            Some(MismatchReason::ContextAfterChanged)
+        );
+    }
+
+    #[test]
+    fn reanchor_change_scoped_comment_returns_none() {
+        let comment = make_comment(
+            Anchor::Change {
+                change_id: change_id(),
+            },
+            Some(Status::Pending),
+            None,
+        );
+        let diff = make_diff(vec![modified_file("foo.rs", vec![])]);
+        assert!(reanchor_comment(&comment, &diff).is_none());
+    }
+
+    #[test]
+    fn reanchor_stack_scoped_comment_returns_none() {
+        let comment = make_comment(Anchor::Stack, None, None);
+        let diff = make_diff(vec![modified_file("foo.rs", vec![])]);
+        assert!(reanchor_comment(&comment, &diff).is_none());
+    }
+
+    #[test]
+    fn reanchor_none_status_exact_match_returns_pending() {
+        let anchor = line_anchor("foo.rs", "target", 2);
+        let comment = make_comment(
+            Anchor::Line {
+                change_id: change_id(),
+                location: anchor.clone(),
+            },
+            None,
+            None,
+        );
+        let hunk = make_hunk(
+            "@@ -1,3 +1,3 @@",
+            None,
+            vec![
+                ctx_line("x", 1, 1),
+                ctx_line("target", 2, 2),
+                ctx_line("y", 3, 3),
+            ],
+        );
+        let diff = make_diff(vec![modified_file("foo.rs", vec![hunk])]);
+        let updated = reanchor_comment(&comment, &diff)
+            .expect("legacy no-status comment with exact match should return pending");
+        assert_eq!(updated.status, Some(Status::Pending));
+        assert!(updated.mismatch_reason.is_none());
     }
 }

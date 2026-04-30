@@ -298,16 +298,44 @@ impl App {
     fn refresh_inline_comments(&mut self) {
         match crate::store::load_change_comments(&self.repo_root, &self.details.change_id) {
             Ok(comments) => {
-                self.loaded_comments = comments;
+                self.loaded_comments = self.reconcile_and_persist(comments);
                 self.comments_loaded_ok = true;
             }
             Err(e) => {
-                self.status_message = Some(format!("warning: could not load comments: {e}"));
+                self.status_message = Some(format!(
+                    "warning: could not load comments: {}",
+                    sanitize_for_status(&e.to_string())
+                ));
                 self.loaded_comments = Vec::new();
                 self.comments_loaded_ok = false;
             }
         }
         self.rebuild_annotated_views();
+    }
+
+    fn reconcile_and_persist(&mut self, comments: Vec<Comment>) -> Vec<Comment> {
+        let mut errors: Vec<String> = Vec::new();
+        let reconciled: Vec<Comment> = comments
+            .into_iter()
+            .map(
+                |comment| match crate::anchoring::reanchor_comment(&comment, &self.details.diff) {
+                    None => comment,
+                    Some(updated) => {
+                        match crate::store::update_comment(&self.repo_root, &updated) {
+                            Ok(()) => updated,
+                            Err(e) => {
+                                errors.push(format_persist_error(&updated, &e));
+                                comment
+                            }
+                        }
+                    }
+                },
+            )
+            .collect();
+        if let Some(last) = errors.into_iter().last() {
+            self.status_message = Some(last);
+        }
+        reconciled
     }
 
     fn rebuild_annotated_views(&mut self) {
@@ -512,6 +540,42 @@ impl App {
 enum Edge {
     Top,
     Bottom,
+}
+
+/// Prevent JSONL-derived strings from injecting terminal escape
+/// sequences or `BiDi` overrides into the ratatui status bar. Local-CLI
+/// threat model, but path / error fragments come from untrusted on-disk
+/// records.
+fn sanitize_for_status(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if (c.is_control() && c != '\t')
+                || matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+            {
+                '?'
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+fn format_persist_error(comment: &Comment, err: &JjrError) -> String {
+    let raw_location = match &comment.anchor {
+        Anchor::Line { location, .. } => format!(
+            "{}:{}",
+            location.file.display(),
+            location
+                .new_line
+                .or(location.old_line)
+                .map_or_else(|| "?".to_owned(), |n| n.to_string()),
+        ),
+        Anchor::Change { change_id } => change_id.as_str().to_owned(),
+        Anchor::Stack => "stack".to_owned(),
+    };
+    let location = sanitize_for_status(&raw_location);
+    let err = sanitize_for_status(&err.to_string());
+    format!("warning: could not persist re-anchor for {location}: {err}")
 }
 
 fn run_app(
@@ -1141,7 +1205,10 @@ fn delete_focused_comment(app: &mut App) {
             }
         }
         Err(e) => {
-            app.status_message = Some(format!("delete failed: {e}"));
+            app.status_message = Some(format!(
+                "delete failed: {}",
+                sanitize_for_status(&e.to_string())
+            ));
         }
     }
 }
@@ -1257,7 +1324,6 @@ fn save_composer(app: &mut App, composer: &Composer, now: time::OffsetDateTime) 
     // Body silently truncates at the serializer; warn the reviewer so they
     // know to copy the overflow elsewhere if needed. Save proceeds.
     let oversized = body.chars().count() > crate::comment::BODY_MAX;
-    let (change_id, location) = build_location_from_composer(app, composer);
 
     if let Some(created_at) = composer.editing {
         return persist_update_from_composer(
@@ -1265,8 +1331,6 @@ fn save_composer(app: &mut App, composer: &Composer, now: time::OffsetDateTime) 
             composer,
             UpdateArgs {
                 body,
-                change_id,
-                location,
                 created_at,
                 now,
                 oversized,
@@ -1274,6 +1338,7 @@ fn save_composer(app: &mut App, composer: &Composer, now: time::OffsetDateTime) 
         );
     }
 
+    let (change_id, location) = build_location_from_composer(app, composer);
     let comment = Comment {
         schema_version: SchemaVersion,
         anchor: Anchor::Line {
@@ -1303,14 +1368,15 @@ fn save_composer(app: &mut App, composer: &Composer, now: time::OffsetDateTime) 
         Err(JjrError::DuplicateCommentTimestamp { .. }) => SaveOutcome::Errored(
             "save failed: two comments at the same timestamp — wait a moment and retry".to_owned(),
         ),
-        Err(e) => SaveOutcome::Errored(format!("save failed: {e}")),
+        Err(e) => SaveOutcome::Errored(format!(
+            "save failed: {}",
+            sanitize_for_status(&e.to_string())
+        )),
     }
 }
 
 struct UpdateArgs {
     body: String,
-    change_id: ChangeId,
-    location: LineAnchor,
     created_at: time::OffsetDateTime,
     now: time::OffsetDateTime,
     oversized: bool,
@@ -1321,21 +1387,27 @@ fn persist_update_from_composer(
     composer: &Composer,
     args: UpdateArgs,
 ) -> SaveOutcome {
+    // Source the anchor from the latest in-memory record (keyed by
+    // `created_at`) rather than the composer's open-time snapshot. If the
+    // anchor moved between compose-open and compose-submit (e.g., a refresh
+    // re-anchored it to a new line), the user's edit must apply to the new
+    // anchor location, not the stale snapshot.
+    let Some(latest) = app
+        .loaded_comments
+        .iter()
+        .find(|c| c.created_at == args.created_at)
+        .cloned()
+    else {
+        return SaveOutcome::Errored(
+            "comment was removed between open and save; edit not saved".to_owned(),
+        );
+    };
+
     let updated = Comment {
-        schema_version: SchemaVersion,
-        anchor: Anchor::Line {
-            change_id: args.change_id,
-            location: args.location,
-        },
-        repo_root: app.repo_root.clone(),
-        revset: app.revset.clone(),
-        commit_id: Some(app.details.commit_id.clone()),
         body: args.body,
         severity: composer.severity,
-        created_at: args.created_at,
         updated_at: Some(args.now),
-        status: Some(Status::Pending),
-        mismatch_reason: None,
+        ..latest
     };
 
     match crate::store::update_comment(&app.repo_root, &updated) {
@@ -1349,7 +1421,10 @@ fn persist_update_from_composer(
             }
             SaveOutcome::Saved
         }
-        Err(e) => SaveOutcome::Errored(format!("update failed: {e}")),
+        Err(e) => SaveOutcome::Errored(format!(
+            "update failed: {}",
+            sanitize_for_status(&e.to_string())
+        )),
     }
 }
 
@@ -1387,7 +1462,10 @@ fn delete_via_composer(app: &mut App, composer: &Composer) -> SaveOutcome {
             app.status_message = Some("comment deleted".to_owned());
             SaveOutcome::Saved
         }
-        Err(e) => SaveOutcome::Errored(format!("delete failed: {e}")),
+        Err(e) => SaveOutcome::Errored(format!(
+            "delete failed: {}",
+            sanitize_for_status(&e.to_string())
+        )),
     }
 }
 
@@ -1447,6 +1525,81 @@ mod tests {
     use crate::change_id::{ChangeId, CommitId};
     use crate::diff::{Diff, DiffFile, Hunk, Line, LineKind};
     use crossterm::event::KeyModifiers;
+
+    #[test]
+    fn sanitize_for_status_strips_escape_and_control_bytes() {
+        let raw = "foo\x1b[2J\x1b[Hpwned\nbar\x07";
+        let sanitized = sanitize_for_status(raw);
+        for ch in sanitized.chars() {
+            assert!(
+                !ch.is_control() || ch == '\t',
+                "sanitized output must not contain control bytes (except tab); found {ch:?}"
+            );
+        }
+        assert!(!sanitized.contains('\x1b'), "ESC must be stripped");
+    }
+
+    #[test]
+    fn sanitize_for_status_preserves_printable_and_tab() {
+        let raw = "warning: foo\tbar baz";
+        assert_eq!(sanitize_for_status(raw), raw);
+    }
+
+    #[test]
+    fn sanitize_for_status_strips_unicode_bidi_overrides() {
+        let raw = "foo\u{202e}bar\u{2066}baz\u{2069}qux";
+        let sanitized = sanitize_for_status(raw);
+        for forbidden in [
+            '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}', '\u{202E}', '\u{2066}', '\u{2067}',
+            '\u{2068}', '\u{2069}',
+        ] {
+            assert!(
+                !sanitized.contains(forbidden),
+                "BiDi mark {forbidden:?} must be stripped"
+            );
+        }
+        assert!(sanitized.contains("foo"));
+        assert!(sanitized.contains("bar"));
+    }
+
+    #[test]
+    fn format_persist_error_sanitizes_path_with_escape_sequences() {
+        let comment = Comment {
+            schema_version: SchemaVersion,
+            anchor: Anchor::Line {
+                change_id: ChangeId::parse("abc12345").unwrap(),
+                location: LineAnchor {
+                    file: PathBuf::from("foo\x1b[2J\x1b[Hpwned"),
+                    side: Side::New,
+                    old_line: None,
+                    new_line: Some(1),
+                    hunk_header: "@@".to_owned(),
+                    target_text: "t".to_owned(),
+                    context_before: vec![],
+                    context_after: vec![],
+                },
+            },
+            repo_root: PathBuf::from("/repo"),
+            revset: "@".to_owned(),
+            commit_id: None,
+            body: "b".to_owned(),
+            severity: Severity::Note,
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
+            updated_at: None,
+            status: Some(Status::Pending),
+            mismatch_reason: None,
+        };
+        let err = JjrError::Io {
+            source: std::io::Error::other("nope\x1b]8;;evil\x07hyperlink"),
+        };
+        let msg = format_persist_error(&comment, &err);
+        for ch in msg.chars() {
+            assert!(
+                !ch.is_control() || ch == '\t',
+                "format_persist_error output must not contain control bytes (except tab); found {ch:?}"
+            );
+        }
+    }
 
     fn make_line(
         kind: RenderedLineKind,
@@ -1998,6 +2151,112 @@ mod tests {
             "body should be preserved across failed update; got: {}",
             composer_snapshot.body_text()
         );
+    }
+
+    #[test]
+    fn edit_save_uses_latest_in_memory_anchor_not_composer_snapshot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = make_app_with_comment_on_disk(dir.path());
+        let created_at = time::OffsetDateTime::UNIX_EPOCH;
+
+        open_composer_for_edit(&mut app);
+        let Screen::Composer(ref mut composer) = app.screen else {
+            panic!("expected Composer screen");
+        };
+        for ch in " edited".chars() {
+            composer
+                .body
+                .input(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        let composer_snapshot = {
+            let Screen::Composer(ref c) = app.screen else {
+                unreachable!()
+            };
+            Composer::for_edit(EditedComment {
+                target: c.target.clone(),
+                severity: c.severity,
+                body: c.body_text(),
+                identity: c.editing.unwrap(),
+            })
+        };
+
+        // Simulate re-anchor: location drifts in memory, composer snapshot stays stale.
+        let new_line: u32 = 99;
+        if let Anchor::Line {
+            ref mut location, ..
+        } = app.loaded_comments[0].anchor
+        {
+            location.new_line = Some(new_line);
+            location.target_text = "moved target".to_owned();
+        } else {
+            panic!("expected Line anchor");
+        }
+        // Persist the in-memory mutation to disk so update_comment finds the
+        // correct timestamp.
+        crate::store::update_comment(&app.repo_root, &app.loaded_comments[0])
+            .expect("seed disk with moved anchor");
+
+        let save_time = time::OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(60);
+        let outcome = save_composer(&mut app, &composer_snapshot, save_time);
+        assert!(matches!(outcome, SaveOutcome::Saved), "expected Saved");
+
+        let loaded = crate::store::load_change_comments(&app.repo_root, &app.details.change_id)
+            .expect("load");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].created_at, created_at);
+        let Anchor::Line { location, .. } = &loaded[0].anchor else {
+            panic!("expected Line anchor on loaded record");
+        };
+        assert_eq!(
+            location.new_line,
+            Some(new_line),
+            "persisted anchor must be the latest in-memory location, not the composer snapshot"
+        );
+        assert_eq!(
+            location.target_text, "moved target",
+            "persisted target_text must be the latest in-memory value"
+        );
+        assert!(
+            loaded[0].body.contains("edited"),
+            "persisted body must carry the user's edit; got: {}",
+            loaded[0].body
+        );
+    }
+
+    /// If `loaded_comments` no longer contains a record with the composer's
+    /// `created_at` (race with deletion in another flow), edit-save aborts
+    /// with a status-bar warning rather than writing the snapshot back.
+    #[test]
+    fn edit_save_aborts_when_in_memory_record_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = make_app_with_comment_on_disk(dir.path());
+
+        open_composer_for_edit(&mut app);
+        let composer_snapshot = {
+            let Screen::Composer(ref c) = app.screen else {
+                panic!("expected Composer screen");
+            };
+            Composer::for_edit(EditedComment {
+                target: c.target.clone(),
+                severity: c.severity,
+                body: c.body_text(),
+                identity: c.editing.unwrap(),
+            })
+        };
+
+        app.loaded_comments.clear();
+
+        let save_time = time::OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(60);
+        let outcome = save_composer(&mut app, &composer_snapshot, save_time);
+        match outcome {
+            SaveOutcome::Errored(msg) => {
+                assert!(
+                    msg.contains("comment was removed"),
+                    "expected 'comment was removed' message; got: {msg}"
+                );
+            }
+            SaveOutcome::Saved | SaveOutcome::Refused(_) => panic!("expected Errored"),
+        }
     }
 
     /// D2. `^D` delete-from-composer error path. With the JSONL wiped, the

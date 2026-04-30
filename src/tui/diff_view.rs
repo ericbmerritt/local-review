@@ -1,4 +1,4 @@
-use crate::comment::{Anchor, Comment, Severity, Side};
+use crate::comment::{Anchor, Comment, Severity, Side, Status};
 use crate::diff::{DiffFile, Hunk, Line, LineKind};
 
 use super::composer::format_age;
@@ -67,13 +67,16 @@ pub(crate) struct InlineComment {
 
 /// Convert a saved `Comment` to an `InlineComment` for rendering, filtered by
 /// file path. Returns `None` if the comment is not a line-scoped comment for
-/// the given file.
+/// the given file, or if the comment is stale and must not appear inline.
 pub(crate) fn comment_to_inline(
     comment: &Comment,
     comment_index: usize,
     file_path: Option<&std::path::Path>,
     now: time::OffsetDateTime,
 ) -> Option<InlineComment> {
+    if comment.status == Some(Status::Stale) {
+        return None;
+    }
     let Anchor::Line { location, .. } = &comment.anchor else {
         return None;
     };
@@ -225,9 +228,9 @@ fn render_line(line: &Line, hunk_header: &str) -> RenderedLine {
 
 fn line_matches_comment(line: &RenderedLine, comment: &InlineComment) -> bool {
     match (comment.source_line, comment.target_line) {
-        (Some(sl), _) if comment.target_line.is_none() => line.source_line == Some(sl),
         (_, Some(tl)) => line.target_line == Some(tl),
-        _ => false,
+        (Some(sl), None) => line.source_line == Some(sl),
+        (None, None) => false,
     }
 }
 
@@ -596,5 +599,15 @@ mod tests {
             .find(|l| l.kind == RenderedLineKind::InlineCommentBody)
             .expect("body line should exist");
         assert_eq!(body.kind, RenderedLineKind::InlineCommentBody);
+    }
+
+    #[test]
+    fn stale_comment_is_excluded_from_inline_rendering() {
+        let mut comment = make_line_comment("foo.txt", Severity::Note);
+        comment.status = Some(Status::Stale);
+        comment.mismatch_reason = Some(crate::comment::MismatchReason::TargetTextChanged);
+        let now = time::OffsetDateTime::UNIX_EPOCH;
+        let inline = comment_to_inline(&comment, 0, Some(std::path::Path::new("foo.txt")), now);
+        assert!(inline.is_none(), "stale comments must not render inline");
     }
 }
