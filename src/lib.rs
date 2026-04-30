@@ -1,3 +1,4 @@
+pub mod anchoring;
 pub mod change_id;
 pub mod comment;
 pub mod cursor;
