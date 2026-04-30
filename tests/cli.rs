@@ -630,3 +630,55 @@ fn packet_no_comments_exits_2_with_message() {
         .code(2)
         .stderr(predicate::str::contains("no comments to send"));
 }
+
+/// `jjr claude @` with no comments exits 2 and emits "no comments to send".
+/// Same `EmptyPacket` path as `jjr packet`, but via the claude subcommand.
+#[test]
+fn claude_no_comments_exits_2_with_message() {
+    if !jj_on_path() {
+        eprintln!("jj not on PATH; skipping claude_no_comments_exits_2_with_message");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = build_fixture_named(&tmp, "single_change.sh");
+
+    Command::cargo_bin("jjr")
+        .unwrap()
+        .current_dir(&repo)
+        .args(["claude", "@"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("no comments to send"));
+}
+
+/// `jjr claude @` with no `claude` binary on PATH exits non-zero and emits a
+/// message naming the missing binary.
+///
+/// We force `claude` to be absent by prepending a directory that has no
+/// `claude` binary to PATH (and removing PATH entries that might have it).
+/// The fixture must have a pending comment so we get past the `EmptyPacket`
+/// check and actually try to invoke claude.
+#[test]
+fn claude_missing_binary_exits_nonzero_with_clear_message() {
+    if !jj_on_path() {
+        eprintln!(
+            "jj not on PATH; skipping claude_missing_binary_exits_nonzero_with_clear_message"
+        );
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = build_fixture_named(&tmp, "single_change_with_pending.sh");
+    let empty_dir = tmp.path().join("empty_bin");
+    std::fs::create_dir_all(&empty_dir).unwrap();
+
+    Command::cargo_bin("jjr")
+        .unwrap()
+        .current_dir(&repo)
+        .env("PATH", empty_dir.to_str().unwrap())
+        .args(["claude", "@"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("claude").or(predicate::str::contains("PATH")));
+}

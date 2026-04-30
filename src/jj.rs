@@ -20,6 +20,43 @@ pub struct ChangeDetails {
     pub diff: Diff,
 }
 
+/// Edit the working copy to the given change within `repo_root`.
+///
+/// Passes `--repository` so the call is safe regardless of the process cwd.
+pub fn edit(repo_root: &std::path::Path, change_id: &ChangeId) -> Result<()> {
+    let repo_str = repo_root.to_str().unwrap_or(".");
+    run_jj_discard(&["--repository", repo_str, "edit", change_id.as_str()])
+}
+
+/// Return the change ID currently checked out as `@` in `repo_root`.
+///
+/// Passes `--repository` so the call is safe regardless of the process cwd.
+pub fn current_change(repo_root: &std::path::Path) -> Result<ChangeId> {
+    let repo_str = repo_root.to_str().unwrap_or(".");
+    let output = run_jj(&[
+        "--repository",
+        repo_str,
+        "log",
+        "-r",
+        "@",
+        "--no-graph",
+        "--color=never",
+        "-T",
+        r#"change_id ++ "\n""#,
+    ])?;
+    let non_empty: Vec<&str> = output.lines().filter(|l| !l.trim().is_empty()).collect();
+    match non_empty.as_slice() {
+        [single] => ChangeId::parse(single.trim()),
+        [] => Err(JjrError::RevsetNoMatch {
+            revset: "@".to_owned(),
+        }),
+        _ => Err(JjrError::RevsetAmbiguous {
+            revset: "@".to_owned(),
+            raw: output,
+        }),
+    }
+}
+
 /// Resolve a revset expression (including `@`, `@-`, branch names, etc.) to a
 /// `ChangeId`. The revset must resolve to exactly one change.
 pub fn resolve_revset(revset: &str) -> Result<ChangeId> {
@@ -65,6 +102,7 @@ pub fn diff_for_change(change_id: &ChangeId) -> Result<Diff> {
     show_diff(change_id)
 }
 
+#[derive(Debug)]
 struct LogMetadata {
     change_id: ChangeId,
     commit_id: CommitId,
@@ -82,16 +120,30 @@ fn log_metadata(change_id: &ChangeId) -> Result<LogMetadata> {
         log_template(),
     ])?;
 
-    let mut entries = parse_log_template_records(&output)?;
-    let entry = entries.pop().ok_or_else(|| JjrError::JjUnexpectedOutput {
-        raw: output.clone(),
-    })?;
+    let entries = parse_log_template_records(&output)?;
+    log_metadata_from_records(change_id, entries, output)
+}
 
-    Ok(LogMetadata {
-        change_id: entry.change_id,
-        commit_id: entry.commit_id,
-        description: entry.description,
-    })
+/// Pure record-count enforcement for `log_metadata`. Splitting this out keeps
+/// the divergent-change-id branch unit-testable without spawning jj.
+fn log_metadata_from_records(
+    change_id: &ChangeId,
+    entries: Vec<LogRecord>,
+    raw: String,
+) -> Result<LogMetadata> {
+    let mut iter = entries.into_iter();
+    match (iter.next(), iter.next()) {
+        (Some(entry), None) => Ok(LogMetadata {
+            change_id: entry.change_id,
+            commit_id: entry.commit_id,
+            description: entry.description,
+        }),
+        (None, _) => Err(JjrError::JjUnexpectedOutput { raw }),
+        (Some(_), Some(_)) => Err(JjrError::RevsetAmbiguous {
+            revset: change_id.as_str().to_owned(),
+            raw,
+        }),
+    }
 }
 
 fn show_diff(change_id: &ChangeId) -> Result<Diff> {
@@ -294,6 +346,11 @@ fn run_jj(args: &[&str]) -> Result<String> {
     String::from_utf8(output.stdout).map_err(|source| JjrError::JjOutputEncoding { source })
 }
 
+/// Like [`run_jj`] but discards stdout.
+fn run_jj_discard(args: &[&str]) -> Result<()> {
+    run_jj(args).map(|_| ())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -392,9 +449,9 @@ mod tests {
     }
 
     /// Pin the raw parser's contract: it returns *all* records in input order.
-    /// `log_metadata` enforces single-record semantics on top via `.pop()`,
-    /// silently dropping earlier entries — that's the caller's responsibility,
-    /// not the parser's.
+    /// `log_metadata` enforces single-record semantics on top by erroring with
+    /// `RevsetAmbiguous` when more than one record is present (e.g. divergent
+    /// change IDs); the parser itself stays oblivious.
     #[test]
     fn parse_log_template_records_returns_all_records_caller_enforces_count() {
         let raw = "abc11111\x1Faabbccdd11223344\x1Ffirst\n\
@@ -405,5 +462,59 @@ mod tests {
         assert_eq!(records[1].description, "second");
         assert_eq!(records[0].change_id.as_str(), "abc11111");
         assert_eq!(records[1].change_id.as_str(), "abc22222");
+    }
+
+    /// Divergent change IDs cause jj to emit two records for a single change-id
+    /// argument. Pin that `log_metadata_from_records` rejects this with
+    /// `RevsetAmbiguous` rather than silently keeping one of the commits — a
+    /// silent pick would route Claude at the wrong diff.
+    #[test]
+    fn log_metadata_from_records_two_records_returns_revset_ambiguous() {
+        let change_id = ChangeId::parse("abc11111").unwrap();
+        let entries = vec![
+            LogRecord {
+                change_id: ChangeId::parse("abc11111").unwrap(),
+                commit_id: CommitId::parse("aabbccdd11223344").unwrap(),
+                description: "first".to_owned(),
+            },
+            LogRecord {
+                change_id: ChangeId::parse("abc11111").unwrap(),
+                commit_id: CommitId::parse("eeff112233445566").unwrap(),
+                description: "second".to_owned(),
+            },
+        ];
+        let raw = "abc11111\x1Faabbccdd11223344\x1Ffirst\n\
+                   abc11111\x1Feeff112233445566\x1Fsecond\n"
+            .to_owned();
+        let err = log_metadata_from_records(&change_id, entries, raw).unwrap_err();
+        assert!(
+            matches!(err, JjrError::RevsetAmbiguous { ref revset, .. } if revset == "abc11111"),
+            "expected RevsetAmbiguous for divergent change-id, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn log_metadata_from_records_zero_records_returns_unexpected_output() {
+        let change_id = ChangeId::parse("abc11111").unwrap();
+        let err = log_metadata_from_records(&change_id, vec![], String::new()).unwrap_err();
+        assert!(
+            matches!(err, JjrError::JjUnexpectedOutput { .. }),
+            "expected JjUnexpectedOutput for empty records, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn log_metadata_from_records_one_record_returns_metadata() {
+        let change_id = ChangeId::parse("abc11111").unwrap();
+        let entries = vec![LogRecord {
+            change_id: ChangeId::parse("abc11111").unwrap(),
+            commit_id: CommitId::parse("aabbccdd11223344").unwrap(),
+            description: "only".to_owned(),
+        }];
+        let raw = "abc11111\x1Faabbccdd11223344\x1Fonly\n".to_owned();
+        let meta = log_metadata_from_records(&change_id, entries, raw).unwrap();
+        assert_eq!(meta.change_id.as_str(), "abc11111");
+        assert_eq!(meta.commit_id.as_str(), "aabbccdd11223344");
+        assert_eq!(meta.description, "only");
     }
 }

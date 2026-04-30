@@ -4,12 +4,15 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
+use jjr::claude::{self, ClaudeOutcome};
 use jjr::error::JjrError;
 use jjr::jj;
 use jjr::packet;
+use jjr::stack::{ResolvedStack, RevsetHash, StackEntry};
 use jjr::store;
 use jjr::tui;
 use jjr::util::pluralize;
+use jjr::working_copy_guard::WorkingCopyGuard;
 
 #[derive(Parser)]
 #[command(name = "jjr")]
@@ -65,6 +68,20 @@ enum Command {
         #[arg(long)]
         include_stale: bool,
     },
+
+    /// Generate a review packet and invoke Claude CLI to address the comments.
+    ///
+    /// The working copy is moved to the target change for Claude's session and
+    /// restored to its prior position on exit, regardless of outcome.
+    Claude {
+        /// Revset / change to send to Claude. Resolves to exactly one change.
+        /// Defaults to `@`.
+        revset: Option<String>,
+
+        /// Include comments marked stale. Orphaned comments are never included.
+        #[arg(long)]
+        include_stale: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -79,6 +96,13 @@ fn main() -> ExitCode {
         }) => {
             let effective = revset.unwrap_or_else(|| jj::DEFAULT_STACK_REVSET.to_owned());
             return run_packet(&effective, output.as_deref(), include_stale);
+        }
+        Some(Command::Claude {
+            revset,
+            include_stale,
+        }) => {
+            let effective = revset.unwrap_or_else(|| "@".to_owned());
+            return run_claude(&effective, include_stale);
         }
         None => match cli.change {
             None => run_stack(jj::DEFAULT_STACK_REVSET, cli.restart),
@@ -119,6 +143,59 @@ fn run_packet(revset: &str, output: Option<&std::path::Path>, include_stale: boo
 
     match result {
         Ok(()) => ExitCode::SUCCESS,
+        Err(JjrError::EmptyPacket { .. }) => {
+            let mut stderr = std::io::stderr().lock();
+            let _ = writeln!(stderr, "no comments to send");
+            ExitCode::from(2)
+        }
+        Err(err) => {
+            print_error(&err);
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_claude(revset: &str, include_stale: bool) -> ExitCode {
+    let result = (|| -> Result<(), JjrError> {
+        let repo_root = std::env::current_dir().map_err(|source| JjrError::Io { source })?;
+        let change_id = jj::resolve_revset(revset)?;
+        let details = jj::show(&change_id)?;
+
+        let resolved = ResolvedStack {
+            revset_hash: RevsetHash::from_revset(revset),
+            revset: revset.to_owned(),
+            entries: vec![StackEntry {
+                change_id: change_id.clone(),
+                commit_id: details.commit_id,
+                description: details.description,
+            }],
+        };
+
+        let pkt = packet::build_packet(
+            &repo_root,
+            revset,
+            &resolved,
+            include_stale,
+            jj::diff_for_change,
+        )?;
+        let prompt = packet::render_prompt(&pkt);
+
+        let _guard = WorkingCopyGuard::enter(&repo_root, &change_id)?;
+        match claude::invoke_claude(&prompt)? {
+            ClaudeOutcome::Success => Ok(()),
+            ClaudeOutcome::Failed { exit_code } => Err(JjrError::ClaudeFailed { exit_code }),
+        }
+    })();
+
+    match result {
+        Ok(()) => {
+            let mut stderr = std::io::stderr().lock();
+            let _ = writeln!(
+                stderr,
+                "claude completed; re-run `jjr` to review the result"
+            );
+            ExitCode::SUCCESS
+        }
         Err(JjrError::EmptyPacket { .. }) => {
             let mut stderr = std::io::stderr().lock();
             let _ = writeln!(stderr, "no comments to send");

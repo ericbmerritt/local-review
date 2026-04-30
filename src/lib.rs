@@ -1,5 +1,6 @@
 pub mod anchoring;
 pub mod change_id;
+pub mod claude;
 pub mod comment;
 pub mod cursor;
 pub mod diff;
@@ -10,6 +11,7 @@ pub mod stack;
 pub mod store;
 pub mod tui;
 pub mod util;
+pub mod working_copy_guard;
 
 pub use change_id::{ChangeId, CommitId};
 pub use comment::{

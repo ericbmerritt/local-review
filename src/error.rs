@@ -86,4 +86,15 @@ pub enum JjrError {
 
     #[snafu(display("no comments to send for revset {revset}"))]
     EmptyPacket { revset: String },
+
+    #[snafu(display(
+        "claude is not on PATH; install Claude CLI (https://docs.anthropic.com/en/docs/claude-code)"
+    ))]
+    ClaudeMissing { source: std::io::Error },
+
+    #[snafu(display(
+        "claude exited with {}: see stderr above for details",
+        exit_code.map_or_else(|| "signal".to_owned(), |c| c.to_string())
+    ))]
+    ClaudeFailed { exit_code: Option<i32> },
 }
