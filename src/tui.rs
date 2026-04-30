@@ -15,7 +15,8 @@ use ratatui::{Frame, Terminal};
 
 use crate::change_id::ChangeId;
 use crate::comment::{
-    Anchor, Comment, LineAnchor, SchemaVersion, Severity, Side, Status, CONTEXT_MAX,
+    Anchor, Comment, DescriptionAnchor, LineAnchor, SchemaVersion, Severity, Side, Status,
+    CONTEXT_MAX,
 };
 use crate::cursor;
 use crate::error::{JjrError, Result};
@@ -34,9 +35,12 @@ mod stale_screen;
 
 use composer::{
     default_severity, ChangeContext, Composer, ComposerAction, ComposerContexts, ComposerScope,
-    EditedComment, LineTarget, StackContextSnapshot,
+    DescriptionContext, EditedComment, LineTarget, StackContextSnapshot,
 };
-use diff_view::{comment_to_inline, DiffView, InlineComment, RenderedLine, RenderedLineKind};
+use diff_view::{
+    comment_to_inline, description_comment_to_inline, DiffView, InlineComment, RenderedLine,
+    RenderedLineKind,
+};
 use file_picker::{build_entries as build_file_picker_entries, FilePickerState};
 use overview_screen::{OverviewCommentSet, OverviewScreenState};
 use send_to_claude::{ConfirmData, SendToClaudeState};
@@ -327,8 +331,7 @@ impl App {
         stack: Option<StackContext>,
         transition_mode: TransitionMode,
     ) -> Self {
-        let rendered_per_file: Vec<DiffView> =
-            details.diff.files.iter().map(DiffView::from_file).collect();
+        let rendered_per_file = build_rendered_views(&details);
         let annotated_per_file = rendered_per_file.clone();
         Self {
             details,
@@ -389,7 +392,11 @@ impl App {
         let reconciled: Vec<Comment> = comments
             .into_iter()
             .map(|comment| {
-                match crate::anchoring::reanchor_comment(&comment, &self.details.diff, "") {
+                match crate::anchoring::reanchor_comment(
+                    &comment,
+                    &self.details.diff,
+                    &self.details.description,
+                ) {
                     None => comment,
                     Some(updated) => {
                         match crate::store::update_comment(&self.repo_root, &updated) {
@@ -412,24 +419,34 @@ impl App {
     fn rebuild_annotated_views(&mut self) {
         let now = time::OffsetDateTime::now_utc();
         let severity_filter = self.severity_filter;
+        // rendered_per_file[0] is the description view; diff files start at index 1.
         self.annotated_per_file = self
             .rendered_per_file
             .iter()
             .enumerate()
-            .map(|(file_idx, base_view)| {
-                let file_path = self
-                    .details
-                    .diff
-                    .files
-                    .get(file_idx)
-                    .map(|f| f.display_path().to_owned());
-                let inline: Vec<InlineComment> = self
-                    .loaded_comments
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(idx, c)| comment_to_inline(c, idx, file_path.as_deref(), now))
-                    .filter(|ic| severity_filter.is_none_or(|filter| ic.severity == filter))
-                    .collect();
+            .map(|(view_idx, base_view)| {
+                let inline: Vec<InlineComment> = if view_idx == 0 {
+                    self.loaded_comments
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(idx, c)| description_comment_to_inline(c, idx, now))
+                        .filter(|ic| severity_filter.is_none_or(|filter| ic.severity == filter))
+                        .collect()
+                } else {
+                    let diff_file_idx = view_idx - 1;
+                    let file_path = self
+                        .details
+                        .diff
+                        .files
+                        .get(diff_file_idx)
+                        .map(|f| f.display_path().to_owned());
+                    self.loaded_comments
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(idx, c)| comment_to_inline(c, idx, file_path.as_deref(), now))
+                        .filter(|ic| severity_filter.is_none_or(|filter| ic.severity == filter))
+                        .collect()
+                };
                 base_view.clone().with_inline_comments(&inline)
             })
             .collect();
@@ -629,7 +646,7 @@ impl App {
 
         let details = jj::show(&change_id)?;
 
-        self.rendered_per_file = details.diff.files.iter().map(DiffView::from_file).collect();
+        self.rendered_per_file = build_rendered_views(&details);
         self.annotated_per_file = self.rendered_per_file.clone();
         self.details = details;
         self.file_index = 0;
@@ -978,7 +995,8 @@ fn render_rendered_line(line: &RenderedLine, focused: bool, width: u16) -> TuiLi
         | RenderedLineKind::Context
         | RenderedLineKind::Notice
         | RenderedLineKind::Added
-        | RenderedLineKind::Removed => {}
+        | RenderedLineKind::Removed
+        | RenderedLineKind::DescriptionLine => {}
     }
 
     let prefix = match line.kind {
@@ -987,7 +1005,8 @@ fn render_rendered_line(line: &RenderedLine, focused: bool, width: u16) -> TuiLi
         RenderedLineKind::HunkHeader
         | RenderedLineKind::HunkSeparator
         | RenderedLineKind::Context
-        | RenderedLineKind::Notice => "  ",
+        | RenderedLineKind::Notice
+        | RenderedLineKind::DescriptionLine => "  ",
         RenderedLineKind::InlineCommentMeta { .. } | RenderedLineKind::InlineCommentBody => {
             unreachable!("inline comment kinds returned above")
         }
@@ -999,7 +1018,8 @@ fn render_rendered_line(line: &RenderedLine, focused: bool, width: u16) -> TuiLi
         RenderedLineKind::HunkHeader
         | RenderedLineKind::HunkSeparator
         | RenderedLineKind::Context
-        | RenderedLineKind::Notice => Style::default(),
+        | RenderedLineKind::Notice
+        | RenderedLineKind::DescriptionLine => Style::default(),
         RenderedLineKind::InlineCommentMeta { .. } | RenderedLineKind::InlineCommentBody => {
             unreachable!("inline comment kinds returned above")
         }
@@ -1306,8 +1326,10 @@ fn view_in_source(app: &mut App) {
         return;
     };
 
+    // file_index 0 is the description view; diff files start at view index 1.
+    let view_idx = fidx + 1;
     app.screen = Screen::Main;
-    app.file_index = fidx;
+    app.file_index = view_idx;
     app.scroll = 0;
 
     let line_num = match location.side {
@@ -1316,7 +1338,7 @@ fn view_in_source(app: &mut App) {
     };
 
     if let Some(target_line_num) = line_num {
-        let view = &app.annotated_per_file[fidx];
+        let view = &app.annotated_per_file[view_idx];
         let pos = view.lines.iter().position(|l| match location.side {
             Side::Old => l.source_line == Some(target_line_num),
             Side::New => l.target_line == Some(target_line_num),
@@ -1356,7 +1378,8 @@ fn enter_reanchor_mode(app: &mut App) {
 
     match file_idx {
         Some(fidx) => {
-            app.file_index = fidx;
+            // file_index 0 is the description view; diff files start at 1.
+            app.file_index = fidx + 1;
             app.line_index = 0;
             app.scroll = 0;
         }
@@ -1557,8 +1580,7 @@ fn invoke_claude_from_tui(app: &mut App) -> Result<()> {
     match outcome? {
         crate::claude::ClaudeOutcome::Success => match jj::show(&change_id) {
             Ok(details) => {
-                app.rendered_per_file =
-                    details.diff.files.iter().map(DiffView::from_file).collect();
+                app.rendered_per_file = build_rendered_views(&details);
                 app.annotated_per_file = app.rendered_per_file.clone();
                 app.details = details;
                 app.file_index = 0;
@@ -1735,7 +1757,9 @@ fn overview_open_composer(app: &mut App, rows: &[overview_screen::OverviewRow], 
 fn open_composer_with_scope(app: &mut App, scope: ComposerScope, target_change_id: ChangeId) {
     let line_target = match build_line_target(app) {
         BuildTargetResult::Ready(t) => t,
-        BuildTargetResult::NonCommentable | BuildTargetResult::NoView => {
+        BuildTargetResult::DescriptionLine { .. }
+        | BuildTargetResult::NonCommentable
+        | BuildTargetResult::NoView => {
             // Scope may be Stack or Change — a synthetic line target is fine here.
             let Some(file) = app.details.diff.files.first() else {
                 app.status_message = Some("no diff to anchor comment to".to_owned());
@@ -1792,21 +1816,22 @@ fn open_overview_change_comment_editor(app: &mut App, change_idx: usize, comment
     open_meta_comment_editor(app, &comment);
 }
 
-/// Open the composer in edit mode for a non-line comment (change or stack
-/// scope). The full source `Comment` is captured into `Composer.original` so
-/// save/delete route through the original anchor — required for stack-scoped
-/// comments and for change-scoped comments on changes other than the one
-/// loaded in the main view.
+/// Open the composer in edit mode for an existing comment. Routes the
+/// `Anchor` variant to the matching `ComposerScope` and populates the
+/// corresponding context snapshot.
 fn open_meta_comment_editor(app: &mut App, comment: &Comment) {
     let scope = match &comment.anchor {
         Anchor::Change { .. } => ComposerScope::Change,
         Anchor::Stack { .. } => ComposerScope::Stack,
-        Anchor::Line { .. } | Anchor::Description { .. } => ComposerScope::Line,
+        Anchor::Description { .. } => ComposerScope::Description,
+        Anchor::Line { .. } => ComposerScope::Line,
     };
 
     let line_target = match build_line_target(app) {
         BuildTargetResult::Ready(t) => t,
-        BuildTargetResult::NonCommentable | BuildTargetResult::NoView => {
+        BuildTargetResult::DescriptionLine { .. }
+        | BuildTargetResult::NonCommentable
+        | BuildTargetResult::NoView => {
             let Some(file) = app.details.diff.files.first() else {
                 app.status_message = Some("no diff to anchor comment to".to_owned());
                 return;
@@ -1834,7 +1859,23 @@ fn open_meta_comment_editor(app: &mut App, comment: &Comment) {
         | Anchor::Description { change_id, .. } => change_id.clone(),
         Anchor::Stack { .. } => app.details.change_id.clone(),
     };
-    let contexts = composer_contexts_for_change(app, line_target, target_change_id);
+    let mut contexts = composer_contexts_for_change(app, line_target, target_change_id);
+    // For description-scoped edits, populate the description snapshot from the
+    // saved anchor so the composer chrome shows the description context block
+    // and the save path can rebuild a `DescriptionAnchor`.
+    if let Anchor::Description {
+        change_id: anchor_change_id,
+        location,
+    } = &comment.anchor
+    {
+        contexts.description = Some(DescriptionContext {
+            change_id: anchor_change_id.clone(),
+            target_line: location.display_line,
+            target_text: location.target_text.clone(),
+            context_before: location.context_before.clone(),
+            context_after: location.context_after.clone(),
+        });
+    }
     let edited = EditedComment {
         contexts,
         severity: comment.severity,
@@ -2076,7 +2117,34 @@ fn handle_composer_event(app: &mut App, key: KeyEvent) {
                 app.screen = Screen::Composer(composer);
             }
         },
+        ComposerAction::RefusedScopeChord(scope) => {
+            app.status_message = Some(refused_scope_chord_status(scope).to_owned());
+            app.screen = Screen::Composer(composer);
+        }
     }
+}
+
+fn refused_scope_chord_status(scope: composer::RefusableScope) -> &'static str {
+    match scope {
+        composer::RefusableScope::Description => composer::STATUS_DESCRIPTION_UNAVAILABLE,
+        composer::RefusableScope::Stack => composer::STATUS_STACK_UNAVAILABLE,
+    }
+}
+
+// -- T-G3-byte: pin the refusal-status strings byte-for-byte. Comparing
+//   against the const by name passes when the const itself has a typo;
+//   string literals catch that.
+#[cfg(test)]
+#[test]
+fn refused_scope_chord_status_returns_expected_strings_per_scope() {
+    assert_eq!(
+        refused_scope_chord_status(composer::RefusableScope::Stack),
+        "stack scope unavailable in single-change mode"
+    );
+    assert_eq!(
+        refused_scope_chord_status(composer::RefusableScope::Description),
+        "description scope unavailable: open from a description line"
+    );
 }
 
 #[derive(Debug)]
@@ -2120,7 +2188,46 @@ fn composer_contexts_for_change(
         line,
         change,
         stack,
+        description: None,
     }
+}
+
+/// On-disk anchor stores the full window (`CONTEXT_MAX` each side); the
+/// chrome-time render is responsible for re-capping if needed.
+fn build_description_context(app: &App, target_line: Option<u32>) -> DescriptionContext {
+    let (context_before, context_after) = app
+        .current_view()
+        .map(|v| collect_description_context(&v.lines, app.line_index))
+        .unwrap_or_default();
+    let target_text = app
+        .current_view()
+        .and_then(|v| v.lines.get(app.line_index))
+        .map(|l| l.text.clone())
+        .unwrap_or_default();
+    DescriptionContext {
+        change_id: app.details.change_id.clone(),
+        target_line,
+        target_text,
+        context_before,
+        context_after,
+    }
+}
+
+/// Build composer contexts for a description-line composer. The `line` field
+/// carries a synthetic `LineTarget` so code paths that always read it don't
+/// need special-casing.
+fn composer_contexts_for_description(app: &App) -> ComposerContexts {
+    let synthetic_line = LineTarget {
+        file: PathBuf::new(),
+        rendered_index: app.line_index,
+        source_line: None,
+        target_line: None,
+        target_text: String::new(),
+        hunk_header: String::new(),
+        context_before: Vec::new(),
+        context_after: Vec::new(),
+    };
+    composer_contexts(app, synthetic_line)
 }
 
 fn open_composer(app: &mut App) {
@@ -2142,6 +2249,15 @@ fn open_composer(app: &mut App) {
                 let severity = default_severity(app.last_severity);
                 app.screen = Screen::Composer(Box::new(Composer::new(contexts, severity)));
             }
+        }
+        BuildTargetResult::DescriptionLine { target_line } => {
+            let desc_ctx = build_description_context(app, target_line);
+            let mut contexts = composer_contexts_for_description(app);
+            contexts.description = Some(desc_ctx);
+            let severity = default_severity(app.last_severity);
+            let mut composer = Composer::new(contexts, severity);
+            composer.scope = ComposerScope::Description;
+            app.screen = Screen::Composer(Box::new(composer));
         }
         BuildTargetResult::NonCommentable => {
             app.status_message = Some("cannot comment on this line".to_owned());
@@ -2216,6 +2332,10 @@ fn delete_focused_comment(app: &mut App) {
 
 enum BuildTargetResult {
     Ready(LineTarget),
+    /// Cursor is on a description line; use description scope.
+    DescriptionLine {
+        target_line: Option<u32>,
+    },
     /// Cursor is on a `HunkHeader`, `HunkSeparator`, `Notice`, or inline comment line.
     NonCommentable,
     /// No file is open in the current view.
@@ -2232,6 +2352,11 @@ fn build_line_target(app: &App) -> BuildTargetResult {
 
     match line.kind {
         RenderedLineKind::Added | RenderedLineKind::Removed | RenderedLineKind::Context => {}
+        RenderedLineKind::DescriptionLine => {
+            return BuildTargetResult::DescriptionLine {
+                target_line: line.target_line,
+            };
+        }
         RenderedLineKind::HunkHeader
         | RenderedLineKind::HunkSeparator
         | RenderedLineKind::Notice
@@ -2239,7 +2364,20 @@ fn build_line_target(app: &App) -> BuildTargetResult {
         | RenderedLineKind::InlineCommentBody => return BuildTargetResult::NonCommentable,
     }
 
-    let Some(file) = app.details.diff.files.get(app.file_index) else {
+    // file_index 0 is the description view; diff files start at index 1. The
+    // DescriptionLine match arm above returns early, so by here the cursor is
+    // on a diff line and `file_index >= 1` is invariant — make it load-bearing
+    // by panicking explicitly if a future change leaks a non-Description line
+    // into view 0 (vs. silently sliding `0` through saturating_sub).
+    #[expect(
+        clippy::expect_used,
+        reason = "load-bearing invariant: DescriptionLine arm above returns early, so file_index >= 1 here"
+    )]
+    let diff_file_idx = app
+        .file_index
+        .checked_sub(1)
+        .expect("file_index 0 is description view; reached only after DescriptionLine return");
+    let Some(file) = app.details.diff.files.get(diff_file_idx) else {
         return BuildTargetResult::NoView;
     };
     let file = file.display_path().to_owned();
@@ -2267,7 +2405,19 @@ fn collect_context(lines: &[RenderedLine], idx: usize) -> (Vec<String>, Vec<Stri
             RenderedLineKind::Added | RenderedLineKind::Removed | RenderedLineKind::Context
         )
     };
+    collect_context_with(lines, idx, is_content)
+}
 
+fn collect_description_context(lines: &[RenderedLine], idx: usize) -> (Vec<String>, Vec<String>) {
+    let is_content = |k: RenderedLineKind| matches!(k, RenderedLineKind::DescriptionLine);
+    collect_context_with(lines, idx, is_content)
+}
+
+fn collect_context_with(
+    lines: &[RenderedLine],
+    idx: usize,
+    is_content: impl Fn(RenderedLineKind) -> bool,
+) -> (Vec<String>, Vec<String>) {
     let before: Vec<String> = lines[..idx]
         .iter()
         .rev()
@@ -2383,6 +2533,22 @@ fn build_comment_from_composer(
                     SaveOutcome::Refused("stack-scope requires --stack mode — not saved".to_owned())
                 })?;
             Anchor::Stack { revset_hash }
+        }
+        ComposerScope::Description => {
+            let desc_ctx = composer.contexts.description.as_ref().ok_or_else(|| {
+                SaveOutcome::Refused("description-scope context missing — not saved".to_owned())
+            })?;
+            let location = DescriptionAnchor {
+                display_line: desc_ctx.target_line,
+                target_text: desc_ctx.target_text.clone(),
+                context_before: desc_ctx.context_before.clone(),
+                context_after: desc_ctx.context_after.clone(),
+            }
+            .normalized();
+            Anchor::Description {
+                change_id: desc_ctx.change_id.clone(),
+                location,
+            }
         }
     };
 
@@ -2539,6 +2705,17 @@ fn pick_side(source_line: Option<u32>, target_line: Option<u32>) -> Side {
     }
 }
 
+/// Build the full `rendered_per_file` list for a `ChangeDetails`.
+///
+/// Index 0 is always the synthetic description view; indices 1.. are the diff
+/// files in their natural order.
+fn build_rendered_views(details: &ChangeDetails) -> Vec<DiffView> {
+    let mut views = Vec::with_capacity(details.diff.files.len() + 1);
+    views.push(DiffView::from_description(&details.description));
+    views.extend(details.diff.files.iter().map(DiffView::from_file));
+    views
+}
+
 fn open_file_picker(app: &mut App) {
     let entries = build_file_picker_entries(&app.details.diff.files, &app.loaded_comments);
     app.screen = Screen::FilePicker(FilePickerState {
@@ -2581,13 +2758,16 @@ fn file_picker_enter(app: &mut App) {
     let Some(entry) = state.entries.get(state.selected_index) else {
         return;
     };
-    let diff_file_index = entry.diff_file_index;
-    let is_binary = matches!(
-        app.details.diff.files.get(diff_file_index),
-        Some(crate::diff::DiffFile::Binary { .. })
-    );
+    let view_index = entry.view_index;
+    // view_index 0 is the description view; diff files start at 1.
+    let diff_file_index = view_index.saturating_sub(1);
+    let is_binary = view_index > 0
+        && matches!(
+            app.details.diff.files.get(diff_file_index),
+            Some(crate::diff::DiffFile::Binary { .. })
+        );
     app.screen = Screen::Main;
-    app.file_index = diff_file_index;
+    app.file_index = view_index;
     app.scroll = 0;
     if is_binary {
         app.status_message = Some("binary file — no commentable lines".to_owned());
@@ -2596,12 +2776,15 @@ fn file_picker_enter(app: &mut App) {
     }
     let first_commentable = app
         .annotated_per_file
-        .get(diff_file_index)
+        .get(view_index)
         .and_then(|v| {
             v.lines.iter().position(|l| {
                 matches!(
                     l.kind,
-                    RenderedLineKind::Added | RenderedLineKind::Removed | RenderedLineKind::Context
+                    RenderedLineKind::Added
+                        | RenderedLineKind::Removed
+                        | RenderedLineKind::Context
+                        | RenderedLineKind::DescriptionLine
                 )
             })
         })
@@ -2613,7 +2796,7 @@ fn refresh_current_change(app: &mut App) {
     let change_id = app.details.change_id.clone();
     match jj::show(&change_id) {
         Ok(details) => {
-            app.rendered_per_file = details.diff.files.iter().map(DiffView::from_file).collect();
+            app.rendered_per_file = build_rendered_views(&details);
             app.annotated_per_file = app.rendered_per_file.clone();
             app.details = details;
             app.overview_cache = None;
@@ -2867,13 +3050,17 @@ mod tests {
             description: String::new(),
             diff: Diff { files: vec![file] },
         };
-        App::new(
+        let mut app = App::new(
             details,
             PathBuf::from("/repo"),
             "@".to_owned(),
             None,
             TransitionMode::Never,
-        )
+        );
+        // Start on the first diff file (view_index 1). Description view is
+        // at index 0 but most tests target diff-file content.
+        app.file_index = 1;
+        app
     }
 
     fn sample_diff_file() -> DiffFile {
@@ -2925,10 +3112,11 @@ mod tests {
 
         for kind in kinds {
             let mut app = make_app_with_single_file(sample_diff_file());
-            // Replace the annotated view's first line with one of `kind` so the
+            // Replace the diff file view's first line with one of `kind` so the
             // cursor lands on it. This bypasses normal rendering — fine for a
             // build_line_target test which only reads `current_view().lines[idx]`.
-            let first_line = app.annotated_per_file[0]
+            // annotated_per_file[1] is the diff file; [0] is the description view.
+            let first_line = app.annotated_per_file[1]
                 .lines
                 .get_mut(0)
                 .expect("sample diff has at least one line");
@@ -2952,7 +3140,9 @@ mod tests {
                 assert_eq!(target.source_line, None);
                 assert_eq!(target.target_text, "added");
             }
-            BuildTargetResult::NonCommentable | BuildTargetResult::NoView => {
+            BuildTargetResult::NonCommentable
+            | BuildTargetResult::NoView
+            | BuildTargetResult::DescriptionLine { .. } => {
                 panic!("expected Ready");
             }
         }
@@ -2969,7 +3159,9 @@ mod tests {
                 // pick_side on a context line picks New.
                 assert_eq!(pick_side(target.source_line, target.target_line), Side::New);
             }
-            BuildTargetResult::NonCommentable | BuildTargetResult::NoView => {
+            BuildTargetResult::NonCommentable
+            | BuildTargetResult::NoView
+            | BuildTargetResult::DescriptionLine { .. } => {
                 panic!("expected Ready");
             }
         }
@@ -2985,7 +3177,9 @@ mod tests {
                 assert_eq!(target.target_line, None);
                 assert_eq!(pick_side(target.source_line, target.target_line), Side::Old);
             }
-            BuildTargetResult::NonCommentable | BuildTargetResult::NoView => {
+            BuildTargetResult::NonCommentable
+            | BuildTargetResult::NoView
+            | BuildTargetResult::DescriptionLine { .. } => {
                 panic!("expected Ready");
             }
         }
@@ -2999,6 +3193,7 @@ mod tests {
                 description: "test change".to_owned(),
             },
             stack: None,
+            description: None,
         }
     }
 
@@ -3660,6 +3855,7 @@ mod tests {
                 | RenderedLineKind::Added
                 | RenderedLineKind::Removed
                 | RenderedLineKind::Notice
+                | RenderedLineKind::DescriptionLine
                 | RenderedLineKind::InlineCommentBody => false,
             })
             .map(|(i, _)| i)
@@ -4090,14 +4286,15 @@ mod tests {
             label.contains("foo.txt"),
             "label should include file path, got: {label:?}"
         );
+        // 2 total views: description (0) + diff file (1); file_index=1 → "2 of 2"
         assert!(
-            label.contains("1 of 1"),
+            label.contains("2 of 2"),
             "label should show position of total, got: {label:?}"
         );
     }
 
     #[test]
-    fn file_header_label_no_files_shows_placeholder() {
+    fn file_header_label_no_diff_files_shows_description_view() {
         use crate::diff::Diff;
         let details = ChangeDetails {
             change_id: ChangeId::parse(&"a".repeat(32)).unwrap(),
@@ -4114,8 +4311,8 @@ mod tests {
         );
         let label = file_header_label(&app);
         assert!(
-            label.contains("(no files)"),
-            "empty diff should show placeholder, got: {label:?}"
+            label.contains("<description>"),
+            "no-diff-files app should show description view label, got: {label:?}"
         );
     }
 
@@ -4389,7 +4586,8 @@ mod tests {
             matches!(app.screen, Screen::Main),
             "Enter should switch to Screen::Main"
         );
-        assert_eq!(app.file_index, 0);
+        // view_index 1 is the first diff file (description view is at 0)
+        assert_eq!(app.file_index, 1);
     }
 
     #[test]
@@ -4585,7 +4783,8 @@ mod tests {
         handle_stale_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
         assert!(matches!(app.screen, Screen::Main));
-        assert_eq!(app.file_index, 0);
+        // view_index 1 is the first diff file (description view is at 0)
+        assert_eq!(app.file_index, 1);
         assert_eq!(
             app.line_index, 0,
             "absent anchor line should fall back to line_index 0"
@@ -4847,6 +5046,54 @@ mod tests {
         assert_eq!(loaded_b[0].body, "B-edited");
         assert_eq!(loaded_b[0].severity, Severity::Suggestion);
         assert_eq!(loaded_b[0].created_at, original.created_at);
+    }
+
+    // -- B2: editing a Description-anchored comment via `open_meta_comment_editor`
+    //   must open the composer in `Description` scope (not Line) and populate
+    //   `composer.contexts.description` from the saved anchor's window.
+    #[test]
+    fn open_meta_comment_editor_description_scope_populates_description_context() {
+        use crate::comment::DescriptionAnchor;
+        let mut app = make_app_with_single_file(sample_diff_file());
+        let original = Comment {
+            schema_version: SchemaVersion,
+            anchor: Anchor::Description {
+                change_id: app.details.change_id.clone(),
+                location: DescriptionAnchor {
+                    display_line: Some(2),
+                    target_text: "second line".to_owned(),
+                    context_before: vec!["first line".to_owned()],
+                    context_after: vec!["third line".to_owned()],
+                },
+            },
+            repo_root: app.repo_root.clone(),
+            revset: app.revset.clone(),
+            commit_id: None,
+            body: "review the wording here".to_owned(),
+            severity: Severity::Suggestion,
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
+            updated_at: None,
+            status: Some(Status::Pending),
+            mismatch_reason: None,
+        };
+
+        open_meta_comment_editor(&mut app, &original);
+
+        let Screen::Composer(ref composer) = app.screen else {
+            panic!("expected composer screen");
+        };
+        assert_eq!(composer.scope, ComposerScope::Description);
+        let desc_ctx = composer
+            .contexts
+            .description
+            .as_ref()
+            .expect("description context must be populated");
+        assert_eq!(desc_ctx.target_line, Some(2));
+        assert_eq!(desc_ctx.target_text, "second line");
+        assert_eq!(desc_ctx.context_before, vec!["first line".to_owned()]);
+        assert_eq!(desc_ctx.context_after, vec!["third line".to_owned()]);
+        assert_eq!(composer.severity, Severity::Suggestion);
+        assert_eq!(composer.body_text(), "review the wording here");
     }
 
     #[test]
@@ -5306,12 +5553,17 @@ mod tests {
             TransitionMode::Never,
         );
         open_file_picker(&mut app);
+        // Entry 0 is description; binary file is at entry 1.
+        if let Screen::FilePicker(ref mut s) = app.screen {
+            file_picker::move_cursor(s, 1);
+        }
         handle_file_picker_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(
             matches!(app.screen, Screen::Main),
             "Enter should return to Main"
         );
-        assert_eq!(app.file_index, 0);
+        // view_index 1 is the binary file entry
+        assert_eq!(app.file_index, 1);
         assert_eq!(app.line_index, 0);
         let msg = app
             .status_message
@@ -5369,13 +5621,13 @@ mod tests {
     }
 
     #[test]
-    fn file_picker_enter_on_empty_diff_is_noop() {
+    fn file_picker_enter_description_entry_navigates_to_description_view() {
         let id = ChangeId::parse(&"a".repeat(32)).unwrap();
         let commit_id = CommitId::parse(&"a".repeat(40)).unwrap();
         let details = ChangeDetails {
             change_id: id,
             commit_id,
-            description: String::new(),
+            description: "first line\nsecond line".to_owned(),
             diff: Diff { files: vec![] },
         };
         let mut app = App::new(
@@ -5386,12 +5638,18 @@ mod tests {
             TransitionMode::Never,
         );
         open_file_picker(&mut app);
-        // Empty entry list — Enter should leave the screen as FilePicker
-        // (early return in file_picker_enter when entries are empty).
+        // Entry 0 is always the description view.
         handle_file_picker_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(
-            matches!(app.screen, Screen::FilePicker(_)),
-            "Enter on empty entry list should be a no-op (still on FilePicker)"
+            matches!(app.screen, Screen::Main),
+            "Enter should navigate to Main"
+        );
+        assert_eq!(app.file_index, 0, "file_index 0 is the description view");
+        // Description lines are commentable, so cursor lands on the first one.
+        let cursor_kind = app.current_view().unwrap().lines[app.line_index].kind;
+        assert!(
+            matches!(cursor_kind, RenderedLineKind::DescriptionLine),
+            "cursor must land on a description line; got {cursor_kind:?}"
         );
     }
 
@@ -5399,9 +5657,14 @@ mod tests {
     fn file_picker_enter_single_file_navigates_to_first_commentable_line() {
         let mut app = make_app_with_single_file(sample_diff_file());
         open_file_picker(&mut app);
+        // Entry 0 is description (empty); navigate to entry 1 (the diff file).
+        if let Screen::FilePicker(ref mut s) = app.screen {
+            file_picker::move_cursor(s, 1);
+        }
         handle_file_picker_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(app.screen, Screen::Main));
-        assert_eq!(app.file_index, 0);
+        // view_index 1 is the first diff file
+        assert_eq!(app.file_index, 1);
         // First commentable line is the Context at index 1 (HunkHeader is at 0).
         let cursor_kind = app.current_view().unwrap().lines[app.line_index].kind;
         assert!(

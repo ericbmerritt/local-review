@@ -49,6 +49,10 @@ pub(crate) enum RenderedLineKind {
     },
     /// Continuation line for a multi-line inline comment body.
     InlineCommentBody,
+    /// A line from the change description, rendered in the synthetic description
+    /// view prepended to the diff files list. `target_line` holds the 1-based
+    /// line number within the description; `source_line` is always `None`.
+    DescriptionLine,
 }
 
 /// A resolved inline comment ready to be injected below its target diff line.
@@ -104,11 +108,72 @@ pub(crate) fn comment_to_inline(
     })
 }
 
+/// `source_line` is always `None`; the description view has no old side.
+pub(crate) fn description_comment_to_inline(
+    comment: &Comment,
+    comment_index: usize,
+    now: time::OffsetDateTime,
+) -> Option<InlineComment> {
+    if matches!(comment.status, Some(Status::Stale | Status::Orphaned)) {
+        return None;
+    }
+    let Anchor::Description { location, .. } = &comment.anchor else {
+        return None;
+    };
+
+    let age = format_age(now, comment.created_at);
+    let body_lines = comment.body.lines().map(str::to_owned).collect();
+
+    Some(InlineComment {
+        source_line: None,
+        target_line: location.display_line,
+        severity: comment.severity,
+        age,
+        body_lines,
+        comment_index,
+    })
+}
+
 impl DiffView {
     pub(crate) fn from_file(file: &DiffFile) -> Self {
         let title = render_title(file);
         let lines = render_lines(file);
         Self { title, lines }
+    }
+
+    /// Build the synthetic description view that always sits at view index 0,
+    /// alongside the diff files. Empty / whitespace-only descriptions yield a
+    /// single `Notice` placeholder row so the pane is never blank.
+    pub(crate) fn from_description(description: &str) -> Self {
+        if description.trim().is_empty() {
+            return Self {
+                title: "<description>".to_owned(),
+                lines: vec![RenderedLine {
+                    kind: RenderedLineKind::Notice,
+                    text: "(no description)".to_owned(),
+                    source_line: None,
+                    target_line: None,
+                    hunk_header: None,
+                    comment_severity: None,
+                }],
+            };
+        }
+        let lines = description
+            .lines()
+            .enumerate()
+            .map(|(idx, text)| RenderedLine {
+                kind: RenderedLineKind::DescriptionLine,
+                text: text.to_owned(),
+                source_line: None,
+                target_line: Some(u32::try_from(idx + 1).unwrap_or(u32::MAX)),
+                hunk_header: None,
+                comment_severity: None,
+            })
+            .collect();
+        Self {
+            title: "<description>".to_owned(),
+            lines,
+        }
     }
 
     /// Return a new `DiffView` with `InlineComment` annotation lines injected
@@ -581,6 +646,7 @@ mod tests {
             | RenderedLineKind::Added
             | RenderedLineKind::Removed
             | RenderedLineKind::Notice
+            | RenderedLineKind::DescriptionLine
             | RenderedLineKind::InlineCommentBody => {
                 panic!("expected InlineCommentMeta")
             }
@@ -611,5 +677,194 @@ mod tests {
         let now = time::OffsetDateTime::UNIX_EPOCH;
         let inline = comment_to_inline(&comment, 0, Some(std::path::Path::new("foo.txt")), now);
         assert!(inline.is_none(), "orphaned comments must not render inline");
+    }
+
+    fn make_description_comment(display_line: Option<u32>, severity: Severity) -> Comment {
+        use crate::comment::DescriptionAnchor;
+        Comment {
+            schema_version: SchemaVersion,
+            anchor: Anchor::Description {
+                change_id: crate::change_id::ChangeId::parse(&"a".repeat(32)).unwrap(),
+                location: DescriptionAnchor {
+                    display_line,
+                    target_text: "summary line".to_owned(),
+                    context_before: vec![],
+                    context_after: vec![],
+                },
+            },
+            repo_root: PathBuf::from("/repo"),
+            revset: "@".to_owned(),
+            commit_id: None,
+            body: "description note".to_owned(),
+            severity,
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
+            updated_at: None,
+            status: Some(Status::Pending),
+            mismatch_reason: None,
+        }
+    }
+
+    // -- B1: a description-anchored comment becomes an `InlineComment`
+    //   targeting the saved `display_line`. Pins the parallel-path conversion
+    //   that the description view 0 needs.
+    #[test]
+    fn description_comment_to_inline_uses_display_line_as_target() {
+        let comment = make_description_comment(Some(2), Severity::Required);
+        let now = time::OffsetDateTime::UNIX_EPOCH;
+        let inline = description_comment_to_inline(&comment, 7, now)
+            .expect("description anchor should yield Some");
+        assert_eq!(inline.target_line, Some(2));
+        assert_eq!(inline.source_line, None);
+        assert_eq!(inline.severity, Severity::Required);
+        assert_eq!(inline.comment_index, 7);
+        assert_eq!(inline.body_lines, vec!["description note".to_owned()]);
+    }
+
+    // -- B1: a line-anchored comment must not slip through the description
+    //   conversion path. Defends the symmetric bug where the wrong path
+    //   accepts the wrong anchor kind.
+    #[test]
+    fn description_comment_to_inline_returns_none_for_line_anchor() {
+        let comment = make_line_comment("foo.txt", Severity::Note);
+        let now = time::OffsetDateTime::UNIX_EPOCH;
+        let inline = description_comment_to_inline(&comment, 0, now);
+        assert!(
+            inline.is_none(),
+            "line anchor must not match description path"
+        );
+    }
+
+    // -- B1: a description-anchored comment must not slip through the
+    //   line-comment conversion path; otherwise it would be injected into
+    //   the wrong (diff-file) view.
+    #[test]
+    fn comment_to_inline_returns_none_for_description_anchor() {
+        let comment = make_description_comment(Some(1), Severity::Note);
+        let now = time::OffsetDateTime::UNIX_EPOCH;
+        let inline = comment_to_inline(&comment, 0, Some(std::path::Path::new("foo.txt")), now);
+        assert!(
+            inline.is_none(),
+            "description anchor must not be rendered as line comment"
+        );
+    }
+
+    // -- B1: a description comment injects an inline at the matching
+    //   description-view line (built via `from_description`) and does NOT
+    //   appear when injecting against a diff-file view.
+    #[test]
+    fn description_comment_injects_into_description_view_at_display_line() {
+        let view = DiffView::from_description("first line\nsecond line\nthird line");
+        let inline = description_comment_to_inline(
+            &make_description_comment(Some(2), Severity::Suggestion),
+            0,
+            time::OffsetDateTime::UNIX_EPOCH,
+        )
+        .expect("description anchor yields Some");
+        let augmented = view.with_inline_comments(&[inline]);
+        // 3 description lines + meta + 1 body line under line 2.
+        assert_eq!(augmented.lines.len(), 5);
+        assert_eq!(augmented.lines[0].kind, RenderedLineKind::DescriptionLine);
+        assert_eq!(augmented.lines[1].kind, RenderedLineKind::DescriptionLine);
+        assert!(matches!(
+            augmented.lines[2].kind,
+            RenderedLineKind::InlineCommentMeta { .. }
+        ));
+        assert_eq!(augmented.lines[3].kind, RenderedLineKind::InlineCommentBody);
+        assert_eq!(augmented.lines[4].kind, RenderedLineKind::DescriptionLine);
+    }
+
+    #[test]
+    fn description_comment_does_not_inject_into_diff_file_view() {
+        let view = DiffView::from_file(&sample_modified());
+        let original_len = view.lines.len();
+        // Build the diff-file inline list using `comment_to_inline` (which
+        // refuses description anchors); confirm the augmented view is unchanged.
+        let comment = make_description_comment(Some(2), Severity::Note);
+        let now = time::OffsetDateTime::UNIX_EPOCH;
+        let inline_opt = comment_to_inline(&comment, 0, Some(std::path::Path::new("foo.txt")), now);
+        let inlines: Vec<_> = inline_opt.into_iter().collect();
+        let augmented = view.with_inline_comments(&inlines);
+        assert_eq!(augmented.lines.len(), original_len);
+    }
+
+    // -- T1: stale and orphaned description-anchored comments must not render
+    //   inline. Mirrors the line-anchored guard.
+    #[test]
+    fn description_comment_to_inline_returns_none_for_stale_or_orphaned() {
+        let now = time::OffsetDateTime::UNIX_EPOCH;
+        let mut stale = make_description_comment(Some(1), Severity::Note);
+        stale.status = Some(Status::Stale);
+        assert!(
+            description_comment_to_inline(&stale, 0, now).is_none(),
+            "stale description comment must not render inline"
+        );
+
+        let mut orphaned = make_description_comment(Some(1), Severity::Required);
+        orphaned.status = Some(Status::Orphaned);
+        assert!(
+            description_comment_to_inline(&orphaned, 0, now).is_none(),
+            "orphaned description comment must not render inline"
+        );
+    }
+
+    // -- U4: empty / whitespace-only descriptions render a Notice placeholder
+    //   so the description pane is never silently blank.
+    #[test]
+    fn from_description_empty_input_renders_no_description_placeholder() {
+        let view = DiffView::from_description("");
+        assert_eq!(view.title, "<description>");
+        assert_eq!(view.lines.len(), 1);
+        assert_eq!(view.lines[0].kind, RenderedLineKind::Notice);
+        assert_eq!(view.lines[0].text, "(no description)");
+
+        let view_ws = DiffView::from_description("   \n\t\n");
+        assert_eq!(view_ws.lines.len(), 1);
+        assert_eq!(view_ws.lines[0].kind, RenderedLineKind::Notice);
+    }
+
+    // -- T-G5: display_line=0 boundary. `from_description` emits 1-based
+    //   target_line numbers, so an inline with `target_line: Some(0)` will
+    //   not match any rendered DescriptionLine — the comment is silently
+    //   dropped from the rendered view. Pin the current behavior so a
+    //   future change is intentional.
+    #[test]
+    fn description_comment_with_display_line_zero_does_not_inject_anywhere() {
+        let comment = make_description_comment(Some(0), Severity::Note);
+        let now = time::OffsetDateTime::UNIX_EPOCH;
+        let inline = description_comment_to_inline(&comment, 0, now)
+            .expect("conversion succeeds — display_line=0 is a valid Option<u32>");
+        assert_eq!(inline.target_line, Some(0));
+
+        let view = DiffView::from_description("hello\nworld");
+        // Description lines are 1-based (1, 2). target_line=0 matches none.
+        let original_len = view.lines.len();
+        let augmented = view.with_inline_comments(&[inline]);
+        assert_eq!(
+            augmented.lines.len(),
+            original_len,
+            "display_line=0 must not inject anywhere — pinning silent-drop"
+        );
+    }
+
+    // -- T-G5-none: display_line=None (re-anchored stale that lost its line).
+    //   `with_inline_comments` matches only `Some(line_num)`, so a
+    //   `target_line: None` inline is silently dropped from the rendered view.
+    //   Pin the boundary so a future change is intentional.
+    #[test]
+    fn description_comment_with_display_line_none_does_not_inject_anywhere() {
+        let comment = make_description_comment(None, Severity::Note);
+        let now = time::OffsetDateTime::UNIX_EPOCH;
+        let inline = description_comment_to_inline(&comment, 0, now)
+            .expect("conversion succeeds for None display_line");
+        assert_eq!(inline.target_line, None);
+
+        let view = DiffView::from_description("hello\nworld");
+        let original_len = view.lines.len();
+        let augmented = view.with_inline_comments(&[inline]);
+        assert_eq!(
+            augmented.lines.len(),
+            original_len,
+            "display_line=None must not inject anywhere — pinning silent-drop"
+        );
     }
 }

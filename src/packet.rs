@@ -26,6 +26,8 @@ pub struct ChangePacket {
     pub description: String,
     /// Change-scoped comments in created-at order.
     pub change_comments: Vec<Comment>,
+    /// Description-scoped comments in created-at order.
+    pub description_comments: Vec<Comment>,
     /// Line-scoped comments in file-then-line order.
     pub line_comments: Vec<Comment>,
     /// Diff for the change. `None` when there are no line comments.
@@ -53,7 +55,7 @@ pub fn build_packet(
         let raw = store::load_change_comments(repo_root, &entry.change_id)?;
         let filtered = filter_comments(raw, include_stale);
 
-        let (change_comments, line_comments) = partition_by_scope(filtered);
+        let (change_comments, line_comments, description_comments) = partition_by_scope(filtered);
 
         let diff = if line_comments.is_empty() {
             None
@@ -63,12 +65,16 @@ pub fn build_packet(
 
         let sorted_line = sort_line_comments(line_comments);
 
-        if !change_comments.is_empty() || !sorted_line.is_empty() {
+        if !change_comments.is_empty()
+            || !sorted_line.is_empty()
+            || !description_comments.is_empty()
+        {
             changes.push(ChangePacket {
                 change_id: entry.change_id.clone(),
                 commit_id: entry.commit_id.clone(),
                 description: entry.description.clone(),
                 change_comments,
+                description_comments,
                 line_comments: sorted_line,
                 diff,
             });
@@ -144,41 +150,136 @@ pub fn render_prompt(packet: &Packet) -> String {
         out.push('\n');
         out.push_str("## Changes\n");
         for cp in &packet.changes {
-            out.push('\n');
-            let _ = writeln!(out, "Change ID: {}", cp.change_id.as_str());
-            let _ = writeln!(out, "Commit: {}", cp.commit_id.as_str());
-            let _ = writeln!(out, "Description: {}", cp.description);
-
-            if !cp.change_comments.is_empty() {
-                out.push('\n');
-                out.push_str("### Change-Level Review Comments\n");
-                for comment in &cp.change_comments {
-                    out.push('\n');
-                    out.push_str(&render_change_comment_block(comment));
-                }
-            }
-
-            if !cp.line_comments.is_empty() {
-                out.push('\n');
-                out.push_str("### Line-Level Review Comments\n");
-                for comment in &cp.line_comments {
-                    out.push('\n');
-                    out.push_str(&render_line_comment_block(comment));
-                }
-            }
-
-            if let Some(diff) = &cp.diff {
-                if !cp.line_comments.is_empty() {
-                    out.push('\n');
-                    out.push_str("### Relevant Diff Context\n");
-                    out.push('\n');
-                    out.push_str(&render_diff_context(diff, &cp.line_comments));
-                }
-            }
+            out.push_str(&render_change_packet(cp));
         }
     }
 
     out
+}
+
+fn render_change_packet(cp: &ChangePacket) -> String {
+    let mut out = String::new();
+    out.push('\n');
+    let _ = writeln!(out, "Change ID: {}", cp.change_id.as_str());
+    let _ = writeln!(out, "Commit: {}", cp.commit_id.as_str());
+    out.push_str("Description:\n");
+    write_fenced_block(&mut out, &cp.description);
+
+    if !cp.change_comments.is_empty() {
+        out.push('\n');
+        out.push_str("### Change-Level Review Comments\n");
+        for comment in &cp.change_comments {
+            out.push('\n');
+            out.push_str(&render_change_comment_block(comment));
+        }
+    }
+
+    if !cp.description_comments.is_empty() {
+        out.push_str(&render_description_comments_section(cp));
+    }
+
+    if !cp.line_comments.is_empty() {
+        out.push('\n');
+        out.push_str("### Line-Level Review Comments\n");
+        for comment in &cp.line_comments {
+            out.push('\n');
+            out.push_str(&render_line_comment_block(comment));
+        }
+    }
+
+    if let Some(diff) = &cp.diff {
+        if !cp.line_comments.is_empty() {
+            out.push('\n');
+            out.push_str("### Relevant Diff Context\n");
+            out.push('\n');
+            out.push_str(&render_diff_context(diff, &cp.line_comments));
+        }
+    }
+
+    out
+}
+
+fn render_description_comments_section(cp: &ChangePacket) -> String {
+    let mut out = String::new();
+    out.push('\n');
+    out.push_str("### Description Comments\n");
+
+    if cp.description.is_empty() {
+        // No global description text to anchor the section. Each comment owns
+        // its own reconstructed context block so the reader sees exactly the
+        // window that comment was anchored against — no overlap between
+        // adjacent comments, no false-aggregate header.
+        for comment in &cp.description_comments {
+            out.push('\n');
+            out.push_str(&render_description_comment_block(comment));
+            out.push('\n');
+            out.push_str("#### Description Context\n");
+            let payload = anchor_context_payload(comment);
+            write_fenced_block(&mut out, &payload);
+        }
+    } else {
+        for comment in &cp.description_comments {
+            out.push('\n');
+            out.push_str(&render_description_comment_block(comment));
+        }
+        out.push('\n');
+        out.push_str("#### Description Context\n");
+        write_fenced_block(&mut out, &cp.description);
+    }
+    out
+}
+
+/// Reconstruct the context window from a single description comment's anchor:
+/// `context_before` lines, then `target_text`, then `context_after` lines.
+/// Empty when the comment is not a description-anchored variant.
+fn anchor_context_payload(comment: &Comment) -> String {
+    let Anchor::Description { location, .. } = &comment.anchor else {
+        return String::new();
+    };
+    let mut out = String::new();
+    for line in &location.context_before {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push_str(&location.target_text);
+    if !location.context_after.is_empty() {
+        out.push('\n');
+        out.push_str(&location.context_after.join("\n"));
+    }
+    out
+}
+
+/// Emit `text` inside a triple-backtick fenced block. Escalates the fence
+/// length when `text` contains a backtick run that would otherwise close the
+/// fence prematurely. The closing fence matches the opening length.
+fn write_fenced_block(out: &mut String, text: &str) {
+    let longest_run = longest_backtick_run(text);
+    let fence_len = longest_run.max(2) + 1;
+    let fence: String = "`".repeat(fence_len);
+    out.push_str(&fence);
+    out.push('\n');
+    out.push_str(text);
+    if !text.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(&fence);
+    out.push('\n');
+}
+
+fn longest_backtick_run(s: &str) -> usize {
+    let mut longest = 0;
+    let mut current = 0;
+    for ch in s.chars() {
+        if ch == '`' {
+            current += 1;
+            if current > longest {
+                longest = current;
+            }
+        } else {
+            current = 0;
+        }
+    }
+    longest
 }
 
 pub(crate) fn severity_label(s: Severity) -> &'static str {
@@ -201,6 +302,53 @@ fn render_stack_comment_block(comment: &Comment) -> String {
     out.push_str(&comment.body);
     out.push('\n');
     out
+}
+
+fn render_description_comment_block(comment: &Comment) -> String {
+    let Anchor::Description { location, .. } = &comment.anchor else {
+        return String::new();
+    };
+
+    let label = severity_label(comment.severity);
+    let mut out = String::new();
+    // Drop the trailing colon when display_line is absent; otherwise the
+    // heading reads as `description:` with nothing after it. A no-line
+    // description anchor is a re-anchored stale that lost its line number.
+    match location.display_line {
+        Some(n) => {
+            let _ = writeln!(out, "### [{label}] description:{n}");
+        }
+        None => {
+            let _ = writeln!(out, "### [{label}] description");
+        }
+    }
+    write_anchor_context(
+        &mut out,
+        &location.target_text,
+        &location.context_before,
+        &location.context_after,
+    );
+    out.push('\n');
+    out.push_str("Comment:\n");
+    out.push_str(&comment.body);
+    out.push('\n');
+    out
+}
+
+/// Single source of truth for the anchor-context block shared by line- and
+/// description-anchored comment renders. Format pinned in
+/// `write_anchor_context_emits_full_block`.
+fn write_anchor_context(out: &mut String, target_text: &str, before: &[String], after: &[String]) {
+    out.push_str("Target line:\n");
+    let _ = writeln!(out, "    {target_text}");
+    out.push_str("Context:\n");
+    for line in before {
+        let _ = writeln!(out, "    {line}");
+    }
+    let _ = writeln!(out, ">>> {target_text}");
+    for line in after {
+        let _ = writeln!(out, "    {line}");
+    }
 }
 
 fn render_change_comment_block(comment: &Comment) -> String {
@@ -256,16 +404,12 @@ fn render_line_comment_block(comment: &Comment) -> String {
         side_str
     );
     let _ = writeln!(out, "Hunk: {}", anchor.hunk_header);
-    out.push_str("Target line:\n");
-    let _ = writeln!(out, "    {}", anchor.target_text);
-    out.push_str("Context:\n");
-    for line in &anchor.context_before {
-        let _ = writeln!(out, "    {line}");
-    }
-    let _ = writeln!(out, ">>> {}", anchor.target_text);
-    for line in &anchor.context_after {
-        let _ = writeln!(out, "    {line}");
-    }
+    write_anchor_context(
+        &mut out,
+        &anchor.target_text,
+        &anchor.context_before,
+        &anchor.context_after,
+    );
     out.push('\n');
     out.push_str("Comment:\n");
     out.push_str(&comment.body);
@@ -370,17 +514,27 @@ fn filter_comments(comments: Vec<Comment>, include_stale: bool) -> Vec<Comment> 
         .collect()
 }
 
-fn partition_by_scope(comments: Vec<Comment>) -> (Vec<Comment>, Vec<Comment>) {
+fn partition_by_scope(comments: Vec<Comment>) -> (Vec<Comment>, Vec<Comment>, Vec<Comment>) {
     let mut change_comments = Vec::new();
     let mut line_comments = Vec::new();
+    let mut description_comments = Vec::new();
     for c in comments {
         match &c.anchor {
             Anchor::Change { .. } => change_comments.push(c),
             Anchor::Line { .. } => line_comments.push(c),
-            Anchor::Stack { .. } | Anchor::Description { .. } => {}
+            Anchor::Description { .. } => description_comments.push(c),
+            Anchor::Stack { .. } => {
+                // Stack-scoped comments are handled at the packet level, not
+                // per-change. They must not appear in per-change JSONL files.
+                debug_assert!(
+                    false,
+                    "stack-scoped comment in per-change store is a bug: {:?}",
+                    c.anchor
+                );
+            }
         }
     }
-    (change_comments, line_comments)
+    (change_comments, line_comments, description_comments)
 }
 
 fn sort_line_comments(mut comments: Vec<Comment>) -> Vec<Comment> {
@@ -665,6 +819,7 @@ mod tests {
                     "this change is too large",
                     Severity::Suggestion,
                 )],
+                description_comments: vec![],
                 line_comments: vec![],
                 diff: None,
             }],
@@ -695,6 +850,7 @@ mod tests {
                 commit_id: commit_id("aabbccdd11223344"),
                 description: "Add feature".to_owned(),
                 change_comments: vec![],
+                description_comments: vec![],
                 line_comments: vec![line_comment],
                 diff: Some(simple_diff()),
             }],
@@ -752,6 +908,7 @@ mod tests {
                     "change note",
                     Severity::Suggestion,
                 )],
+                description_comments: vec![],
                 line_comments: vec![],
                 diff: None,
             }],
@@ -1153,5 +1310,464 @@ mod tests {
             out.contains(body),
             "body must be rendered verbatim; got:\n{out}"
         );
+    }
+
+    // --- description-comment rendering ---
+
+    fn make_description_comment(
+        change_id: &ChangeId,
+        body: &str,
+        severity: Severity,
+        target_text: &str,
+        display_line: Option<u32>,
+    ) -> Comment {
+        use crate::comment::DescriptionAnchor;
+        Comment {
+            schema_version: SchemaVersion,
+            anchor: Anchor::Description {
+                change_id: change_id.clone(),
+                location: DescriptionAnchor {
+                    display_line,
+                    target_text: target_text.to_owned(),
+                    context_before: vec![],
+                    context_after: vec![],
+                },
+            },
+            repo_root: PathBuf::from("/repo"),
+            revset: "@".to_owned(),
+            commit_id: None,
+            body: body.to_owned(),
+            severity,
+            created_at: datetime!(2026-04-29 10:03:00 UTC),
+            updated_at: None,
+            status: Some(Status::Pending),
+            mismatch_reason: None,
+        }
+    }
+
+    // -- B3: heading hierarchy. The Description Comments section emits
+    //   `### Description Comments` and a `#### Description Context` child;
+    //   no second `###` sibling under the same parent.
+    #[test]
+    fn render_description_section_uses_h4_for_context_block() {
+        let id = cid("abc11111");
+        let comment = make_description_comment(
+            &id,
+            "tighten this wording",
+            Severity::Suggestion,
+            "summary line",
+            Some(1),
+        );
+        let packet = Packet {
+            repo_root: PathBuf::from("/repo"),
+            revset: "@".to_owned(),
+            stack_comments: vec![],
+            changes: vec![ChangePacket {
+                change_id: id,
+                commit_id: commit_id("aabbccdd11223344"),
+                description: "summary line\nbody line".to_owned(),
+                change_comments: vec![],
+                description_comments: vec![comment],
+                line_comments: vec![],
+                diff: None,
+            }],
+        };
+        let out = render_prompt(&packet);
+        assert!(
+            out.contains("### Description Comments\n"),
+            "expected `### Description Comments` heading"
+        );
+        assert!(
+            out.contains("#### Description Context\n"),
+            "context block must be `####`, not `###`; got:\n{out}"
+        );
+        // The h3 form must not appear; only the h4 nested form is permitted.
+        // Search for `### Description Context` as a line-prefix to avoid the
+        // false-positive caused by `####` having `###` as a prefix substring.
+        assert!(
+            !out
+                .lines()
+                .any(|l| l == "### Description Context"
+                    || l.starts_with("### Description Context ")),
+            "must not emit `### Description Context` (sibling of Description Comments); got:\n{out}"
+        );
+    }
+
+    // -- T1a: populated description renders with target text, line marker,
+    //   the context block, and the comment body.
+    #[test]
+    fn render_description_section_populated_includes_target_and_context() {
+        let id = cid("abc11111");
+        let comment = make_description_comment(
+            &id,
+            "the body of the description note",
+            Severity::Required,
+            "summary line",
+            Some(1),
+        );
+        let packet = Packet {
+            repo_root: PathBuf::from("/repo"),
+            revset: "@".to_owned(),
+            stack_comments: vec![],
+            changes: vec![ChangePacket {
+                change_id: id,
+                commit_id: commit_id("aabbccdd11223344"),
+                description: "summary line\nbody line".to_owned(),
+                change_comments: vec![],
+                description_comments: vec![comment],
+                line_comments: vec![],
+                diff: None,
+            }],
+        };
+        let out = render_prompt(&packet);
+        assert!(out.contains("### Description Comments"));
+        assert!(out.contains("#### Description Context"));
+        // Fenced code with the description text.
+        assert!(
+            out.contains("```\nsummary line\nbody line\n```\n"),
+            "expected fenced description block; got:\n{out}"
+        );
+        // Description-comment heading with severity + display_line marker.
+        assert!(
+            out.contains("[REQUIRED] description:1"),
+            "expected severity+line heading; got:\n{out}"
+        );
+        // Target text rendered.
+        assert!(out.contains("    summary line"));
+        // Comment body verbatim.
+        assert!(out.contains("the body of the description note"));
+    }
+
+    // -- T1b: when there are no description comments, the section is omitted
+    //   entirely from the rendered prompt — not an empty heading.
+    #[test]
+    fn render_description_section_omitted_when_no_comments() {
+        let id = cid("abc11111");
+        let packet = Packet {
+            repo_root: PathBuf::from("/repo"),
+            revset: "@".to_owned(),
+            stack_comments: vec![],
+            changes: vec![ChangePacket {
+                change_id: id.clone(),
+                commit_id: commit_id("aabbccdd11223344"),
+                description: "summary line".to_owned(),
+                change_comments: vec![make_change_comment(&id, "change body", Severity::Note)],
+                description_comments: vec![],
+                line_comments: vec![],
+                diff: None,
+            }],
+        };
+        let out = render_prompt(&packet);
+        assert!(
+            !out.contains("Description Comments"),
+            "Description Comments section must be omitted when empty; got:\n{out}"
+        );
+        assert!(
+            !out.contains("Description Context"),
+            "Description Context must be omitted when empty; got:\n{out}"
+        );
+    }
+
+    // -- CV3: write_fenced_block escalates fence length when the payload
+    //   contains a triple-backtick run that would close a 3-tick fence early.
+    #[test]
+    fn write_fenced_block_escapes_triple_backtick_in_payload() {
+        let mut out = String::new();
+        write_fenced_block(&mut out, "before\n```\nafter");
+        // Payload's longest run is 3 ticks; fence must be >= 4.
+        assert!(
+            out.starts_with("````\n"),
+            "fence must escalate to >= 4 ticks; got:\n{out}"
+        );
+        assert!(
+            out.ends_with("````\n"),
+            "closing fence must match opening length; got:\n{out}"
+        );
+        assert!(out.contains("before\n```\nafter"));
+    }
+
+    #[test]
+    fn write_fenced_block_uses_three_ticks_when_payload_has_no_run() {
+        let mut out = String::new();
+        write_fenced_block(&mut out, "no backticks here\n");
+        assert!(out.starts_with("```\n"), "default fence is 3 ticks");
+        assert!(out.ends_with("```\n"));
+    }
+
+    #[test]
+    fn write_fenced_block_escalates_for_quintuple_run() {
+        let mut out = String::new();
+        write_fenced_block(&mut out, "weird ````` run");
+        assert!(
+            out.starts_with("``````\n"),
+            "5-tick run forces 6-tick fence; got:\n{out}"
+        );
+    }
+
+    // -- T-CV3-leading-fence: payload that opens with a bare 3-tick fence at
+    //   byte zero. Pins the position-agnostic scan; a token-only check would
+    //   miss this and emit a 3-tick wrapper that closes at the embedded run.
+    #[test]
+    fn write_fenced_block_handles_leading_bare_fence_at_byte_zero() {
+        let mut out = String::new();
+        write_fenced_block(&mut out, "```\nfoo");
+        assert!(
+            out.starts_with("````\n"),
+            "leading bare fence forces >= 4-tick wrapper; got:\n{out}"
+        );
+        assert!(
+            out.ends_with("````\n"),
+            "closing fence must match opening length; got:\n{out}"
+        );
+        assert!(out.contains("```\nfoo"));
+    }
+
+    // -- C2: pin the shared anchor-context block format. Single source of
+    //   truth for line-anchored and description-anchored comment renders.
+    #[test]
+    fn write_anchor_context_emits_full_block() {
+        let mut out = String::new();
+        write_anchor_context(
+            &mut out,
+            "the target",
+            &["before-1".to_owned(), "before-2".to_owned()],
+            &["after-1".to_owned(), "after-2".to_owned()],
+        );
+        let expected = concat!(
+            "Target line:\n",
+            "    the target\n",
+            "Context:\n",
+            "    before-1\n",
+            "    before-2\n",
+            ">>> the target\n",
+            "    after-1\n",
+            "    after-2\n",
+        );
+        assert_eq!(out, expected, "anchor-context block format drifted");
+    }
+
+    // -- T3-A1: multiple comments + empty description preserve order and emit
+    //   a per-comment context block, no overlap between adjacent comments.
+    #[test]
+    fn render_description_section_preserves_comment_order_with_empty_description() {
+        let id = cid("abc11111");
+        let c1 =
+            make_description_comment(&id, "first body", Severity::Note, "first target", Some(1));
+        let c2 = make_description_comment(
+            &id,
+            "second body",
+            Severity::Required,
+            "second target",
+            Some(2),
+        );
+        let packet = Packet {
+            repo_root: PathBuf::from("/repo"),
+            revset: "@".to_owned(),
+            stack_comments: vec![],
+            changes: vec![ChangePacket {
+                change_id: id,
+                commit_id: commit_id("aabbccdd11223344"),
+                description: String::new(),
+                change_comments: vec![],
+                description_comments: vec![c1, c2],
+                line_comments: vec![],
+                diff: None,
+            }],
+        };
+        let out = render_prompt(&packet);
+        // Both comment bodies present.
+        assert!(out.contains("first body"));
+        assert!(out.contains("second body"));
+        // Both anchors' target_text surface in their own context blocks.
+        let first_target_pos = out
+            .find("first target\n```")
+            .or_else(|| out.find("first target"))
+            .expect("first target text must appear in a context block");
+        let second_target_pos = out
+            .find("second target\n```")
+            .or_else(|| out.find("second target"))
+            .expect("second target text must appear in a context block");
+        assert!(
+            first_target_pos < second_target_pos,
+            "context blocks must appear in description_comments order"
+        );
+        // Two `#### Description Context` headings (one per comment).
+        let ctx_count = out.matches("#### Description Context\n").count();
+        assert_eq!(
+            ctx_count, 2,
+            "expected one context block per comment; got:\n{out}"
+        );
+    }
+
+    // -- T3-A2: empty anchor window (target_text + context_*) yields a
+    //   minimal but well-formed fence — no missing closing tick, no
+    //   surprise content. Pins the shape so a future change is intentional.
+    #[test]
+    fn render_description_section_with_empty_anchor_window_renders_minimal_fence() {
+        use crate::comment::DescriptionAnchor;
+        let id = cid("abc11111");
+        let comment = Comment {
+            schema_version: SchemaVersion,
+            anchor: Anchor::Description {
+                change_id: id.clone(),
+                location: DescriptionAnchor {
+                    display_line: Some(1),
+                    target_text: String::new(),
+                    context_before: vec![],
+                    context_after: vec![],
+                },
+            },
+            repo_root: PathBuf::from("/repo"),
+            revset: "@".to_owned(),
+            commit_id: None,
+            body: "the body".to_owned(),
+            severity: Severity::Note,
+            created_at: datetime!(2026-04-29 10:03:00 UTC),
+            updated_at: None,
+            status: Some(Status::Pending),
+            mismatch_reason: None,
+        };
+        let packet = Packet {
+            repo_root: PathBuf::from("/repo"),
+            revset: "@".to_owned(),
+            stack_comments: vec![],
+            changes: vec![ChangePacket {
+                change_id: id,
+                commit_id: commit_id("aabbccdd11223344"),
+                description: String::new(),
+                change_comments: vec![],
+                description_comments: vec![comment],
+                line_comments: vec![],
+                diff: None,
+            }],
+        };
+        let out = render_prompt(&packet);
+        // Minimal fence: opening tick, single `\n` (target_text was empty),
+        // closing tick. Both `#### Description Context\n```\n\n```\n` —
+        // exactly one blank line inside.
+        assert!(
+            out.contains("#### Description Context\n```\n\n```\n"),
+            "minimal fence shape must be `````` + blank + ``````; got:\n{out}"
+        );
+    }
+
+    // -- partition routing: Anchor::Description is bucketed into the
+    //   description list, not change or line.
+    #[test]
+    fn partition_by_scope_routes_description_to_description_bucket() {
+        let id = cid("abc11111");
+        let desc = make_description_comment(&id, "d", Severity::Note, "x", Some(1));
+        let change = make_change_comment(&id, "c", Severity::Note);
+        let line = make_line_comment(&id, "src/x.rs", 5, "l", Severity::Note);
+        let (changes, lines, descriptions) = partition_by_scope(vec![desc, change, line]);
+        assert_eq!(descriptions.len(), 1);
+        assert_eq!(descriptions[0].body, "d");
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].body, "c");
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].body, "l");
+    }
+
+    // -- T2: heading drops the trailing colon when display_line is None. A
+    //   re-anchored stale that lost its line number renders as
+    //   `### [SEV] description`, not `### [SEV] description:`.
+    #[test]
+    fn render_description_comment_block_heading_format_with_no_display_line() {
+        let id = cid("abc11111");
+        let comment =
+            make_description_comment(&id, "the body", Severity::Required, "summary line", None);
+        let block = render_description_comment_block(&comment);
+        assert!(
+            block.contains("### [REQUIRED] description\n"),
+            "expected heading without trailing colon; got:\n{block}"
+        );
+        assert!(
+            !block.contains("description:\n"),
+            "must not emit `description:` when display_line is None; got:\n{block}"
+        );
+    }
+
+    // -- T2 (paired): when display_line is Some, the heading still includes
+    //   the line number with the colon. Pins both branches of the format.
+    #[test]
+    fn render_description_comment_block_heading_with_display_line_includes_colon() {
+        let id = cid("abc11111");
+        let comment = make_description_comment(
+            &id,
+            "the body",
+            Severity::Suggestion,
+            "summary line",
+            Some(7),
+        );
+        let block = render_description_comment_block(&comment);
+        assert!(
+            block.contains("### [SUGGESTION] description:7\n"),
+            "expected heading with line number; got:\n{block}"
+        );
+    }
+
+    // -- T3: half-state — comments present but description text empty. The
+    //   section still renders; the context block is reconstructed from the
+    //   comments' anchor windows rather than left empty.
+    #[test]
+    fn render_description_section_uses_anchor_context_when_description_text_empty() {
+        use crate::comment::DescriptionAnchor;
+        let id = cid("abc11111");
+        let comment = Comment {
+            schema_version: SchemaVersion,
+            anchor: Anchor::Description {
+                change_id: id.clone(),
+                location: DescriptionAnchor {
+                    display_line: Some(2),
+                    target_text: "anchor target text".to_owned(),
+                    context_before: vec!["anchor before".to_owned()],
+                    context_after: vec!["anchor after".to_owned()],
+                },
+            },
+            repo_root: PathBuf::from("/repo"),
+            revset: "@".to_owned(),
+            commit_id: None,
+            body: "the comment body".to_owned(),
+            severity: Severity::Required,
+            created_at: datetime!(2026-04-29 10:03:00 UTC),
+            updated_at: None,
+            status: Some(Status::Pending),
+            mismatch_reason: None,
+        };
+        let packet = Packet {
+            repo_root: PathBuf::from("/repo"),
+            revset: "@".to_owned(),
+            stack_comments: vec![],
+            changes: vec![ChangePacket {
+                change_id: id,
+                commit_id: commit_id("aabbccdd11223344"),
+                description: String::new(),
+                change_comments: vec![],
+                description_comments: vec![comment],
+                line_comments: vec![],
+                diff: None,
+            }],
+        };
+        let out = render_prompt(&packet);
+        assert!(out.contains("### Description Comments\n"));
+        assert!(
+            out.contains("#### Description Context\n"),
+            "context heading must still appear; got:\n{out}"
+        );
+        // Context block is reconstructed from the anchor's window.
+        assert!(
+            out.contains("anchor before\n"),
+            "anchor context_before must surface; got:\n{out}"
+        );
+        assert!(
+            out.contains("anchor target text\n"),
+            "anchor target_text must surface; got:\n{out}"
+        );
+        assert!(
+            out.contains("anchor after\n"),
+            "anchor context_after must surface; got:\n{out}"
+        );
+        // Comment body still rendered.
+        assert!(out.contains("the comment body"));
     }
 }

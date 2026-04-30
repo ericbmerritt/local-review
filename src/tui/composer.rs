@@ -18,7 +18,27 @@ pub(crate) enum ComposerScope {
     Line,
     Change,
     Stack,
+    Description,
 }
+
+/// Subset of `ComposerScope` whose chord can be refused at keypress time.
+/// Line/Change have no context-absent failure mode (they are always populated
+/// from the cursor / current change), so they are not part of this enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RefusableScope {
+    Stack,
+    Description,
+}
+
+/// Status hint surfaced when ^K is pressed in single-change mode (no `stack`
+/// snapshot). Shared between the chord refusal path and the chrome-time
+/// "stack scope unavailable" line in `composer_overlay`.
+pub(crate) const STATUS_STACK_UNAVAILABLE: &str = "stack scope unavailable in single-change mode";
+
+/// Status hint surfaced when Alt+D is pressed without a description snapshot
+/// (composer not opened from a description line).
+pub(crate) const STATUS_DESCRIPTION_UNAVAILABLE: &str =
+    "description scope unavailable: open from a description line";
 
 /// All data needed to build a `LineAnchor` once the composer saves.
 /// Naming note: `source_line`/`target_line` map to `old_line`/`new_line` in
@@ -55,19 +75,36 @@ pub(crate) struct StackContextSnapshot {
     pub(crate) revset_hash: RevsetHash,
 }
 
+/// Description-scope context captured at composer open time. Mirrors
+/// `ChangeContext`/`StackContextSnapshot`; carries the cursor's 1-based line
+/// number plus the surrounding context window used to build a
+/// `DescriptionAnchor` on save.
+#[derive(Debug, Clone)]
+pub(crate) struct DescriptionContext {
+    pub(crate) change_id: ChangeId,
+    pub(crate) target_line: Option<u32>,
+    pub(crate) target_text: String,
+    pub(crate) context_before: Vec<String>,
+    pub(crate) context_after: Vec<String>,
+}
+
 /// Per-scope context snapshots, captured at composer open time so the chrome
 /// block can swap immediately when the reviewer presses ^L/^C/^K without
 /// needing to reach back into App.
 #[derive(Debug, Clone)]
 pub(crate) struct ComposerContexts {
-    /// Always present — every view has a current diff line.
+    /// Always present; for Description scope, a synthetic `LineTarget` with
+    /// empty path is used (the description view has no diff line).
     pub(crate) line: LineTarget,
     pub(crate) change: ChangeContext,
     /// `None` in single-change mode; stack ^K save will refuse if None.
     pub(crate) stack: Option<StackContextSnapshot>,
+    /// `None` when the composer was not opened from a description line. Present
+    /// when the cursor was on a `DescriptionLine` at open time.
+    pub(crate) description: Option<DescriptionContext>,
 }
 
-/// State for Screen 2 — Comment composer modal.
+/// State for the comment composer modal.
 pub(crate) struct Composer {
     pub(crate) contexts: ComposerContexts,
     pub(crate) scope: ComposerScope,
@@ -82,6 +119,10 @@ pub(crate) struct Composer {
     /// (i.e., the stack overview). Save/delete use this snapshot's anchor
     /// directly. `None` for new comments and for main-view line-comment edits.
     pub(crate) original: Option<Comment>,
+    /// In-modal status hint, set when a chord is refused (Alt+D without
+    /// description snapshot, ^K without stack snapshot). Cleared on the next
+    /// keypress so the hint doesn't linger after the user moves on.
+    pub(crate) refusal_status: Option<&'static str>,
 }
 
 impl Composer {
@@ -119,6 +160,7 @@ impl Composer {
             body: TextArea::default(),
             editing: None,
             original: None,
+            refusal_status: None,
         }
     }
 
@@ -137,6 +179,7 @@ impl Composer {
             body: textarea,
             editing: Some(edited.identity),
             original: edited.original,
+            refusal_status: None,
         }
     }
 
@@ -163,6 +206,14 @@ impl Composer {
                 format!("{prefix} · change {id}")
             }
             ComposerScope::Stack => format!("{prefix} · stack"),
+            ComposerScope::Description => {
+                if let Some(ctx) = &self.contexts.description {
+                    let line = ctx.target_line.unwrap_or(0);
+                    format!("{prefix} · description:{line}")
+                } else {
+                    format!("{prefix} · description")
+                }
+            }
         }
     }
 
@@ -183,17 +234,26 @@ pub(crate) enum ComposerAction {
     /// `^D` pressed while in edit mode; caller should delete the original
     /// comment and close the composer.
     Delete,
+    /// Scope chord pressed without a backing context snapshot.
+    RefusedScopeChord(RefusableScope),
 }
 
 /// Handle a key event inside the composer.
 ///
 /// Scope chords (`^L`, `^C`, `^K`) and save/delete (`^X`, `^D`) are Ctrl-
-/// chorded; severity chords (`Alt+R`, `Alt+S`, `Alt+N`) are Alt-chorded
-/// because `Ctrl+digit` is unreliable across terminals (Ctrl+3 = ESC,
-/// Ctrl+2 = NUL) and Ctrl-letter chords for severity collide with Sublime/
-/// VS Code-style "save" interception (Ctrl+S) and tui-textarea's next-line
-/// binding (Ctrl+N). All intercepted keys are consumed before being passed
-/// to tui-textarea; everything else flows through.
+/// chorded; severity chords (`Alt+R`, `Alt+S`, `Alt+N`) plus description
+/// scope (`Alt+D`) are Alt-chorded because `Ctrl+digit` is unreliable across
+/// terminals (Ctrl+3 = ESC, Ctrl+2 = NUL) and Ctrl-letter chords for
+/// severity collide with Sublime/VS Code-style "save" interception (Ctrl+S)
+/// and tui-textarea's next-line binding (Ctrl+N). All intercepted keys are
+/// consumed before being passed to tui-textarea; everything else flows
+/// through.
+///
+/// Scope chords whose context snapshot is absent (`^K` in single-change mode
+/// without a `stack` snapshot, `Alt+D` outside the description view without
+/// a `description` snapshot) return `RefusedScopeChord(scope)` so the caller
+/// can surface a status hint. The scope itself is left unchanged — the radio
+/// never points at a scope without backing context.
 ///
 /// `^C` is captured as scope=Change — NOT as SIGINT.
 #[expect(
@@ -201,6 +261,10 @@ pub(crate) enum ComposerAction {
     reason = "unhandled Ctrl+KeyCode variants are intentionally ignored; forwarded to textarea"
 )]
 pub(crate) fn handle_composer_key(composer: &mut Composer, key: KeyEvent) -> ComposerAction {
+    // Any keypress (including refusal-producing chords below, which overwrite
+    // it) clears a stale in-modal refusal hint so it doesn't linger.
+    composer.refusal_status = None;
+
     if key.modifiers == KeyModifiers::CONTROL {
         match key.code {
             KeyCode::Char('l') => {
@@ -212,8 +276,12 @@ pub(crate) fn handle_composer_key(composer: &mut Composer, key: KeyEvent) -> Com
                 return ComposerAction::Continue;
             }
             KeyCode::Char('k') => {
-                composer.scope = ComposerScope::Stack;
-                return ComposerAction::Continue;
+                if composer.contexts.stack.is_some() {
+                    composer.scope = ComposerScope::Stack;
+                    return ComposerAction::Continue;
+                }
+                composer.refusal_status = Some(STATUS_STACK_UNAVAILABLE);
+                return ComposerAction::RefusedScopeChord(RefusableScope::Stack);
             }
             KeyCode::Char('x') => {
                 return ComposerAction::Save;
@@ -238,6 +306,14 @@ pub(crate) fn handle_composer_key(composer: &mut Composer, key: KeyEvent) -> Com
             KeyCode::Char('n' | 'N') => {
                 composer.severity = Severity::Note;
                 return ComposerAction::Continue;
+            }
+            KeyCode::Char('d' | 'D') => {
+                if composer.contexts.description.is_some() {
+                    composer.scope = ComposerScope::Description;
+                    return ComposerAction::Continue;
+                }
+                composer.refusal_status = Some(STATUS_DESCRIPTION_UNAVAILABLE);
+                return ComposerAction::RefusedScopeChord(RefusableScope::Description);
             }
             _ => {}
         }
@@ -333,6 +409,7 @@ mod tests {
                 revset: "trunk()..@".to_owned(),
                 revset_hash: RevsetHash::from_revset("trunk()..@"),
             }),
+            description: None,
         }
     }
 
@@ -581,5 +658,119 @@ mod tests {
         let key = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
         let action = handle_composer_key(&mut c, key);
         assert_eq!(action, ComposerAction::Continue);
+    }
+
+    fn make_description_context() -> DescriptionContext {
+        DescriptionContext {
+            change_id: ChangeId::parse("abc12345").unwrap(),
+            target_line: Some(1),
+            target_text: "summary".to_owned(),
+            context_before: vec![],
+            context_after: vec![],
+        }
+    }
+
+    // -- B5: Alt+D switches to Description scope when a description context
+    //   snapshot is present.
+    #[test]
+    fn handle_composer_key_alt_d_sets_description_scope_when_snapshot_present() {
+        let mut c = make_composer(Severity::Suggestion);
+        c.contexts.description = Some(make_description_context());
+        let key = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::ALT);
+        let action = handle_composer_key(&mut c, key);
+        assert_eq!(action, ComposerAction::Continue);
+        assert_eq!(c.scope, ComposerScope::Description);
+    }
+
+    // -- U3: Alt+D without a snapshot returns RefusedScopeChord(Description)
+    //   so the caller can surface a status hint. Scope is unchanged.
+    #[test]
+    fn handle_composer_key_alt_d_emits_refusal_status_when_snapshot_absent() {
+        let mut c = make_composer(Severity::Suggestion);
+        c.scope = ComposerScope::Line;
+        assert!(c.contexts.description.is_none());
+        let key = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::ALT);
+        let action = handle_composer_key(&mut c, key);
+        assert_eq!(
+            action,
+            ComposerAction::RefusedScopeChord(RefusableScope::Description)
+        );
+        assert_eq!(c.scope, ComposerScope::Line);
+    }
+
+    // -- U3: ^K without a stack snapshot returns RefusedScopeChord(Stack).
+    //   Single-change mode has `stack: None`.
+    #[test]
+    fn handle_composer_key_ctrl_k_emits_refusal_status_when_stack_unavailable() {
+        let mut c = make_composer(Severity::Suggestion);
+        c.contexts.stack = None;
+        c.scope = ComposerScope::Line;
+        let key = KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL);
+        let action = handle_composer_key(&mut c, key);
+        assert_eq!(
+            action,
+            ComposerAction::RefusedScopeChord(RefusableScope::Stack)
+        );
+        assert_eq!(c.scope, ComposerScope::Line);
+    }
+
+    // -- E2: refusal hint stored on `composer.refusal_status` so the modal can
+    //   surface it inline. Cleared on the next keypress.
+    #[test]
+    fn composer_refusal_status_visible_in_modal_when_alt_d_pressed_without_snapshot() {
+        let mut c = make_composer(Severity::Suggestion);
+        assert!(c.contexts.description.is_none());
+        assert!(c.refusal_status.is_none(), "starts unset");
+        handle_composer_key(&mut c, KeyEvent::new(KeyCode::Char('d'), KeyModifiers::ALT));
+        assert_eq!(c.refusal_status, Some(STATUS_DESCRIPTION_UNAVAILABLE));
+        // Next non-refusing keypress clears the hint.
+        handle_composer_key(
+            &mut c,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+        );
+        assert_eq!(c.refusal_status, None);
+    }
+
+    // -- T-E2-stack-clear: ^K refusal pins both set AND clear, symmetric with
+    //   the Alt+D test.
+    #[test]
+    fn composer_refusal_status_set_on_ctrl_k_without_stack() {
+        let mut c = make_composer(Severity::Suggestion);
+        c.contexts.stack = None;
+        handle_composer_key(
+            &mut c,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(c.refusal_status, Some(STATUS_STACK_UNAVAILABLE));
+        // Next non-refusing keypress clears the hint.
+        handle_composer_key(
+            &mut c,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+        );
+        assert_eq!(c.refusal_status, None);
+    }
+
+    // -- C3: status row contributes 0 rows when `refusal_status` is None and
+    //   STATUS_ROWS when set. Pins the "no permanent tax" contract — body
+    //   reclaims its row as soon as the hint clears.
+    #[test]
+    fn status_row_height_zero_when_refusal_status_none_and_reclaims_after_clear() {
+        use crate::tui::composer_overlay::{status_row_height, STATUS_ROWS_FOR_TEST};
+        let mut c = make_composer(Severity::Suggestion);
+        c.contexts.stack = None;
+        // Initial state: no refusal → 0 rows.
+        assert_eq!(status_row_height(&c), 0);
+        // ^K without stack → refusal hint set → STATUS_ROWS_FOR_TEST.
+        handle_composer_key(
+            &mut c,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(status_row_height(&c), STATUS_ROWS_FOR_TEST);
+        // Next non-refusing keypress → cleared → 0 rows again.
+        handle_composer_key(
+            &mut c,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+        );
+        assert_eq!(status_row_height(&c), 0);
     }
 }

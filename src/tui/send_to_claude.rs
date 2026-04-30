@@ -132,6 +132,7 @@ fn scope_label(scope: ComposerScope) -> &'static str {
         ComposerScope::Stack => "stack",
         ComposerScope::Change => "change",
         ComposerScope::Line => "line",
+        ComposerScope::Description => "description",
     }
 }
 
@@ -376,6 +377,7 @@ mod tests {
                 commit_id: commit_id(),
                 description: "desc".to_owned(),
                 change_comments: vec![make_change_comment(Severity::Required)],
+                description_comments: vec![],
                 line_comments: vec![
                     make_line_comment("src/client.rs", Severity::Required),
                     make_line_comment("src/client.rs", Severity::Required),
@@ -474,6 +476,7 @@ mod tests {
                 commit_id: commit_id(),
                 description: "d".to_owned(),
                 change_comments: vec![],
+                description_comments: vec![],
                 line_comments: vec![
                     make_line_comment("z/last.rs", Severity::Note),
                     make_line_comment("a/first.rs", Severity::Note),
@@ -501,6 +504,7 @@ mod tests {
                 commit_id: commit_id(),
                 description: "d".to_owned(),
                 change_comments: vec![],
+                description_comments: vec![],
                 line_comments: vec![stale, pending],
                 diff: None,
             }],
@@ -522,6 +526,7 @@ mod tests {
                 commit_id: commit_id(),
                 description: "d".to_owned(),
                 change_comments: vec![],
+                description_comments: vec![],
                 line_comments: vec![orphaned, pending],
                 diff: None,
             }],
@@ -541,6 +546,7 @@ mod tests {
                 commit_id: commit_id(),
                 description: "d".to_owned(),
                 change_comments: vec![make_change_comment(Severity::Suggestion)],
+                description_comments: vec![],
                 line_comments: vec![],
                 diff: None,
             }],

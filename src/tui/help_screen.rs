@@ -28,6 +28,7 @@ Movement
 
 Comments
     Enter   c             new comment on current line
+                          (on a description line: opens description-scoped comment)
     e                     edit (cursor on a comment)
     d                     delete (cursor on a comment)
     1                     filter to required only (press again to clear)
@@ -35,7 +36,7 @@ Comments
     3                     filter to note only (press again to clear)
 
 Views
-    f                     file picker — jump to a file in the change
+    f                     file picker — jump to a file or the description
     r                     refresh diff and comments for current change
     s                     stack overview (stack mode only)
     S                     stale comments view
@@ -72,6 +73,7 @@ Send to Claude  (press C from main view)
 
 In comment composer
     ^L ^C ^K              scope:    line / change / stack
+    M-d                   scope:    description (only when opened on a description line)
     M-r M-s M-n           severity: required / suggestion / note  (Alt + r/s/n)
     ^X                    save
     ^D                    delete (edit mode only)

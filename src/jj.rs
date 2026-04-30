@@ -88,13 +88,36 @@ pub fn resolve_revset(revset: &str) -> Result<ChangeId> {
 
 pub fn show(change_id: &ChangeId) -> Result<ChangeDetails> {
     let metadata = log_metadata(change_id)?;
+    let description = fetch_description(change_id)?;
     let diff = show_diff(change_id)?;
     Ok(ChangeDetails {
         change_id: metadata.change_id,
         commit_id: metadata.commit_id,
-        description: metadata.description,
+        description,
         diff,
     })
+}
+
+/// Full multi-line description for a single change. Trailing newline stripped
+/// so callers can split on `\n` without an empty trailing line.
+pub fn fetch_description(change_id: &ChangeId) -> Result<String> {
+    let output = run_jj(&[
+        "log",
+        "-r",
+        change_id.as_str(),
+        "--no-graph",
+        "--color=never",
+        "-T",
+        "description",
+    ])?;
+    Ok(strip_trailing_newline(&output).to_owned())
+}
+
+/// Strip trailing `\n` and `\r` so callers can split on `\n` without an
+/// empty trailing element. Handles CRLF (`"line\r\n"` → `"line"`), bare LF,
+/// and runs of trailing newlines. Internal `\r` characters are preserved.
+pub(crate) fn strip_trailing_newline(s: &str) -> &str {
+    s.trim_end_matches(['\n', '\r'])
 }
 
 /// Fetch the unified diff for a single change.
@@ -106,7 +129,6 @@ pub fn diff_for_change(change_id: &ChangeId) -> Result<Diff> {
 struct LogMetadata {
     change_id: ChangeId,
     commit_id: CommitId,
-    description: String,
 }
 
 fn log_metadata(change_id: &ChangeId) -> Result<LogMetadata> {
@@ -136,7 +158,6 @@ fn log_metadata_from_records(
         (Some(entry), None) => Ok(LogMetadata {
             change_id: entry.change_id,
             commit_id: entry.commit_id,
-            description: entry.description,
         }),
         (None, _) => Err(JjrError::JjUnexpectedOutput { raw }),
         (Some(_), Some(_)) => Err(JjrError::RevsetAmbiguous {
@@ -503,6 +524,47 @@ mod tests {
         );
     }
 
+    // -- T-G4: pure helper that owns the post-processing of `jj log -T
+    //   description` output. Pinning here keeps `fetch_description`'s
+    //   contract honest without spawning jj.
+    #[test]
+    fn strip_trailing_newline_handles_multi_line_input() {
+        assert_eq!(
+            strip_trailing_newline("First line\nSecond line\n"),
+            "First line\nSecond line"
+        );
+    }
+
+    #[test]
+    fn strip_trailing_newline_handles_only_newline() {
+        assert_eq!(strip_trailing_newline("\n"), "");
+    }
+
+    #[test]
+    fn strip_trailing_newline_leaves_no_newline_input_unchanged() {
+        assert_eq!(
+            strip_trailing_newline("Add retry policy"),
+            "Add retry policy"
+        );
+    }
+
+    // -- C1: CRLF inputs (jj output normalized through tools that emit `\r\n`)
+    //   must lose both characters; downstream consumers don't expect a stray CR.
+    #[test]
+    fn strip_trailing_newline_strips_crlf() {
+        assert_eq!(strip_trailing_newline("line\r\n"), "line");
+    }
+
+    #[test]
+    fn strip_trailing_newline_strips_multiple_trailing_newlines() {
+        assert_eq!(strip_trailing_newline("line\n\n\n"), "line");
+    }
+
+    #[test]
+    fn strip_trailing_newline_preserves_internal_carriage_returns() {
+        assert_eq!(strip_trailing_newline("a\r\nb"), "a\r\nb");
+    }
+
     #[test]
     fn log_metadata_from_records_one_record_returns_metadata() {
         let change_id = ChangeId::parse("abc11111").unwrap();
@@ -515,6 +577,5 @@ mod tests {
         let meta = log_metadata_from_records(&change_id, entries, raw).unwrap();
         assert_eq!(meta.change_id.as_str(), "abc11111");
         assert_eq!(meta.commit_id.as_str(), "aabbccdd11223344");
-        assert_eq!(meta.description, "only");
     }
 }

@@ -25,35 +25,52 @@ pub(super) struct FilePickerState {
 #[derive(Debug, Clone)]
 pub(super) struct FilePickerEntry {
     pub(super) display_path: PathBuf,
-    pub(super) diff_file_index: usize,
+    /// Index into `App::rendered_per_file` / `App::annotated_per_file`.
+    /// Index 0 is the synthetic description view; indices 1+ are diff files.
+    pub(super) view_index: usize,
     pub(super) comment_count: usize,
 }
 
 pub(super) fn build_entries(files: &[DiffFile], comments: &[Comment]) -> Vec<FilePickerEntry> {
-    files
+    let mut entries = Vec::with_capacity(files.len() + 1);
+
+    let description_comments = comments
         .iter()
-        .enumerate()
-        .map(|(diff_file_index, file)| {
-            let display_path = file.display_path().to_owned();
-            let comment_count = comments
-                .iter()
-                .filter(|c| {
-                    if matches!(c.status, Some(Status::Stale | Status::Orphaned)) {
-                        return false;
-                    }
-                    let crate::comment::Anchor::Line { location, .. } = &c.anchor else {
-                        return false;
-                    };
-                    location.file.as_path() == display_path.as_path()
-                })
-                .count();
-            FilePickerEntry {
-                display_path,
-                diff_file_index,
-                comment_count,
+        .filter(|c| {
+            if matches!(c.status, Some(Status::Stale | Status::Orphaned)) {
+                return false;
             }
+            matches!(c.anchor, crate::comment::Anchor::Description { .. })
         })
-        .collect()
+        .count();
+    entries.push(FilePickerEntry {
+        display_path: PathBuf::from("<description>"),
+        view_index: 0,
+        comment_count: description_comments,
+    });
+
+    for (diff_file_index, file) in files.iter().enumerate() {
+        let display_path = file.display_path().to_owned();
+        let comment_count = comments
+            .iter()
+            .filter(|c| {
+                if matches!(c.status, Some(Status::Stale | Status::Orphaned)) {
+                    return false;
+                }
+                let crate::comment::Anchor::Line { location, .. } = &c.anchor else {
+                    return false;
+                };
+                location.file.as_path() == display_path.as_path()
+            })
+            .count();
+        entries.push(FilePickerEntry {
+            display_path,
+            view_index: diff_file_index + 1,
+            comment_count,
+        });
+    }
+
+    entries
 }
 
 pub(super) fn render(frame: &mut Frame<'_>, state: &FilePickerState) {
@@ -238,13 +255,16 @@ mod tests {
             make_comment("foo.rs", Some(Status::Stale)),
         ];
         let entries = build_entries(&files, &comments);
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].display_path, PathBuf::from("foo.rs"));
-        assert_eq!(entries[0].diff_file_index, 0);
-        assert_eq!(entries[0].comment_count, 2);
-        assert_eq!(entries[1].display_path, PathBuf::from("bar.rs"));
-        assert_eq!(entries[1].diff_file_index, 1);
-        assert_eq!(entries[1].comment_count, 1);
+        // entry 0 is the description view
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].display_path, PathBuf::from("<description>"));
+        assert_eq!(entries[0].view_index, 0);
+        assert_eq!(entries[1].display_path, PathBuf::from("foo.rs"));
+        assert_eq!(entries[1].view_index, 1);
+        assert_eq!(entries[1].comment_count, 2);
+        assert_eq!(entries[2].display_path, PathBuf::from("bar.rs"));
+        assert_eq!(entries[2].view_index, 2);
+        assert_eq!(entries[2].comment_count, 1);
     }
 
     #[test]
@@ -255,7 +275,8 @@ mod tests {
             make_comment("foo.rs", Some(Status::Orphaned)),
         ];
         let entries = build_entries(&files, &comments);
-        assert_eq!(entries[0].comment_count, 0);
+        // entry 0 is description, entries 1+ are diff files
+        assert_eq!(entries[1].comment_count, 0);
     }
 
     #[test]
@@ -292,22 +313,25 @@ mod tests {
     #[test]
     fn move_cursor_down_clamps_at_last() {
         let files = diff_files();
-        let entry_count = files.len();
+        let entries = build_entries(&files, &[]);
+        let entry_count = entries.len();
         let mut state = FilePickerState {
             selected_index: entry_count - 1,
             scroll_offset: 0,
-            entries: build_entries(&files, &[]),
+            entries,
         };
         move_cursor(&mut state, 1);
         assert_eq!(state.selected_index, entry_count - 1);
     }
 
     #[test]
-    fn build_entries_preserves_diff_file_index() {
+    fn build_entries_view_indices_start_at_zero_for_description() {
         let files = diff_files();
         let entries = build_entries(&files, &[]);
-        for (i, entry) in entries.iter().enumerate() {
-            assert_eq!(entry.diff_file_index, i);
+        // entry 0 is description (view_index 0); diff files follow at 1, 2, ...
+        assert_eq!(entries[0].view_index, 0);
+        for (i, entry) in entries[1..].iter().enumerate() {
+            assert_eq!(entry.view_index, i + 1);
         }
     }
 
