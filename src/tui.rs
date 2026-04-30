@@ -27,11 +27,13 @@ mod composer;
 mod composer_overlay;
 mod diff_view;
 mod help_screen;
+mod stale_screen;
 
 use composer::{
     default_severity, Composer, ComposerAction, ComposerScope, EditedComment, LineTarget,
 };
 use diff_view::{comment_to_inline, DiffView, InlineComment, RenderedLine, RenderedLineKind};
+use stale_screen::StaleScreenState;
 
 const MIN_COLS: u16 = 60;
 const MIN_ROWS: u16 = 10;
@@ -69,6 +71,25 @@ const TRANSITION_DESC_BUDGET: usize = 36;
 /// Beyond this, dots are truncated with a trailing `…`; the numeric count
 /// stays accurate so the user still sees the true total.
 const TRANSITION_DOT_MAX: usize = 5;
+
+/// Single source of truth for severity → terminal color. Used by inline comment
+/// rendering, the composer's severity picker, and the stale-comments view.
+pub(super) fn severity_color(severity: Severity) -> Color {
+    match severity {
+        Severity::Required => Color::Red,
+        Severity::Suggestion => Color::Yellow,
+        Severity::Note => Color::DarkGray,
+    }
+}
+
+/// Single source of truth for severity → display label.
+pub(super) fn severity_label(severity: Severity) -> &'static str {
+    match severity {
+        Severity::Required => "required",
+        Severity::Suggestion => "suggestion",
+        Severity::Note => "note",
+    }
+}
 
 pub fn run(change_id: &ChangeId, repo_root: &std::path::Path) -> Result<()> {
     let details = jj::show(change_id)?;
@@ -168,6 +189,8 @@ enum Screen {
     Composer(Box<Composer>),
     /// Between-change transition beat shown when advancing in stack mode.
     Transition(TransitionState),
+    /// Stale comments browser.
+    Stale(StaleScreenState),
 }
 
 /// State for the transition screen shown between changes in stack mode.
@@ -204,6 +227,19 @@ impl SeverityHistogram {
         }
         h
     }
+}
+
+/// Context kept while the user is picking a new anchor for a stale comment.
+///
+/// Save-then-delete ordering: if the process dies between saving the new
+/// comment and deleting the original stale, the user sees both on next load
+/// and can delete the stale manually. Delete-then-save would be strictly
+/// worse: a crash after delete but before save loses the comment entirely.
+struct PendingReanchor {
+    /// Used to delete after save succeeds.
+    original: Comment,
+    body: String,
+    severity: Severity,
 }
 
 /// Stack navigation context; absent in single-change mode.
@@ -253,6 +289,8 @@ struct App {
     /// Whether the most recent comment load succeeded. `false` means the
     /// transition modal should not advertise a comment count.
     comments_loaded_ok: bool,
+    /// Active when the user is picking a new anchor for a stale comment.
+    pending_reanchor: Option<PendingReanchor>,
 }
 
 impl App {
@@ -284,6 +322,7 @@ impl App {
             stack,
             transition_mode,
             comments_loaded_ok: false,
+            pending_reanchor: None,
         }
     }
 
@@ -636,9 +675,18 @@ fn load_transition_mode(repo_root: &std::path::Path) -> TransitionMode {
     }
 }
 
-// Always draw the main view first; modals (Help, Composer, Transition) overlay
-// on top so they sit visually above the diff with the same back-state preserved.
+// Full-screen views (Stale) replace the main view entirely. Modals (Help,
+// Composer, Transition) overlay on top of the main diff view.
 fn render(frame: &mut Frame<'_>, app: &mut App) {
+    if matches!(app.screen, Screen::Stale(_)) {
+        // Take the state out, render with &mut state, then put it back.
+        let Screen::Stale(mut state) = std::mem::replace(&mut app.screen, Screen::Main) else {
+            unreachable!("matched above");
+        };
+        stale_screen::render(frame, &mut state, app);
+        app.screen = Screen::Stale(state);
+        return;
+    }
     render_main(frame, app);
     match &app.screen {
         Screen::Main => {}
@@ -649,6 +697,7 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
         Screen::Transition(state) => {
             render_transition(frame, app, state);
         }
+        Screen::Stale(_) => unreachable!("handled above"),
     }
 }
 
@@ -766,9 +815,7 @@ fn render_rendered_line(line: &RenderedLine, focused: bool, width: u16) -> TuiLi
     match line.kind {
         RenderedLineKind::InlineCommentMeta { .. } | RenderedLineKind::InlineCommentBody => {
             let color = match line.comment_severity {
-                Some(Severity::Required) => Color::Red,
-                Some(Severity::Suggestion) => Color::Yellow,
-                Some(Severity::Note) => Color::DarkGray,
+                Some(s) => severity_color(s),
                 None => Color::Cyan,
             };
             let base_style = Style::default().fg(color);
@@ -856,12 +903,33 @@ fn footer_text(app: &App) -> (&'static str, Style) {
 fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let (text, style) = if let Some(msg) = app.status_message.as_deref() {
         (msg.to_owned(), Style::default().fg(Color::Yellow))
+    } else if let Some(reanchor) = app.pending_reanchor.as_ref() {
+        let prompt = reanchor_prompt(&reanchor.body, area.width);
+        (prompt, Style::default().fg(Color::Yellow))
     } else {
         let (text, style) = footer_text(app);
         (text.to_owned(), style)
     };
     let widget = Paragraph::new(text).style(style);
     frame.render_widget(widget, area);
+}
+
+fn reanchor_prompt(body: &str, width: u16) -> String {
+    // 74 chars of fixed text in the long form: `re-anchoring "" — navigate and
+    // press c to pick the new line; Esc to cancel` (count excludes the body).
+    const LONG_FIXED_CHARS: usize = 74;
+    const SHORT_FORM: &str = "re-anchoring \u{2014} c to pick line; Esc cancel";
+
+    let width = usize::from(width);
+    if width > LONG_FIXED_CHARS {
+        let body_budget = width.saturating_sub(LONG_FIXED_CHARS);
+        let body_preview = truncate(body, body_budget);
+        format!(
+            "re-anchoring \"{body_preview}\" \u{2014} navigate and press c to pick the new line; Esc to cancel"
+        )
+    } else {
+        SHORT_FORM.to_owned()
+    }
 }
 
 fn handle_event(app: &mut App) -> Result<()> {
@@ -876,6 +944,7 @@ fn handle_event(app: &mut App) -> Result<()> {
             Screen::Help => handle_help_key(app, key),
             Screen::Composer(_) => handle_composer_event(app, key),
             Screen::Transition(_) => handle_transition_key(app, key)?,
+            Screen::Stale(_) => handle_stale_key(app, key),
         }
     }
     Ok(())
@@ -886,11 +955,27 @@ fn handle_event(app: &mut App) -> Result<()> {
     reason = "unhandled KeyCode variants are intentionally ignored"
 )]
 fn handle_main_key(app: &mut App, key: KeyEvent) -> Result<()> {
-    app.status_message = None;
+    if app.pending_reanchor.is_some() {
+        match key.code {
+            KeyCode::Esc => {
+                app.pending_reanchor = None;
+                app.status_message = None;
+                return Ok(());
+            }
+            KeyCode::Char('c') | KeyCode::Enter => {
+                open_composer(app);
+                return Ok(());
+            }
+            _ => {}
+        }
+    } else {
+        app.status_message = None;
+    }
 
     match key.code {
         KeyCode::Char('q') => app.should_quit = true,
         KeyCode::Char('?') => app.screen = Screen::Help,
+        KeyCode::Char('S') => open_stale_screen(app),
         KeyCode::Up | KeyCode::Char('k') => app.move_line(-1),
         KeyCode::Down | KeyCode::Char('j') => app.move_line(1),
         KeyCode::PageUp => app.move_page(-1),
@@ -913,6 +998,170 @@ fn handle_help_key(app: &mut App, key: KeyEvent) {
     if matches!(key.code, KeyCode::Char('q' | '?') | KeyCode::Esc) {
         app.screen = Screen::Main;
     }
+}
+
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "unhandled KeyCode variants are intentionally ignored on the stale screen"
+)]
+fn handle_stale_key(app: &mut App, key: KeyEvent) {
+    let Screen::Stale(ref state) = app.screen else {
+        return;
+    };
+    let count = state.stale_indices.len();
+
+    match key.code {
+        KeyCode::Char('q') | KeyCode::Esc => {
+            app.screen = Screen::Main;
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            if let Screen::Stale(ref mut s) = app.screen {
+                s.selected_index = s.selected_index.saturating_sub(1);
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') if count > 0 => {
+            if let Screen::Stale(ref mut s) = app.screen {
+                s.selected_index = (s.selected_index + 1).min(count - 1);
+            }
+        }
+        KeyCode::Char('d') => {
+            let focused = focused_stale(app).cloned();
+            if let Some(comment) = focused {
+                delete_focused_stale(app, &comment);
+            }
+        }
+        KeyCode::Enter => {
+            view_in_source(app);
+        }
+        KeyCode::Char('e') => {
+            enter_reanchor_mode(app);
+        }
+        _ => {}
+    }
+}
+
+fn focused_stale(app: &App) -> Option<&Comment> {
+    let Screen::Stale(ref state) = app.screen else {
+        return None;
+    };
+    let &comment_idx = state.stale_indices.get(state.selected_index)?;
+    app.loaded_comments.get(comment_idx)
+}
+
+fn delete_focused_stale(app: &mut App, comment: &Comment) {
+    match crate::store::delete_comment(&app.repo_root, comment) {
+        Ok(()) => {
+            app.refresh_inline_comments();
+            let new_indices = stale_screen::stale_comment_indices(&app.loaded_comments);
+            let new_count = new_indices.len();
+            if let Screen::Stale(ref mut state) = app.screen {
+                state.stale_indices = new_indices;
+                if new_count == 0 {
+                    state.selected_index = 0;
+                } else if state.selected_index >= new_count {
+                    state.selected_index = new_count - 1;
+                }
+            }
+        }
+        Err(e) => {
+            app.status_message = Some(format!(
+                "delete failed: {}",
+                sanitize_for_status(&e.to_string())
+            ));
+        }
+    }
+}
+
+fn view_in_source(app: &mut App) {
+    let focused = focused_stale(app).cloned();
+    let Some(comment) = focused else {
+        return;
+    };
+    let Anchor::Line { location, .. } = &comment.anchor else {
+        return;
+    };
+
+    let file_idx = app
+        .details
+        .diff
+        .files
+        .iter()
+        .position(|f| f.display_path() == location.file.as_path());
+
+    let Some(fidx) = file_idx else {
+        app.status_message = Some("file not in current diff".to_owned());
+        return;
+    };
+
+    app.screen = Screen::Main;
+    app.file_index = fidx;
+    app.scroll = 0;
+
+    let line_num = match location.side {
+        Side::Old => location.old_line,
+        Side::New => location.new_line,
+    };
+
+    if let Some(target_line_num) = line_num {
+        let view = &app.annotated_per_file[fidx];
+        let pos = view.lines.iter().position(|l| match location.side {
+            Side::Old => l.source_line == Some(target_line_num),
+            Side::New => l.target_line == Some(target_line_num),
+        });
+        app.line_index = pos.unwrap_or(0);
+    } else {
+        app.line_index = 0;
+    }
+}
+
+fn enter_reanchor_mode(app: &mut App) {
+    let focused = focused_stale(app).cloned();
+    let Some(comment) = focused else {
+        return;
+    };
+    let Anchor::Line { location, .. } = &comment.anchor else {
+        return;
+    };
+
+    let severity = comment.severity;
+    let file = location.file.clone();
+
+    app.pending_reanchor = Some(PendingReanchor {
+        body: comment.body.clone(),
+        severity,
+        original: comment,
+    });
+
+    app.screen = Screen::Main;
+
+    let file_idx = app
+        .details
+        .diff
+        .files
+        .iter()
+        .position(|f| f.display_path() == file.as_path());
+
+    match file_idx {
+        Some(fidx) => {
+            app.file_index = fidx;
+            app.line_index = 0;
+            app.scroll = 0;
+        }
+        None => {
+            app.status_message = Some(
+                "re-anchor: file not in current diff; pick a line in the visible file".to_owned(),
+            );
+        }
+    }
+}
+
+fn open_stale_screen(app: &mut App) {
+    let stale_indices = stale_screen::stale_comment_indices(&app.loaded_comments);
+    app.screen = Screen::Stale(StaleScreenState {
+        selected_index: 0,
+        stale_indices,
+        scroll_offset: 0,
+    });
 }
 
 #[expect(
@@ -1100,13 +1349,23 @@ fn handle_composer_event(app: &mut App, key: KeyEvent) {
         ComposerAction::Continue => {
             app.screen = Screen::Composer(composer);
         }
-        ComposerAction::Cancel => {
-            // Discard; screen already set to Main by the replace above.
-        }
+        ComposerAction::Cancel => {}
         ComposerAction::Save => {
             match save_composer(app, &composer, time::OffsetDateTime::now_utc()) {
                 SaveOutcome::Saved => {
-                    // Screen already set to Main by the replace above.
+                    if let Some(reanchor) = app.pending_reanchor.take() {
+                        match crate::store::delete_comment(&app.repo_root, &reanchor.original) {
+                            Ok(()) => {
+                                app.refresh_inline_comments();
+                            }
+                            Err(e) => {
+                                app.status_message = Some(format!(
+                                    "re-anchor saved; could not delete original: {}",
+                                    sanitize_for_status(&e.to_string())
+                                ));
+                            }
+                        }
+                    }
                 }
                 SaveOutcome::Refused(msg) | SaveOutcome::Errored(msg) => {
                     app.status_message = Some(msg);
@@ -1116,17 +1375,13 @@ fn handle_composer_event(app: &mut App, key: KeyEvent) {
                 }
             }
         }
-        ComposerAction::Delete => {
-            match delete_via_composer(app, &composer) {
-                SaveOutcome::Saved => {
-                    // Screen already set to Main by the replace above.
-                }
-                SaveOutcome::Refused(msg) | SaveOutcome::Errored(msg) => {
-                    app.status_message = Some(msg);
-                    app.screen = Screen::Composer(composer);
-                }
+        ComposerAction::Delete => match delete_via_composer(app, &composer) {
+            SaveOutcome::Saved => {}
+            SaveOutcome::Refused(msg) | SaveOutcome::Errored(msg) => {
+                app.status_message = Some(msg);
+                app.screen = Screen::Composer(composer);
             }
-        }
+        },
     }
 }
 
@@ -1144,8 +1399,21 @@ enum SaveOutcome {
 fn open_composer(app: &mut App) {
     match build_line_target(app) {
         BuildTargetResult::Ready(target) => {
-            let severity = default_severity(app.last_severity);
-            app.screen = Screen::Composer(Box::new(Composer::new(target, severity)));
+            if let Some(reanchor) = app.pending_reanchor.as_ref() {
+                let severity = reanchor.severity;
+                let body = reanchor.body.clone();
+                let mut composer = Composer::new(target, severity);
+                for (i, line) in body.lines().enumerate() {
+                    if i > 0 {
+                        composer.body.insert_newline();
+                    }
+                    composer.body.insert_str(line);
+                }
+                app.screen = Screen::Composer(Box::new(composer));
+            } else {
+                let severity = default_severity(app.last_severity);
+                app.screen = Screen::Composer(Box::new(Composer::new(target, severity)));
+            }
         }
         BuildTargetResult::NonCommentable => {
             app.status_message = Some("cannot comment on this line".to_owned());
@@ -2935,5 +3203,478 @@ mod tests {
             !text.contains("n/p"),
             "single-change footer should not mention n/p, got: {text:?}"
         );
+    }
+
+    // ---- stale screen integration tests ----
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "test fixture needs all fields for a well-formed stale comment"
+    )]
+    fn make_stale_comment_on_file(
+        dir: &std::path::Path,
+        change_id: ChangeId,
+        file: &str,
+        new_line: u32,
+        body: &str,
+        created_at: time::OffsetDateTime,
+    ) -> Comment {
+        use crate::comment::{
+            Anchor, Comment, LineAnchor, MismatchReason, SchemaVersion, Severity, Side, Status,
+        };
+        Comment {
+            schema_version: SchemaVersion,
+            anchor: Anchor::Line {
+                change_id,
+                location: LineAnchor {
+                    file: PathBuf::from(file),
+                    side: Side::New,
+                    old_line: None,
+                    new_line: Some(new_line),
+                    hunk_header: "@@ -1,3 +1,3 @@".to_owned(),
+                    target_text: "old body that changed".to_owned(),
+                    context_before: vec![],
+                    context_after: vec![],
+                },
+            },
+            repo_root: dir.to_owned(),
+            revset: "@".to_owned(),
+            commit_id: None,
+            body: body.to_owned(),
+            severity: Severity::Required,
+            created_at,
+            updated_at: None,
+            status: Some(Status::Stale),
+            mismatch_reason: Some(MismatchReason::TargetTextChanged),
+        }
+    }
+
+    fn make_app_with_stale_comment(dir: &std::path::Path) -> App {
+        let mut app = make_app_with_single_file(sample_diff_file());
+        app.repo_root = dir.to_owned();
+        let comment = make_stale_comment_on_file(
+            dir,
+            app.details.change_id.clone(),
+            "foo.txt",
+            2,
+            "stale body",
+            time::OffsetDateTime::UNIX_EPOCH,
+        );
+        crate::store::save_comment(dir, &comment).unwrap();
+        app.refresh_inline_comments();
+        app
+    }
+
+    #[test]
+    fn s_key_from_main_transitions_to_stale_screen() {
+        let mut app = make_app_with_single_file(sample_diff_file());
+        let key = KeyEvent::new(KeyCode::Char('S'), KeyModifiers::NONE);
+        handle_main_key(&mut app, key).unwrap();
+        assert!(
+            matches!(app.screen, Screen::Stale(_)),
+            "S should switch to Screen::Stale"
+        );
+        let Screen::Stale(ref state) = app.screen else {
+            unreachable!()
+        };
+        assert_eq!(state.selected_index, 0);
+    }
+
+    #[test]
+    fn stale_screen_down_moves_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = make_app_with_stale_comment(dir.path());
+
+        open_stale_screen(&mut app);
+        let Screen::Stale(ref state) = app.screen else {
+            panic!("expected Stale screen");
+        };
+        assert!(!state.stale_indices.is_empty(), "should have stale entries");
+
+        let comment2 = make_stale_comment_on_file(
+            dir.path(),
+            app.details.change_id.clone(),
+            "foo.txt",
+            1,
+            "second stale",
+            time::OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1),
+        );
+        crate::store::save_comment(dir.path(), &comment2).unwrap();
+        app.refresh_inline_comments();
+        open_stale_screen(&mut app);
+
+        let count_before = {
+            let Screen::Stale(ref s) = app.screen else {
+                panic!("expected Stale");
+            };
+            s.stale_indices.len()
+        };
+        assert!(count_before >= 2, "need at least 2 stale entries");
+
+        handle_stale_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        let Screen::Stale(ref s) = app.screen else {
+            panic!("expected Stale screen");
+        };
+        assert_eq!(s.selected_index, 1);
+    }
+
+    #[test]
+    fn stale_screen_q_returns_to_main() {
+        let mut app = make_app_with_single_file(sample_diff_file());
+        open_stale_screen(&mut app);
+        handle_stale_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+        );
+        assert!(
+            matches!(app.screen, Screen::Main),
+            "q should return to Screen::Main"
+        );
+    }
+
+    #[test]
+    fn stale_d_deletes_focused_comment_and_refreshes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = make_app_with_stale_comment(dir.path());
+        open_stale_screen(&mut app);
+
+        let Screen::Stale(ref s) = app.screen else {
+            panic!("expected Stale screen");
+        };
+        assert!(!s.stale_indices.is_empty(), "should have stale entries");
+
+        handle_stale_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+        );
+
+        let loaded =
+            crate::store::load_change_comments(dir.path(), &app.details.change_id).unwrap();
+        assert!(
+            loaded.iter().all(|c| c.status != Some(Status::Stale)),
+            "stale comment should be deleted from disk"
+        );
+
+        let Screen::Stale(ref s) = app.screen else {
+            panic!("expected still on Stale screen");
+        };
+        assert!(s.stale_indices.is_empty(), "stale_indices should be empty");
+    }
+
+    #[test]
+    fn stale_enter_navigates_to_file_in_main_view() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = make_app_with_stale_comment(dir.path());
+        open_stale_screen(&mut app);
+
+        handle_stale_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(
+            matches!(app.screen, Screen::Main),
+            "Enter should switch to Screen::Main"
+        );
+        assert_eq!(app.file_index, 0);
+    }
+
+    #[test]
+    fn stale_e_enters_reanchor_mode_and_switches_to_main() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = make_app_with_stale_comment(dir.path());
+        open_stale_screen(&mut app);
+
+        handle_stale_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+        );
+
+        assert!(
+            matches!(app.screen, Screen::Main),
+            "e should switch to Screen::Main"
+        );
+        assert!(
+            app.pending_reanchor.is_some(),
+            "pending_reanchor should be set"
+        );
+        assert_eq!(app.pending_reanchor.as_ref().unwrap().body, "stale body");
+    }
+
+    #[test]
+    fn esc_from_main_with_no_composer_cancels_reanchor_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = make_app_with_stale_comment(dir.path());
+        open_stale_screen(&mut app);
+        handle_stale_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+        );
+        assert!(app.pending_reanchor.is_some(), "re-anchor should be active");
+
+        handle_main_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+        assert!(
+            app.pending_reanchor.is_none(),
+            "Esc from main should clear pending_reanchor"
+        );
+        assert!(
+            app.status_message.is_none(),
+            "status message should be cleared"
+        );
+    }
+
+    #[test]
+    fn reanchor_composer_save_creates_new_and_deletes_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = make_app_with_stale_comment(dir.path());
+
+        open_stale_screen(&mut app);
+        handle_stale_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+        );
+        assert!(app.pending_reanchor.is_some());
+
+        app.line_index = 2;
+        assert!(
+            matches!(
+                app.current_view().unwrap().lines[2].kind,
+                RenderedLineKind::Added | RenderedLineKind::Context | RenderedLineKind::Removed
+            ),
+            "line 2 should be commentable"
+        );
+
+        handle_main_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        let Screen::Composer(ref c) = app.screen else {
+            panic!("expected Composer screen after c in re-anchor mode");
+        };
+        assert_eq!(
+            c.body_text(),
+            "stale body",
+            "composer should be pre-filled with stale comment body"
+        );
+
+        let Screen::Composer(composer) = std::mem::replace(&mut app.screen, Screen::Main) else {
+            panic!("expected Composer");
+        };
+        let now = time::OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(10);
+        let outcome = save_composer(&mut app, &composer, now);
+        assert!(matches!(outcome, SaveOutcome::Saved), "expected Saved");
+
+        if let Some(reanchor) = app.pending_reanchor.take() {
+            crate::store::delete_comment(&app.repo_root, &reanchor.original).unwrap();
+            app.refresh_inline_comments();
+        }
+
+        let loaded =
+            crate::store::load_change_comments(dir.path(), &app.details.change_id).unwrap();
+        assert_eq!(
+            loaded.len(),
+            1,
+            "should have exactly one comment (the re-anchored one)"
+        );
+        assert_ne!(
+            loaded[0].created_at,
+            time::OffsetDateTime::UNIX_EPOCH,
+            "re-anchored comment should have the new timestamp"
+        );
+        assert!(
+            app.pending_reanchor.is_none(),
+            "pending_reanchor should be cleared"
+        );
+    }
+
+    #[test]
+    fn esc_from_composer_in_reanchor_mode_preserves_pending_reanchor() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = make_app_with_stale_comment(dir.path());
+
+        open_stale_screen(&mut app);
+        handle_stale_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+        );
+        assert!(app.pending_reanchor.is_some());
+
+        app.line_index = 2;
+        handle_main_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(matches!(app.screen, Screen::Composer(_)));
+
+        handle_composer_event(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(
+            matches!(app.screen, Screen::Main),
+            "Esc from composer returns to Main"
+        );
+        assert!(
+            app.pending_reanchor.is_some(),
+            "pending_reanchor must NOT be cleared when composer is dismissed without saving"
+        );
+    }
+
+    #[test]
+    fn stale_enter_with_file_not_in_diff_stays_on_stale_screen() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = make_app_with_single_file(sample_diff_file());
+        app.repo_root = dir.path().to_owned();
+        let comment = make_stale_comment_on_file(
+            dir.path(),
+            app.details.change_id.clone(),
+            "absent_file.txt",
+            1,
+            "stale on missing file",
+            time::OffsetDateTime::UNIX_EPOCH,
+        );
+        crate::store::save_comment(dir.path(), &comment).unwrap();
+        app.refresh_inline_comments();
+
+        open_stale_screen(&mut app);
+        handle_stale_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(
+            matches!(app.screen, Screen::Stale(_)),
+            "Enter on file-not-in-diff stale entry should stay on Stale screen"
+        );
+        let msg = app
+            .status_message
+            .as_deref()
+            .expect("status message should warn about missing file");
+        assert!(
+            msg.contains("not in current diff"),
+            "expected diff-warning, got: {msg:?}"
+        );
+    }
+
+    #[test]
+    fn stale_enter_with_anchor_line_absent_falls_back_to_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = make_app_with_single_file(sample_diff_file());
+        app.repo_root = dir.path().to_owned();
+        let comment = make_stale_comment_on_file(
+            dir.path(),
+            app.details.change_id.clone(),
+            "foo.txt",
+            9999,
+            "stale on absent line",
+            time::OffsetDateTime::UNIX_EPOCH,
+        );
+        crate::store::save_comment(dir.path(), &comment).unwrap();
+        app.refresh_inline_comments();
+
+        open_stale_screen(&mut app);
+        handle_stale_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(matches!(app.screen, Screen::Main));
+        assert_eq!(app.file_index, 0);
+        assert_eq!(
+            app.line_index, 0,
+            "absent anchor line should fall back to line_index 0"
+        );
+    }
+
+    #[test]
+    fn delete_focused_with_cursor_at_end_clamps_to_new_last() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = make_app_with_stale_comment(dir.path());
+        for (i, body) in ["second", "third"].iter().enumerate() {
+            let comment = make_stale_comment_on_file(
+                dir.path(),
+                app.details.change_id.clone(),
+                "foo.txt",
+                u32::try_from(i + 3).unwrap_or(3),
+                body,
+                time::OffsetDateTime::UNIX_EPOCH
+                    + time::Duration::seconds(i64::try_from(i + 1).unwrap_or(1)),
+            );
+            crate::store::save_comment(dir.path(), &comment).unwrap();
+        }
+        app.refresh_inline_comments();
+        open_stale_screen(&mut app);
+
+        let last_idx = {
+            let Screen::Stale(ref s) = app.screen else {
+                panic!("expected Stale");
+            };
+            assert!(s.stale_indices.len() >= 3, "need at least 3 stale entries");
+            s.stale_indices.len() - 1
+        };
+        if let Screen::Stale(ref mut s) = app.screen {
+            s.selected_index = last_idx;
+        }
+
+        handle_stale_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+        );
+
+        let Screen::Stale(ref s) = app.screen else {
+            panic!("expected Stale screen");
+        };
+        assert_eq!(
+            s.selected_index,
+            s.stale_indices.len() - 1,
+            "selected_index should clamp to new last after delete from tail"
+        );
+    }
+
+    #[test]
+    fn pending_reanchor_survives_stale_screen_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = make_app_with_stale_comment(dir.path());
+
+        open_stale_screen(&mut app);
+        handle_stale_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+        );
+        assert!(app.pending_reanchor.is_some(), "reanchor active");
+
+        handle_main_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('S'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(matches!(app.screen, Screen::Stale(_)));
+        assert!(
+            app.pending_reanchor.is_some(),
+            "S into Stale must not clear pending_reanchor"
+        );
+
+        handle_stale_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+        );
+        assert!(matches!(app.screen, Screen::Main));
+        assert!(
+            app.pending_reanchor.is_some(),
+            "q from Stale must not clear pending_reanchor"
+        );
+    }
+
+    #[test]
+    fn reanchor_prompt_fits_within_terminal_width_80() {
+        let body = "a".repeat(1024);
+        let prompt = reanchor_prompt(&body, 80);
+        assert!(
+            prompt.chars().count() <= 80,
+            "prompt {} chars exceeds 80",
+            prompt.chars().count()
+        );
+    }
+
+    #[test]
+    fn reanchor_prompt_falls_back_to_short_form_at_narrow_width() {
+        let body = "abc";
+        let prompt = reanchor_prompt(body, 40);
+        assert!(
+            !prompt.contains("navigate and press"),
+            "short form should not include long-form navigate text, got: {prompt:?}"
+        );
+        assert!(prompt.contains("re-anchoring"));
+        assert!(prompt.chars().count() <= 60, "short form fits comfortably");
     }
 }

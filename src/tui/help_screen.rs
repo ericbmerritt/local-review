@@ -32,8 +32,20 @@ Comments
     d                     delete (cursor on a comment)
 
 Views
+    S                     stale comments view
     ?                     this help
     q                     quit
+
+Stale comments view
+    ↑ ↓     k j           select entry
+    Enter                 view in source (navigate main view to anchor)
+    d                     delete focused stale comment
+    e                     edit & re-anchor (switch to main, pick new line)
+    q   Esc               back to main view
+
+Re-anchor mode (after pressing e in stale view)
+    c   Enter             open composer at current line (pre-filled body)
+    Esc                   cancel re-anchor mode
 
 In comment composer
     ^L ^C ^K              scope:    line / change / stack

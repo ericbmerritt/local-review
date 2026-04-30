@@ -252,7 +252,7 @@ fn bare_jjr_goes_to_stack_mode_and_not_single_change() {
     );
 }
 
-/// G1: A multi-change revset like `trunk()..@` passed as a positional argument
+/// A multi-change revset like `trunk()..@` passed as a positional argument
 /// goes to single-change dispatch, where `resolve_revset` correctly errors
 /// with `RevsetAmbiguous`. This pins that positional revsets do NOT silently
 /// route to stack mode — only bare `jjr` and `--stack` do.

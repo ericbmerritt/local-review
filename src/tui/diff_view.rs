@@ -235,7 +235,7 @@ fn line_matches_comment(line: &RenderedLine, comment: &InlineComment) -> bool {
 }
 
 fn inject_comment_lines(output: &mut Vec<RenderedLine>, comment: &InlineComment) {
-    let label = severity_label(comment.severity);
+    let label = super::severity_label(comment.severity);
     // `●` sigil pairs with the severity color so NO_COLOR terminals still
     // distinguish severity by reading the label.
     let meta = format!("┃ ● {label} · {}", comment.age);
@@ -258,14 +258,6 @@ fn inject_comment_lines(output: &mut Vec<RenderedLine>, comment: &InlineComment)
             hunk_header: None,
             comment_severity: Some(comment.severity),
         });
-    }
-}
-
-fn severity_label(severity: Severity) -> &'static str {
-    match severity {
-        Severity::Note => "note",
-        Severity::Suggestion => "suggestion",
-        Severity::Required => "required",
     }
 }
 

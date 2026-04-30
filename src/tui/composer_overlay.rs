@@ -1,5 +1,5 @@
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line as TuiLine, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
@@ -133,15 +133,8 @@ fn render_severity_picker(frame: &mut Frame<'_>, area: Rect, composer: &Composer
     } else {
         "[ ]"
     };
-    // Color the picked severity to match the inline-comment palette in
-    // `tui::render_rendered_line` so the reviewer sees the same red/yellow/gray.
-    let picked_color = match composer.severity {
-        Severity::Required => Color::Red,
-        Severity::Suggestion => Color::Yellow,
-        Severity::Note => Color::DarkGray,
-    };
     let picked_style = Style::default()
-        .fg(picked_color)
+        .fg(super::severity_color(composer.severity))
         .add_modifier(Modifier::BOLD);
 
     let mut spans: Vec<Span<'_>> = Vec::with_capacity(8);
