@@ -147,11 +147,18 @@ fn detect_binary(section: &str) -> Option<PathBuf> {
     let mut diff_paths: Option<(&str, &str)> = None;
 
     for line in section.lines() {
+        // Only the diff header carries binary-marker lines; once a hunk
+        // (`@@ ...`) starts, any subsequent line is `+`/`-`/` ` content and
+        // could legitimately contain the literal strings below — including
+        // this file's own source.
+        if line.starts_with("@@ ") {
+            break;
+        }
         if let Some(rest) = line.strip_prefix("diff --git ") {
             diff_paths = parse_diff_git_line(rest);
         } else if line.starts_with("Binary files ")
             || line.starts_with("Binary file ")
-            || line.contains("GIT binary patch")
+            || line == "GIT binary patch"
         {
             return diff_paths.map(|(_, b)| PathBuf::from(strip_b_prefix(b)));
         }
@@ -607,6 +614,25 @@ index 1..2 100644\n\
     #[test]
     fn detect_binary_returns_none_for_non_binary() {
         assert!(detect_binary(SIMPLE_DIFF).is_none());
+    }
+
+    #[test]
+    fn detect_binary_ignores_marker_strings_inside_hunk_content() {
+        // Regression: the binary-detection logic used to scan every line of
+        // the section, including `+`/`-` content. A new file whose body
+        // happened to contain "GIT binary patch" or "Binary files " (such
+        // as this very parser source) self-misclassified as binary.
+        let section = "\
+diff --git a/src/diff.rs b/src/diff.rs
+new file mode 100644
+--- /dev/null
++++ b/src/diff.rs
+@@ -0,0 +1,3 @@
++// Detect the GIT binary patch marker in real git output.
++// Also detect Binary files a/X and b/X differ.
++let _ = ();
+";
+        assert!(detect_binary(section).is_none());
     }
 
     #[test]
