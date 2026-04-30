@@ -179,6 +179,11 @@ pub(super) struct OverviewCommentSet {
     pub(super) stack_level: Vec<Comment>,
     /// Per-change comments in stack order (parallel to `ResolvedStack.entries`).
     pub(super) per_change: Vec<Vec<Comment>>,
+    /// Comments from change files whose `change_id` is no longer in the resolved
+    /// revset. Loaded with `status = Orphaned`. Not rendered anywhere in the
+    /// current UI; held for future `jjr orphans` surfacing.
+    #[expect(dead_code, reason = "held for future jjr orphans surfacing")]
+    pub(super) orphaned: Vec<Comment>,
 }
 
 impl OverviewCommentSet {
@@ -734,6 +739,7 @@ mod tests {
         OverviewCommentSet {
             stack_level,
             per_change,
+            orphaned: vec![],
         }
     }
 

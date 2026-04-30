@@ -341,6 +341,57 @@ fn log_warning(msg: &str) {
     let _ = writeln!(handle, "warning: {msg}");
 }
 
+/// Walk `.jj-review/comments/` and return the `ChangeId` for every
+/// `<change-id>.jsonl` file found there.
+///
+/// `_stack.jsonl` is excluded — it is not a per-change file. Files whose
+/// stems cannot be parsed back into a valid `ChangeId` are silently skipped
+/// (graceful degradation: a hand-created or partially-written file should not
+/// prevent the rest of the orphan detection pass from running).
+///
+/// Returns an empty `Vec` when the comments directory does not exist.
+pub fn list_change_ids_with_comments(repo_root: &Path) -> Result<Vec<ChangeId>> {
+    let dir = comments_dir(repo_root);
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let entries = std::fs::read_dir(&dir).map_err(|source| JjrError::Io { source })?;
+
+    let mut ids = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|source| JjrError::Io { source })?;
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+
+        if !name_str.ends_with(".jsonl") {
+            continue;
+        }
+        if name_str == STACK_FILENAME {
+            continue;
+        }
+
+        let stem = name_str.trim_end_matches(".jsonl");
+        // Filename encoding reversal: divergent IDs have `_` in place of `/`
+        // (e.g. `abc11111_1.jsonl` → `abc11111/1`). Non-divergent IDs contain
+        // no underscore so the replacement is a no-op. Filenames whose stems
+        // cannot be parsed as a valid ChangeId are skipped silently — a
+        // hand-created or partially-written file must not block detection.
+        //
+        // `to_filename` encodes the head/disambiguator separator `/` as `_`. The
+        // decode here replaces ALL `_` with `/`, which is unambiguous because
+        // `is_valid_change_id` requires the head to be ASCII-alphanumeric only —
+        // no `_` can appear except the one this round-trip introduces. A future
+        // charset change that admits `_` in heads MUST update this decode and
+        // the encode in `ChangeId::to_filename` together.
+        let canonical = stem.replace('_', "/");
+        if let Ok(id) = ChangeId::parse(&canonical) {
+            ids.push(id);
+        }
+    }
+    Ok(ids)
+}
+
 /// Aggregate result of a stale-comment clear pass.
 pub struct ClearStats {
     pub changes_touched: usize,
@@ -1290,5 +1341,126 @@ mod tests {
         let loaded = load_stack_comments(dir.path(), &hash).unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].body, "cross-cutting concern");
+    }
+
+    #[test]
+    fn list_change_ids_empty_dir_returns_empty() {
+        let dir = tmp();
+        ensure_review_dir(dir.path()).unwrap();
+        let ids = list_change_ids_with_comments(dir.path()).unwrap();
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn list_change_ids_missing_dir_returns_empty() {
+        let dir = tmp();
+        let ids = list_change_ids_with_comments(dir.path()).unwrap();
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn list_change_ids_single_file_returns_one_id() {
+        let dir = tmp();
+        let id = cid("abc12345");
+        let ts = datetime!(2026-04-29 14:00:00 UTC);
+        let comment = rooted(make_line_comment(id.clone(), ts, "body"), dir.path());
+        save_comment(dir.path(), &comment).unwrap();
+
+        let ids = list_change_ids_with_comments(dir.path()).unwrap();
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids[0], id);
+    }
+
+    #[test]
+    fn list_change_ids_excludes_stack_file() {
+        let dir = tmp();
+        let id = cid("abc12345");
+        let ts1 = datetime!(2026-04-29 14:00:00 UTC);
+        let ts2 = datetime!(2026-04-29 14:01:00 UTC);
+        let change_comment = rooted(make_line_comment(id, ts1, "change"), dir.path());
+        let stack_comment = rooted(make_stack_comment(ts2, "stack"), dir.path());
+        save_comment(dir.path(), &change_comment).unwrap();
+        save_comment(dir.path(), &stack_comment).unwrap();
+
+        let ids = list_change_ids_with_comments(dir.path()).unwrap();
+        assert_eq!(ids.len(), 1, "stack file must not appear in returned ids");
+    }
+
+    #[test]
+    fn list_change_ids_multiple_files_returns_all() {
+        let dir = tmp();
+        let id1 = cid("abc11111");
+        let id2 = cid("abc22222");
+        let ts1 = datetime!(2026-04-29 14:00:00 UTC);
+        let ts2 = datetime!(2026-04-29 14:01:00 UTC);
+        let c1 = rooted(make_line_comment(id1.clone(), ts1, "first"), dir.path());
+        let c2 = rooted(make_line_comment(id2.clone(), ts2, "second"), dir.path());
+        save_comment(dir.path(), &c1).unwrap();
+        save_comment(dir.path(), &c2).unwrap();
+
+        let mut ids = list_change_ids_with_comments(dir.path()).unwrap();
+        ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        assert_eq!(ids.len(), 2);
+        assert_eq!(ids[0], id1);
+        assert_eq!(ids[1], id2);
+    }
+
+    #[test]
+    fn list_change_ids_malformed_filename_skipped_silently() {
+        let dir = tmp();
+        ensure_review_dir(dir.path()).unwrap();
+        let bad_path = dir
+            .path()
+            .join(".jj-review")
+            .join("comments")
+            .join("bogus.jsonl");
+        std::fs::write(&bad_path, "").unwrap();
+
+        let ids = list_change_ids_with_comments(dir.path()).unwrap();
+        assert!(
+            ids.is_empty(),
+            "malformed filename must be skipped silently"
+        );
+    }
+
+    #[test]
+    fn list_change_ids_divergent_change_id_roundtrips() {
+        let dir = tmp();
+        let id = cid("abc11111/1");
+        let ts = datetime!(2026-04-29 14:00:00 UTC);
+        let comment = rooted(make_line_comment(id.clone(), ts, "divergent"), dir.path());
+        save_comment(dir.path(), &comment).unwrap();
+
+        let ids = list_change_ids_with_comments(dir.path()).unwrap();
+        assert_eq!(ids.len(), 1);
+        assert_eq!(
+            ids[0], id,
+            "divergent change_id must round-trip via filename"
+        );
+    }
+
+    #[test]
+    fn list_change_ids_ambiguous_decode_silently_dropped() {
+        // Pin: a hand-crafted filename whose `_`-to-`/` decode produces an
+        // ambiguous form must be skipped silently. `abcdef12_34_5.jsonl`
+        // decodes to `abcdef12/34/5`; `splitn(2, '/')` yields head `abcdef12`
+        // and disambiguator `34/5`, which fails the all-digits check in
+        // `is_valid_change_id`. Future charset/parser changes that admit `_`
+        // in heads would silently start matching such files — this test
+        // surfaces the breakage.
+        let dir = tmp();
+        ensure_review_dir(dir.path()).unwrap();
+        let crafted = dir
+            .path()
+            .join(".jj-review")
+            .join("comments")
+            .join("abcdef12_34_5.jsonl");
+        std::fs::write(&crafted, "").unwrap();
+
+        let ids = list_change_ids_with_comments(dir.path()).unwrap();
+        assert!(
+            ids.is_empty(),
+            "ambiguous-decode filename must be skipped silently, got {ids:?}"
+        );
     }
 }

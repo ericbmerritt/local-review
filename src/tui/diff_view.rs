@@ -67,14 +67,15 @@ pub(crate) struct InlineComment {
 
 /// Convert a saved `Comment` to an `InlineComment` for rendering, filtered by
 /// file path. Returns `None` if the comment is not a line-scoped comment for
-/// the given file, or if the comment is stale and must not appear inline.
+/// the given file, or if the comment is stale or orphaned and must not appear
+/// inline.
 pub(crate) fn comment_to_inline(
     comment: &Comment,
     comment_index: usize,
     file_path: Option<&std::path::Path>,
     now: time::OffsetDateTime,
 ) -> Option<InlineComment> {
-    if comment.status == Some(Status::Stale) {
+    if matches!(comment.status, Some(Status::Stale | Status::Orphaned)) {
         return None;
     }
     let Anchor::Line { location, .. } = &comment.anchor else {
@@ -601,5 +602,14 @@ mod tests {
         let now = time::OffsetDateTime::UNIX_EPOCH;
         let inline = comment_to_inline(&comment, 0, Some(std::path::Path::new("foo.txt")), now);
         assert!(inline.is_none(), "stale comments must not render inline");
+    }
+
+    #[test]
+    fn orphaned_comment_is_excluded_from_inline_rendering() {
+        let mut comment = make_line_comment("foo.txt", Severity::Required);
+        comment.status = Some(Status::Orphaned);
+        let now = time::OffsetDateTime::UNIX_EPOCH;
+        let inline = comment_to_inline(&comment, 0, Some(std::path::Path::new("foo.txt")), now);
+        assert!(inline.is_none(), "orphaned comments must not render inline");
     }
 }

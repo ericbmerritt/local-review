@@ -74,8 +74,7 @@ const TRANSITION_DESC_BUDGET: usize = 36;
 /// The numeric count stays accurate so the user still sees the true total.
 pub(super) const DOT_BUDGET: usize = 5;
 
-/// Single source of truth for severity → terminal color. Used by inline comment
-/// rendering, the composer's severity picker, and the stale-comments view.
+/// Severity -> terminal color.
 pub(super) fn severity_color(severity: Severity) -> Color {
     match severity {
         Severity::Required => Color::Red,
@@ -84,7 +83,7 @@ pub(super) fn severity_color(severity: Severity) -> Color {
     }
 }
 
-/// Single source of truth for severity → display label.
+/// Severity -> display label.
 pub(super) fn severity_label(severity: Severity) -> &'static str {
     match severity {
         Severity::Required => "required",
@@ -225,9 +224,9 @@ impl SeverityHistogram {
     pub(super) fn from_comments(comments: &[Comment]) -> Self {
         let mut h = Self::default();
         for c in comments {
-            // Stale records do not contribute to active-comment counts; the
-            // stale view owns them.
-            if c.status == Some(Status::Stale) {
+            // Stale and orphaned records do not contribute to active-comment
+            // counts. Stale lives in the stale view; orphaned is out of scope.
+            if matches!(c.status, Some(Status::Stale | Status::Orphaned)) {
                 continue;
             }
             match c.severity {
@@ -583,9 +582,12 @@ impl App {
             })
             .collect();
 
+        let orphaned = collect_orphaned_comments(&repo_root, &entries);
+
         self.overview_cache = Some(OverviewCommentSet {
             stack_level,
             per_change,
+            orphaned,
         });
     }
 
@@ -677,6 +679,47 @@ fn format_persist_error(comment: &Comment, err: &JjrError) -> String {
     let location = sanitize_for_status(&raw_location);
     let err = sanitize_for_status(&err.to_string());
     format!("warning: could not persist re-anchor for {location}: {err}")
+}
+
+/// Load comments from every per-change JSONL file whose `change_id` is absent
+/// from the resolved stack entries, marking every loaded comment as
+/// `Status::Orphaned`.
+///
+/// The orphaned list is stored in the overview cache and held for future
+/// surfacing (e.g. a `jjr orphans` command). Nothing in the current UI renders
+/// these comments. Best-effort: a load failure for one file is silently skipped
+/// so a single corrupt file does not block the rest of the pass.
+///
+/// Best-effort orphan discovery. Reads every `<change-id>.jsonl` not in
+/// the resolved stack into memory. Memory cost is O(N*M) for N orphan
+/// files * M comments per file; in the single-user local threat model
+/// this is a self-DoS only. If `jjr` ever runs in a shared workspace,
+/// add a hard cap on files and lines processed per session.
+fn collect_orphaned_comments(
+    repo_root: &std::path::Path,
+    stack_entries: &[StackEntry],
+) -> Vec<Comment> {
+    let in_stack: std::collections::HashSet<&ChangeId> =
+        stack_entries.iter().map(|e| &e.change_id).collect();
+
+    let Ok(all_on_disk) = crate::store::list_change_ids_with_comments(repo_root) else {
+        return Vec::new();
+    };
+
+    let mut orphaned = Vec::new();
+    for change_id in all_on_disk {
+        if in_stack.contains(&change_id) {
+            continue;
+        }
+        let Ok(comments) = crate::store::load_change_comments(repo_root, &change_id) else {
+            continue;
+        };
+        for mut comment in comments {
+            comment.status = Some(Status::Orphaned);
+            orphaned.push(comment);
+        }
+    }
+    orphaned
 }
 
 fn run_app(
@@ -4322,6 +4365,137 @@ mod tests {
         assert_eq!(loaded_b[0].body, "B-edited");
         assert_eq!(loaded_b[0].severity, Severity::Suggestion);
         assert_eq!(loaded_b[0].created_at, original.created_at);
+    }
+
+    #[test]
+    fn severity_histogram_excludes_orphaned() {
+        let mut required = comment_with_severity(Severity::Required);
+        required.status = Some(Status::Orphaned);
+        let active = comment_with_severity(Severity::Note);
+        let h = SeverityHistogram::from_comments(&[required, active]);
+        assert_eq!(h.required, 0, "orphaned required must not be counted");
+        assert_eq!(h.note, 1, "active note must be counted");
+        assert_eq!(h.total(), 1);
+    }
+
+    #[test]
+    fn severity_histogram_excludes_stale_and_orphaned_independently() {
+        let mut stale = comment_with_severity(Severity::Required);
+        stale.status = Some(Status::Stale);
+        let mut orphaned = comment_with_severity(Severity::Suggestion);
+        orphaned.status = Some(Status::Orphaned);
+        let active = comment_with_severity(Severity::Note);
+        let h = SeverityHistogram::from_comments(&[stale, orphaned, active]);
+        assert_eq!(h.required, 0);
+        assert_eq!(h.suggestion, 0);
+        assert_eq!(h.note, 1);
+        assert_eq!(h.total(), 1);
+    }
+
+    #[test]
+    fn collect_orphaned_comments_marks_out_of_stack_ids_as_orphaned() {
+        let dir = tempfile::tempdir().unwrap();
+        let id_a = ChangeId::parse(&"a".repeat(32)).unwrap();
+        let id_b = ChangeId::parse(&"b".repeat(32)).unwrap();
+        let id_x = ChangeId::parse(&"c".repeat(32)).unwrap(); // orphaned
+
+        // Save a comment for X (out of stack).
+        let orphan_comment = Comment {
+            schema_version: SchemaVersion,
+            anchor: Anchor::Change {
+                change_id: id_x.clone(),
+            },
+            repo_root: dir.path().to_path_buf(),
+            revset: "@".to_owned(),
+            commit_id: None,
+            body: "orphaned concern".to_owned(),
+            severity: Severity::Note,
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
+            updated_at: None,
+            status: Some(Status::Pending),
+            mismatch_reason: None,
+        };
+        crate::store::save_comment(dir.path(), &orphan_comment).unwrap();
+
+        // Also save a comment for A (in stack) — should NOT appear in orphaned.
+        let active_comment = Comment {
+            schema_version: SchemaVersion,
+            anchor: Anchor::Change {
+                change_id: id_a.clone(),
+            },
+            repo_root: dir.path().to_path_buf(),
+            revset: "@".to_owned(),
+            commit_id: None,
+            body: "active concern".to_owned(),
+            severity: Severity::Note,
+            created_at: time::OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1),
+            updated_at: None,
+            status: Some(Status::Pending),
+            mismatch_reason: None,
+        };
+        crate::store::save_comment(dir.path(), &active_comment).unwrap();
+
+        let stack_entries = vec![
+            StackEntry {
+                change_id: id_a.clone(),
+                commit_id: CommitId::parse(&"a".repeat(40)).unwrap(),
+                description: "first".to_owned(),
+            },
+            StackEntry {
+                change_id: id_b.clone(),
+                commit_id: CommitId::parse(&"b".repeat(40)).unwrap(),
+                description: "second".to_owned(),
+            },
+        ];
+
+        let orphaned = collect_orphaned_comments(dir.path(), &stack_entries);
+        assert_eq!(orphaned.len(), 1, "only X's comment should be orphaned");
+        assert_eq!(
+            orphaned[0].status,
+            Some(Status::Orphaned),
+            "status must be overwritten to Orphaned"
+        );
+        assert_eq!(orphaned[0].body, "orphaned concern");
+    }
+
+    #[test]
+    fn collect_orphaned_comments_empty_dir_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let stack_entries: Vec<StackEntry> = vec![];
+        let orphaned = collect_orphaned_comments(dir.path(), &stack_entries);
+        assert!(orphaned.is_empty());
+    }
+
+    #[test]
+    fn collect_orphaned_comments_all_in_stack_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let id_a = ChangeId::parse(&"a".repeat(32)).unwrap();
+
+        let comment = Comment {
+            schema_version: SchemaVersion,
+            anchor: Anchor::Change {
+                change_id: id_a.clone(),
+            },
+            repo_root: dir.path().to_path_buf(),
+            revset: "@".to_owned(),
+            commit_id: None,
+            body: "active".to_owned(),
+            severity: Severity::Note,
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
+            updated_at: None,
+            status: Some(Status::Pending),
+            mismatch_reason: None,
+        };
+        crate::store::save_comment(dir.path(), &comment).unwrap();
+
+        let stack_entries = vec![StackEntry {
+            change_id: id_a.clone(),
+            commit_id: CommitId::parse(&"a".repeat(40)).unwrap(),
+            description: "first".to_owned(),
+        }];
+
+        let orphaned = collect_orphaned_comments(dir.path(), &stack_entries);
+        assert!(orphaned.is_empty(), "in-stack change must not be orphaned");
     }
 
     /// Delete a stack-scoped comment via `^D` from the composer. The record
