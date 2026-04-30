@@ -5,6 +5,7 @@ use time::OffsetDateTime;
 use tui_textarea::TextArea;
 
 use crate::comment::Severity;
+use crate::stack::RevsetHash;
 
 const SECS_PER_MIN: i64 = 60;
 const SECS_PER_HOUR: i64 = 60 * SECS_PER_MIN;
@@ -19,28 +20,49 @@ pub(crate) enum ComposerScope {
 }
 
 /// All data needed to build a `LineAnchor` once the composer saves.
+/// Naming note: `source_line`/`target_line` map to `old_line`/`new_line` in
+/// the persisted `LineAnchor` — this struct uses the diff-view-side names.
 #[derive(Debug, Clone)]
 pub(crate) struct LineTarget {
     pub(crate) file: PathBuf,
-    /// 0-based index into the rendered lines for context capture.
     pub(crate) rendered_index: usize,
-    /// 1-based source-side line number (`old_line` in the anchor).
     pub(crate) source_line: Option<u32>,
-    /// 1-based target-side line number (`new_line` in the anchor).
     pub(crate) target_line: Option<u32>,
-    /// Raw content of the target line (for `target_text`).
     pub(crate) target_text: String,
-    /// The verbatim `@@ … @@` hunk header this line belongs to.
     pub(crate) hunk_header: String,
-    /// Up to 3 lines immediately before the target (for context).
     pub(crate) context_before: Vec<String>,
-    /// Up to 3 lines immediately after the target (for context).
     pub(crate) context_after: Vec<String>,
+}
+
+/// Snapshot of change-level context captured at composer open time.
+#[derive(Debug, Clone)]
+pub(crate) struct ChangeContext {
+    pub(crate) change_id: String,
+    pub(crate) description: String,
+}
+
+/// Snapshot of stack-level context captured at composer open time.
+#[derive(Debug, Clone)]
+pub(crate) struct StackContextSnapshot {
+    pub(crate) revset: String,
+    pub(crate) revset_hash: RevsetHash,
+}
+
+/// Per-scope context snapshots, captured at composer open time so the chrome
+/// block can swap immediately when the reviewer presses ^L/^C/^K without
+/// needing to reach back into App.
+#[derive(Debug, Clone)]
+pub(crate) struct ComposerContexts {
+    /// Always present — every view has a current diff line.
+    pub(crate) line: LineTarget,
+    pub(crate) change: ChangeContext,
+    /// `None` in single-change mode; stack ^K save will refuse if None.
+    pub(crate) stack: Option<StackContextSnapshot>,
 }
 
 /// State for Screen 2 — Comment composer modal.
 pub(crate) struct Composer {
-    pub(crate) target: LineTarget,
+    pub(crate) contexts: ComposerContexts,
     pub(crate) scope: ComposerScope,
     pub(crate) severity: Severity,
     pub(crate) body: TextArea<'static>,
@@ -50,20 +72,28 @@ pub(crate) struct Composer {
     pub(crate) editing: Option<OffsetDateTime>,
 }
 
+impl Composer {
+    /// Convenience accessor: the line target from the contexts.
+    pub(crate) fn line_target(&self) -> &LineTarget {
+        &self.contexts.line
+    }
+}
+
 /// Bundle of fields drawn from a single `Comment` to seed an edit-mode
 /// composer. Constructing this in the caller keeps `severity`, `body`, and
 /// the `identity` timestamp from drifting apart at the `for_edit` boundary.
 pub(crate) struct EditedComment {
-    pub(crate) target: LineTarget,
+    pub(crate) contexts: ComposerContexts,
     pub(crate) severity: Severity,
     pub(crate) body: String,
     pub(crate) identity: OffsetDateTime,
+    pub(crate) scope: ComposerScope,
 }
 
 impl Composer {
-    pub(crate) fn new(target: LineTarget, severity: Severity) -> Self {
+    pub(crate) fn new(contexts: ComposerContexts, severity: Severity) -> Self {
         Self {
-            target,
+            contexts,
             scope: default_scope_for_cursor(),
             severity,
             body: TextArea::default(),
@@ -80,26 +110,37 @@ impl Composer {
             textarea.insert_str(line);
         }
         Self {
-            target: edited.target,
-            scope: ComposerScope::Line,
+            contexts: edited.contexts,
+            scope: edited.scope,
             severity: edited.severity,
             body: textarea,
             editing: Some(edited.identity),
         }
     }
 
-    /// Modal title, reflecting edit vs. new-comment mode.
+    /// Modal title, reflecting scope and edit vs. new-comment mode.
     pub(crate) fn title(&self) -> String {
-        let file = self.target.file.display();
-        let line = self
-            .target
-            .target_line
-            .or(self.target.source_line)
-            .unwrap_or(0);
-        if self.editing.is_some() {
-            format!("Edit comment · {file}:{line}")
+        let prefix = if self.editing.is_some() {
+            "Edit comment"
         } else {
-            format!("Comment · {file}:{line}")
+            "Comment"
+        };
+        match self.scope {
+            ComposerScope::Line => {
+                let file = self.contexts.line.file.display();
+                let line = self
+                    .contexts
+                    .line
+                    .target_line
+                    .or(self.contexts.line.source_line)
+                    .unwrap_or(0);
+                format!("{prefix} · {file}:{line}")
+            }
+            ComposerScope::Change => {
+                let id = &self.contexts.change.change_id;
+                format!("{prefix} · change {id}")
+            }
+            ComposerScope::Stack => format!("{prefix} · stack"),
         }
     }
 
@@ -249,6 +290,24 @@ mod tests {
         }
     }
 
+    fn make_contexts() -> ComposerContexts {
+        ComposerContexts {
+            line: make_target(),
+            change: ChangeContext {
+                change_id: "abc12345".to_owned(),
+                description: "Add retry policy".to_owned(),
+            },
+            stack: Some(StackContextSnapshot {
+                revset: "trunk()..@".to_owned(),
+                revset_hash: RevsetHash::from_revset("trunk()..@"),
+            }),
+        }
+    }
+
+    fn make_composer(severity: Severity) -> Composer {
+        Composer::new(make_contexts(), severity)
+    }
+
     #[test]
     fn default_severity_uses_last_when_present() {
         assert_eq!(
@@ -315,7 +374,7 @@ mod tests {
 
     #[test]
     fn handle_composer_key_ctrl_l_sets_line_scope() {
-        let mut c = Composer::new(make_target(), Severity::Suggestion);
+        let mut c = make_composer(Severity::Suggestion);
         c.scope = ComposerScope::Change;
         let key = KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL);
         let action = handle_composer_key(&mut c, key);
@@ -325,7 +384,7 @@ mod tests {
 
     #[test]
     fn handle_composer_key_ctrl_c_sets_change_scope() {
-        let mut c = Composer::new(make_target(), Severity::Suggestion);
+        let mut c = make_composer(Severity::Suggestion);
         let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         let action = handle_composer_key(&mut c, key);
         assert_eq!(action, ComposerAction::Continue);
@@ -334,7 +393,7 @@ mod tests {
 
     #[test]
     fn handle_composer_key_ctrl_k_sets_stack_scope() {
-        let mut c = Composer::new(make_target(), Severity::Suggestion);
+        let mut c = make_composer(Severity::Suggestion);
         let key = KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL);
         let action = handle_composer_key(&mut c, key);
         assert_eq!(action, ComposerAction::Continue);
@@ -343,7 +402,7 @@ mod tests {
 
     #[test]
     fn handle_composer_key_ctrl_1_sets_note() {
-        let mut c = Composer::new(make_target(), Severity::Required);
+        let mut c = make_composer(Severity::Required);
         let key = KeyEvent::new(KeyCode::Char('1'), KeyModifiers::CONTROL);
         let action = handle_composer_key(&mut c, key);
         assert_eq!(action, ComposerAction::Continue);
@@ -352,7 +411,7 @@ mod tests {
 
     #[test]
     fn handle_composer_key_ctrl_2_sets_suggestion() {
-        let mut c = Composer::new(make_target(), Severity::Required);
+        let mut c = make_composer(Severity::Required);
         let key = KeyEvent::new(KeyCode::Char('2'), KeyModifiers::CONTROL);
         let action = handle_composer_key(&mut c, key);
         assert_eq!(action, ComposerAction::Continue);
@@ -361,7 +420,7 @@ mod tests {
 
     #[test]
     fn handle_composer_key_ctrl_3_sets_required() {
-        let mut c = Composer::new(make_target(), Severity::Note);
+        let mut c = make_composer(Severity::Note);
         let key = KeyEvent::new(KeyCode::Char('3'), KeyModifiers::CONTROL);
         let action = handle_composer_key(&mut c, key);
         assert_eq!(action, ComposerAction::Continue);
@@ -370,7 +429,7 @@ mod tests {
 
     #[test]
     fn handle_composer_key_ctrl_x_returns_save() {
-        let mut c = Composer::new(make_target(), Severity::Suggestion);
+        let mut c = make_composer(Severity::Suggestion);
         let key = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL);
         let action = handle_composer_key(&mut c, key);
         assert_eq!(action, ComposerAction::Save);
@@ -378,36 +437,76 @@ mod tests {
 
     #[test]
     fn handle_composer_key_esc_returns_cancel() {
-        let mut c = Composer::new(make_target(), Severity::Suggestion);
+        let mut c = make_composer(Severity::Suggestion);
         let key = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
         let action = handle_composer_key(&mut c, key);
         assert_eq!(action, ComposerAction::Cancel);
     }
 
     #[test]
-    fn composer_title_new_mode() {
-        let c = Composer::new(make_target(), Severity::Suggestion);
+    fn composer_title_new_mode_line_scope() {
+        let c = make_composer(Severity::Suggestion);
         assert_eq!(c.title(), "Comment · src/client.rs:142");
+    }
+
+    #[test]
+    fn composer_title_new_mode_change_scope() {
+        let mut c = make_composer(Severity::Suggestion);
+        c.scope = ComposerScope::Change;
+        assert_eq!(c.title(), "Comment · change abc12345");
+    }
+
+    #[test]
+    fn composer_title_new_mode_stack_scope() {
+        let mut c = make_composer(Severity::Suggestion);
+        c.scope = ComposerScope::Stack;
+        assert_eq!(c.title(), "Comment · stack");
     }
 
     #[test]
     fn composer_title_edit_mode() {
         let c = Composer::for_edit(EditedComment {
-            target: make_target(),
+            contexts: make_contexts(),
             severity: Severity::Required,
             body: "existing body".to_owned(),
             identity: OffsetDateTime::UNIX_EPOCH,
+            scope: ComposerScope::Line,
         });
         assert_eq!(c.title(), "Edit comment · src/client.rs:142");
     }
 
     #[test]
+    fn composer_title_edit_mode_change_scope() {
+        let c = Composer::for_edit(EditedComment {
+            contexts: make_contexts(),
+            severity: Severity::Required,
+            body: "existing body".to_owned(),
+            identity: OffsetDateTime::UNIX_EPOCH,
+            scope: ComposerScope::Change,
+        });
+        assert_eq!(c.title(), "Edit comment · change abc12345");
+    }
+
+    #[test]
+    fn composer_title_edit_mode_stack_scope() {
+        let c = Composer::for_edit(EditedComment {
+            contexts: make_contexts(),
+            severity: Severity::Required,
+            body: "existing body".to_owned(),
+            identity: OffsetDateTime::UNIX_EPOCH,
+            scope: ComposerScope::Stack,
+        });
+        assert_eq!(c.title(), "Edit comment · stack");
+    }
+
+    #[test]
     fn for_edit_prepopulates_body_and_severity() {
         let c = Composer::for_edit(EditedComment {
-            target: make_target(),
+            contexts: make_contexts(),
             severity: Severity::Required,
             body: "line one\nline two".to_owned(),
             identity: OffsetDateTime::UNIX_EPOCH,
+            scope: ComposerScope::Line,
         });
         assert_eq!(c.body_text(), "line one\nline two");
         assert_eq!(c.severity, Severity::Required);
@@ -418,10 +517,11 @@ mod tests {
     #[test]
     fn ctrl_d_in_edit_mode_returns_delete() {
         let mut c = Composer::for_edit(EditedComment {
-            target: make_target(),
+            contexts: make_contexts(),
             severity: Severity::Note,
             body: "body".to_owned(),
             identity: OffsetDateTime::UNIX_EPOCH,
+            scope: ComposerScope::Line,
         });
         let key = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
         let action = handle_composer_key(&mut c, key);
@@ -430,7 +530,7 @@ mod tests {
 
     #[test]
     fn ctrl_d_outside_edit_mode_forwarded_to_textarea() {
-        let mut c = Composer::new(make_target(), Severity::Suggestion);
+        let mut c = make_composer(Severity::Suggestion);
         let key = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
         let action = handle_composer_key(&mut c, key);
         assert_eq!(action, ComposerAction::Continue);

@@ -1333,7 +1333,13 @@ mod tests {
 
     #[test]
     fn reanchor_stack_scoped_comment_returns_none() {
-        let comment = make_comment(Anchor::Stack, None, None);
+        let comment = make_comment(
+            Anchor::Stack {
+                revset_hash: crate::stack::RevsetHash::from_revset("@"),
+            },
+            None,
+            None,
+        );
         let diff = make_diff(vec![modified_file("foo.rs", vec![])]);
         assert!(reanchor_comment(&comment, &diff).is_none());
     }

@@ -30,7 +30,8 @@ mod help_screen;
 mod stale_screen;
 
 use composer::{
-    default_severity, Composer, ComposerAction, ComposerScope, EditedComment, LineTarget,
+    default_severity, ChangeContext, Composer, ComposerAction, ComposerContexts, ComposerScope,
+    EditedComment, LineTarget, StackContextSnapshot,
 };
 use diff_view::{comment_to_inline, DiffView, InlineComment, RenderedLine, RenderedLineKind};
 use stale_screen::StaleScreenState;
@@ -610,7 +611,7 @@ fn format_persist_error(comment: &Comment, err: &JjrError) -> String {
                 .map_or_else(|| "?".to_owned(), |n| n.to_string()),
         ),
         Anchor::Change { change_id } => change_id.as_str().to_owned(),
-        Anchor::Stack => "stack".to_owned(),
+        Anchor::Stack { .. } => "stack".to_owned(),
     };
     let location = sanitize_for_status(&raw_location);
     let err = sanitize_for_status(&err.to_string());
@@ -1375,6 +1376,7 @@ fn handle_composer_event(app: &mut App, key: KeyEvent) {
     }
 }
 
+#[derive(Debug)]
 enum SaveOutcome {
     /// Comment persisted; composer should close.
     Saved,
@@ -1386,13 +1388,30 @@ enum SaveOutcome {
     Errored(String),
 }
 
+fn composer_contexts(app: &App, line: LineTarget) -> ComposerContexts {
+    let change = ChangeContext {
+        change_id: app.details.change_id.as_str().to_owned(),
+        description: app.details.description.clone(),
+    };
+    let stack = app.stack.as_ref().map(|s| StackContextSnapshot {
+        revset: s.revset.clone(),
+        revset_hash: s.revset_hash,
+    });
+    ComposerContexts {
+        line,
+        change,
+        stack,
+    }
+}
+
 fn open_composer(app: &mut App) {
     match build_line_target(app) {
         BuildTargetResult::Ready(target) => {
+            let contexts = composer_contexts(app, target);
             if let Some(reanchor) = app.pending_reanchor.as_ref() {
                 let severity = reanchor.severity;
                 let body = reanchor.body.clone();
-                let mut composer = Composer::new(target, severity);
+                let mut composer = Composer::new(contexts, severity);
                 for (i, line) in body.lines().enumerate() {
                     if i > 0 {
                         composer.body.insert_newline();
@@ -1402,7 +1421,7 @@ fn open_composer(app: &mut App) {
                 app.screen = Screen::Composer(Box::new(composer));
             } else {
                 let severity = default_severity(app.last_severity);
-                app.screen = Screen::Composer(Box::new(Composer::new(target, severity)));
+                app.screen = Screen::Composer(Box::new(Composer::new(contexts, severity)));
             }
         }
         BuildTargetResult::NonCommentable => {
@@ -1435,11 +1454,13 @@ fn open_composer_for_edit(app: &mut App) {
         context_after: location.context_after.clone(),
     };
 
+    let contexts = composer_contexts(app, target);
     let edited = EditedComment {
-        target,
+        contexts,
         severity: comment.severity,
         body: comment.body.clone(),
         identity: comment.created_at,
+        scope: ComposerScope::Line,
     };
     let composer = Composer::for_edit(edited);
     app.screen = Screen::Composer(Box::new(composer));
@@ -1547,33 +1568,22 @@ fn collect_context(lines: &[RenderedLine], idx: usize) -> (Vec<String>, Vec<Stri
 }
 
 fn build_location_from_composer(app: &App, composer: &Composer) -> (ChangeId, LineAnchor) {
-    let side = pick_side(composer.target.source_line, composer.target.target_line);
+    let t = composer.line_target();
+    let side = pick_side(t.source_line, t.target_line);
     let location = LineAnchor {
-        file: PathBuf::from(&composer.target.file),
+        file: PathBuf::from(&t.file),
         side,
-        old_line: composer.target.source_line,
-        new_line: composer.target.target_line,
-        hunk_header: composer.target.hunk_header.clone(),
-        target_text: composer.target.target_text.clone(),
-        context_before: composer.target.context_before.clone(),
-        context_after: composer.target.context_after.clone(),
+        old_line: t.source_line,
+        new_line: t.target_line,
+        hunk_header: t.hunk_header.clone(),
+        target_text: t.target_text.clone(),
+        context_before: t.context_before.clone(),
+        context_after: t.context_after.clone(),
     };
     (app.details.change_id.clone(), location)
 }
 
 fn save_composer(app: &mut App, composer: &Composer, now: time::OffsetDateTime) -> SaveOutcome {
-    // Change and Stack scopes are selectable in the UI (so the picker reflects
-    // the chord state) but persistence is not yet supported for those scopes.
-    match composer.scope {
-        ComposerScope::Line => {}
-        ComposerScope::Change => {
-            return SaveOutcome::Refused("change-scope not supported yet — not saved".to_owned());
-        }
-        ComposerScope::Stack => {
-            return SaveOutcome::Refused("stack-scope not supported yet — not saved".to_owned());
-        }
-    }
-
     let body = composer.body_text();
     if body.trim().is_empty() {
         return SaveOutcome::Refused("comment body is empty — not saved".to_owned());
@@ -1596,22 +1606,10 @@ fn save_composer(app: &mut App, composer: &Composer, now: time::OffsetDateTime) 
         );
     }
 
-    let (change_id, location) = build_location_from_composer(app, composer);
-    let comment = Comment {
-        schema_version: SchemaVersion,
-        anchor: Anchor::Line {
-            change_id,
-            location,
-        },
-        repo_root: app.repo_root.clone(),
-        revset: app.revset.clone(),
-        commit_id: Some(app.details.commit_id.clone()),
-        body,
-        severity: composer.severity,
-        created_at: now,
-        updated_at: None,
-        status: Some(Status::Pending),
-        mismatch_reason: None,
+    let comment = build_comment_from_composer(app, composer, body, now);
+    let comment = match comment {
+        Ok(c) => c,
+        Err(refused) => return refused,
     };
 
     match crate::store::save_comment(&app.repo_root, &comment) {
@@ -1631,6 +1629,51 @@ fn save_composer(app: &mut App, composer: &Composer, now: time::OffsetDateTime) 
             sanitize_for_status(&e.to_string())
         )),
     }
+}
+
+fn build_comment_from_composer(
+    app: &App,
+    composer: &Composer,
+    body: String,
+    now: time::OffsetDateTime,
+) -> std::result::Result<Comment, SaveOutcome> {
+    let anchor = match composer.scope {
+        ComposerScope::Line => {
+            let (change_id, location) = build_location_from_composer(app, composer);
+            Anchor::Line {
+                change_id,
+                location,
+            }
+        }
+        ComposerScope::Change => Anchor::Change {
+            change_id: app.details.change_id.clone(),
+        },
+        ComposerScope::Stack => {
+            let revset_hash = composer
+                .contexts
+                .stack
+                .as_ref()
+                .map(|s| s.revset_hash)
+                .ok_or_else(|| {
+                    SaveOutcome::Refused("stack-scope requires --stack mode — not saved".to_owned())
+                })?;
+            Anchor::Stack { revset_hash }
+        }
+    };
+
+    Ok(Comment {
+        schema_version: SchemaVersion,
+        anchor,
+        repo_root: app.repo_root.clone(),
+        revset: app.revset.clone(),
+        commit_id: Some(app.details.commit_id.clone()),
+        body,
+        severity: composer.severity,
+        created_at: now,
+        updated_at: None,
+        status: Some(Status::Pending),
+        mismatch_reason: None,
+    })
 }
 
 struct UpdateArgs {
@@ -2107,8 +2150,20 @@ mod tests {
         }
     }
 
+    fn make_contexts_for_test(target: LineTarget) -> ComposerContexts {
+        ComposerContexts {
+            line: target,
+            change: ChangeContext {
+                change_id: "abc12345".to_owned(),
+                description: "test change".to_owned(),
+            },
+            stack: None,
+        }
+    }
+
     fn make_composer_with_body(target: LineTarget, body: &str) -> Composer {
-        let mut composer = Composer::new(target, Severity::Suggestion);
+        let contexts = make_contexts_for_test(target);
+        let mut composer = Composer::new(contexts, Severity::Suggestion);
         for ch in body.chars() {
             composer
                 .body
@@ -2118,19 +2173,110 @@ mod tests {
     }
 
     #[test]
-    fn save_composer_refuses_change_scope_with_message() {
+    fn save_composer_change_scope_saves_to_change_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = make_app_with_single_file(sample_diff_file());
+        app.repo_root = dir.path().to_path_buf();
+        app.line_index = 2;
+        let BuildTargetResult::Ready(target) = build_line_target(&app) else {
+            panic!("expected Ready");
+        };
+        let mut composer = make_composer_with_body(target, "change-level concern");
+        composer.scope = ComposerScope::Change;
+        let outcome = save_composer(&mut app, &composer, time::OffsetDateTime::UNIX_EPOCH);
+        assert!(
+            matches!(outcome, SaveOutcome::Saved),
+            "expected Saved; got {outcome:?}"
+        );
+
+        let loaded =
+            crate::store::load_change_comments(&app.repo_root, &app.details.change_id).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert!(
+            matches!(loaded[0].anchor, Anchor::Change { .. }),
+            "expected Change anchor"
+        );
+        assert_eq!(loaded[0].body, "change-level concern");
+    }
+
+    #[test]
+    fn save_composer_stack_scope_saves_to_stack_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = make_app_with_single_file(sample_diff_file());
+        app.repo_root = dir.path().to_path_buf();
+        app.line_index = 2;
+        let entry = StackEntry {
+            change_id: app.details.change_id.clone(),
+            commit_id: app.details.commit_id.clone(),
+            description: String::new(),
+        };
+        let revset_hash = RevsetHash::from_revset("trunk()..@");
+        app.stack = Some(StackContext {
+            entries: vec![entry],
+            current_index: 0,
+            revset: "trunk()..@".to_owned(),
+            revset_hash,
+        });
+
+        let BuildTargetResult::Ready(target) = build_line_target(&app) else {
+            panic!("expected Ready");
+        };
+        // Build contexts via the production helper so stack snapshot mirrors
+        // what the running app would carry into the composer.
+        let contexts = composer_contexts(&app, target);
+        let mut composer = Composer::new(contexts, Severity::Suggestion);
+        for ch in "stack-level concern".chars() {
+            composer
+                .body
+                .input(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        composer.scope = ComposerScope::Stack;
+
+        let outcome = save_composer(&mut app, &composer, time::OffsetDateTime::UNIX_EPOCH);
+        assert!(
+            matches!(outcome, SaveOutcome::Saved),
+            "expected Saved; got {outcome:?}"
+        );
+
+        let loaded = crate::store::load_stack_comments(&app.repo_root, &revset_hash).unwrap();
+        assert_eq!(loaded.len(), 1);
+        match &loaded[0].anchor {
+            Anchor::Stack {
+                revset_hash: persisted,
+            } => {
+                assert_eq!(*persisted, revset_hash, "persisted hash should match");
+            }
+            Anchor::Line { .. } | Anchor::Change { .. } => {
+                panic!("expected Stack anchor; got {:?}", loaded[0].anchor)
+            }
+        }
+        assert_eq!(loaded[0].body, "stack-level concern");
+
+        // Confirm the record landed in `_stack.jsonl`, not the change file.
+        let stack_path = dir
+            .path()
+            .join(".jj-review")
+            .join("comments")
+            .join("_stack.jsonl");
+        assert!(stack_path.exists(), "_stack.jsonl should exist");
+    }
+
+    #[test]
+    fn save_composer_stack_scope_refuses_in_single_change_mode() {
         let mut app = make_app_with_single_file(sample_diff_file());
         app.line_index = 2;
         let BuildTargetResult::Ready(target) = build_line_target(&app) else {
             panic!("expected Ready");
         };
         let mut composer = make_composer_with_body(target, "hello");
-        composer.scope = ComposerScope::Change;
+        composer.scope = ComposerScope::Stack;
         let outcome = save_composer(&mut app, &composer, time::OffsetDateTime::UNIX_EPOCH);
         match outcome {
             SaveOutcome::Refused(msg) => {
-                assert!(msg.contains("change-scope"), "got message: {msg}");
-                assert!(msg.contains("not supported yet"), "got message: {msg}");
+                assert!(
+                    msg.contains("stack-scope requires --stack mode"),
+                    "got message: {msg}"
+                );
             }
             SaveOutcome::Saved | SaveOutcome::Errored(_) => panic!("expected Refused"),
         }
@@ -2261,10 +2407,11 @@ mod tests {
                 unreachable!()
             };
             Composer::for_edit(EditedComment {
-                target: c.target.clone(),
+                contexts: c.contexts.clone(),
                 severity: c.severity,
                 body: c.body_text(),
                 identity: c.editing.unwrap(),
+                scope: c.scope,
             })
         };
         let save_time = time::OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(60);
@@ -2346,7 +2493,8 @@ mod tests {
         let BuildTargetResult::Ready(target) = build_line_target(&app) else {
             panic!("expected Ready");
         };
-        let composer = Composer::new(target, Severity::Note);
+        let contexts = make_contexts_for_test(target);
+        let composer = Composer::new(contexts, Severity::Note);
         let outcome = delete_via_composer(&mut app, &composer);
         assert!(
             matches!(outcome, SaveOutcome::Refused(_)),
@@ -2377,10 +2525,11 @@ mod tests {
                 unreachable!()
             };
             Composer::for_edit(EditedComment {
-                target: c.target.clone(),
+                contexts: c.contexts.clone(),
                 severity: c.severity,
                 body: c.body_text(),
                 identity: c.editing.unwrap(),
+                scope: c.scope,
             })
         };
 
@@ -2431,10 +2580,11 @@ mod tests {
                 unreachable!()
             };
             Composer::for_edit(EditedComment {
-                target: c.target.clone(),
+                contexts: c.contexts.clone(),
                 severity: c.severity,
                 body: c.body_text(),
                 identity: c.editing.unwrap(),
+                scope: c.scope,
             })
         };
 
@@ -2495,10 +2645,11 @@ mod tests {
                 panic!("expected Composer screen");
             };
             Composer::for_edit(EditedComment {
-                target: c.target.clone(),
+                contexts: c.contexts.clone(),
                 severity: c.severity,
                 body: c.body_text(),
                 identity: c.editing.unwrap(),
+                scope: c.scope,
             })
         };
 
@@ -2531,10 +2682,11 @@ mod tests {
                 panic!("expected Composer screen");
             };
             Composer::for_edit(EditedComment {
-                target: c.target.clone(),
+                contexts: c.contexts.clone(),
                 severity: c.severity,
                 body: c.body_text(),
                 identity: c.editing.unwrap(),
+                scope: c.scope,
             })
         };
 

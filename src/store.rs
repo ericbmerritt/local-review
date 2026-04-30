@@ -6,7 +6,7 @@ use tempfile::NamedTempFile;
 use crate::change_id::ChangeId;
 use crate::comment::{format_rfc3339, Anchor, Comment, Status, SCHEMA_VERSION_VALUE};
 use crate::error::{JjrError, Result};
-use crate::stack::ResolvedStack;
+use crate::stack::{ResolvedStack, RevsetHash};
 
 /// Filename reserved for stack-scoped comments. jj change IDs never start with
 /// `_`, so there is no collision risk.
@@ -25,7 +25,7 @@ fn anchor_file(repo_root: &Path, comment: &Comment) -> PathBuf {
         Anchor::Line { change_id, .. } | Anchor::Change { change_id } => {
             change_file(repo_root, change_id)
         }
-        Anchor::Stack => comments_dir(repo_root).join(STACK_FILENAME),
+        Anchor::Stack { .. } => comments_dir(repo_root).join(STACK_FILENAME),
     }
 }
 
@@ -78,6 +78,35 @@ pub fn load_change_comments(repo_root: &Path, change_id: &ChangeId) -> Result<Ve
         return Ok(Vec::new());
     }
     load_jsonl_file(&path)
+}
+
+/// Load stack-scoped comments from `_stack.jsonl`, filtered to `revset_hash`.
+///
+/// Returns an empty `Vec` when the file does not exist. Any record in
+/// `_stack.jsonl` whose anchor is not `Anchor::Stack` is a corruption indicator
+/// and causes this function to return `JjrError::StackFileCorruption`.
+pub fn load_stack_comments(repo_root: &Path, revset_hash: &RevsetHash) -> Result<Vec<Comment>> {
+    let path = comments_dir(repo_root).join(STACK_FILENAME);
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let all = load_jsonl_file(&path)?;
+    let mut result = Vec::new();
+    for comment in all {
+        match &comment.anchor {
+            Anchor::Stack {
+                revset_hash: rh, ..
+            } => {
+                if rh == revset_hash {
+                    result.push(comment);
+                }
+            }
+            Anchor::Line { .. } | Anchor::Change { .. } => {
+                return Err(JjrError::StackFileCorruption { path: path.clone() });
+            }
+        }
+    }
+    Ok(result)
 }
 
 /// Performs a pre-write uniqueness check on `created_at`: if any existing
@@ -530,10 +559,16 @@ mod tests {
         assert!(matches!(result, Err(JjrError::CommentNotFound { .. })));
     }
 
+    fn sample_revset_hash() -> RevsetHash {
+        RevsetHash::from_revset("main..@")
+    }
+
     fn make_stack_comment(created_at: OffsetDateTime, body: &str) -> Comment {
         Comment {
             schema_version: SchemaVersion,
-            anchor: Anchor::Stack,
+            anchor: Anchor::Stack {
+                revset_hash: sample_revset_hash(),
+            },
             repo_root: PathBuf::new(),
             revset: "main..@".to_owned(),
             commit_id: None,
@@ -1112,5 +1147,148 @@ mod tests {
             before, after,
             "real file must be untouched when write_file errors"
         );
+    }
+
+    #[test]
+    fn load_stack_comments_returns_empty_when_file_absent() {
+        let dir = tmp();
+        let hash = sample_revset_hash();
+        let loaded = load_stack_comments(dir.path(), &hash).unwrap();
+        assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn load_stack_comments_filters_by_revset_hash() {
+        let dir = tmp();
+        let hash_a = RevsetHash::from_revset("trunk()..@");
+        let hash_b = RevsetHash::from_revset("other..@");
+
+        let ts1 = datetime!(2026-04-29 14:00:00 UTC);
+        let ts2 = datetime!(2026-04-29 14:01:00 UTC);
+        let ts3 = datetime!(2026-04-29 14:02:00 UTC);
+
+        let mut c_a1 = make_stack_comment_with_hash(hash_a, ts1, "stack-a first");
+        c_a1.repo_root = dir.path().to_owned();
+        let mut c_a2 = make_stack_comment_with_hash(hash_a, ts2, "stack-a second");
+        c_a2.repo_root = dir.path().to_owned();
+        let mut c_b = make_stack_comment_with_hash(hash_b, ts3, "stack-b comment");
+        c_b.repo_root = dir.path().to_owned();
+
+        save_comment(dir.path(), &c_a1).unwrap();
+        save_comment(dir.path(), &c_a2).unwrap();
+        save_comment(dir.path(), &c_b).unwrap();
+
+        let loaded_a = load_stack_comments(dir.path(), &hash_a).unwrap();
+        assert_eq!(loaded_a.len(), 2);
+        let bodies: Vec<&str> = loaded_a.iter().map(|c| c.body.as_str()).collect();
+        assert!(bodies.contains(&"stack-a first"));
+        assert!(bodies.contains(&"stack-a second"));
+
+        let loaded_b = load_stack_comments(dir.path(), &hash_b).unwrap();
+        assert_eq!(loaded_b.len(), 1);
+        assert_eq!(loaded_b[0].body, "stack-b comment");
+    }
+
+    fn make_stack_comment_with_hash(
+        revset_hash: RevsetHash,
+        created_at: OffsetDateTime,
+        body: &str,
+    ) -> Comment {
+        Comment {
+            schema_version: SchemaVersion,
+            anchor: Anchor::Stack { revset_hash },
+            repo_root: PathBuf::new(),
+            revset: "trunk()..@".to_owned(),
+            commit_id: None,
+            body: body.to_owned(),
+            severity: Severity::Note,
+            created_at,
+            updated_at: None,
+            status: None,
+            mismatch_reason: None,
+        }
+    }
+
+    #[test]
+    fn load_stack_comments_errors_on_non_stack_record() {
+        let dir = tmp();
+        let id = cid("abc12345");
+        let ts = datetime!(2026-04-29 14:00:00 UTC);
+        let line_comment = rooted(make_line_comment(id, ts, "wrong scope"), dir.path());
+        ensure_review_dir(dir.path()).unwrap();
+        let stack_path = dir
+            .path()
+            .join(".jj-review")
+            .join("comments")
+            .join(STACK_FILENAME);
+        let line = serde_json::to_string(&line_comment).unwrap();
+        std::fs::write(&stack_path, format!("{line}\n")).unwrap();
+
+        let hash = sample_revset_hash();
+        let result = load_stack_comments(dir.path(), &hash);
+        assert!(
+            matches!(result, Err(JjrError::StackFileCorruption { .. })),
+            "expected StackFileCorruption; got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn save_change_scoped_comment_routes_to_change_file() {
+        let dir = tmp();
+        let id = cid("abc12345");
+        let ts = datetime!(2026-04-29 14:00:00 UTC);
+        let comment = rooted(
+            make_change_scoped_comment(&id, ts, "change-level concern"),
+            dir.path(),
+        );
+        save_comment(dir.path(), &comment).unwrap();
+
+        let change_path = dir
+            .path()
+            .join(".jj-review")
+            .join("comments")
+            .join("abc12345.jsonl");
+        assert!(
+            change_path.exists(),
+            "change-scoped comment must go to <change-id>.jsonl"
+        );
+
+        let stack_path = dir
+            .path()
+            .join(".jj-review")
+            .join("comments")
+            .join(STACK_FILENAME);
+        assert!(
+            !stack_path.exists(),
+            "_stack.jsonl must not be created for change-scope"
+        );
+
+        let loaded = load_change_comments(dir.path(), &id).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].body, "change-level concern");
+    }
+
+    #[test]
+    fn save_stack_scoped_comment_routes_to_stack_file() {
+        let dir = tmp();
+        let hash = sample_revset_hash();
+        let ts = datetime!(2026-04-29 14:00:00 UTC);
+        let mut c = make_stack_comment_with_hash(hash, ts, "cross-cutting concern");
+        c.repo_root = dir.path().to_owned();
+        save_comment(dir.path(), &c).unwrap();
+
+        let stack_path = dir
+            .path()
+            .join(".jj-review")
+            .join("comments")
+            .join(STACK_FILENAME);
+        assert!(
+            stack_path.exists(),
+            "stack-scoped comment must go to _stack.jsonl"
+        );
+
+        let loaded = load_stack_comments(dir.path(), &hash).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].body, "cross-cutting concern");
     }
 }

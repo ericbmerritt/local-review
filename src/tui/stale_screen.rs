@@ -86,7 +86,6 @@ pub(super) fn current_line_at(comment: &Comment, diff: &Diff) -> NowLine {
     NowLine::NotPresent
 }
 
-/// `inner_rows` is the height available for entries (block-inner area).
 pub(super) fn compute_scroll_offset(
     selected_index: usize,
     inner_rows: u16,
@@ -439,7 +438,9 @@ mod tests {
     fn current_line_at_for_non_line_anchor_returns_not_present() {
         let comment = Comment {
             schema_version: SchemaVersion,
-            anchor: Anchor::Stack,
+            anchor: Anchor::Stack {
+                revset_hash: crate::stack::RevsetHash::from_revset("@"),
+            },
             repo_root: PathBuf::from("/repo"),
             revset: "@".to_owned(),
             commit_id: None,

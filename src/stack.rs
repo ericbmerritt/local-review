@@ -62,6 +62,31 @@ impl RevsetHash {
             s
         })
     }
+
+    /// Parse a lowercase hex string produced by [`RevsetHash::hex`].
+    ///
+    /// Returns `None` if the input is not exactly 64 lowercase hex characters.
+    #[must_use]
+    pub fn from_hex_str(s: &str) -> Option<Self> {
+        if s.len() != 64 {
+            return None;
+        }
+        let mut bytes = [0u8; 32];
+        for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
+            let hi = hex_nibble(chunk[0])?;
+            let lo = hex_nibble(chunk[1])?;
+            bytes[i] = (hi << 4) | lo;
+        }
+        Some(Self(bytes))
+    }
+}
+
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        _ => None,
+    }
 }
 
 fn canonicalize_revset(revset: &str) -> String {
@@ -141,5 +166,37 @@ mod tests {
             mixed, lower,
             "canonicalization lowercases identifier-like portions of revsets"
         );
+    }
+
+    #[test]
+    fn from_hex_str_roundtrips_with_hex() {
+        let original = RevsetHash::from_revset("trunk()..@");
+        let hex = original.hex();
+        let restored = RevsetHash::from_hex_str(&hex).expect("valid hex must parse");
+        assert_eq!(original, restored);
+    }
+
+    #[test]
+    fn from_hex_str_rejects_wrong_length() {
+        assert!(RevsetHash::from_hex_str("abc").is_none());
+        assert!(RevsetHash::from_hex_str("").is_none());
+        let too_long = "a".repeat(65);
+        assert!(RevsetHash::from_hex_str(&too_long).is_none());
+    }
+
+    #[test]
+    fn from_hex_str_rejects_uppercase() {
+        let h = RevsetHash::from_revset("@");
+        let upper = h.hex().to_uppercase();
+        assert!(
+            RevsetHash::from_hex_str(&upper).is_none(),
+            "from_hex_str only accepts lowercase hex"
+        );
+    }
+
+    #[test]
+    fn from_hex_str_rejects_non_hex_chars() {
+        let bad: String = "g".repeat(64);
+        assert!(RevsetHash::from_hex_str(&bad).is_none());
     }
 }

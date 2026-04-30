@@ -77,4 +77,10 @@ pub enum JjrError {
 
     #[snafu(display("clear: at least one filter flag is required (try --stale)"))]
     NoFilterSpecified,
+
+    #[snafu(display(
+        "{} contains a non-stack-scoped record; file is meant to be stack-scope-only",
+        path.display()
+    ))]
+    StackFileCorruption { path: PathBuf },
 }

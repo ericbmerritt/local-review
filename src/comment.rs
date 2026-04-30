@@ -6,6 +6,7 @@ use time::OffsetDateTime;
 
 use crate::change_id::{ChangeId, CommitId};
 use crate::error::{JjrError, Result};
+use crate::stack::RevsetHash;
 
 pub(crate) const SCHEMA_VERSION_VALUE: &str = "diff-comment/v2";
 pub(crate) const TARGET_TEXT_MAX: usize = 1024;
@@ -199,6 +200,9 @@ impl<'de> Deserialize<'de> for MismatchReason {
 
 /// Where a comment is attached: a specific line, a whole change, or the
 /// entire stack. Serialized to the wire format with the `"scope"` discriminator.
+///
+/// Stack-scoped records carry the `revset_hash` so `_stack.jsonl` can host
+/// comments from multiple stacks and be filtered per-session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Anchor {
     Line {
@@ -208,7 +212,9 @@ pub enum Anchor {
     Change {
         change_id: ChangeId,
     },
-    Stack,
+    Stack {
+        revset_hash: RevsetHash,
+    },
 }
 
 /// Durable anchor for a line comment — survives small edits via text matching.
@@ -337,6 +343,9 @@ struct CommentDto {
     commit_id: Option<CommitId>,
     repo_root: String,
     revset: String,
+    /// Hex-encoded `RevsetHash`; present only for `scope = "stack"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    revset_hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     file: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -385,23 +394,24 @@ impl CommentDto {
         // Apply spec constraints at the write boundary so a Comment built by
         // direct struct literal can never serialize an oversized record.
         let normalized_anchor = normalize_anchor(c.anchor.clone());
-        let (scope, change_id, line_fields) = anchor_to_dto_fields(&normalized_anchor)?;
+        let fields = anchor_to_dto_fields(&normalized_anchor)?;
 
         Ok(Self {
             schema_version: SchemaVersion,
-            scope,
-            change_id,
+            scope: fields.scope,
+            change_id: fields.change_id,
             commit_id: c.commit_id.clone(),
             repo_root,
             revset: c.revset.clone(),
-            file: line_fields.as_ref().map(|f| f.file.clone()),
-            side: line_fields.as_ref().map(|f| f.side),
-            old_line: line_fields.as_ref().and_then(|f| f.old_line),
-            new_line: line_fields.as_ref().and_then(|f| f.new_line),
-            hunk_header: line_fields.as_ref().map(|f| f.hunk_header.clone()),
-            target_text: line_fields.as_ref().map(|f| f.target_text.clone()),
-            context_before: line_fields.as_ref().map(|f| f.context_before.clone()),
-            context_after: line_fields.as_ref().map(|f| f.context_after.clone()),
+            revset_hash: fields.revset_hash_hex,
+            file: fields.line.as_ref().map(|f| f.file.clone()),
+            side: fields.line.as_ref().map(|f| f.side),
+            old_line: fields.line.as_ref().and_then(|f| f.old_line),
+            new_line: fields.line.as_ref().and_then(|f| f.new_line),
+            hunk_header: fields.line.as_ref().map(|f| f.hunk_header.clone()),
+            target_text: fields.line.as_ref().map(|f| f.target_text.clone()),
+            context_before: fields.line.as_ref().map(|f| f.context_before.clone()),
+            context_after: fields.line.as_ref().map(|f| f.context_after.clone()),
             body: truncate_body(c.body.clone()),
             severity: c.severity,
             created_at,
@@ -428,6 +438,7 @@ impl CommentDto {
         let anchor = dto_fields_to_anchor(
             &self.scope,
             self.change_id,
+            self.revset_hash,
             self.file,
             self.side,
             self.old_line,
@@ -469,7 +480,7 @@ fn normalize_anchor(anchor: Anchor) -> Anchor {
             change_id,
             location: location.normalized(),
         },
-        a @ (Anchor::Change { .. } | Anchor::Stack) => a,
+        a @ (Anchor::Change { .. } | Anchor::Stack { .. }) => a,
     }
 }
 
@@ -484,7 +495,14 @@ struct LineFields {
     context_after: Vec<String>,
 }
 
-fn anchor_to_dto_fields(anchor: &Anchor) -> Result<(String, Option<ChangeId>, Option<LineFields>)> {
+struct AnchorDtoFields {
+    scope: String,
+    change_id: Option<ChangeId>,
+    revset_hash_hex: Option<String>,
+    line: Option<LineFields>,
+}
+
+fn anchor_to_dto_fields(anchor: &Anchor) -> Result<AnchorDtoFields> {
     match anchor {
         Anchor::Line {
             change_id,
@@ -497,10 +515,11 @@ fn anchor_to_dto_fields(anchor: &Anchor) -> Result<(String, Option<ChangeId>, Op
                     source: std::io::Error::other("file path is not valid UTF-8"),
                 })?
                 .to_owned();
-            Ok((
-                "line".to_owned(),
-                Some(change_id.clone()),
-                Some(LineFields {
+            Ok(AnchorDtoFields {
+                scope: "line".to_owned(),
+                change_id: Some(change_id.clone()),
+                revset_hash_hex: None,
+                line: Some(LineFields {
                     file,
                     side: location.side,
                     old_line: location.old_line,
@@ -510,10 +529,20 @@ fn anchor_to_dto_fields(anchor: &Anchor) -> Result<(String, Option<ChangeId>, Op
                     context_before: location.context_before.clone(),
                     context_after: location.context_after.clone(),
                 }),
-            ))
+            })
         }
-        Anchor::Change { change_id } => Ok(("change".to_owned(), Some(change_id.clone()), None)),
-        Anchor::Stack => Ok(("stack".to_owned(), None, None)),
+        Anchor::Change { change_id } => Ok(AnchorDtoFields {
+            scope: "change".to_owned(),
+            change_id: Some(change_id.clone()),
+            revset_hash_hex: None,
+            line: None,
+        }),
+        Anchor::Stack { revset_hash } => Ok(AnchorDtoFields {
+            scope: "stack".to_owned(),
+            change_id: None,
+            revset_hash_hex: Some(revset_hash.hex()),
+            line: None,
+        }),
     }
 }
 
@@ -524,6 +553,7 @@ fn anchor_to_dto_fields(anchor: &Anchor) -> Result<(String, Option<ChangeId>, Op
 fn dto_fields_to_anchor(
     scope: &str,
     change_id: Option<ChangeId>,
+    revset_hash_hex: Option<String>,
     file: Option<String>,
     side: Option<Side>,
     old_line: Option<u32>,
@@ -576,7 +606,17 @@ fn dto_fields_to_anchor(
             })?;
             Ok(Anchor::Change { change_id })
         }
-        "stack" => Ok(Anchor::Stack),
+        "stack" => {
+            let hex = revset_hash_hex.ok_or_else(|| JjrError::Io {
+                source: std::io::Error::other("scope=stack requires revset_hash"),
+            })?;
+            let revset_hash = RevsetHash::from_hex_str(&hex).ok_or_else(|| JjrError::Io {
+                source: std::io::Error::other(format!(
+                    "scope=stack: revset_hash is malformed (expected 64 hex chars, got {hex:?})"
+                )),
+            })?;
+            Ok(Anchor::Stack { revset_hash })
+        }
         other => Err(JjrError::Io {
             source: std::io::Error::other(format!("unknown scope \"{other}\"")),
         }),
@@ -670,11 +710,17 @@ mod tests {
         assert_eq!(restored, original);
     }
 
+    fn sample_revset_hash() -> RevsetHash {
+        RevsetHash::from_revset("main..@")
+    }
+
     #[test]
     fn stack_comment_roundtrips_through_serde() {
         let original = Comment {
             schema_version: SchemaVersion,
-            anchor: Anchor::Stack,
+            anchor: Anchor::Stack {
+                revset_hash: sample_revset_hash(),
+            },
             repo_root: PathBuf::from("/workspace/project"),
             revset: "main..@".to_owned(),
             commit_id: None,
@@ -688,6 +734,50 @@ mod tests {
         let json = serde_json::to_string(&original).unwrap();
         let restored: Comment = serde_json::from_str(&json).unwrap();
         assert_eq!(restored, original);
+    }
+
+    #[test]
+    fn stack_comment_wire_shape_includes_revset_hash() {
+        let hash = sample_revset_hash();
+        let c = Comment {
+            schema_version: SchemaVersion,
+            anchor: Anchor::Stack { revset_hash: hash },
+            repo_root: PathBuf::from("/w"),
+            revset: "main..@".to_owned(),
+            commit_id: None,
+            body: "stack comment".to_owned(),
+            severity: Severity::Note,
+            created_at: datetime!(2026-04-29 14:22:01 UTC),
+            updated_at: None,
+            status: None,
+            mismatch_reason: None,
+        };
+        let v: serde_json::Value = serde_json::to_value(&c).unwrap();
+        assert_eq!(v["scope"], "stack");
+        assert_eq!(v["revset_hash"], hash.hex());
+        assert!(v.get("change_id").is_none());
+        assert!(v.get("file").is_none());
+    }
+
+    #[test]
+    fn stack_scope_missing_revset_hash_errors() {
+        let json = r#"{"schema_version":"diff-comment/v2","scope":"stack","repo_root":"/w","revset":"@","comment":"b","severity":"note","created_at":"2026-04-29T14:22:01Z"}"#;
+        let err = serde_json::from_str::<Comment>(json)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("scope=stack requires revset_hash"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn stack_scope_malformed_revset_hash_errors() {
+        let json = r#"{"schema_version":"diff-comment/v2","scope":"stack","revset_hash":"notvalid","repo_root":"/w","revset":"@","comment":"b","severity":"note","created_at":"2026-04-29T14:22:01Z"}"#;
+        let err = serde_json::from_str::<Comment>(json)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("revset_hash is malformed"), "got: {err}");
     }
 
     #[test]
@@ -916,7 +1006,9 @@ mod tests {
     fn stack_comment_wire_shape_omits_change_and_line_fields() {
         let c = Comment {
             schema_version: SchemaVersion,
-            anchor: Anchor::Stack,
+            anchor: Anchor::Stack {
+                revset_hash: sample_revset_hash(),
+            },
             repo_root: PathBuf::from("/w"),
             revset: "main..@".to_owned(),
             commit_id: None,
@@ -1075,8 +1167,9 @@ mod tests {
     #[test]
     fn oversized_body_is_truncated_at_deserialize_time() {
         let huge = "x".repeat(BODY_MAX + 5000);
+        let hash = RevsetHash::from_revset("@").hex();
         let json = format!(
-            r#"{{"schema_version":"diff-comment/v2","scope":"stack","repo_root":"/w","revset":"@","comment":"{huge}","severity":"note","created_at":"2026-04-29T14:22:01Z"}}"#
+            r#"{{"schema_version":"diff-comment/v2","scope":"stack","revset_hash":"{hash}","repo_root":"/w","revset":"@","comment":"{huge}","severity":"note","created_at":"2026-04-29T14:22:01Z"}}"#
         );
         let c: Comment = serde_json::from_str(&json).unwrap();
         assert_eq!(c.body.chars().count(), BODY_MAX + 1);

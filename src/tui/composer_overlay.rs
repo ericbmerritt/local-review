@@ -16,11 +16,16 @@ pub(super) const COMPOSER_OVERLAY_WIDTH: u16 = 72;
 pub(super) const COMPOSER_OVERLAY_HEIGHT: u16 = 22;
 
 // Per-row heights for the composer modal interior, top to bottom:
-//   CONTEXT  — diff lines around the cursor (3 lines + padding)
+//   CONTEXT  — scope-specific context block (line: diff + ▶; change/stack: 2 rows)
 //   SCOPE    — scope picker row + 1 spacer
 //   SEVERITY — severity picker row + 1 spacer
 //   BODY     — multi-line editor (consumes remaining space, min 4 rows)
 //   FOOTER   — keybinding hints split across 2 lines
+//
+// Line scope uses 5 rows (room for up to 5 context lines); change/stack use 2
+// rows (change_id + description, or revset). The layout is fixed at 5 rows to
+// keep the modal height stable across scope switches; the change/stack blocks
+// simply leave rows empty.
 const CONTEXT_ROWS: u16 = 5;
 const SCOPE_ROWS: u16 = 2;
 const SEVERITY_ROWS: u16 = 2;
@@ -68,7 +73,21 @@ fn render_composer_context(
     composer: &Composer,
     view: Option<&DiffView>,
 ) {
-    let idx = composer.target.rendered_index;
+    match composer.scope {
+        ComposerScope::Line => render_line_context(frame, area, composer, view),
+        ComposerScope::Change => render_change_context(frame, area, composer),
+        ComposerScope::Stack => render_stack_context(frame, area, composer),
+    }
+}
+
+fn render_line_context(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    composer: &Composer,
+    view: Option<&DiffView>,
+) {
+    let line_target = composer.line_target();
+    let idx = line_target.rendered_index;
 
     let context_lines: Vec<TuiLine<'_>> = if let Some(view) = view {
         let start = idx.saturating_sub(2);
@@ -76,8 +95,8 @@ fn render_composer_context(
         (start..=end)
             .filter_map(|i| view.lines.get(i))
             .map(|l| {
-                let marker = if l.source_line == composer.target.source_line
-                    && l.target_line == composer.target.target_line
+                let marker = if l.source_line == line_target.source_line
+                    && l.target_line == line_target.target_line
                     && (l.source_line.is_some() || l.target_line.is_some())
                 {
                     "▶ "
@@ -93,6 +112,50 @@ fn render_composer_context(
 
     let widget = Paragraph::new(context_lines);
     frame.render_widget(widget, area);
+}
+
+/// Cap descriptions in chrome so a long line cannot wrap into the scope
+/// picker row below. Matches the stack overview's ~50-char convention; also
+/// honors the available width so very narrow terminals still don't wrap.
+const CHROME_DESC_MAX: usize = 50;
+
+fn truncate_for_chrome(s: &str, area_width: u16) -> String {
+    let budget = usize::from(area_width).saturating_sub(4);
+    let cap = budget.min(CHROME_DESC_MAX);
+    if s.chars().count() <= cap {
+        return s.to_owned();
+    }
+    let head = cap.saturating_sub(2);
+    let mut out: String = s.chars().take(head).collect();
+    out.push_str("..");
+    out
+}
+
+fn render_change_context(frame: &mut Frame<'_>, area: Rect, composer: &Composer) {
+    let ctx = &composer.contexts.change;
+    let desc = truncate_for_chrome(&ctx.description, area.width);
+    let id_line = TuiLine::from(format!("  change  {}", ctx.change_id));
+    let desc_line = TuiLine::from(format!("  {desc}"));
+    let widget = Paragraph::new(Text::from(vec![id_line, desc_line]));
+    frame.render_widget(widget, area);
+}
+
+fn render_stack_context(frame: &mut Frame<'_>, area: Rect, composer: &Composer) {
+    let text = match &composer.contexts.stack {
+        Some(ctx) => format!("  revset  {}", truncate_for_chrome(&ctx.revset, area.width)),
+        None => "  stack scope unavailable (single-change mode)".to_owned(),
+    };
+    let widget = Paragraph::new(text.as_str());
+    frame.render_widget(widget, area);
+}
+
+/// Short `change_id` used in the scope picker row, where horizontal space is
+/// tight. 8 chars is enough to disambiguate within a typical stack while
+/// staying inside the 72-col modal even with the radio chrome.
+const SCOPE_PICKER_CHANGE_ID_LEN: usize = 8;
+
+fn short_change_id(s: &str) -> String {
+    s.chars().take(SCOPE_PICKER_CHANGE_ID_LEN).collect()
 }
 
 fn render_scope_picker(frame: &mut Frame<'_>, area: Rect, composer: &Composer) {
@@ -111,8 +174,10 @@ fn render_scope_picker(frame: &mut Frame<'_>, area: Rect, composer: &Composer) {
     } else {
         "[ ]"
     };
-    let text =
-        format!("  scope     {line_mark} line    {change_mark} change    {stack_mark} stack");
+    let change_short = short_change_id(&composer.contexts.change.change_id);
+    let text = format!(
+        "  scope     {line_mark} line    {change_mark} change · {change_short}    {stack_mark} stack"
+    );
     let widget = Paragraph::new(text.as_str());
     frame.render_widget(widget, area);
 }
