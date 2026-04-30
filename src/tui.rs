@@ -28,6 +28,7 @@ mod composer_overlay;
 mod diff_view;
 mod help_screen;
 mod overview_screen;
+mod send_to_claude;
 mod stale_screen;
 
 use composer::{
@@ -36,6 +37,7 @@ use composer::{
 };
 use diff_view::{comment_to_inline, DiffView, InlineComment, RenderedLine, RenderedLineKind};
 use overview_screen::{OverviewCommentSet, OverviewScreenState};
+use send_to_claude::{ConfirmData, SendToClaudeState};
 use stale_screen::StaleScreenState;
 
 const MIN_COLS: u16 = 60;
@@ -194,6 +196,8 @@ enum Screen {
     Stale(StaleScreenState),
     /// Stack overview (press `s` from Main).
     Overview(OverviewScreenState),
+    /// Send-to-Claude confirmation (press `C` from Main).
+    SendToClaude(Box<SendToClaudeState>),
 }
 
 /// State for the transition screen shown between changes in stack mode.
@@ -816,6 +820,9 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
         Screen::Transition(state) => {
             render_transition(frame, app, state);
         }
+        Screen::SendToClaude(state) => {
+            send_to_claude::render(frame, state);
+        }
         Screen::Stale(_) | Screen::Overview(_) => unreachable!("handled above"),
     }
 }
@@ -1065,6 +1072,7 @@ fn handle_event(app: &mut App) -> Result<()> {
             Screen::Transition(_) => handle_transition_key(app, key)?,
             Screen::Stale(_) => handle_stale_key(app, key),
             Screen::Overview(_) => handle_overview_key(app, key)?,
+            Screen::SendToClaude(_) => handle_send_to_claude_key(app, key)?,
         }
     }
     Ok(())
@@ -1106,6 +1114,7 @@ fn handle_main_key(app: &mut App, key: KeyEvent) -> Result<()> {
         KeyCode::Tab => app.cycle_file(1),
         KeyCode::BackTab => app.cycle_file(-1),
         KeyCode::Char('c') | KeyCode::Enter => open_composer(app),
+        KeyCode::Char('C') => open_send_to_claude(app),
         KeyCode::Char('e') => open_composer_for_edit(app),
         KeyCode::Char('d') => delete_focused_comment(app),
         KeyCode::Char('n') => app.advance_stack()?,
@@ -1299,6 +1308,223 @@ fn open_overview_screen(app: &mut App) {
         app.load_overview_comments();
     }
     app.screen = Screen::Overview(OverviewScreenState::new());
+}
+
+fn open_send_to_claude(app: &mut App) {
+    let change_id = app.details.change_id.clone();
+    let revset_hash = app.stack.as_ref().map(|s| s.revset_hash);
+
+    let resolved = ResolvedStack {
+        revset_hash: revset_hash.unwrap_or_else(|| RevsetHash::from_revset(&app.revset)),
+        revset: app.revset.clone(),
+        entries: vec![StackEntry {
+            change_id: change_id.clone(),
+            commit_id: app.details.commit_id.clone(),
+            description: app.details.description.clone(),
+        }],
+    };
+
+    let packet = match crate::packet::build_packet(
+        &app.repo_root,
+        &app.revset,
+        &resolved,
+        false,
+        jj::diff_for_change,
+    ) {
+        Ok(p) => p,
+        Err(JjrError::EmptyPacket { .. }) => {
+            app.status_message = Some("no comments to send".to_owned());
+            return;
+        }
+        Err(e) => {
+            app.status_message = Some(format!(
+                "could not build packet: {}",
+                sanitize_for_status(&e.to_string())
+            ));
+            return;
+        }
+    };
+
+    let stale_count =
+        send_to_claude::stale_count_for_change(&app.repo_root, &change_id, revset_hash);
+    let scope_severity_grid = send_to_claude::compute_scope_severity_grid(&packet);
+    let files_affected = send_to_claude::compute_files_affected(&packet);
+
+    let data = ConfirmData {
+        change_id,
+        change_description: app.details.description.clone(),
+        scope_severity_grid,
+        files_affected,
+        stale_count,
+        packet,
+    };
+    app.screen = Screen::SendToClaude(Box::new(SendToClaudeState::Confirm(data)));
+}
+
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "unhandled KeyCode variants are intentionally ignored on the send-to-claude screen"
+)]
+fn handle_send_to_claude_key(app: &mut App, key: KeyEvent) -> Result<()> {
+    let Screen::SendToClaude(ref state) = app.screen else {
+        return Ok(());
+    };
+
+    match state.as_ref() {
+        SendToClaudeState::Confirm(_) => match key.code {
+            KeyCode::Esc => {
+                app.screen = Screen::Main;
+            }
+            KeyCode::Char('v') => {
+                let Screen::SendToClaude(boxed) = std::mem::replace(&mut app.screen, Screen::Main)
+                else {
+                    unreachable!("matched above");
+                };
+                let SendToClaudeState::Confirm(data) = *boxed else {
+                    unreachable!("matched Confirm above");
+                };
+                let prompt = crate::packet::render_prompt(&data.packet);
+                app.screen = Screen::SendToClaude(Box::new(SendToClaudeState::PromptView {
+                    confirm: data,
+                    prompt,
+                    scroll_offset: 0,
+                }));
+            }
+            KeyCode::Enter => {
+                invoke_claude_from_tui(app)?;
+            }
+            _ => {}
+        },
+        SendToClaudeState::PromptView { scroll_offset, .. } => {
+            let offset = *scroll_offset;
+            match key.code {
+                KeyCode::Char('q') | KeyCode::Esc => {
+                    let Screen::SendToClaude(boxed) =
+                        std::mem::replace(&mut app.screen, Screen::Main)
+                    else {
+                        unreachable!("matched above");
+                    };
+                    let SendToClaudeState::PromptView { confirm, .. } = *boxed else {
+                        unreachable!("matched PromptView above");
+                    };
+                    app.screen =
+                        Screen::SendToClaude(Box::new(SendToClaudeState::Confirm(confirm)));
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if let Screen::SendToClaude(ref mut s) = app.screen {
+                        if let SendToClaudeState::PromptView {
+                            ref mut scroll_offset,
+                            ..
+                        } = s.as_mut()
+                        {
+                            *scroll_offset = offset.saturating_sub(1);
+                        }
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if let Screen::SendToClaude(ref mut s) = app.screen {
+                        if let SendToClaudeState::PromptView {
+                            ref mut scroll_offset,
+                            ..
+                        } = s.as_mut()
+                        {
+                            *scroll_offset = offset.saturating_add(1);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Suspend the TUI, run Claude with the current change's packet, then
+/// restore the alternate screen and redraw.
+///
+/// The normal exit path uses `restore_tui()?` so I/O errors propagate. A
+/// `TerminalRestoreGuard` covers the panic path: if anything inside the
+/// closure unwinds, the guard's Drop best-effort-restores raw mode and the
+/// alternate screen so the user's shell isn't left wedged.
+fn invoke_claude_from_tui(app: &mut App) -> Result<()> {
+    let Screen::SendToClaude(ref state) = app.screen else {
+        return Ok(());
+    };
+    let SendToClaudeState::Confirm(data) = state.as_ref() else {
+        return Ok(());
+    };
+
+    let change_id = data.change_id.clone();
+    let prompt = crate::packet::render_prompt(&data.packet);
+    let repo_root = app.repo_root.clone();
+
+    suspend_tui()?;
+    let restore = TerminalRestoreGuard;
+
+    let outcome = (|| -> Result<crate::claude::ClaudeOutcome> {
+        let _guard = crate::working_copy_guard::WorkingCopyGuard::enter(&repo_root, &change_id)?;
+        crate::claude::invoke_claude(&prompt)
+    })();
+
+    std::mem::forget(restore);
+    restore_tui()?;
+
+    app.screen = Screen::Main;
+
+    match outcome? {
+        crate::claude::ClaudeOutcome::Success => match jj::show(&change_id) {
+            Ok(details) => {
+                app.rendered_per_file =
+                    details.diff.files.iter().map(DiffView::from_file).collect();
+                app.annotated_per_file = app.rendered_per_file.clone();
+                app.details = details;
+                app.file_index = 0;
+                app.line_index = 0;
+                app.scroll = 0;
+                app.overview_cache = None;
+                app.refresh_inline_comments();
+            }
+            Err(e) => {
+                app.status_message = Some(format!(
+                    "claude completed; could not reload diff: {}",
+                    sanitize_for_status(&e.to_string())
+                ));
+            }
+        },
+        crate::claude::ClaudeOutcome::Failed { exit_code } => {
+            let code_str = exit_code.map_or_else(|| "signal".to_owned(), |c| c.to_string());
+            app.status_message = Some(format!(
+                "claude exited with {code_str}; working copy restored"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn suspend_tui() -> Result<()> {
+    disable_raw_mode().map_err(io_err)?;
+    let mut out = stdout();
+    execute!(out, LeaveAlternateScreen).map_err(io_err)?;
+    Ok(())
+}
+
+fn restore_tui() -> Result<()> {
+    enable_raw_mode().map_err(io_err)?;
+    let mut out = stdout();
+    execute!(out, EnterAlternateScreen).map_err(io_err)?;
+    Ok(())
+}
+
+/// Best-effort terminal restoration on panic. Armed after `suspend_tui()`
+/// and disarmed via `mem::forget` on the normal path so `restore_tui()` can
+/// surface I/O errors instead of swallowing them.
+struct TerminalRestoreGuard;
+
+impl Drop for TerminalRestoreGuard {
+    fn drop(&mut self) {
+        let _ = enable_raw_mode();
+        let _ = execute!(stdout(), EnterAlternateScreen);
+    }
 }
 
 #[expect(

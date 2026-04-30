@@ -37,6 +37,9 @@ Views
     ?                     this help
     q                     quit
 
+Actions
+    C                     send current change to Claude
+
 Stack overview  (press s from main view)
     ↑ ↓     k j           select row
     Enter                 open change (on change row) / edit comment (on comment row)
@@ -56,6 +59,11 @@ Stale comments view
 Re-anchor mode (after pressing e in stale view)
     c   Enter             open composer at current line (pre-filled body)
     Esc                   cancel re-anchor mode
+
+Send to Claude  (press C from main view)
+    v                     view full rendered prompt (what Claude will see)
+    Enter                 send — suspends TUI, runs Claude, redraws on return
+    Esc                   cancel
 
 In comment composer
     ^L ^C ^K              scope:    line / change / stack
