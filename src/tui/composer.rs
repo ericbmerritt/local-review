@@ -4,7 +4,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use time::OffsetDateTime;
 use tui_textarea::TextArea;
 
-use crate::comment::Severity;
+use crate::change_id::ChangeId;
+use crate::comment::{Comment, Severity};
 use crate::stack::RevsetHash;
 
 const SECS_PER_MIN: i64 = 60;
@@ -35,9 +36,15 @@ pub(crate) struct LineTarget {
 }
 
 /// Snapshot of change-level context captured at composer open time.
+///
+/// `change_id` is the typed `ChangeId` of the change the comment will attach to
+/// when scope is `ComposerScope::Change`. For composers opened from the main
+/// view this is `app.details.change_id`; for composers opened from the stack
+/// overview it is the `change_id` of the cursor row (which may differ from the
+/// currently loaded change).
 #[derive(Debug, Clone)]
 pub(crate) struct ChangeContext {
-    pub(crate) change_id: String,
+    pub(crate) change_id: ChangeId,
     pub(crate) description: String,
 }
 
@@ -70,6 +77,11 @@ pub(crate) struct Composer {
     /// call `update_comment` instead of `save_comment`. The timestamp
     /// identifies the record on disk.
     pub(crate) editing: Option<OffsetDateTime>,
+    /// In edit mode, the source `Comment` snapshot when the editor was opened
+    /// from a context that doesn't expose the record through `loaded_comments`
+    /// (i.e., the stack overview). Save/delete use this snapshot's anchor
+    /// directly. `None` for new comments and for main-view line-comment edits.
+    pub(crate) original: Option<Comment>,
 }
 
 impl Composer {
@@ -82,12 +94,20 @@ impl Composer {
 /// Bundle of fields drawn from a single `Comment` to seed an edit-mode
 /// composer. Constructing this in the caller keeps `severity`, `body`, and
 /// the `identity` timestamp from drifting apart at the `for_edit` boundary.
+///
+/// `original`, when `Some`, carries the full source `Comment` so save/delete
+/// from contexts that don't have the comment in `App::loaded_comments` (i.e.,
+/// the stack overview) can route through the store using the original anchor.
+/// `None` is used for line-comment edits opened from the main view, where the
+/// in-memory `loaded_comments` lookup keyed by `created_at` is the source of
+/// truth.
 pub(crate) struct EditedComment {
     pub(crate) contexts: ComposerContexts,
     pub(crate) severity: Severity,
     pub(crate) body: String,
     pub(crate) identity: OffsetDateTime,
     pub(crate) scope: ComposerScope,
+    pub(crate) original: Option<Comment>,
 }
 
 impl Composer {
@@ -98,6 +118,7 @@ impl Composer {
             severity,
             body: TextArea::default(),
             editing: None,
+            original: None,
         }
     }
 
@@ -115,6 +136,7 @@ impl Composer {
             severity: edited.severity,
             body: textarea,
             editing: Some(edited.identity),
+            original: edited.original,
         }
     }
 
@@ -137,7 +159,7 @@ impl Composer {
                 format!("{prefix} · {file}:{line}")
             }
             ComposerScope::Change => {
-                let id = &self.contexts.change.change_id;
+                let id = self.contexts.change.change_id.as_str();
                 format!("{prefix} · change {id}")
             }
             ComposerScope::Stack => format!("{prefix} · stack"),
@@ -294,7 +316,7 @@ mod tests {
         ComposerContexts {
             line: make_target(),
             change: ChangeContext {
-                change_id: "abc12345".to_owned(),
+                change_id: ChangeId::parse("abc12345").unwrap(),
                 description: "Add retry policy".to_owned(),
             },
             stack: Some(StackContextSnapshot {
@@ -471,6 +493,7 @@ mod tests {
             body: "existing body".to_owned(),
             identity: OffsetDateTime::UNIX_EPOCH,
             scope: ComposerScope::Line,
+            original: None,
         });
         assert_eq!(c.title(), "Edit comment · src/client.rs:142");
     }
@@ -483,6 +506,7 @@ mod tests {
             body: "existing body".to_owned(),
             identity: OffsetDateTime::UNIX_EPOCH,
             scope: ComposerScope::Change,
+            original: None,
         });
         assert_eq!(c.title(), "Edit comment · change abc12345");
     }
@@ -495,6 +519,7 @@ mod tests {
             body: "existing body".to_owned(),
             identity: OffsetDateTime::UNIX_EPOCH,
             scope: ComposerScope::Stack,
+            original: None,
         });
         assert_eq!(c.title(), "Edit comment · stack");
     }
@@ -507,6 +532,7 @@ mod tests {
             body: "line one\nline two".to_owned(),
             identity: OffsetDateTime::UNIX_EPOCH,
             scope: ComposerScope::Line,
+            original: None,
         });
         assert_eq!(c.body_text(), "line one\nline two");
         assert_eq!(c.severity, Severity::Required);
@@ -522,6 +548,7 @@ mod tests {
             body: "body".to_owned(),
             identity: OffsetDateTime::UNIX_EPOCH,
             scope: ComposerScope::Line,
+            original: None,
         });
         let key = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
         let action = handle_composer_key(&mut c, key);

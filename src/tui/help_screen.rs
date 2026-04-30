@@ -32,9 +32,19 @@ Comments
     d                     delete (cursor on a comment)
 
 Views
+    s                     stack overview (stack mode only)
     S                     stale comments view
     ?                     this help
     q                     quit
+
+Stack overview  (press s from main view)
+    ↑ ↓     k j           select row
+    Enter                 open change (on change row) / edit comment (on comment row)
+    c                     new comment; scope defaults from cursor
+                          (stack header → stack scope; change row → change scope)
+    ▶                     selection cursor
+    ▸                     change loaded in the main view
+    q   Esc               back to main view
 
 Stale comments view
     ↑ ↓     k j           select entry

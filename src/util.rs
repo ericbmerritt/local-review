@@ -16,7 +16,14 @@ pub(crate) fn page_size(viewport_rows: u16) -> usize {
 }
 
 /// Truncate `input` to at most `max` characters, appending `…` if truncated.
+///
+/// When `max == 0` returns an empty string — the ellipsis itself would
+/// overflow the budget. Callers that want a non-empty indicator at zero
+/// budget must allocate at least one column.
 pub(crate) fn truncate(input: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
     if input.chars().count() <= max {
         return input.to_owned();
     }
@@ -99,9 +106,11 @@ mod tests {
     }
 
     #[test]
-    fn truncate_max_zero_produces_ellipsis() {
-        let result = truncate("hi", 0);
-        assert_eq!(result, "…");
+    fn truncate_max_zero_returns_empty() {
+        // At max==0 even the `…` indicator would overflow the budget; the
+        // overview's column-fitting depends on this precise behavior.
+        assert_eq!(truncate("hi", 0), "");
+        assert_eq!(truncate("", 0), "");
     }
 
     #[test]

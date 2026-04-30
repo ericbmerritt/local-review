@@ -27,6 +27,7 @@ mod composer;
 mod composer_overlay;
 mod diff_view;
 mod help_screen;
+mod overview_screen;
 mod stale_screen;
 
 use composer::{
@@ -34,6 +35,7 @@ use composer::{
     EditedComment, LineTarget, StackContextSnapshot,
 };
 use diff_view::{comment_to_inline, DiffView, InlineComment, RenderedLine, RenderedLineKind};
+use overview_screen::{OverviewCommentSet, OverviewScreenState};
 use stale_screen::StaleScreenState;
 
 const MIN_COLS: u16 = 60;
@@ -68,10 +70,9 @@ const TRANSITION_MODAL_HEIGHT: u16 = 18;
 /// is ~38 cols after borders + indent, so 36 leaves room for the trailing `…`.
 const TRANSITION_DESC_BUDGET: usize = 36;
 
-/// Maximum number of `●` dots to render per severity in the transition modal.
-/// Beyond this, dots are truncated with a trailing `…`; the numeric count
-/// stays accurate so the user still sees the true total.
-const TRANSITION_DOT_MAX: usize = 5;
+/// Maximum number of `●` dots rendered before truncating with a trailing `…`.
+/// The numeric count stays accurate so the user still sees the true total.
+pub(super) const DOT_BUDGET: usize = 5;
 
 /// Single source of truth for severity → terminal color. Used by inline comment
 /// rendering, the composer's severity picker, and the stale-comments view.
@@ -192,6 +193,8 @@ enum Screen {
     Transition(TransitionState),
     /// Stale comments browser.
     Stale(StaleScreenState),
+    /// Stack overview (press `s` from Main).
+    Overview(OverviewScreenState),
 }
 
 /// State for the transition screen shown between changes in stack mode.
@@ -208,18 +211,25 @@ struct TransitionState {
     severity_histogram: SeverityHistogram,
 }
 
-/// Counts of comments by severity for the reviewed change.
-#[derive(Debug, Default, Clone, Copy)]
-struct SeverityHistogram {
-    required: usize,
-    suggestion: usize,
-    note: usize,
+/// Counts of comments by severity. Used by the transition modal and the stack
+/// overview's right-edge dot column. Stale comments are excluded from counts —
+/// they live exclusively in the stale comments view (Screen 5) per spec.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(super) struct SeverityHistogram {
+    pub(super) required: usize,
+    pub(super) suggestion: usize,
+    pub(super) note: usize,
 }
 
 impl SeverityHistogram {
-    fn from_comments(comments: &[Comment]) -> Self {
+    pub(super) fn from_comments(comments: &[Comment]) -> Self {
         let mut h = Self::default();
         for c in comments {
+            // Stale records do not contribute to active-comment counts; the
+            // stale view owns them.
+            if c.status == Some(Status::Stale) {
+                continue;
+            }
             match c.severity {
                 Severity::Required => h.required += 1,
                 Severity::Suggestion => h.suggestion += 1,
@@ -227,6 +237,10 @@ impl SeverityHistogram {
             }
         }
         h
+    }
+
+    pub(super) fn total(self) -> usize {
+        self.required + self.suggestion + self.note
     }
 }
 
@@ -292,6 +306,9 @@ struct App {
     comments_loaded_ok: bool,
     /// Active when the user is picking a new anchor for a stale comment.
     pending_reanchor: Option<PendingReanchor>,
+    /// Cached comments for the stack overview. `None` means the cache is
+    /// invalid and must be rebuilt the next time the overview is opened.
+    overview_cache: Option<OverviewCommentSet>,
 }
 
 impl App {
@@ -324,6 +341,7 @@ impl App {
             transition_mode,
             comments_loaded_ok: false,
             pending_reanchor: None,
+            overview_cache: None,
         }
     }
 
@@ -336,6 +354,10 @@ impl App {
     }
 
     fn refresh_inline_comments(&mut self) {
+        // Any comment edit invalidates the overview cache so the next open
+        // gets a fresh load.
+        self.overview_cache = None;
+
         match crate::store::load_change_comments(&self.repo_root, &self.details.change_id) {
             Ok(comments) => {
                 self.loaded_comments = self.reconcile_and_persist(comments);
@@ -539,6 +561,45 @@ impl App {
         self.load_stack_entry(prev_index, false)
     }
 
+    /// Load all comments needed for the stack overview and store them in the cache.
+    fn load_overview_comments(&mut self) {
+        let Some(ctx) = self.stack.as_ref() else {
+            return;
+        };
+        let revset_hash = ctx.revset_hash;
+        let entries = ctx.entries.clone();
+        let repo_root = self.repo_root.clone();
+
+        let stack_level = crate::store::load_stack_comments(&repo_root, &revset_hash)
+            .unwrap_or_else(|e| {
+                let _ = e; // best-effort; ignore load failures for overview
+                Vec::new()
+            });
+
+        let per_change: Vec<Vec<Comment>> = entries
+            .iter()
+            .map(|entry| {
+                crate::store::load_change_comments(&repo_root, &entry.change_id).unwrap_or_default()
+            })
+            .collect();
+
+        self.overview_cache = Some(OverviewCommentSet {
+            stack_level,
+            per_change,
+        });
+    }
+
+    /// Navigate directly to stack entry at `idx` without emitting a transition screen.
+    fn goto_stack_index(&mut self, idx: usize) -> Result<()> {
+        let Some(ctx) = self.stack.as_ref() else {
+            return Ok(());
+        };
+        if idx >= ctx.entries.len() {
+            return Ok(());
+        }
+        self.load_stack_entry(idx, true)
+    }
+
     /// Load the stack entry at `idx`. Persists the cursor if `advance` is true.
     fn load_stack_entry(&mut self, idx: usize, advance: bool) -> Result<()> {
         let (revset, revset_hash, change_id) = {
@@ -676,11 +737,10 @@ fn load_transition_mode(repo_root: &std::path::Path) -> TransitionMode {
     }
 }
 
-// Full-screen views (Stale) replace the main view entirely. Modals (Help,
-// Composer, Transition) overlay on top of the main diff view.
+// Full-screen views (Stale, Overview) replace the main view entirely. Modals
+// (Help, Composer, Transition) overlay on top of the main diff view.
 fn render(frame: &mut Frame<'_>, app: &mut App) {
     if matches!(app.screen, Screen::Stale(_)) {
-        // Take the state out, render with &mut state, then put it back.
         let Screen::Stale(mut state) = std::mem::replace(&mut app.screen, Screen::Main) else {
             unreachable!("matched above");
         };
@@ -688,6 +748,21 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
         app.screen = Screen::Stale(state);
         return;
     }
+
+    if matches!(app.screen, Screen::Overview(_)) {
+        // Take the state and cache out temporarily to satisfy the borrow checker.
+        let Screen::Overview(mut state) = std::mem::replace(&mut app.screen, Screen::Main) else {
+            unreachable!("matched above");
+        };
+        let cache = app.overview_cache.take();
+        if let Some(ref cache_ref) = cache {
+            overview_screen::render(frame, &mut state, app, cache_ref);
+        }
+        app.overview_cache = cache;
+        app.screen = Screen::Overview(state);
+        return;
+    }
+
     render_main(frame, app);
     match &app.screen {
         Screen::Main => {}
@@ -698,7 +773,7 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
         Screen::Transition(state) => {
             render_transition(frame, app, state);
         }
-        Screen::Stale(_) => unreachable!("handled above"),
+        Screen::Stale(_) | Screen::Overview(_) => unreachable!("handled above"),
     }
 }
 
@@ -946,6 +1021,7 @@ fn handle_event(app: &mut App) -> Result<()> {
             Screen::Composer(_) => handle_composer_event(app, key),
             Screen::Transition(_) => handle_transition_key(app, key)?,
             Screen::Stale(_) => handle_stale_key(app, key),
+            Screen::Overview(_) => handle_overview_key(app, key)?,
         }
     }
     Ok(())
@@ -977,6 +1053,7 @@ fn handle_main_key(app: &mut App, key: KeyEvent) -> Result<()> {
         KeyCode::Char('q') => app.should_quit = true,
         KeyCode::Char('?') => app.screen = Screen::Help,
         KeyCode::Char('S') => open_stale_screen(app),
+        KeyCode::Char('s') => open_overview_screen(app),
         KeyCode::Up | KeyCode::Char('k') => app.move_line(-1),
         KeyCode::Down | KeyCode::Char('j') => app.move_line(1),
         KeyCode::PageUp => app.move_page(-1),
@@ -1165,6 +1242,256 @@ fn open_stale_screen(app: &mut App) {
     });
 }
 
+fn open_overview_screen(app: &mut App) {
+    if app.pending_reanchor.is_some() {
+        app.status_message =
+            Some("finish or cancel re-anchor mode before opening the stack overview".to_owned());
+        return;
+    }
+    if app.stack.is_none() {
+        app.status_message = Some("stack overview requires --stack mode".to_owned());
+        return;
+    }
+    if app.overview_cache.is_none() {
+        app.load_overview_comments();
+    }
+    app.screen = Screen::Overview(OverviewScreenState::new());
+}
+
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "unhandled KeyCode variants are intentionally ignored on the overview screen"
+)]
+fn handle_overview_key(app: &mut App, key: KeyEvent) -> Result<()> {
+    let Screen::Overview(ref state) = app.screen else {
+        return Ok(());
+    };
+
+    let rows = if let (Some(ctx), Some(cache)) = (app.stack.as_ref(), app.overview_cache.as_ref()) {
+        overview_screen::build_rows(
+            cache,
+            &ctx.entries,
+            cache.stale_count(),
+            cache.total_count(),
+        )
+    } else {
+        Vec::new()
+    };
+
+    let current_selected = state.selected_row;
+
+    match key.code {
+        KeyCode::Char('q') | KeyCode::Esc => {
+            app.screen = Screen::Main;
+        }
+        KeyCode::Char('?') => {
+            app.screen = Screen::Help;
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            let new_sel = overview_screen::move_cursor(&rows, current_selected, -1);
+            if let Screen::Overview(ref mut s) = app.screen {
+                s.selected_row = new_sel;
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            let new_sel = overview_screen::move_cursor(&rows, current_selected, 1);
+            if let Screen::Overview(ref mut s) = app.screen {
+                s.selected_row = new_sel;
+            }
+        }
+        KeyCode::Enter => {
+            overview_enter(app, &rows, current_selected)?;
+        }
+        KeyCode::Char('c') => {
+            overview_open_composer(app, &rows, current_selected);
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Handle `Enter` on the overview screen.
+fn overview_enter(
+    app: &mut App,
+    rows: &[overview_screen::OverviewRow],
+    selected: usize,
+) -> Result<()> {
+    let Some(row) = rows.get(selected) else {
+        return Ok(());
+    };
+    match row {
+        overview_screen::OverviewRow::ChangeRow(change_idx) => {
+            let idx = *change_idx;
+            app.screen = Screen::Main;
+            app.goto_stack_index(idx)?;
+        }
+        overview_screen::OverviewRow::StackComment(ci) => {
+            open_overview_stack_comment_editor(app, *ci);
+        }
+        overview_screen::OverviewRow::ChangeComment {
+            change_idx,
+            comment_idx,
+        } => {
+            open_overview_change_comment_editor(app, *change_idx, *comment_idx);
+        }
+        overview_screen::OverviewRow::StackHeader
+        | overview_screen::OverviewRow::Separator
+        | overview_screen::OverviewRow::SummaryFooterStale
+        | overview_screen::OverviewRow::SummaryFooterTotal => {}
+    }
+    Ok(())
+}
+
+/// Open the composer with a scope derived from the cursor's row type.
+///
+/// For `Change` scope the target `change_id` is the cursor row's change (which
+/// may differ from the change loaded in the main view). For `Stack` and any
+/// non-actionable rows we fall back to the current change as a placeholder
+/// only — the `change_id` is unused for `Stack` scope.
+fn overview_open_composer(app: &mut App, rows: &[overview_screen::OverviewRow], selected: usize) {
+    let (scope, change_idx_for_change_scope) = rows
+        .get(selected)
+        .map(|row| match row {
+            overview_screen::OverviewRow::StackHeader
+            | overview_screen::OverviewRow::StackComment(_) => (ComposerScope::Stack, None),
+            overview_screen::OverviewRow::ChangeRow(ci) => (ComposerScope::Change, Some(*ci)),
+            overview_screen::OverviewRow::ChangeComment { change_idx, .. } => {
+                (ComposerScope::Change, Some(*change_idx))
+            }
+            overview_screen::OverviewRow::Separator
+            | overview_screen::OverviewRow::SummaryFooterStale
+            | overview_screen::OverviewRow::SummaryFooterTotal => (ComposerScope::Change, None),
+        })
+        .unwrap_or((ComposerScope::Change, None));
+
+    let target_change_id: ChangeId = change_idx_for_change_scope
+        .and_then(|idx| {
+            app.stack
+                .as_ref()
+                .and_then(|s| s.entries.get(idx).map(|e| e.change_id.clone()))
+        })
+        .unwrap_or_else(|| app.details.change_id.clone());
+
+    open_composer_with_scope(app, scope, target_change_id);
+}
+
+/// Open a new-comment composer pre-set to `scope`, using the current change's
+/// first commentable line as the line target (for the contexts snapshot).
+/// `target_change_id` binds the composer's change-scope target — the overview
+/// path passes the cursor's change; the main-view path passes the current
+/// change.
+fn open_composer_with_scope(app: &mut App, scope: ComposerScope, target_change_id: ChangeId) {
+    let line_target = match build_line_target(app) {
+        BuildTargetResult::Ready(t) => t,
+        BuildTargetResult::NonCommentable | BuildTargetResult::NoView => {
+            // Scope may be Stack or Change — a synthetic line target is fine here.
+            let Some(file) = app.details.diff.files.first() else {
+                app.status_message = Some("no diff to anchor comment to".to_owned());
+                return;
+            };
+            LineTarget {
+                file: file.display_path().to_owned(),
+                rendered_index: 0,
+                source_line: None,
+                target_line: None,
+                target_text: String::new(),
+                hunk_header: String::new(),
+                context_before: Vec::new(),
+                context_after: Vec::new(),
+            }
+        }
+    };
+
+    let contexts = composer_contexts_for_change(app, line_target, target_change_id);
+    let severity = default_severity(app.last_severity);
+    let mut composer = Composer::new(contexts, severity);
+    composer.scope = scope;
+    app.screen = Screen::Composer(Box::new(composer));
+}
+
+/// Open the composer in edit mode for a stack-level comment.
+fn open_overview_stack_comment_editor(app: &mut App, comment_idx: usize) {
+    let comment = app
+        .overview_cache
+        .as_ref()
+        .and_then(|c| c.stack_level.get(comment_idx))
+        .cloned();
+    let Some(comment) = comment else {
+        app.status_message = Some("comment not found".to_owned());
+        return;
+    };
+    open_meta_comment_editor(app, &comment);
+}
+
+/// Open the composer in edit mode for a change-level comment from the overview.
+fn open_overview_change_comment_editor(app: &mut App, change_idx: usize, comment_idx: usize) {
+    let comment = app
+        .overview_cache
+        .as_ref()
+        .and_then(|c| c.per_change.get(change_idx))
+        .and_then(|v| v.get(comment_idx))
+        .cloned();
+
+    let Some(comment) = comment else {
+        app.status_message = Some("comment not found".to_owned());
+        return;
+    };
+
+    open_meta_comment_editor(app, &comment);
+}
+
+/// Open the composer in edit mode for a non-line comment (change or stack
+/// scope). The full source `Comment` is captured into `Composer.original` so
+/// save/delete route through the original anchor — required for stack-scoped
+/// comments and for change-scoped comments on changes other than the one
+/// loaded in the main view.
+fn open_meta_comment_editor(app: &mut App, comment: &Comment) {
+    let scope = match &comment.anchor {
+        Anchor::Change { .. } => ComposerScope::Change,
+        Anchor::Stack { .. } => ComposerScope::Stack,
+        Anchor::Line { .. } => ComposerScope::Line,
+    };
+
+    let line_target = match build_line_target(app) {
+        BuildTargetResult::Ready(t) => t,
+        BuildTargetResult::NonCommentable | BuildTargetResult::NoView => {
+            let Some(file) = app.details.diff.files.first() else {
+                app.status_message = Some("no diff to anchor comment to".to_owned());
+                return;
+            };
+            LineTarget {
+                file: file.display_path().to_owned(),
+                rendered_index: 0,
+                source_line: None,
+                target_line: None,
+                target_text: String::new(),
+                hunk_header: String::new(),
+                context_before: Vec::new(),
+                context_after: Vec::new(),
+            }
+        }
+    };
+
+    // Bind the contexts' change_id to the source comment when it is a
+    // change-scoped record on a non-current change; otherwise use the current
+    // change. The composer overlay's title and the build_comment path read
+    // from `composer.contexts.change.change_id`.
+    let target_change_id = match &comment.anchor {
+        Anchor::Change { change_id } | Anchor::Line { change_id, .. } => change_id.clone(),
+        Anchor::Stack { .. } => app.details.change_id.clone(),
+    };
+    let contexts = composer_contexts_for_change(app, line_target, target_change_id);
+    let edited = EditedComment {
+        contexts,
+        severity: comment.severity,
+        body: comment.body.clone(),
+        identity: comment.created_at,
+        scope,
+        original: Some(comment.clone()),
+    };
+    app.screen = Screen::Composer(Box::new(Composer::for_edit(edited)));
+}
+
 #[expect(
     clippy::wildcard_enum_match_arm,
     reason = "unhandled KeyCode variants are intentionally ignored on the transition modal"
@@ -1314,22 +1641,44 @@ fn render_transition_comment_summary(frame: &mut Frame<'_>, area: Rect, state: &
     frame.render_widget(Paragraph::new(line), area);
 }
 
-/// Render a string of `●` dots for the transition severity summary.
+/// Render a string of `●` dots for a single count.
 ///
-/// Caps at [`TRANSITION_DOT_MAX`]; any overflow becomes a trailing `…`. The
+/// Caps at [`DOT_BUDGET`]; any overflow becomes a trailing `…`. The
 /// numeric count next to the dots still tells the truth.
-fn render_dots(count: usize) -> String {
+pub(super) fn render_dots(count: usize) -> String {
     if count == 0 {
         String::new()
-    } else if count <= TRANSITION_DOT_MAX {
+    } else if count <= DOT_BUDGET {
         "●".repeat(count)
     } else {
-        format!("{}…", "●".repeat(TRANSITION_DOT_MAX))
+        format!("{}…", "●".repeat(DOT_BUDGET))
     }
 }
 
+/// Render mixed-severity dots sharing a single [`DOT_BUDGET`] across all
+/// severities. Dots emit in severity order (required, suggestion, note) and
+/// stop at the budget; if the histogram total exceeds the budget, a trailing
+/// `…` is appended.
+pub(super) fn render_dots_mixed(hist: SeverityHistogram) -> String {
+    let mut dots = String::new();
+    let mut budget = DOT_BUDGET;
+    for count in [hist.required, hist.suggestion, hist.note] {
+        let take = count.min(budget);
+        for _ in 0..take {
+            dots.push('●');
+        }
+        budget = budget.saturating_sub(take);
+        if budget == 0 {
+            break;
+        }
+    }
+    if hist.total() > DOT_BUDGET {
+        dots.push('…');
+    }
+    dots
+}
+
 fn handle_composer_event(app: &mut App, key: KeyEvent) {
-    // Take the composer out of app.screen temporarily so we can mutate app.
     let Screen::Composer(mut composer) = std::mem::replace(&mut app.screen, Screen::Main) else {
         return;
     };
@@ -1389,9 +1738,25 @@ enum SaveOutcome {
 }
 
 fn composer_contexts(app: &App, line: LineTarget) -> ComposerContexts {
+    composer_contexts_for_change(app, line, app.details.change_id.clone())
+}
+
+/// Build composer contexts targeting an explicit `change_id`. Used by the
+/// overview screen so the composer's `Change` scope binds to the cursor's
+/// change rather than the change loaded in the main view.
+fn composer_contexts_for_change(
+    app: &App,
+    line: LineTarget,
+    change_id: ChangeId,
+) -> ComposerContexts {
+    let description = if change_id == app.details.change_id {
+        app.details.description.clone()
+    } else {
+        String::new()
+    };
     let change = ChangeContext {
-        change_id: app.details.change_id.as_str().to_owned(),
-        description: app.details.description.clone(),
+        change_id,
+        description,
     };
     let stack = app.stack.as_ref().map(|s| StackContextSnapshot {
         revset: s.revset.clone(),
@@ -1461,6 +1826,9 @@ fn open_composer_for_edit(app: &mut App) {
         body: comment.body.clone(),
         identity: comment.created_at,
         scope: ComposerScope::Line,
+        // Main-view line-comment edits resolve through `app.loaded_comments`
+        // so the latest in-memory anchor (post-re-anchor) is honored.
+        original: None,
     };
     let composer = Composer::for_edit(edited);
     app.screen = Screen::Composer(Box::new(composer));
@@ -1645,8 +2013,11 @@ fn build_comment_from_composer(
                 location,
             }
         }
+        // Read the target change_id from the composer's snapshot, not from
+        // `app.details`. The two diverge when the composer was opened from the
+        // stack overview cursor pointing at a non-current change.
         ComposerScope::Change => Anchor::Change {
-            change_id: app.details.change_id.clone(),
+            change_id: composer.contexts.change.change_id.clone(),
         },
         ComposerScope::Stack => {
             let revset_hash = composer
@@ -1688,27 +2059,35 @@ fn persist_update_from_composer(
     composer: &Composer,
     args: UpdateArgs,
 ) -> SaveOutcome {
-    // Source the anchor from the latest in-memory record (keyed by
-    // `created_at`) rather than the composer's open-time snapshot. If the
-    // anchor moved between compose-open and compose-submit (e.g., a refresh
-    // re-anchored it to a new line), the user's edit must apply to the new
-    // anchor location, not the stale snapshot.
-    let Some(latest) = app
-        .loaded_comments
-        .iter()
-        .find(|c| c.created_at == args.created_at)
-        .cloned()
-    else {
-        return SaveOutcome::Errored(
-            "comment was removed between open and save; edit not saved".to_owned(),
-        );
+    // Two paths:
+    // (1) Edit from main view (`composer.original` is None): source the anchor
+    //     from `app.loaded_comments` keyed by `created_at` so a re-anchor that
+    //     happened between compose-open and compose-submit lands the edit at
+    //     the new location.
+    // (2) Edit from stack overview (`composer.original` is Some): the comment
+    //     does not appear in `app.loaded_comments` (it belongs to a different
+    //     change or to the stack file), so use the original snapshot directly.
+    let source = if let Some(orig) = composer.original.as_ref() {
+        orig.clone()
+    } else {
+        let Some(latest) = app
+            .loaded_comments
+            .iter()
+            .find(|c| c.created_at == args.created_at)
+            .cloned()
+        else {
+            return SaveOutcome::Errored(
+                "comment was removed between open and save; edit not saved".to_owned(),
+            );
+        };
+        latest
     };
 
     let updated = Comment {
         body: args.body,
         severity: composer.severity,
         updated_at: Some(args.now),
-        ..latest
+        ..source
     };
 
     match crate::store::update_comment(&app.repo_root, &updated) {
@@ -1739,22 +2118,31 @@ fn delete_via_composer(app: &mut App, composer: &Composer) -> SaveOutcome {
     // `delete_comment` keys records by `(anchor, created_at)`. The other
     // `Comment` fields are unused by the store; we still build the full
     // record because the API requires it.
-    let (change_id, location) = build_location_from_composer(app, composer);
-    let comment = Comment {
-        schema_version: SchemaVersion,
-        anchor: Anchor::Line {
-            change_id,
-            location,
-        },
-        repo_root: app.repo_root.clone(),
-        revset: app.revset.clone(),
-        commit_id: Some(app.details.commit_id.clone()),
-        body: composer.body_text(),
-        severity: composer.severity,
-        created_at,
-        updated_at: None,
-        status: Some(Status::Pending),
-        mismatch_reason: None,
+    //
+    // When `composer.original` is set (edit opened from the stack overview),
+    // delete keys off that snapshot's anchor so stack- and non-current-change
+    // comments resolve to the right JSONL file. Otherwise reconstruct the
+    // line anchor from the composer's contexts (the main-view edit path).
+    let comment = if let Some(orig) = composer.original.as_ref() {
+        orig.clone()
+    } else {
+        let (change_id, location) = build_location_from_composer(app, composer);
+        Comment {
+            schema_version: SchemaVersion,
+            anchor: Anchor::Line {
+                change_id,
+                location,
+            },
+            repo_root: app.repo_root.clone(),
+            revset: app.revset.clone(),
+            commit_id: Some(app.details.commit_id.clone()),
+            body: composer.body_text(),
+            severity: composer.severity,
+            created_at,
+            updated_at: None,
+            status: Some(Status::Pending),
+            mismatch_reason: None,
+        }
     };
 
     match crate::store::delete_comment(&app.repo_root, &comment) {
@@ -2154,15 +2542,18 @@ mod tests {
         ComposerContexts {
             line: target,
             change: ChangeContext {
-                change_id: "abc12345".to_owned(),
+                change_id: ChangeId::parse("abc12345").unwrap(),
                 description: "test change".to_owned(),
             },
             stack: None,
         }
     }
 
-    fn make_composer_with_body(target: LineTarget, body: &str) -> Composer {
-        let contexts = make_contexts_for_test(target);
+    /// Build a composer whose change-context `change_id` matches `app.details.change_id`.
+    /// Use this when the test will assert against `app.details.change_id` in the
+    /// store (i.e., `Change` or `Line` scope tests).
+    fn make_composer_with_body(app: &App, target: LineTarget, body: &str) -> Composer {
+        let contexts = composer_contexts(app, target);
         let mut composer = Composer::new(contexts, Severity::Suggestion);
         for ch in body.chars() {
             composer
@@ -2181,7 +2572,7 @@ mod tests {
         let BuildTargetResult::Ready(target) = build_line_target(&app) else {
             panic!("expected Ready");
         };
-        let mut composer = make_composer_with_body(target, "change-level concern");
+        let mut composer = make_composer_with_body(&app, target, "change-level concern");
         composer.scope = ComposerScope::Change;
         let outcome = save_composer(&mut app, &composer, time::OffsetDateTime::UNIX_EPOCH);
         assert!(
@@ -2268,7 +2659,7 @@ mod tests {
         let BuildTargetResult::Ready(target) = build_line_target(&app) else {
             panic!("expected Ready");
         };
-        let mut composer = make_composer_with_body(target, "hello");
+        let mut composer = make_composer_with_body(&app, target, "hello");
         composer.scope = ComposerScope::Stack;
         let outcome = save_composer(&mut app, &composer, time::OffsetDateTime::UNIX_EPOCH);
         match outcome {
@@ -2289,7 +2680,7 @@ mod tests {
         let BuildTargetResult::Ready(target) = build_line_target(&app) else {
             panic!("expected Ready");
         };
-        let composer = make_composer_with_body(target, "");
+        let composer = make_composer_with_body(&app, target, "");
         let outcome = save_composer(&mut app, &composer, time::OffsetDateTime::UNIX_EPOCH);
         assert!(matches!(outcome, SaveOutcome::Refused(_)));
     }
@@ -2303,7 +2694,7 @@ mod tests {
         let BuildTargetResult::Ready(target) = build_line_target(&app) else {
             panic!("expected Ready");
         };
-        let composer = make_composer_with_body(target, "first body content");
+        let composer = make_composer_with_body(&app, target, "first body content");
         let now = time::OffsetDateTime::UNIX_EPOCH;
 
         // First save succeeds.
@@ -2333,7 +2724,7 @@ mod tests {
         let BuildTargetResult::Ready(target) = build_line_target(&app) else {
             panic!("expected Ready for Added line");
         };
-        let composer = make_composer_with_body(target, "test comment body");
+        let composer = make_composer_with_body(&app, target, "test comment body");
         let now = time::OffsetDateTime::UNIX_EPOCH;
         let outcome = save_composer(&mut app, &composer, now);
         assert!(matches!(outcome, SaveOutcome::Saved), "setup save failed");
@@ -2412,6 +2803,7 @@ mod tests {
                 body: c.body_text(),
                 identity: c.editing.unwrap(),
                 scope: c.scope,
+                original: c.original.clone(),
             })
         };
         let save_time = time::OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(60);
@@ -2530,6 +2922,7 @@ mod tests {
                 body: c.body_text(),
                 identity: c.editing.unwrap(),
                 scope: c.scope,
+                original: c.original.clone(),
             })
         };
 
@@ -2585,6 +2978,7 @@ mod tests {
                 body: c.body_text(),
                 identity: c.editing.unwrap(),
                 scope: c.scope,
+                original: c.original.clone(),
             })
         };
 
@@ -2650,6 +3044,7 @@ mod tests {
                 body: c.body_text(),
                 identity: c.editing.unwrap(),
                 scope: c.scope,
+                original: c.original.clone(),
             })
         };
 
@@ -2687,6 +3082,7 @@ mod tests {
                 body: c.body_text(),
                 identity: c.editing.unwrap(),
                 scope: c.scope,
+                original: c.original.clone(),
             })
         };
 
@@ -2787,7 +3183,7 @@ mod tests {
         let BuildTargetResult::Ready(target) = build_line_target(app) else {
             panic!("expected Ready");
         };
-        let composer = make_composer_with_body(target, body_text);
+        let composer = make_composer_with_body(app, target, body_text);
         let outcome = save_composer(app, &composer, when);
         assert!(matches!(outcome, SaveOutcome::Saved), "save {body_text}");
     }
@@ -2934,8 +3330,6 @@ mod tests {
         assert_eq!(preserved.updated_at, None);
     }
 
-    // ---- transition_enabled boundary tests (G3) ----
-
     fn app_with_mode(mode: TransitionMode) -> App {
         let mut app = make_app_with_single_file(sample_diff_file());
         app.transition_mode = mode;
@@ -2976,8 +3370,6 @@ mod tests {
         let app = app_with_mode(TransitionMode::Auto);
         assert!(app.transition_enabled(9));
     }
-
-    // ---- load_transition_mode tests (G4) ----
 
     #[test]
     fn load_transition_mode_missing_file_is_never() {
@@ -3026,8 +3418,6 @@ mod tests {
         assert_eq!(load_transition_mode(dir.path()), TransitionMode::Never);
     }
 
-    // ---- progress_bar_string tests (D1) ----
-
     #[test]
     fn progress_bar_zero_total_returns_empty() {
         assert_eq!(progress_bar_string(0, 0, 10), String::new());
@@ -3061,8 +3451,6 @@ mod tests {
         assert_eq!(progress_bar_string(2, 5, 0), String::new());
     }
 
-    // ---- single-change footer does not advertise n/p (H3) ----
-
     #[test]
     fn single_change_app_has_no_stack_context() {
         // The footer logic branches on `app.stack.is_some()`. Confirm a
@@ -3071,8 +3459,6 @@ mod tests {
         let app = make_app_with_single_file(sample_diff_file());
         assert!(app.stack.is_none(), "single-change app must not have stack");
     }
-
-    // ---- SeverityHistogram (D2) ----
 
     #[test]
     fn severity_histogram_counts_by_kind() {
@@ -3115,8 +3501,6 @@ mod tests {
             mismatch_reason: None,
         }
     }
-
-    // ---- Cursor persistence on quit (A2) ----
 
     #[test]
     fn persist_cursor_on_exit_writes_current_index_for_stack_app() {
@@ -3181,13 +3565,10 @@ mod tests {
         assert!(!dir.path().join(".jj-review").join("cursor.json").exists());
     }
 
-    // ---- pick_retreat_index (B) ----
-    //
-    // The pure helper carries the navigation contract for `p`. Side-effect
-    // properties (no cursor write) follow from `retreat_stack` routing the
-    // index through `load_stack_entry(idx, advance=false)`; the helper itself
-    // does not touch any I/O.
-
+    // The pure `pick_retreat_index` helper carries the navigation contract for
+    // `p`. Side-effect properties (no cursor write) follow from `retreat_stack`
+    // routing the index through `load_stack_entry(idx, advance=false)`; the
+    // helper itself does not touch any I/O.
     #[test]
     fn pick_retreat_index_at_zero_returns_none() {
         assert_eq!(pick_retreat_index(0), None);
@@ -3208,8 +3589,6 @@ mod tests {
         assert_eq!(pick_retreat_index(usize::MAX), Some(usize::MAX - 1));
     }
 
-    // ---- transition modal footer fits (A) ----
-
     #[test]
     fn transition_footer_fits_inside_modal() {
         // Modal interior is `TRANSITION_MODAL_WIDTH - 2` cols (border on each
@@ -3225,8 +3604,6 @@ mod tests {
         );
     }
 
-    // ---- render_dots cap (D) ----
-
     #[test]
     fn render_dots_zero_is_empty() {
         assert_eq!(render_dots(0), "");
@@ -3239,20 +3616,18 @@ mod tests {
 
     #[test]
     fn render_dots_at_max() {
-        assert_eq!(render_dots(TRANSITION_DOT_MAX), "●●●●●");
+        assert_eq!(render_dots(DOT_BUDGET), "●●●●●");
     }
 
     #[test]
     fn render_dots_one_over_max_truncates_with_ellipsis() {
-        assert_eq!(render_dots(TRANSITION_DOT_MAX + 1), "●●●●●…");
+        assert_eq!(render_dots(DOT_BUDGET + 1), "●●●●●…");
     }
 
     #[test]
     fn render_dots_far_over_max_still_truncates() {
         assert_eq!(render_dots(50), "●●●●●…");
     }
-
-    // ---- file_header_label ----
 
     #[test]
     fn file_header_label_shows_path_and_position() {
@@ -3291,8 +3666,6 @@ mod tests {
         );
     }
 
-    // ---- footer_text ----
-
     #[test]
     fn footer_text_stack_mode_contains_revision() {
         let mut app = make_app_with_single_file(sample_diff_file());
@@ -3324,8 +3697,6 @@ mod tests {
             "single-change footer should not mention n/p, got: {text:?}"
         );
     }
-
-    // ---- stale screen integration tests ----
 
     #[expect(
         clippy::too_many_arguments,
@@ -3796,5 +4167,248 @@ mod tests {
         );
         assert!(prompt.contains("re-anchoring"));
         assert!(prompt.chars().count() <= 60, "short form fits comfortably");
+    }
+
+    /// Build a stack-mode app whose current change is change A and whose stack
+    /// also has change B. Repo root is set to `dir`. Used by overview-routing
+    /// tests so the composer can load on either change without I/O.
+    fn make_stack_app_with_two_changes(dir: &std::path::Path) -> (App, ChangeId, ChangeId) {
+        let id_a = ChangeId::parse(&"a".repeat(32)).unwrap();
+        let id_b = ChangeId::parse(&"b".repeat(32)).unwrap();
+        let entry_a = StackEntry {
+            change_id: id_a.clone(),
+            commit_id: CommitId::parse(&"a".repeat(40)).unwrap(),
+            description: "first".to_owned(),
+        };
+        let entry_b = StackEntry {
+            change_id: id_b.clone(),
+            commit_id: CommitId::parse(&"b".repeat(40)).unwrap(),
+            description: "second".to_owned(),
+        };
+        let revset = "trunk()..@".to_owned();
+        let revset_hash = RevsetHash::from_revset(&revset);
+        let details = ChangeDetails {
+            change_id: id_a.clone(),
+            commit_id: entry_a.commit_id.clone(),
+            description: "first".to_owned(),
+            diff: Diff {
+                files: vec![sample_diff_file()],
+            },
+        };
+        let stack_ctx = StackContext {
+            entries: vec![entry_a, entry_b],
+            current_index: 0,
+            revset,
+            revset_hash,
+        };
+        let app = App::new(
+            details,
+            dir.to_path_buf(),
+            "trunk()..@".to_owned(),
+            Some(stack_ctx),
+            TransitionMode::Never,
+        );
+        (app, id_a, id_b)
+    }
+
+    /// Drive a save through `handle_composer_event` with `^X` to exercise the
+    /// real dispatch path the user hits.
+    fn dispatch_ctrl_x(app: &mut App) {
+        handle_composer_event(
+            app,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+        );
+    }
+
+    /// Drive a delete through `handle_composer_event` with `^D`.
+    fn dispatch_ctrl_d(app: &mut App) {
+        handle_composer_event(
+            app,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+        );
+    }
+
+    /// Edit a stack-scoped comment via the overview path. Body and severity
+    /// persist to `_stack.jsonl` keyed by the original record's anchor.
+    #[test]
+    fn edit_stack_comment_from_overview_persists_body_and_severity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut app, _id_a, _id_b) = make_stack_app_with_two_changes(dir.path());
+        let revset_hash = app.stack.as_ref().unwrap().revset_hash;
+
+        // Seed: one stack-scoped comment on disk.
+        let original = Comment {
+            schema_version: SchemaVersion,
+            anchor: Anchor::Stack { revset_hash },
+            repo_root: dir.path().to_path_buf(),
+            revset: "trunk()..@".to_owned(),
+            commit_id: None,
+            body: "original body".to_owned(),
+            severity: Severity::Note,
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
+            updated_at: None,
+            status: None,
+            mismatch_reason: None,
+        };
+        crate::store::save_comment(dir.path(), &original).unwrap();
+
+        // Open the editor via the overview path (simulates Enter on the row).
+        open_meta_comment_editor(&mut app, &original);
+        let Screen::Composer(ref mut composer) = app.screen else {
+            panic!("expected composer");
+        };
+        // Edit the body and bump severity.
+        composer.body = tui_textarea::TextArea::default();
+        for ch in "edited body text".chars() {
+            composer
+                .body
+                .input(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        composer.severity = Severity::Required;
+
+        dispatch_ctrl_x(&mut app);
+
+        // After save, screen should be back to Main.
+        assert!(matches!(app.screen, Screen::Main));
+
+        let loaded = crate::store::load_stack_comments(dir.path(), &revset_hash).unwrap();
+        assert_eq!(loaded.len(), 1, "stack file should still hold one comment");
+        assert_eq!(loaded[0].body, "edited body text");
+        assert_eq!(loaded[0].severity, Severity::Required);
+        assert_eq!(loaded[0].created_at, original.created_at);
+    }
+
+    /// Edit a change-scoped comment for a non-current change. The record
+    /// must persist to that change's JSONL even though it does not appear in
+    /// `app.loaded_comments` (which only holds the current change).
+    #[test]
+    fn edit_change_comment_for_non_current_change_from_overview_persists() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut app, _id_a, id_b) = make_stack_app_with_two_changes(dir.path());
+
+        let original = Comment {
+            schema_version: SchemaVersion,
+            anchor: Anchor::Change {
+                change_id: id_b.clone(),
+            },
+            repo_root: dir.path().to_path_buf(),
+            revset: "trunk()..@".to_owned(),
+            commit_id: None,
+            body: "B-original".to_owned(),
+            severity: Severity::Note,
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
+            updated_at: None,
+            status: Some(Status::Pending),
+            mismatch_reason: None,
+        };
+        crate::store::save_comment(dir.path(), &original).unwrap();
+
+        open_meta_comment_editor(&mut app, &original);
+        let Screen::Composer(ref mut composer) = app.screen else {
+            panic!("expected composer");
+        };
+        composer.body = tui_textarea::TextArea::default();
+        for ch in "B-edited".chars() {
+            composer
+                .body
+                .input(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        composer.severity = Severity::Suggestion;
+
+        dispatch_ctrl_x(&mut app);
+
+        let loaded_b = crate::store::load_change_comments(dir.path(), &id_b).unwrap();
+        assert_eq!(loaded_b.len(), 1, "B should still hold one comment");
+        assert_eq!(loaded_b[0].body, "B-edited");
+        assert_eq!(loaded_b[0].severity, Severity::Suggestion);
+        assert_eq!(loaded_b[0].created_at, original.created_at);
+    }
+
+    /// Delete a stack-scoped comment via `^D` from the composer. The record
+    /// must be removed from `_stack.jsonl`, not from any change file.
+    #[test]
+    fn delete_stack_comment_via_composer_removes_from_stack_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut app, _id_a, _id_b) = make_stack_app_with_two_changes(dir.path());
+        let revset_hash = app.stack.as_ref().unwrap().revset_hash;
+
+        let original = Comment {
+            schema_version: SchemaVersion,
+            anchor: Anchor::Stack { revset_hash },
+            repo_root: dir.path().to_path_buf(),
+            revset: "trunk()..@".to_owned(),
+            commit_id: None,
+            body: "to-delete".to_owned(),
+            severity: Severity::Note,
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
+            updated_at: None,
+            status: None,
+            mismatch_reason: None,
+        };
+        crate::store::save_comment(dir.path(), &original).unwrap();
+
+        open_meta_comment_editor(&mut app, &original);
+        assert!(matches!(app.screen, Screen::Composer(_)));
+
+        dispatch_ctrl_d(&mut app);
+
+        assert!(matches!(app.screen, Screen::Main));
+        let loaded = crate::store::load_stack_comments(dir.path(), &revset_hash).unwrap();
+        assert!(
+            loaded.is_empty(),
+            "stack file should be empty after delete; got {loaded:?}"
+        );
+    }
+
+    /// New `c` from an overview row pointing at change B (while main view
+    /// holds change A). The new record must land in B's JSONL with
+    /// `Anchor::Change { change_id: B }`.
+    #[test]
+    fn new_change_comment_from_overview_targets_cursor_change() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut app, id_a, id_b) = make_stack_app_with_two_changes(dir.path());
+        // Sanity: main view holds A.
+        assert_eq!(app.details.change_id, id_a);
+
+        // Build the rows (cursor on change B's row).
+        app.load_overview_comments();
+        let cache = app.overview_cache.as_ref().unwrap();
+        let entries = app.stack.as_ref().unwrap().entries.clone();
+        let rows = overview_screen::build_rows(cache, &entries, 0, 0);
+        let cursor_b = rows
+            .iter()
+            .position(|r| matches!(r, overview_screen::OverviewRow::ChangeRow(1)))
+            .expect("change B row must exist");
+
+        overview_open_composer(&mut app, &rows, cursor_b);
+        let Screen::Composer(ref mut composer) = app.screen else {
+            panic!("expected composer");
+        };
+        // The composer must have its target change_id set to B (not A).
+        assert_eq!(composer.contexts.change.change_id, id_b);
+        // Scope auto-selected to Change.
+        assert_eq!(composer.scope, ComposerScope::Change);
+        for ch in "new on B".chars() {
+            composer
+                .body
+                .input(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+
+        dispatch_ctrl_x(&mut app);
+
+        let loaded_a = crate::store::load_change_comments(dir.path(), &id_a).unwrap();
+        let loaded_b = crate::store::load_change_comments(dir.path(), &id_b).unwrap();
+        assert!(
+            loaded_a.is_empty(),
+            "A's file must be untouched; got {loaded_a:?}"
+        );
+        assert_eq!(loaded_b.len(), 1, "B must hold the new comment");
+        assert_eq!(loaded_b[0].body, "new on B");
+        match &loaded_b[0].anchor {
+            Anchor::Change { change_id } => assert_eq!(change_id, &id_b),
+            other @ (Anchor::Line { .. } | Anchor::Stack { .. }) => {
+                panic!("expected Anchor::Change targeting B; got {other:?}")
+            }
+        }
     }
 }

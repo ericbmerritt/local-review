@@ -174,7 +174,7 @@ fn render_scope_picker(frame: &mut Frame<'_>, area: Rect, composer: &Composer) {
     } else {
         "[ ]"
     };
-    let change_short = short_change_id(&composer.contexts.change.change_id);
+    let change_short = short_change_id(composer.contexts.change.change_id.as_str());
     let text = format!(
         "  scope     {line_mark} line    {change_mark} change · {change_short}    {stack_mark} stack"
     );
