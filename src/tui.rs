@@ -10,7 +10,9 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line as TuiLine, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{
+    Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+};
 use ratatui::{Frame, Terminal};
 
 use crate::change_id::ChangeId;
@@ -55,6 +57,11 @@ const BLOCK_BORDER_COLS: u16 = 2;
 /// Initial value for `App::viewport_rows` before the first render measures the
 /// real diff area height. Overwritten by `render_main` on every frame.
 const FALLBACK_VIEWPORT_ROWS: u16 = 20;
+
+/// Width (cells) of the diff-pane length indicator (vertical scrollbar). The
+/// scrollbar widget renders into a single column on the right edge of the
+/// diff body when the diff overflows the viewport.
+const SCROLLBAR_WIDTH: u16 = 1;
 
 /// Stack depth at which `transition_screen = "auto"` starts firing. Per spec,
 /// deep stacks get the beat between changes; short ones don't need the pause.
@@ -960,7 +967,10 @@ fn render_diff(frame: &mut Frame<'_>, area: Rect, app: &App) {
         return;
     };
 
-    let width = area.width;
+    let mut sb_state = scrollbar_state_for_diff(view.lines.len(), app.scroll, area.height);
+    let (body_area, scrollbar_area) = split_diff_body_for_scrollbar(area, sb_state.is_some());
+
+    let width = body_area.width;
     let lines: Vec<TuiLine<'_>> = view
         .lines
         .iter()
@@ -969,7 +979,82 @@ fn render_diff(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .collect();
 
     let widget = Paragraph::new(lines).scroll((app.scroll, 0));
-    frame.render_widget(widget, area);
+    frame.render_widget(widget, body_area);
+
+    if let (Some(state), Some(sb_area)) = (sb_state.as_mut(), scrollbar_area) {
+        let scrollbar = Scrollbar::default()
+            .orientation(ScrollbarOrientation::VerticalRight)
+            .track_style(Style::default().fg(Color::DarkGray))
+            .thumb_style(Style::default().fg(Color::Gray))
+            .begin_style(Style::default().fg(Color::DarkGray))
+            .end_style(Style::default().fg(Color::DarkGray));
+        frame.render_stateful_widget(scrollbar, sb_area, state);
+    }
+}
+
+/// Pure numeric core for the diff scrollbar: returns `Some((content_length,
+/// position))` when the diff overflows the viewport, `None` otherwise.
+///
+/// `content_length` is the number of distinct *scroll positions* (top-line
+/// indices the user can land at), which is `max_scroll + 1` where
+/// `max_scroll = total_lines - viewport_rows`. `position` is `scroll` clamped
+/// to `[0, max_scroll]`.
+///
+/// The clamp is defensive against future ratatui changes — current ratatui
+/// also clamps internally — and gives us a tuple shape the tests can pin
+/// numerically without rendering.
+fn scrollbar_overflow_for_diff(
+    total_lines: usize,
+    scroll: u16,
+    viewport_rows: u16,
+) -> Option<(usize, usize)> {
+    if viewport_rows == 0 {
+        return None;
+    }
+    let viewport_usize = usize::from(viewport_rows);
+    if total_lines <= viewport_usize {
+        return None;
+    }
+    let max_scroll = total_lines - viewport_usize;
+    let position = usize::from(scroll).min(max_scroll);
+    let content_length = max_scroll + 1;
+    Some((content_length, position))
+}
+
+/// Build the [`ScrollbarState`] for a diff body of `total_lines` rendered lines
+/// with topmost-visible row `scroll` in a viewport `viewport_rows` rows tall.
+///
+/// Returns `None` when the diff fits in the viewport (or the viewport is
+/// degenerate); the caller should skip the scrollbar in that case so it does
+/// not waste a column on noise.
+///
+/// Thin shell over [`scrollbar_overflow_for_diff`]: pinning the numeric
+/// behavior happens against the pure helper; this function just lifts the
+/// tuple into ratatui's `ScrollbarState`.
+fn scrollbar_state_for_diff(
+    total_lines: usize,
+    scroll: u16,
+    viewport_rows: u16,
+) -> Option<ScrollbarState> {
+    let (content_length, position) =
+        scrollbar_overflow_for_diff(total_lines, scroll, viewport_rows)?;
+    Some(ScrollbarState::new(content_length).position(position))
+}
+
+/// Split `area` into a body region and an optional [`SCROLLBAR_WIDTH`]-col
+/// scrollbar strip on the right edge.
+///
+/// Returns `(body_area, scrollbar_slot)`. The slot is `None` when no
+/// scrollbar was requested (`with_scrollbar = false`) **or** when the area is
+/// too narrow to host both the body and a scrollbar column. In both cases the
+/// body keeps the full original area.
+fn split_diff_body_for_scrollbar(area: Rect, with_scrollbar: bool) -> (Rect, Option<Rect>) {
+    if !with_scrollbar || area.width <= SCROLLBAR_WIDTH {
+        return (area, None);
+    }
+    let split =
+        Layout::horizontal([Constraint::Min(0), Constraint::Length(SCROLLBAR_WIDTH)]).split(area);
+    (split[0], Some(split[1]))
 }
 
 fn render_rendered_line(line: &RenderedLine, focused: bool, width: u16) -> TuiLine<'_> {
@@ -6122,6 +6207,487 @@ mod tests {
                 RenderedLineKind::Added | RenderedLineKind::Removed | RenderedLineKind::Context
             ),
             "cursor must land on a commentable line; got {cursor_kind:?}"
+        );
+    }
+
+    // -- Length indicator (scrollbar) tests ---------------------------------
+    //
+    // The scrollbar overlays the right edge of the diff body and only renders
+    // when the diff overflows the viewport. The pure helpers below carry the
+    // load-bearing math; the rendering tests then confirm the wiring lands
+    // glyphs where expected at the right edge of the diff area.
+
+    #[test]
+    fn scrollbar_state_for_diff_returns_none_when_diff_fits_viewport() {
+        // Equal length is the boundary: viewport can show the entire diff in
+        // one screen, so the indicator is informational noise — hide it.
+        assert!(scrollbar_state_for_diff(20, 0, 20).is_none());
+        assert!(scrollbar_state_for_diff(5, 0, 20).is_none());
+    }
+
+    #[test]
+    fn scrollbar_state_for_diff_returns_some_when_diff_overflows_viewport() {
+        let state = scrollbar_state_for_diff(100, 0, 20)
+            .expect("100 lines in 20-row viewport must produce a scrollbar");
+        // Sanity: the state is non-degenerate. Internal fields are private,
+        // so we cannot assert on them directly — the rendering tests below
+        // verify the resulting glyphs.
+        let _ = state;
+    }
+
+    #[test]
+    fn scrollbar_state_for_diff_returns_none_for_zero_viewport() {
+        // Defensive: a zero-row viewport is a transient resize state. Don't
+        // try to allocate a scrollbar against it — the math would divide-by-
+        // zero on the renderer side.
+        assert!(scrollbar_state_for_diff(100, 0, 0).is_none());
+    }
+
+    #[test]
+    fn split_diff_body_for_scrollbar_reserves_one_col_on_the_right() {
+        let area = Rect::new(0, 0, 80, 24);
+        let (body, sb) = split_diff_body_for_scrollbar(area, true);
+        assert_eq!(body.width, 79, "body keeps width minus one col");
+        assert_eq!(body.x, 0);
+        let sb_rect = sb.expect("scrollbar slot must exist when requested");
+        assert_eq!(sb_rect.width, 1);
+        assert_eq!(sb_rect.x, 79, "scrollbar pinned to right edge");
+        assert_eq!(sb_rect.height, 24);
+    }
+
+    #[test]
+    fn split_diff_body_for_scrollbar_skips_when_not_requested() {
+        let area = Rect::new(0, 0, 80, 24);
+        let (body, sb) = split_diff_body_for_scrollbar(area, false);
+        assert_eq!(body, area, "body keeps the full area when no scrollbar");
+        assert!(sb.is_none());
+    }
+
+    #[test]
+    fn split_diff_body_for_scrollbar_skips_when_area_too_narrow() {
+        // Width of 1 cannot host both body and scrollbar; keep the body.
+        let area = Rect::new(0, 0, 1, 24);
+        let (body, sb) = split_diff_body_for_scrollbar(area, true);
+        assert_eq!(body, area);
+        assert!(sb.is_none());
+    }
+
+    /// Build a diff file with `line_count` Added lines so tests can exercise
+    /// over- and under-flow against a chosen viewport size.
+    fn long_diff_file(line_count: u32) -> DiffFile {
+        let lines: Vec<Line> = (1..=line_count)
+            .map(|i| Line {
+                kind: LineKind::Added,
+                text: format!("line {i}"),
+                source_line: None,
+                target_line: Some(i),
+            })
+            .collect();
+        DiffFile::Modified {
+            path: PathBuf::from("foo.txt"),
+            hunks: vec![Hunk {
+                header: "@@ -0,0 +1,N @@".to_owned(),
+                function_context: None,
+                source_start: 0,
+                source_length: 0,
+                target_start: 1,
+                target_length: line_count,
+                lines,
+            }],
+        }
+    }
+
+    /// Render the main view into a [`TestBackend`] of the given size and
+    /// return the resulting [`Buffer`] for inspection.
+    fn render_main_to_buffer(app: &mut App, cols: u16, rows: u16) -> ratatui::buffer::Buffer {
+        use ratatui::backend::TestBackend;
+        let backend = TestBackend::new(cols, rows);
+        let mut terminal = Terminal::new(backend).expect("test terminal must construct");
+        terminal
+            .draw(|frame| render_main(frame, app))
+            .expect("test draw must succeed");
+        terminal.backend().buffer().clone()
+    }
+
+    /// True when any cell in column `col` of `buf` contains one of the
+    /// scrollbar glyphs (`▲`, `▼`, `█`, `║`).
+    fn col_contains_scrollbar_glyph(buf: &ratatui::buffer::Buffer, col: u16) -> bool {
+        (0..buf.area.height).any(|row| {
+            matches!(
+                buf[(col, row)].symbol(),
+                "\u{25b2}" | "\u{25bc}" | "\u{2588}" | "\u{2551}"
+            )
+        })
+    }
+
+    #[test]
+    fn scrollbar_renders_when_diff_overflows_viewport() {
+        // 80 rows of diff into a 24-row terminal — the diff body itself is
+        // the terminal height minus stack/file/footer rows, far smaller than
+        // 80, so the scrollbar must appear.
+        let mut app = make_app_with_single_file(long_diff_file(80));
+        let buf = render_main_to_buffer(&mut app, 80, 24);
+        assert!(
+            col_contains_scrollbar_glyph(&buf, 79),
+            "scrollbar glyphs must appear in the rightmost column when the diff overflows the viewport"
+        );
+    }
+
+    #[test]
+    fn scrollbar_does_not_render_when_diff_fits_viewport() {
+        // A 2-line diff fits in any reasonable viewport; the rightmost column
+        // must contain none of the scrollbar glyphs.
+        let mut app = make_app_with_single_file(long_diff_file(2));
+        let buf = render_main_to_buffer(&mut app, 80, 24);
+        assert!(
+            !col_contains_scrollbar_glyph(&buf, 79),
+            "scrollbar must not render when the diff fits the viewport"
+        );
+    }
+
+    /// Return the (0-based) row offset of the FIRST thumb (`█`) cell within
+    /// the scrollbar column of `buf`. Returns `None` if no thumb glyph is
+    /// found.
+    fn scrollbar_thumb_row(buf: &ratatui::buffer::Buffer, col: u16) -> Option<u16> {
+        (0..buf.area.height).find(|&row| buf[(col, row)].symbol() == "\u{2588}")
+    }
+
+    /// Return the (0-based) row offset of the LAST thumb (`█`) cell within
+    /// the scrollbar column of `buf`. Returns `None` if no thumb glyph is
+    /// found. Useful when the thumb spans multiple rows and we care about
+    /// the bottom edge (e.g., "scrolled to end" tests on small content).
+    fn scrollbar_thumb_last_row(buf: &ratatui::buffer::Buffer, col: u16) -> Option<u16> {
+        (0..buf.area.height)
+            .rev()
+            .find(|&row| buf[(col, row)].symbol() == "\u{2588}")
+    }
+
+    /// (`top_row`, `bottom_row`) of the diff area inside the main view, given
+    /// the total terminal `rows`. The main layout is `[stack_bar=3,
+    /// file_header=3, diff=Min(1), footer=1]`, so the diff area starts at
+    /// row 6 and ends at `rows - 2` inclusive. Used by the scrollbar position
+    /// tests to reason about thumb location without scattering the magic
+    /// offsets.
+    fn diff_area_rows(rows: u16) -> (u16, u16) {
+        let top: u16 = 3 + 3;
+        let bottom = rows.saturating_sub(2);
+        (top, bottom)
+    }
+
+    #[test]
+    fn scrollbar_thumb_sits_in_top_half_when_cursor_at_top() {
+        // Cursor at the top drives `scroll = 0` and the thumb to the top of
+        // the track. The thumb's row index must fall in the top half of the
+        // diff area. Pins "where am I in the diff" to "top".
+        let mut app = make_app_with_single_file(long_diff_file(200));
+        app.line_index = 0;
+        let buf = render_main_to_buffer(&mut app, 80, 24);
+        let thumb_row =
+            scrollbar_thumb_row(&buf, 79).expect("thumb glyph must appear when scrollbar renders");
+        let (diff_top, diff_bottom) = diff_area_rows(24);
+        let midpoint = diff_top + (diff_bottom - diff_top) / 2;
+        assert!(
+            thumb_row < midpoint,
+            "thumb must sit in the top half of the track when cursor is at line 0; \
+             got row {thumb_row}, midpoint {midpoint}"
+        );
+    }
+
+    #[test]
+    fn scrollbar_thumb_sits_in_bottom_half_when_cursor_at_bottom() {
+        // Cursor at the bottom drives the viewport to the end of the diff;
+        // the thumb must land in the bottom half of the track.
+        let mut app = make_app_with_single_file(long_diff_file(200));
+        app.line_index = app.current_line_count() - 1;
+        let buf = render_main_to_buffer(&mut app, 80, 24);
+        let thumb_row =
+            scrollbar_thumb_row(&buf, 79).expect("thumb glyph must appear when scrollbar renders");
+        let (diff_top, diff_bottom) = diff_area_rows(24);
+        let midpoint = diff_top + (diff_bottom - diff_top) / 2;
+        assert!(
+            thumb_row > midpoint,
+            "thumb must sit in the bottom half of the track when cursor is at the last line; \
+             got row {thumb_row}, midpoint {midpoint}"
+        );
+    }
+
+    #[test]
+    fn scrollbar_resets_on_file_navigation() {
+        // Cycling between files resets the cursor and the scroll offset (see
+        // `cycle_file`). After the reset, rendering the new file's scrollbar
+        // must place the thumb in the top half of the track — there is no
+        // per-file ScrollbarState carrying stale position from a previous
+        // file.
+        let mut app = make_app_with_single_file(long_diff_file(200));
+        app.line_index = app.current_line_count() - 1;
+        // Ensure scroll moves to the bottom before the cycle.
+        let _ = render_main_to_buffer(&mut app, 80, 24);
+        app.cycle_file(-1); // back to description (file_index 0)
+        app.cycle_file(1); // forward to diff file
+        assert_eq!(app.line_index, 0);
+        assert_eq!(app.scroll, 0);
+        let buf = render_main_to_buffer(&mut app, 80, 24);
+        let thumb_row =
+            scrollbar_thumb_row(&buf, 79).expect("thumb glyph must appear when scrollbar renders");
+        let (diff_top, diff_bottom) = diff_area_rows(24);
+        let midpoint = diff_top + (diff_bottom - diff_top) / 2;
+        assert!(
+            thumb_row < midpoint,
+            "thumb must reset to the top half after switching files; got row {thumb_row}, midpoint {midpoint}"
+        );
+    }
+
+    #[test]
+    fn scrollbar_overflow_for_diff_clamps_scroll_past_end_to_max() {
+        // Helper clamp pinned numerically — ratatui 0.29 also clamps
+        // internally, but we own the clamp at the helper boundary so a
+        // future ratatui change cannot regress the contract. The tuple
+        // assertion is independent of any rendering layer.
+        //
+        // total=30, viewport=10 → max_scroll = 20, content_length = 21.
+        assert_eq!(
+            scrollbar_overflow_for_diff(30, 50, 10),
+            Some((21, 20)),
+            "stale scroll past end must clamp to max_scroll"
+        );
+        assert_eq!(
+            scrollbar_overflow_for_diff(30, 20, 10),
+            Some((21, 20)),
+            "scroll exactly at max passes through"
+        );
+        assert_eq!(
+            scrollbar_overflow_for_diff(30, 5, 10),
+            Some((21, 5)),
+            "scroll below max passes through unmodified"
+        );
+        assert_eq!(
+            scrollbar_overflow_for_diff(30, 0, 10),
+            Some((21, 0)),
+            "scroll at top yields position 0"
+        );
+    }
+
+    #[test]
+    fn scrollbar_state_for_diff_renders_thumb_at_bottom_when_scroll_past_end() {
+        use ratatui::backend::TestBackend;
+        // Integration shim: confirm the helper-clamp tuple lifts into a
+        // ScrollbarState that renders the thumb at the bottom of the track.
+        // The numeric clamp is pinned by the tuple test above; this test
+        // covers the rendering wiring.
+        let mut state = scrollbar_state_for_diff(30, 50, 10)
+            .expect("30 lines vs 10-row viewport must produce a scrollbar");
+        let backend = TestBackend::new(1, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                frame.render_stateful_widget(
+                    Scrollbar::default().orientation(ScrollbarOrientation::VerticalRight),
+                    Rect::new(0, 0, 1, 8),
+                    &mut state,
+                );
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        // The bottom row holds the end-arrow `▼`; the row above (height-2)
+        // is the last track row and must hold the thumb when at max position.
+        let bottom_track = buf[(0, 8 - 2)].symbol().to_owned();
+        assert_eq!(bottom_track, "\u{2588}");
+    }
+
+    #[test]
+    fn scrollbar_renders_at_bottom_after_refresh_shrinks_diff_below_scroll() {
+        // Integration-level pin: `refresh_current_change` does not reset
+        // scroll/line_index. If a refresh shrinks the diff so the previous
+        // top-line index now points past the end, the scrollbar must still
+        // render and land the thumb at the bottom — no panic, no off-track
+        // glyphs, no silent dishonesty.
+        //
+        // We simulate the refresh by mutating the rebuilt views directly
+        // (the real path goes through `jj::show` which we cannot drive in a
+        // unit test). The load-bearing assertion is the same: stale `scroll`
+        // pointing past the new total must produce a coherent scrollbar.
+        let mut app = make_app_with_single_file(long_diff_file(100));
+        // Scroll cursor to near the bottom so app.scroll lands well past 20.
+        app.line_index = app.current_line_count() - 1;
+        let _ = render_main_to_buffer(&mut app, 80, 24);
+        assert!(app.scroll > 20, "precondition: scroll moved past 20");
+
+        // Simulate a refresh that shrinks the diff to 20 lines without
+        // resetting scroll/line_index.
+        let new_details = ChangeDetails {
+            change_id: app.details.change_id.clone(),
+            commit_id: app.details.commit_id.clone(),
+            description: app.details.description.clone(),
+            diff: Diff {
+                files: vec![long_diff_file(20)],
+            },
+        };
+        app.rendered_per_file = build_rendered_views(&new_details);
+        app.annotated_per_file = app.rendered_per_file.clone();
+        app.details = new_details;
+        // Note: scroll and line_index intentionally NOT reset, mirroring
+        // `refresh_current_change` semantics.
+
+        // Numeric pin: the new view has 21 lines (20 added + 1 hunk header)
+        // against a 17-row diff area, max_scroll = 4, content_length = 5.
+        // Stale `app.scroll` (> 20) must clamp to 4.
+        let new_total = app
+            .current_view()
+            .expect("annotated_per_file must include the new file")
+            .lines
+            .len();
+        assert_eq!(
+            scrollbar_overflow_for_diff(new_total, app.scroll, 17),
+            Some((5, 4)),
+            "stale scroll past end must clamp to max_scroll at the helper boundary"
+        );
+
+        // Integration pin: rendering the same state lands the thumb's last
+        // row on the last track row (just above the end-arrow ▼).
+        let buf = render_main_to_buffer(&mut app, 80, 24);
+        let thumb_last = scrollbar_thumb_last_row(&buf, 79)
+            .expect("scrollbar thumb must render even when scroll is past the end");
+        let (_diff_top, diff_bottom) = diff_area_rows(24);
+        assert_eq!(thumb_last, diff_bottom - 1);
+    }
+
+    #[test]
+    fn scrollbar_resets_on_revision_navigation() {
+        // n/p revision navigation routes through `load_stack_entry`, which
+        // resets file_index, line_index, and scroll to zero (line 656). The
+        // load itself goes through `jj::show` and cannot be exercised in a
+        // unit test — but the contract that drives the scrollbar is the
+        // post-load field state. Pin that: after the same field reset
+        // `load_stack_entry` performs, the scrollbar lands at the top.
+        let mut app = make_app_with_single_file(long_diff_file(200));
+        app.line_index = app.current_line_count() - 1;
+        let _ = render_main_to_buffer(&mut app, 80, 24);
+        assert!(app.scroll > 0, "precondition: scroll moved off zero");
+
+        // Mirror the field resets in `load_stack_entry`. The scrollbar reads
+        // these fields directly, so exercising the reset values in isolation
+        // pins the same indicator behavior n/p would produce.
+        app.file_index = 0;
+        app.line_index = 0;
+        app.scroll = 0;
+        // Cycle back to the diff file (file_index 0 is the description view).
+        app.file_index = 1;
+
+        let buf = render_main_to_buffer(&mut app, 80, 24);
+        let thumb_row = scrollbar_thumb_row(&buf, 79)
+            .expect("scrollbar thumb must appear after revision-navigation reset");
+        let (diff_top, diff_bottom) = diff_area_rows(24);
+        let midpoint = diff_top + (diff_bottom - diff_top) / 2;
+        assert!(
+            thumb_row < midpoint,
+            "thumb must reset to the top half after revision navigation; \
+             got row {thumb_row}, midpoint {midpoint}"
+        );
+    }
+
+    #[test]
+    fn scrollbar_accounts_for_inline_comment_augmented_total() {
+        // `with_inline_comments` injects meta + body rows into the rendered
+        // view; the scrollbar must read the augmented total, not the raw
+        // diff line count. Build an 18-line diff that fits a 20-row viewport
+        // on its own, then inject 5 inline comment rows so the augmented
+        // total (23) overflows.
+        use crate::tui::diff_view::InlineComment;
+        let base = DiffView::from_file(&long_diff_file(18));
+        // Inject 5 inline comment rows under target_line = 1 — the first
+        // Added line. Each InlineComment produces 1 meta + body_lines.len()
+        // body rows; one comment with 4 body lines == 5 rows total.
+        let inline = InlineComment {
+            source_line: None,
+            target_line: Some(1),
+            severity: Severity::Note,
+            age: "just now".to_owned(),
+            body_lines: vec![
+                "line1".to_owned(),
+                "line2".to_owned(),
+                "line3".to_owned(),
+                "line4".to_owned(),
+            ],
+            comment_index: 0,
+        };
+        let augmented = base.with_inline_comments(&[inline]);
+        // Augmented total: 18 added + 1 hunk header + 1 meta + 4 body = 24.
+        // Pick a viewport size that fits the original (19 rendered lines)
+        // but not the augmented (24).
+        assert!(augmented.lines.len() > 20);
+        assert!(scrollbar_state_for_diff(augmented.lines.len(), 0, 20).is_some());
+    }
+
+    #[test]
+    fn scrollbar_state_for_diff_returns_none_for_zero_line_buffer() {
+        // Empty buffer is the absolute floor — `total <= viewport` covers
+        // it, but pin the boundary so a future predicate change is intentional.
+        assert!(scrollbar_state_for_diff(0, 0, 20).is_none());
+        assert!(scrollbar_state_for_diff(0, 0, 1).is_none());
+    }
+
+    #[test]
+    fn scrollbar_state_for_diff_renders_at_exactly_one_line_overflow() {
+        // The off-by-one cliff: total == viewport + 1 must produce a
+        // scrollbar (the predicate is `<=`, so == is the floor of overflow).
+        assert!(scrollbar_state_for_diff(21, 0, 20).is_some());
+        // And the negative side: total == viewport must NOT produce one.
+        assert!(scrollbar_state_for_diff(20, 0, 20).is_none());
+    }
+
+    #[test]
+    fn split_diff_body_for_scrollbar_handles_width_two_boundary() {
+        // Width 2: `area.width <= SCROLLBAR_WIDTH` is `2 <= 1` (false), so
+        // we DO split — body keeps 1 col, scrollbar takes 1 col.
+        let area_2 = Rect::new(0, 0, 2, 24);
+        let (body, sb) = split_diff_body_for_scrollbar(area_2, true);
+        assert_eq!(body.width, 1);
+        let sb_rect = sb.expect("width=2 must yield a scrollbar slot");
+        assert_eq!(sb_rect.width, 1);
+
+        // Width 1: too narrow to host both; body keeps the full area.
+        let area_1 = Rect::new(0, 0, 1, 24);
+        let (body, sb) = split_diff_body_for_scrollbar(area_1, true);
+        assert_eq!(body, area_1);
+        assert!(sb.is_none());
+
+        // Width 0: pathological (resize race). Must not panic; returns no
+        // scrollbar slot.
+        let area_0 = Rect::new(0, 0, 0, 24);
+        let (body, sb) = split_diff_body_for_scrollbar(area_0, true);
+        assert_eq!(body, area_0);
+        assert!(sb.is_none());
+    }
+
+    #[test]
+    fn scrollbar_renders_for_long_description_view() {
+        // A long description (file_index 0) uses the same scroll mechanism as
+        // diff files. Verify the scrollbar renders against the synthetic
+        // description view too.
+        let description_lines: String = (0..200)
+            .map(|i| format!("description line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let details = ChangeDetails {
+            change_id: ChangeId::parse(&"a".repeat(32)).unwrap(),
+            commit_id: CommitId::parse(&"a".repeat(40)).unwrap(),
+            description: description_lines,
+            diff: Diff {
+                files: vec![long_diff_file(1)],
+            },
+        };
+        let mut app = App::new(
+            details,
+            PathBuf::from("/repo"),
+            "@".to_owned(),
+            None,
+            TransitionMode::Never,
+        );
+        app.file_index = 0;
+        let buf = render_main_to_buffer(&mut app, 80, 24);
+        assert!(
+            col_contains_scrollbar_glyph(&buf, 79),
+            "scrollbar must render against the synthetic description view when its content overflows"
         );
     }
 }
