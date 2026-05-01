@@ -188,6 +188,19 @@ pub(crate) enum MarkOutcome {
 }
 
 impl ReviewedState {
+    /// True iff `change_id` has any persisted reviewed-state at all,
+    /// regardless of whether the stored `commit_id` still matches the live
+    /// commit or whether the entry's bits are complete.
+    ///
+    /// Used by the cursor smart-resume "fresh stack" check: if no change in
+    /// the current stack has any entry, the reviewer has never touched this
+    /// stack and should land at the OLDEST change. If at least one entry
+    /// exists somewhere in the stack, the reviewer is mid-review and we use
+    /// the existing LATEST→OLDEST walk.
+    pub(crate) fn has_entry(&self, change_id: &ChangeId) -> bool {
+        self.entries.contains_key(change_id)
+    }
+
     /// True iff the user has actually marked this `(change_id, commit_id)`
     /// fully reviewed: an entry exists, its `commit_id` matches the live
     /// commit, AND every file in the live diff is in `reviewed_files`.
@@ -615,6 +628,23 @@ mod tests {
         let mut state = ReviewedState::default();
         state.mark(cid("abc12345"), coid("deadbeef"), ReviewTarget::Description);
         assert!(!state.is_marked_fully_reviewed(&cid("abc12345"), &coid("11223344"), &[]));
+    }
+
+    #[test]
+    fn has_entry_returns_true_when_change_id_present() {
+        // `has_entry` is the predicate behind the cursor smart-resume
+        // fresh-stack check: it must report true as soon as any mark has
+        // been written for the change_id, regardless of commit_id match or
+        // entry completeness.
+        let mut state = ReviewedState::default();
+        state.mark(cid("abc12345"), coid("deadbeef"), ReviewTarget::Description);
+        assert!(state.has_entry(&cid("abc12345")));
+    }
+
+    #[test]
+    fn has_entry_returns_false_for_unknown_change_id() {
+        let state = ReviewedState::default();
+        assert!(!state.has_entry(&cid("abc12345")));
     }
 
     #[test]

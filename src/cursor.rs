@@ -86,82 +86,124 @@ pub(crate) fn clear(repo_root: &Path, hash: RevsetHash) -> Result<()> {
     save(repo_root, &cursor)
 }
 
+/// Whether the current stack carries any persisted reviewed-state.
+///
+/// Captured as a named two-state enum (rather than a bool) because the
+/// resume-rule dispatch reads more clearly with `Fresh` / `Partial` arms,
+/// and the type system catches future callers that would otherwise pass
+/// the wrong boolean for the wrong reason (empty-stack guard, error path,
+/// etc.).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StackReviewState {
+    /// No change in the resolved stack has any entry in `reviewed.json`.
+    /// The reviewer has never touched this stack — land at OLDEST so the
+    /// natural `n` flow walks bottom→top.
+    Fresh,
+    /// At least one change in the resolved stack has a reviewed-state entry
+    /// (regardless of `commit_id` match or completeness). The reviewer is
+    /// mid-review — walk LATEST→OLDEST and pick up the most-recent
+    /// unreviewed change.
+    Partial,
+}
+
+/// Bundle of resume-rule signals consumed by [`resume_index`] and
+/// [`resume_index_from_cursor`].
+///
+/// Each field documents one independent input to the rule. Future signals
+/// add a field; the function signatures stay stable.
+pub(crate) struct ResumeInputs<'a> {
+    /// The resolved stack, oldest-first. Empty stack is a degenerate case
+    /// the caller should rule out before opening the TUI; both resume
+    /// functions defensively return 0 anyway.
+    pub stack_change_ids: &'a [ChangeId],
+    /// Predicate: does this `change_id` already carry any persisted
+    /// comments? Drives the cursor-branch "did the reviewer engage?" check.
+    pub has_comments: &'a dyn Fn(&ChangeId) -> bool,
+    /// Predicate: is this `change_id` fully reviewed at its current
+    /// `commit_id` (description + every diff path marked)? Drives the
+    /// `Partial` smart-resume walk.
+    pub is_fully_reviewed: &'a dyn Fn(&ChangeId) -> bool,
+    /// Whether the stack has any reviewed-state at all. See
+    /// [`StackReviewState`] for the contract behind each variant.
+    pub stack_review_state: StackReviewState,
+}
+
 /// Resolve the resume index for a stack given the cursor file.
 ///
 /// Shell wrapper: loads `cursor.json`, then delegates to the pure
 /// [`resume_index_from_cursor`]. On any load error, falls through to the
 /// `is_fully_reviewed`-driven fallback so the reviewer still lands on
 /// something useful.
-pub(crate) fn resume_index(
-    repo_root: &Path,
-    hash: RevsetHash,
-    stack_change_ids: &[ChangeId],
-    has_comments: &dyn Fn(&ChangeId) -> bool,
-    is_fully_reviewed: &dyn Fn(&ChangeId) -> bool,
-) -> usize {
+pub(crate) fn resume_index(repo_root: &Path, hash: RevsetHash, inputs: &ResumeInputs<'_>) -> usize {
     let cursor = load(repo_root).unwrap_or_default();
-    resume_index_from_cursor(
-        &cursor,
-        hash,
-        stack_change_ids,
-        has_comments,
-        is_fully_reviewed,
-    )
+    resume_index_from_cursor(&cursor, hash, inputs)
 }
 
 /// Pure resume-rule implementation.
 ///
-/// Returns the 0-based index into `stack_change_ids` to open first:
+/// Returns the 0-based index into `inputs.stack_change_ids` to open first:
 ///
-/// 1. If a cursor exists for `hash` and `last_change_id` is in the stack:
+/// 1. If a cursor exists for `hash` and `last_change_id` is in the stack
+///    (this branch always wins; it short-circuits before the
+///    `stack_review_state` dispatch):
 ///    - If `has_comments(last_change_id)` is false, return that position
 ///      (the user landed on a change but never commented — resume there).
 ///    - Otherwise scan forward for the first unreviewed change after it.
 ///    - If every change at or after the cursor has comments, return the
 ///      cursor position (treat the stack as fully reviewed; reopen there).
 /// 2. Otherwise (no cursor entry, or its `last_change_id` left the stack)
-///    walk LATEST → OLDEST and return the index of the most-recent change
-///    that is NOT fully reviewed. If every change is fully reviewed (or
-///    there is no reviewed-state for this stack), return the LATEST index.
-///    This rule never falls back to the OLDEST change, so a reviewer
-///    returning to a half-reviewed stack lands at the front of the work,
-///    not the back.
+///    dispatch on [`StackReviewState`]:
+///    - `Fresh`: land at OLDEST (index 0). A first-time reviewer reads
+///      from the bottom up.
+///    - `Partial`: walk LATEST → OLDEST and return the index of the
+///      most-recent change that is NOT fully reviewed. If every change is
+///      fully reviewed, return the LATEST index. A reviewer returning to a
+///      half-reviewed stack lands at the front of the new work.
 pub(crate) fn resume_index_from_cursor(
     cursor: &Cursor,
     hash: RevsetHash,
-    stack_change_ids: &[ChangeId],
-    has_comments: &dyn Fn(&ChangeId) -> bool,
-    is_fully_reviewed: &dyn Fn(&ChangeId) -> bool,
+    inputs: &ResumeInputs<'_>,
 ) -> usize {
+    if inputs.stack_change_ids.is_empty() {
+        return 0;
+    }
+
     if let Some(entry) = cursor.revsets.get(&hash.hex()) {
-        if let Some(last_pos) = stack_change_ids
+        if let Some(last_pos) = inputs
+            .stack_change_ids
             .iter()
             .position(|id| id == &entry.last_change_id)
         {
             // The cursor change itself qualifies if the reviewer never
             // commented on it.
-            if !has_comments(&stack_change_ids[last_pos]) {
+            if !(inputs.has_comments)(&inputs.stack_change_ids[last_pos]) {
                 return last_pos;
             }
 
             // Scan forward for the first unreviewed change.
-            let next = stack_change_ids[last_pos + 1..]
+            let next = inputs.stack_change_ids[last_pos + 1..]
                 .iter()
-                .position(|id| !has_comments(id))
+                .position(|id| !(inputs.has_comments)(id))
                 .map(|offset| last_pos + 1 + offset);
 
             return next.unwrap_or(last_pos);
         }
     }
 
-    smart_resume_index(stack_change_ids, is_fully_reviewed)
+    match inputs.stack_review_state {
+        StackReviewState::Fresh => 0,
+        StackReviewState::Partial => {
+            smart_resume_index(inputs.stack_change_ids, inputs.is_fully_reviewed)
+        }
+    }
 }
 
 /// Walk LATEST → OLDEST and pick the most-recent change that is NOT fully
-/// reviewed. Falls back to LATEST when every change is reviewed (or the
-/// reviewed-state is empty), never to OLDEST. Returns 0 only when the stack
-/// itself is empty — a degenerate case the caller should already have ruled
-/// out before opening the TUI.
+/// reviewed. Falls back to LATEST when every change reads as fully reviewed,
+/// never to OLDEST. Returns 0 only when the stack itself is empty — a
+/// degenerate case the caller should already have ruled out before opening
+/// the TUI. The "fresh stack" case (no reviewed-state at all) is intercepted
+/// in [`resume_index_from_cursor`] before this function runs.
 fn smart_resume_index(
     stack_change_ids: &[ChangeId],
     is_fully_reviewed: &dyn Fn(&ChangeId) -> bool,
@@ -207,6 +249,22 @@ mod tests {
         c
     }
 
+    /// Build a `ResumeInputs` for tests. Closures borrow from caller frames,
+    /// so the helper takes references with matching lifetimes.
+    fn inputs<'a>(
+        ids: &'a [ChangeId],
+        has_comments: &'a dyn Fn(&ChangeId) -> bool,
+        is_fully_reviewed: &'a dyn Fn(&ChangeId) -> bool,
+        stack_review_state: StackReviewState,
+    ) -> ResumeInputs<'a> {
+        ResumeInputs {
+            stack_change_ids: ids,
+            has_comments,
+            is_fully_reviewed,
+            stack_review_state,
+        }
+    }
+
     #[test]
     fn load_missing_file_returns_empty_cursor() {
         let dir = tmp();
@@ -225,16 +283,21 @@ mod tests {
 
     #[test]
     fn resume_index_falls_back_to_smart_rule_on_corrupt_json() {
-        // Corrupt cursor.json must not blow up the TUI. Old behavior was to
-        // return 0 (oldest); new behavior delegates to the smart fallback,
-        // which lands on the LATEST change when nothing is fully reviewed.
+        // Corrupt cursor.json must not blow up the TUI. With reviewed-state
+        // present somewhere in the stack, the smart fallback walks LATEST→
+        // OLDEST and lands on the most-recent unreviewed change (LATEST when
+        // nothing is reviewed).
         let dir = tmp();
         let path = dir.path().join(".jj-review");
         std::fs::create_dir_all(&path).unwrap();
         std::fs::write(path.join("cursor.json"), b"{not json").unwrap();
         let hash = RevsetHash::from_revset("@");
         let ids = vec![cid("abc11111"), cid("abc22222")];
-        let idx = resume_index(dir.path(), hash, &ids, &|_| false, &|_| false);
+        let idx = resume_index(
+            dir.path(),
+            hash,
+            &inputs(&ids, &|_| false, &|_| false, StackReviewState::Partial),
+        );
         assert_eq!(idx, ids.len() - 1, "smart fallback should pick LATEST");
     }
 
@@ -298,9 +361,14 @@ mod tests {
         let dir = tmp();
         let hash = RevsetHash::from_revset("@");
         let ids = vec![cid("abc11111"), cid("abc22222"), cid("abc33333")];
-        // No cursor file → smart fallback → walk LATEST→OLDEST. Nothing is
-        // reviewed, so the LATEST (index 2) is the most-recent unreviewed.
-        let idx = resume_index(dir.path(), hash, &ids, &|_| false, &|_| false);
+        // No cursor file, partial reviewed-state → smart fallback → walk
+        // LATEST→OLDEST. `is_fully_reviewed` = false everywhere, so LATEST
+        // (index 2) wins.
+        let idx = resume_index(
+            dir.path(),
+            hash,
+            &inputs(&ids, &|_| false, &|_| false, StackReviewState::Partial),
+        );
         assert_eq!(idx, ids.len() - 1);
     }
 
@@ -317,7 +385,16 @@ mod tests {
         // Index 3 (LATEST) is fully reviewed → smart-resume walks back to
         // index 2 as the most-recent unreviewed change.
         let reviewed_id = ids[3].clone();
-        let idx = resume_index(dir.path(), hash, &ids, &|_| false, &|id| id == &reviewed_id);
+        let idx = resume_index(
+            dir.path(),
+            hash,
+            &inputs(
+                &ids,
+                &|_| false,
+                &|id| id == &reviewed_id,
+                StackReviewState::Partial,
+            ),
+        );
         assert_eq!(idx, 2, "must walk back from LATEST to first unreviewed");
     }
 
@@ -326,7 +403,11 @@ mod tests {
         let dir = tmp();
         let hash = RevsetHash::from_revset("@");
         let ids = vec![cid("abc11111"), cid("abc22222"), cid("abc33333")];
-        let idx = resume_index(dir.path(), hash, &ids, &|_| false, &|_| true);
+        let idx = resume_index(
+            dir.path(),
+            hash,
+            &inputs(&ids, &|_| false, &|_| true, StackReviewState::Partial),
+        );
         assert_eq!(
             idx,
             ids.len() - 1,
@@ -344,7 +425,16 @@ mod tests {
         let ids = vec![cid("abc11111"), cid("abc22222"), cid("abc33333")];
         // Index 2 is reviewed → smart fallback picks index 1 (latest unreviewed).
         let reviewed_id = ids[2].clone();
-        let idx = resume_index(dir.path(), hash, &ids, &|_| false, &|id| id == &reviewed_id);
+        let idx = resume_index(
+            dir.path(),
+            hash,
+            &inputs(
+                &ids,
+                &|_| false,
+                &|id| id == &reviewed_id,
+                StackReviewState::Partial,
+            ),
+        );
         assert_eq!(idx, 1);
     }
 
@@ -359,7 +449,11 @@ mod tests {
         // first rule (its own check) only if it has no comments. With every
         // change carrying comments, the resume rule falls through to the
         // last-resort and returns last_pos=1.
-        let idx = resume_index(dir.path(), hash, &ids, &|_| true, &|_| false);
+        let idx = resume_index(
+            dir.path(),
+            hash,
+            &inputs(&ids, &|_| true, &|_| false, StackReviewState::Partial),
+        );
         assert_eq!(idx, 1);
     }
 
@@ -377,9 +471,16 @@ mod tests {
         save(dir.path(), &cursor).unwrap();
         // ids[1] has comments, ids[2] does not → next unreviewed is index 2.
         let no_comment_id = ids[2].clone();
-        let idx = resume_index(dir.path(), hash, &ids, &|id| id != &no_comment_id, &|_| {
-            false
-        });
+        let idx = resume_index(
+            dir.path(),
+            hash,
+            &inputs(
+                &ids,
+                &|id| id != &no_comment_id,
+                &|_| false,
+                StackReviewState::Partial,
+            ),
+        );
         assert_eq!(idx, 2);
     }
 
@@ -393,7 +494,11 @@ mod tests {
         // has_comments=false everywhere → resume at the cursor change itself
         // (per the corrected resume rule: cursor change qualifies if it has
         // no comments yet).
-        let idx = resume_index(dir.path(), hash, &ids, &|_| false, &|_| false);
+        let idx = resume_index(
+            dir.path(),
+            hash,
+            &inputs(&ids, &|_| false, &|_| false, StackReviewState::Partial),
+        );
         assert_eq!(idx, 2);
     }
 
@@ -407,7 +512,16 @@ mod tests {
         let cursor = make_cursor_with_entry("@", ids[1].clone());
         save(dir.path(), &cursor).unwrap();
         let cursor_id = ids[1].clone();
-        let idx = resume_index(dir.path(), hash, &ids, &|id| id != &cursor_id, &|_| false);
+        let idx = resume_index(
+            dir.path(),
+            hash,
+            &inputs(
+                &ids,
+                &|id| id != &cursor_id,
+                &|_| false,
+                StackReviewState::Partial,
+            ),
+        );
         assert_eq!(idx, 1, "cursor change with no comments should resume there");
     }
 
@@ -429,5 +543,181 @@ mod tests {
         let reviewed = ids[3].clone();
         let idx = smart_resume_index(&ids, &|id| id == &reviewed);
         assert_eq!(idx, 2);
+    }
+
+    #[test]
+    fn resume_index_fresh_stack_no_reviewed_state_lands_at_oldest() {
+        // Fresh stack: no stored cursor, no reviewed-state for any change in
+        // the stack. The reviewer has never seen this stack — land at OLDEST
+        // so the progress reads bottom→top instead of dropping the user at
+        // the head of the stack with the visual scrolled to the end.
+        let dir = tmp();
+        let hash = RevsetHash::from_revset("@");
+        let ids = vec![cid("abc11111"), cid("abc22222"), cid("abc33333")];
+        let idx = resume_index(
+            dir.path(),
+            hash,
+            &inputs(&ids, &|_| false, &|_| false, StackReviewState::Fresh),
+        );
+        assert_eq!(idx, 0, "fresh stack must land at OLDEST");
+    }
+
+    #[test]
+    fn resume_index_partial_reviewed_state_walks_latest_to_oldest() {
+        // Partial review state (some change in the stack has an entry, even
+        // if not fully reviewed) → existing LATEST→OLDEST walk picks up the
+        // most-recent unreviewed change. Behavior unchanged from before the
+        // fresh-stack rule landed.
+        let dir = tmp();
+        let hash = RevsetHash::from_revset("@");
+        let ids = vec![
+            cid("abc11111"),
+            cid("abc22222"),
+            cid("abc33333"),
+            cid("abc44444"),
+        ];
+        let reviewed_id = ids[3].clone();
+        let idx = resume_index(
+            dir.path(),
+            hash,
+            &inputs(
+                &ids,
+                &|_| false,
+                &|id| id == &reviewed_id,
+                StackReviewState::Partial,
+            ),
+        );
+        assert_eq!(idx, 2, "partial state walks LATEST→OLDEST");
+    }
+
+    #[test]
+    fn resume_index_stored_cursor_resumes_regardless_of_reviewed_state() {
+        // Stored cursor in the stack short-circuits the reviewed-state check.
+        // Even with `StackReviewState::Fresh`, the cursor branch wins and
+        // lands at the cursor's index.
+        let dir = tmp();
+        let hash = RevsetHash::from_revset("@");
+        let ids = vec![cid("abc11111"), cid("abc22222"), cid("abc33333")];
+        let cursor = make_cursor_with_entry("@", ids[1].clone());
+        save(dir.path(), &cursor).unwrap();
+        let idx = resume_index(
+            dir.path(),
+            hash,
+            &inputs(&ids, &|_| false, &|_| false, StackReviewState::Fresh),
+        );
+        assert_eq!(
+            idx, 1,
+            "stored cursor must take precedence over fresh-stack rule"
+        );
+    }
+
+    // ---- T1: empty-stack guard ----
+
+    #[test]
+    fn resume_index_from_cursor_empty_stack_fresh_returns_zero() {
+        // Defensive: callers should reject empty stacks before the TUI opens,
+        // but the resume rule pins index 0 on both review-state arms so a
+        // future bypass cannot panic on the empty slice.
+        let cursor = Cursor::default();
+        let hash = RevsetHash::from_revset("@");
+        let idx = resume_index_from_cursor(
+            &cursor,
+            hash,
+            &inputs(&[], &|_| false, &|_| false, StackReviewState::Fresh),
+        );
+        assert_eq!(idx, 0);
+    }
+
+    #[test]
+    fn resume_index_from_cursor_empty_stack_partial_returns_zero() {
+        let cursor = Cursor::default();
+        let hash = RevsetHash::from_revset("@");
+        let idx = resume_index_from_cursor(
+            &cursor,
+            hash,
+            &inputs(&[], &|_| false, &|_| false, StackReviewState::Partial),
+        );
+        assert_eq!(idx, 0);
+    }
+
+    // ---- T2: single-change stack pins both paths ----
+
+    #[test]
+    fn resume_index_single_change_fresh_state_lands_at_oldest_which_is_latest() {
+        // With a one-element stack OLDEST and LATEST are the same index. Pin
+        // the convergence so a future refactor cannot silently diverge the
+        // two arms (e.g., a Partial fast-path that returns `len()` would slip
+        // past lossier checks).
+        let dir = tmp();
+        let hash = RevsetHash::from_revset("@");
+        let ids = vec![cid("abc11111")];
+        let idx = resume_index(
+            dir.path(),
+            hash,
+            &inputs(&ids, &|_| false, &|_| false, StackReviewState::Fresh),
+        );
+        assert_eq!(idx, 0, "single-change stack: Fresh must land at index 0");
+    }
+
+    #[test]
+    fn resume_index_single_change_partial_state_walks_to_oldest_which_is_latest() {
+        let dir = tmp();
+        let hash = RevsetHash::from_revset("@");
+        let ids = vec![cid("abc11111")];
+        let idx = resume_index(
+            dir.path(),
+            hash,
+            &inputs(&ids, &|_| false, &|_| false, StackReviewState::Partial),
+        );
+        assert_eq!(
+            idx, 0,
+            "single-change stack: Partial walk also lands at index 0 (only candidate)"
+        );
+    }
+
+    // ---- T3: stored cursor with absent change_id falls through to dispatch ----
+
+    #[test]
+    fn resume_index_stored_cursor_absent_change_id_falls_through_fresh() {
+        // Cursor file present, but `last_change_id` is no longer in the stack
+        // (rebased / abandoned). The cursor branch fails to find a position,
+        // so dispatch on `StackReviewState`. Fresh → OLDEST.
+        let dir = tmp();
+        let hash = RevsetHash::from_revset("@");
+        let cursor = make_cursor_with_entry("@", cid("ffffffff"));
+        save(dir.path(), &cursor).unwrap();
+        let ids = vec![cid("abc11111"), cid("abc22222"), cid("abc33333")];
+        let idx = resume_index(
+            dir.path(),
+            hash,
+            &inputs(&ids, &|_| false, &|_| false, StackReviewState::Fresh),
+        );
+        assert_eq!(idx, 0, "absent-change-id cursor + Fresh → OLDEST");
+    }
+
+    #[test]
+    fn resume_index_stored_cursor_absent_change_id_falls_through_partial() {
+        // Same setup as the Fresh case, but with Partial review state the
+        // smart-resume walk fires and picks the most-recent unreviewed change.
+        let dir = tmp();
+        let hash = RevsetHash::from_revset("@");
+        let cursor = make_cursor_with_entry("@", cid("ffffffff"));
+        save(dir.path(), &cursor).unwrap();
+        let ids = vec![cid("abc11111"), cid("abc22222"), cid("abc33333")];
+        let reviewed_id = ids[2].clone();
+        let idx = resume_index(
+            dir.path(),
+            hash,
+            &inputs(
+                &ids,
+                &|_| false,
+                &|id| id == &reviewed_id,
+                StackReviewState::Partial,
+            ),
+        );
+        assert_eq!(
+            idx, 1,
+            "absent-change-id cursor + Partial → LATEST→OLDEST walk"
+        );
     }
 }

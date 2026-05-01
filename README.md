@@ -75,7 +75,7 @@ From inside any jj-tracked repository:
 $ jjr
 ```
 
-That's it. With no arguments, `jjr` resolves the default stack (`trunk()..@`) and drops you into the TUI at the most-recent unreviewed change — the front of the work. On a fresh stack with no reviewed-state, that's the latest change (top of the stack). On a half-reviewed stack, it's the most-recent change you haven't finished. The `n` / `p` keys then walk oldest-to-newest. Use `jjr --stack --restart` to clear the saved cursor and start at the oldest change.
+That's it. With no arguments, `jjr` resolves the default stack (`trunk()..@`) and drops you into the TUI. On a fresh stack with no reviewed-state, you land at the oldest change so the natural `n` flow walks the stack bottom-up. On a half-reviewed stack, you land at the most-recent change you haven't finished — the front of the new work. The `n` / `p` keys walk oldest-to-newest. Use `jjr --stack --restart` to clear the saved cursor and start over.
 
 A typical session:
 
@@ -84,7 +84,7 @@ A typical session:
 
 # 2. you review the stack
 $ jjr
-  # opens at the most-recent unreviewed change
+  # fresh stack: opens at the oldest change; resumed stack: opens at the most-recent unreviewed change
   # ↑ ↓ to scan a diff, n / p to move between commits (oldest-to-newest), Tab to cycle files
   # Enter on a line to comment; Ctrl-X saves
   # press C to send comments to Claude
@@ -104,7 +104,7 @@ $ jj git push
 
 | Command | What it does |
 |---|---|
-| `jjr` | Walk the stack (`trunk()..@`); opens at the most-recent unreviewed change, then `n` / `p` move oldest-to-newest |
+| `jjr` | Walk the stack (`trunk()..@`); fresh stack opens at the oldest change, resumed stack opens at the most-recent unreviewed change, then `n` / `p` move oldest-to-newest |
 | `jjr --stack` | Same as bare `jjr`; explicit form |
 | `jjr --stack --restart` | Clear the saved cursor and start at the oldest change |
 | `jjr <change-id>` | Review a single specific change |

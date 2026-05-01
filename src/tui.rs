@@ -229,16 +229,33 @@ pub fn run_stack(
         reviewed_state.is_marked_fully_reviewed(id, &entry.commit_id, &diff_paths)
     };
 
+    // Fresh-stack signal: when no change in the resolved stack has any
+    // reviewed-state entry, the smart fallback lands at OLDEST instead of
+    // walking LATEST→OLDEST. A first-time reviewer reads bottom-up.
+    let stack_review_state = if resolved
+        .entries
+        .iter()
+        .any(|entry| reviewed_state.has_entry(&entry.change_id))
+    {
+        cursor::StackReviewState::Partial
+    } else {
+        cursor::StackReviewState::Fresh
+    };
+
+    let stack_change_ids = resolved
+        .entries
+        .iter()
+        .map(|e| e.change_id.clone())
+        .collect::<Vec<_>>();
     let start_index = cursor::resume_index(
         repo_root,
         resolved.revset_hash,
-        &resolved
-            .entries
-            .iter()
-            .map(|e| e.change_id.clone())
-            .collect::<Vec<_>>(),
-        &has_comments,
-        &is_fully_reviewed,
+        &cursor::ResumeInputs {
+            stack_change_ids: &stack_change_ids,
+            has_comments: &has_comments,
+            is_fully_reviewed: &is_fully_reviewed,
+            stack_review_state,
+        },
     );
 
     let entry = &resolved.entries[start_index];
