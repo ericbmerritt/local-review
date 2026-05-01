@@ -10,6 +10,7 @@ pub mod jj;
 pub mod packet;
 pub mod reviewed;
 pub mod stack;
+pub mod stderr_log;
 pub mod store;
 pub mod tui;
 pub mod util;

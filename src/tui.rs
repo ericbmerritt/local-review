@@ -25,6 +25,7 @@ use crate::error::{JjrError, Result};
 use crate::jj::{self, ChangeDetails};
 use crate::reviewed::{MarkOutcome, ReviewTarget, ReviewedState};
 use crate::stack::{ResolvedStack, RevsetHash, StackEntry};
+use crate::stderr_log::StderrLogGuard;
 use crate::util::{clamp_with_delta, page_size, pluralize, truncate};
 
 mod composer;
@@ -175,8 +176,15 @@ pub fn run(change_id: &ChangeId, repo_root: &std::path::Path) -> Result<()> {
     let details = jj::show(change_id)?;
     let revset = change_id.as_str().to_owned();
 
-    let mut terminal = setup_terminal()?;
-    let outcome = run_app(&mut terminal, details, repo_root.to_owned(), revset, None);
+    let (mut terminal, guard) = enter_tui_session(repo_root)?;
+    let outcome = run_app(
+        &mut terminal,
+        details,
+        repo_root.to_owned(),
+        revset,
+        None,
+        Some(guard),
+    );
     teardown_terminal(&mut terminal)?;
     outcome
 }
@@ -268,19 +276,28 @@ pub fn run_stack(
         revset_hash: resolved.revset_hash,
     };
 
-    let mut terminal = setup_terminal()?;
+    let (mut terminal, guard) = enter_tui_session(repo_root)?;
     let outcome = run_app(
         &mut terminal,
         details,
         repo_root.to_owned(),
         resolved.revset.clone(),
         Some(stack_ctx),
+        Some(guard),
     );
     teardown_terminal(&mut terminal)?;
     outcome
 }
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
+
+/// Install the stderr-redirect guard before the alt screen so its Drop
+/// runs after `teardown_terminal` at the call site (via App).
+fn enter_tui_session(repo_root: &std::path::Path) -> Result<(Term, StderrLogGuard)> {
+    let guard = StderrLogGuard::install(repo_root)?;
+    let term = setup_terminal()?;
+    Ok((term, guard))
+}
 
 fn setup_terminal() -> Result<Term> {
     let (cols, rows) = crossterm::terminal::size().map_err(io_err)?;
@@ -495,15 +512,24 @@ struct App {
     /// suspending for `claude`); ratatui's diff cache is now stale and must
     /// be invalidated before the next draw.
     needs_full_redraw: bool,
+    /// `Option` because unit tests construct `App` directly without a real
+    /// stderr redirect. Production paths (`run`, `run_stack`) always pass
+    /// `Some(_)` after `enter_tui_session`.
+    stderr_guard: Option<StderrLogGuard>,
 }
 
 impl App {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "single TUI entry-point constructor; bundling these into a struct adds ceremony"
+    )]
     fn new(
         details: ChangeDetails,
         repo_root: PathBuf,
         revset: String,
         stack: Option<StackContext>,
         transition_mode: TransitionMode,
+        stderr_guard: Option<StderrLogGuard>,
     ) -> Self {
         let rendered_per_file = build_rendered_views(&details);
         let annotated_per_file = rendered_per_file.clone();
@@ -538,6 +564,7 @@ impl App {
             reviewed,
             diff_mode: DiffMode::Auto,
             needs_full_redraw: false,
+            stderr_guard,
         }
     }
 
@@ -1161,15 +1188,27 @@ fn collect_orphaned_comments(
     orphaned
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "single TUI entry point; bundling these into a struct is more ceremony than it's worth"
+)]
 fn run_app(
     terminal: &mut Term,
     details: ChangeDetails,
     repo_root: PathBuf,
     revset: String,
     stack: Option<StackContext>,
+    stderr_guard: Option<StderrLogGuard>,
 ) -> Result<()> {
     let transition_mode = load_transition_mode(&repo_root);
-    let mut app = App::new(details, repo_root, revset, stack, transition_mode);
+    let mut app = App::new(
+        details,
+        repo_root,
+        revset,
+        stack,
+        transition_mode,
+        stderr_guard,
+    );
     app.refresh_inline_comments();
     // The reviewer just landed on the initial file_index (0 = description).
     // Treat that as a review event so a single-view change can flip to
@@ -2417,6 +2456,21 @@ fn invoke_claude_from_tui(app: &mut App) -> Result<()> {
     let prompt = crate::packet::render_prompt(&data.packet);
     let repo_root = app.repo_root.clone();
 
+    // Restore real stderr BEFORE leaving the alt screen so claude (spawned
+    // below) inherits the user's terminal stderr. Without this, claude's
+    // interactive permission prompts get captured by the stderr-log guard
+    // and the user sees nothing on the restored shell.
+    if let Some(g) = app.stderr_guard.as_ref() {
+        g.suspend()?;
+    }
+    // If anything between here and the `mem::forget` below errors or panics,
+    // resume_guard's Drop re-redirects fd 2 back to the log so the next
+    // `log_warning` doesn't corrupt the alt screen. The normal path forgets
+    // the guard and calls `resume()?` explicitly to surface its error.
+    let resume_guard = StderrResumeGuard {
+        guard: app.stderr_guard.as_ref(),
+    };
+
     suspend_tui()?;
     let restore = TerminalRestoreGuard;
 
@@ -2427,6 +2481,11 @@ fn invoke_claude_from_tui(app: &mut App) -> Result<()> {
 
     std::mem::forget(restore);
     restore_tui()?;
+
+    std::mem::forget(resume_guard);
+    if let Some(g) = app.stderr_guard.as_ref() {
+        g.resume()?;
+    }
     app.needs_full_redraw = true;
 
     app.screen = Screen::Main;
@@ -2487,6 +2546,25 @@ impl Drop for TerminalRestoreGuard {
     fn drop(&mut self) {
         let _ = enable_raw_mode();
         let _ = execute!(stdout(), EnterAlternateScreen);
+    }
+}
+
+/// Best-effort `StderrLogGuard::resume` on panic / error path. Armed after
+/// `suspend()` succeeds; disarmed via `mem::forget` on the normal path so
+/// the explicit `resume()?` call can surface its error. Without this, an
+/// error from `suspend_tui()` or `restore_tui()` would propagate while the
+/// stderr redirect is still suspended — fd 2 would stay pointed at the real
+/// terminal under the alt screen, and the next `log_warning` would corrupt
+/// the diff (the very thing the redirect exists to prevent).
+struct StderrResumeGuard<'a> {
+    guard: Option<&'a StderrLogGuard>,
+}
+
+impl Drop for StderrResumeGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(g) = self.guard {
+            let _ = g.resume();
+        }
     }
 }
 
@@ -3991,6 +4069,7 @@ mod tests {
             "@".to_owned(),
             None,
             TransitionMode::Never,
+            None,
         );
         // Start on the first diff file (view_index 1). Description view is
         // at index 0 but most tests target diff-file content.
@@ -5566,6 +5645,7 @@ mod tests {
             revset.clone(),
             Some(stack_ctx),
             TransitionMode::Never,
+            None,
         );
 
         persist_cursor_on_exit(&app);
@@ -5680,6 +5760,7 @@ mod tests {
             "@".to_owned(),
             None,
             TransitionMode::Never,
+            None,
         );
         let label = file_header_label(&app);
         assert!(
@@ -6303,6 +6384,7 @@ mod tests {
             "trunk()..@".to_owned(),
             Some(stack_ctx),
             TransitionMode::Never,
+            None,
         );
         (app, id_a, id_b)
     }
@@ -6966,6 +7048,7 @@ mod tests {
             "@".to_owned(),
             None,
             TransitionMode::Never,
+            None,
         );
         app.file_index = 0;
         open_file_picker(&mut app);
@@ -7121,6 +7204,7 @@ mod tests {
             "@".to_owned(),
             None,
             TransitionMode::Never,
+            None,
         );
         open_file_picker(&mut app);
         // Entry 0 is description; binary file is at entry 1.
@@ -7206,6 +7290,7 @@ mod tests {
             "@".to_owned(),
             None,
             TransitionMode::Never,
+            None,
         );
         open_file_picker(&mut app);
         // Entry 0 is always the description view.
@@ -7490,6 +7575,7 @@ mod tests {
             "@".to_owned(),
             None,
             TransitionMode::Never,
+            None,
         )
     }
 
@@ -7508,6 +7594,7 @@ mod tests {
             "@".to_owned(),
             None,
             TransitionMode::Never,
+            None,
         )
     }
 
@@ -7857,6 +7944,7 @@ mod tests {
             "@".to_owned(),
             None,
             TransitionMode::Never,
+            None,
         );
         app.file_index = 0;
         let buf = render_to_buffer(&mut app, 80, 24);
@@ -8229,6 +8317,7 @@ mod tests {
             "@".to_owned(),
             None,
             TransitionMode::Never,
+            None,
         )
     }
 

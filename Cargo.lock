@@ -487,6 +487,7 @@ dependencies = [
  "blake3",
  "clap",
  "crossterm",
+ "libc",
  "predicates",
  "ratatui",
  "serde",
