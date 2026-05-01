@@ -13,7 +13,7 @@ use jjr::packet;
 use jjr::stack::{ResolvedStack, RevsetHash, StackEntry};
 use jjr::store;
 use jjr::tui;
-use jjr::util::{confirm_response, pluralize};
+use jjr::util::{confirm_response, find_repo_root, pluralize};
 use jjr::working_copy_guard::WorkingCopyGuard;
 
 #[derive(Parser)]
@@ -160,7 +160,7 @@ fn main() -> ExitCode {
 
 fn run_export(revset: &str, format: ExportFormat) -> ExitCode {
     let result = (|| -> Result<(), JjrError> {
-        let repo_root = std::env::current_dir().map_err(|source| JjrError::Io { source })?;
+        let repo_root = find_repo_root()?;
         let resolved = jj::resolve_stack(revset)?;
         let data = export::collect_export_data(&repo_root, &resolved)?;
         if export::is_empty(&data) {
@@ -194,7 +194,7 @@ fn run_export(revset: &str, format: ExportFormat) -> ExitCode {
 
 fn run_packet(revset: &str, output: Option<&std::path::Path>, include_stale: bool) -> ExitCode {
     let result = (|| -> Result<(), JjrError> {
-        let repo_root = std::env::current_dir().map_err(|source| JjrError::Io { source })?;
+        let repo_root = find_repo_root()?;
         let resolved = jj::resolve_stack(revset)?;
         let pkt = packet::build_packet(
             &repo_root,
@@ -230,7 +230,7 @@ fn run_packet(revset: &str, output: Option<&std::path::Path>, include_stale: boo
 
 fn run_claude(revset: &str, include_stale: bool) -> ExitCode {
     let result = (|| -> Result<(), JjrError> {
-        let repo_root = std::env::current_dir().map_err(|source| JjrError::Io { source })?;
+        let repo_root = find_repo_root()?;
         let change_id = jj::resolve_revset(revset)?;
         let details = jj::show(&change_id)?;
 
@@ -282,19 +282,19 @@ fn run_claude(revset: &str, include_stale: bool) -> ExitCode {
 }
 
 fn run_single(revset: &str) -> Result<(), JjrError> {
-    let repo_root = std::env::current_dir().map_err(|source| JjrError::Io { source })?;
+    let repo_root = find_repo_root()?;
     let change_id = jj::resolve_revset(revset)?;
     tui::run(&change_id, &repo_root)
 }
 
 fn run_stack(revset: &str, restart: bool) -> Result<(), JjrError> {
-    let repo_root = std::env::current_dir().map_err(|source| JjrError::Io { source })?;
+    let repo_root = find_repo_root()?;
     let resolved = jj::resolve_stack(revset)?;
     tui::run_stack(&repo_root, &resolved, restart)
 }
 
 fn run_clear(revset: &str, stale: bool, orphaned: bool, yes: bool) -> Result<(), JjrError> {
-    let repo_root = std::env::current_dir().map_err(|source| JjrError::Io { source })?;
+    let repo_root = find_repo_root()?;
     let resolved = jj::resolve_stack(revset)?;
 
     if stale {

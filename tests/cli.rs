@@ -58,8 +58,35 @@ fn errors_outside_jj_repo() {
         .arg("@")
         .assert()
         .failure()
-        // `jj failed: ...` is the JjFailed variant, which fires when jj is run outside a repo.
-        .stderr(predicate::str::contains("jj failed"));
+        // `not inside a jj repo: ...` is the NotInJjRepo variant; the walk-up
+        // helper detects the absence of `.jj/` before jj is invoked.
+        .stderr(predicate::str::contains("not inside a jj repo"));
+}
+
+#[test]
+fn finds_repo_root_when_invoked_from_subdirectory() {
+    if !jj_on_path() {
+        eprintln!("jj not on PATH; skipping finds_repo_root_when_invoked_from_subdirectory");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = build_fixture(&tmp);
+    let subdir = repo.join("nested").join("inner");
+    std::fs::create_dir_all(&subdir).unwrap();
+
+    // `jjr export @` from a child of the repo must walk up, find `.jj/`, and
+    // resolve the revset against the discovered root. With no comments yet
+    // recorded the command exits 2 with "no comments to export" — proof the
+    // repo root was found and the export pipeline ran. Before the walk-up
+    // fix, this would have failed with "There is no jj repo".
+    Command::cargo_bin("jjr")
+        .unwrap()
+        .current_dir(&subdir)
+        .args(["export", "@"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("no comments to export"));
 }
 
 #[test]

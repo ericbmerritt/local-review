@@ -83,6 +83,42 @@ pub(crate) fn atomic_write_bytes(
     Ok(())
 }
 
+/// Locate the jj repo root by walking up from the process's current directory.
+///
+/// Returns the first ancestor that contains a `.jj/` directory. If no
+/// `.jj/` is found before reaching the filesystem root, returns
+/// `JjrError::NotInJjRepo` carrying the original cwd for diagnostics.
+///
+/// This wraps `find_repo_root_from(&current_dir())` so the cwd-touching part
+/// stays separate from the pure walk-up logic that the tests exercise.
+pub fn find_repo_root() -> crate::error::Result<std::path::PathBuf> {
+    let cwd = std::env::current_dir().map_err(|source| crate::error::JjrError::Io { source })?;
+    find_repo_root_from(&cwd)
+}
+
+/// Walk up from `start` looking for a directory containing a `.jj/`
+/// subdirectory. Pure on its inputs (no cwd or env access) so tests can
+/// drive it with arbitrary fixture paths.
+///
+/// A `.jj` entry that is a regular file (not a directory) is ignored; jj
+/// itself only treats `.jj/` as a repo marker.
+fn find_repo_root_from(start: &std::path::Path) -> crate::error::Result<std::path::PathBuf> {
+    let mut current = start;
+    loop {
+        if current.join(".jj").is_dir() {
+            return Ok(current.to_owned());
+        }
+        match current.parent() {
+            Some(parent) if parent != current => current = parent,
+            _ => {
+                return Err(crate::error::JjrError::NotInJjRepo {
+                    cwd: start.to_owned(),
+                });
+            }
+        }
+    }
+}
+
 /// Append `s` to `word` when `count != 1`. English plurals only; deliberately
 /// simple — the only words this serves are short, regular nouns ("comment",
 /// "change", "suggestion", "note").
@@ -252,5 +288,76 @@ mod tests {
         assert!(confirm_response("  y  "));
         assert!(confirm_response("  yes\n"));
         assert!(!confirm_response("  n  "));
+    }
+
+    #[test]
+    fn find_repo_root_returns_dir_with_dot_jj() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".jj")).unwrap();
+        let resolved = find_repo_root_from(dir.path()).unwrap();
+        assert_eq!(
+            std::fs::canonicalize(&resolved).unwrap(),
+            std::fs::canonicalize(dir.path()).unwrap()
+        );
+    }
+
+    #[test]
+    fn find_repo_root_walks_up_from_subdirectory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".jj")).unwrap();
+        let sub = dir.path().join("subdir");
+        std::fs::create_dir_all(&sub).unwrap();
+        let resolved = find_repo_root_from(&sub).unwrap();
+        assert_eq!(
+            std::fs::canonicalize(&resolved).unwrap(),
+            std::fs::canonicalize(dir.path()).unwrap()
+        );
+    }
+
+    #[test]
+    fn find_repo_root_walks_up_through_multiple_levels() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".jj")).unwrap();
+        let deep = dir.path().join("a").join("b").join("c");
+        std::fs::create_dir_all(&deep).unwrap();
+        let resolved = find_repo_root_from(&deep).unwrap();
+        assert_eq!(
+            std::fs::canonicalize(&resolved).unwrap(),
+            std::fs::canonicalize(dir.path()).unwrap()
+        );
+    }
+
+    #[test]
+    fn find_repo_root_returns_error_when_no_jj_found() {
+        // Anchor the search at a tempdir whose ancestors (the system temp
+        // root) do not contain a `.jj/`. If the test host happened to have a
+        // `.jj` somewhere above /tmp the walk-up would still terminate at
+        // `/`, but in any sane CI/dev environment this exits with the
+        // expected error.
+        let dir = tempfile::tempdir().unwrap();
+        let result = find_repo_root_from(dir.path());
+        match result {
+            Err(crate::error::JjrError::NotInJjRepo { cwd }) => {
+                assert_eq!(
+                    std::fs::canonicalize(&cwd).unwrap(),
+                    std::fs::canonicalize(dir.path()).unwrap()
+                );
+            }
+            other => panic!("expected NotInJjRepo, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn find_repo_root_uses_dot_jj_directory_not_file() {
+        // jj itself only treats `.jj/` as a repo marker — a regular file
+        // named `.jj` should NOT match. We pin that behavior here so a
+        // regression to `.exists()` (which would match files too) is caught.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".jj"), b"not a directory").unwrap();
+        let result = find_repo_root_from(dir.path());
+        assert!(
+            matches!(result, Err(crate::error::JjrError::NotInJjRepo { .. })),
+            "expected NotInJjRepo when .jj is a file, got {result:?}"
+        );
     }
 }

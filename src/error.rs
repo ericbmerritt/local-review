@@ -51,6 +51,12 @@ pub enum JjrError {
     #[snafu(display("io error: {source}"))]
     Io { source: std::io::Error },
 
+    #[snafu(display(
+        "not inside a jj repo: searched up from {} and found no .jj directory",
+        cwd.display()
+    ))]
+    NotInJjRepo { cwd: PathBuf },
+
     #[snafu(display("terminal is too narrow: {} columns (minimum 60)", cols))]
     TerminalTooNarrow { cols: u16 },
 
