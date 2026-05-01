@@ -491,6 +491,10 @@ struct App {
     /// `Auto`, which picks unified or side-by-side at draw time based on
     /// the diff pane's body width.
     diff_mode: DiffMode,
+    /// Set when the alternate screen was re-entered out-of-band (e.g. after
+    /// suspending for `claude`); ratatui's diff cache is now stale and must
+    /// be invalidated before the next draw.
+    needs_full_redraw: bool,
 }
 
 impl App {
@@ -533,6 +537,7 @@ impl App {
             severity_filter: None,
             reviewed,
             diff_mode: DiffMode::Auto,
+            needs_full_redraw: false,
         }
     }
 
@@ -1172,6 +1177,7 @@ fn run_app(
     app.mark_current_file_reviewed();
 
     while !app.should_quit {
+        maybe_clear_for_full_redraw(terminal, &mut app)?;
         terminal
             .draw(|frame| render(frame, &mut app))
             .map_err(io_err)?;
@@ -1182,6 +1188,22 @@ fn run_app(
     // resumes here. Best-effort: a cursor write failure should not block exit.
     persist_cursor_on_exit(&app);
 
+    Ok(())
+}
+
+/// Invalidate ratatui's previous-frame buffer cache when the screen has been
+/// re-entered out-of-band (e.g. after suspending for `claude`). Without this,
+/// the next `terminal.draw()` only writes diffs against a buffer that no
+/// longer matches the freshly-blank alternate screen, leaving cells ratatui
+/// thinks "unchanged" stale on screen.
+fn maybe_clear_for_full_redraw<B: ratatui::backend::Backend>(
+    terminal: &mut Terminal<B>,
+    app: &mut App,
+) -> Result<()> {
+    if app.needs_full_redraw {
+        terminal.clear().map_err(io_err)?;
+        app.needs_full_redraw = false;
+    }
     Ok(())
 }
 
@@ -2405,6 +2427,7 @@ fn invoke_claude_from_tui(app: &mut App) -> Result<()> {
 
     std::mem::forget(restore);
     restore_tui()?;
+    app.needs_full_redraw = true;
 
     app.screen = Screen::Main;
 
@@ -8656,6 +8679,60 @@ mod tests {
             .get(&app.details.change_id)
             .expect("post-reload must mark the description");
         assert!(entry.description_reviewed);
+    }
+
+    /// Pin the default: a freshly-built `App` does not request a full
+    /// redraw. The flag is only set out-of-band (e.g. after returning from
+    /// `claude`), and a wrong default would force a `terminal.clear()` on
+    /// every first frame.
+    #[test]
+    fn app_default_needs_full_redraw_is_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = make_app_in_dir(dir.path().to_owned(), vec![sample_diff_file()]);
+        assert!(!app.needs_full_redraw);
+    }
+
+    /// Pre-seeds the `TestBackend` buffer with non-space glyphs so the
+    /// post-clear all-spaces assertion actually proves the clear ran (a
+    /// no-op helper would fail this test).
+    #[test]
+    fn maybe_clear_for_full_redraw_clears_when_flagged_and_resets_flag() {
+        use ratatui::backend::TestBackend;
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = make_app_in_dir(dir.path().to_owned(), vec![sample_diff_file()]);
+
+        let backend = TestBackend::new(4, 2);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                let para = Paragraph::new("XXXX\nYYYY");
+                frame.render_widget(para, area);
+            })
+            .expect("draw");
+        // Sanity: the pre-seed actually wrote glyphs; otherwise the
+        // post-clear assertion would be vacuous.
+        let pre = terminal.backend().buffer().clone();
+        assert_eq!(pre[(0, 0)].symbol(), "X");
+        assert_eq!(pre[(0, 1)].symbol(), "Y");
+
+        app.needs_full_redraw = true;
+        maybe_clear_for_full_redraw(&mut terminal, &mut app).expect("helper");
+
+        assert!(
+            !app.needs_full_redraw,
+            "helper must reset the flag after clearing"
+        );
+        let buf = terminal.backend().buffer().clone();
+        for y in 0..2 {
+            for x in 0..4 {
+                assert_eq!(
+                    buf[(x, y)].symbol(),
+                    " ",
+                    "clear() must blank the backing buffer at ({x}, {y})"
+                );
+            }
+        }
     }
 
     // ---- Saskia tweaks: U keybind toggle ----
