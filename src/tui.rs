@@ -34,8 +34,8 @@ mod send_to_claude;
 mod stale_screen;
 
 use composer::{
-    default_severity, ChangeContext, Composer, ComposerAction, ComposerContexts, ComposerScope,
-    DescriptionContext, EditedComment, LineTarget, StackContextSnapshot,
+    default_severity, Composer, ComposerAction, ComposerInit, ComposerScope, DescriptionContext,
+    EditedComment, LineTarget, StackContextSnapshot,
 };
 use diff_view::{
     comment_to_inline, description_comment_to_inline, DiffView, InlineComment, RenderedLine,
@@ -1723,20 +1723,24 @@ fn overview_enter(
 /// non-actionable rows we fall back to the current change as a placeholder
 /// only — the `change_id` is unused for `Stack` scope.
 fn overview_open_composer(app: &mut App, rows: &[overview_screen::OverviewRow], selected: usize) {
-    let (scope, change_idx_for_change_scope) = rows
+    let (initial_tag, change_idx_for_change_scope) = rows
         .get(selected)
         .map(|row| match row {
             overview_screen::OverviewRow::StackHeader
-            | overview_screen::OverviewRow::StackComment(_) => (ComposerScope::Stack, None),
-            overview_screen::OverviewRow::ChangeRow(ci) => (ComposerScope::Change, Some(*ci)),
+            | overview_screen::OverviewRow::StackComment(_) => (OverviewInitialScope::Stack, None),
+            overview_screen::OverviewRow::ChangeRow(ci) => {
+                (OverviewInitialScope::Change, Some(*ci))
+            }
             overview_screen::OverviewRow::ChangeComment { change_idx, .. } => {
-                (ComposerScope::Change, Some(*change_idx))
+                (OverviewInitialScope::Change, Some(*change_idx))
             }
             overview_screen::OverviewRow::Separator
             | overview_screen::OverviewRow::SummaryFooterStale
-            | overview_screen::OverviewRow::SummaryFooterTotal => (ComposerScope::Change, None),
+            | overview_screen::OverviewRow::SummaryFooterTotal => {
+                (OverviewInitialScope::Change, None)
+            }
         })
-        .unwrap_or((ComposerScope::Change, None));
+        .unwrap_or((OverviewInitialScope::Change, None));
 
     let target_change_id: ChangeId = change_idx_for_change_scope
         .and_then(|idx| {
@@ -1746,43 +1750,84 @@ fn overview_open_composer(app: &mut App, rows: &[overview_screen::OverviewRow], 
         })
         .unwrap_or_else(|| app.details.change_id.clone());
 
-    open_composer_with_scope(app, scope, target_change_id);
+    open_composer_with_scope(app, initial_tag, target_change_id);
 }
 
-/// Open a new-comment composer pre-set to `scope`, using the current change's
-/// first commentable line as the line target (for the contexts snapshot).
-/// `target_change_id` binds the composer's change-scope target — the overview
+/// Cursor-derived hint for the composer's initial scope when opened from the
+/// overview screen. The actual `ComposerScope` is constructed inside
+/// `open_composer_with_scope` from the availability snapshots — this hint
+/// only encodes the cursor-row's intent, not the per-variant payload.
+#[derive(Debug, Clone, Copy)]
+enum OverviewInitialScope {
+    Change,
+    Stack,
+}
+
+/// Open a new-comment composer with an initial-scope hint from the cursor.
+/// `target_change_id` binds the composer's Change-scope target — the overview
 /// path passes the cursor's change; the main-view path passes the current
-/// change.
-fn open_composer_with_scope(app: &mut App, scope: ComposerScope, target_change_id: ChangeId) {
-    let line_target = match build_line_target(app) {
-        BuildTargetResult::Ready(t) => t,
+/// change. If the requested initial scope's availability is missing
+/// (e.g., Stack hint in single-change mode), the composer falls back to a
+/// scope that does have backing context (Line if the cursor is on a
+/// commentable line, otherwise Change).
+fn open_composer_with_scope(
+    app: &mut App,
+    initial: OverviewInitialScope,
+    target_change_id: ChangeId,
+) {
+    let line_available = match build_line_target(app) {
+        BuildTargetResult::Ready(t) => Some(t),
         BuildTargetResult::DescriptionLine { .. }
         | BuildTargetResult::NonCommentable
-        | BuildTargetResult::NoView => {
-            // Scope may be Stack or Change — a synthetic line target is fine here.
-            let Some(file) = app.details.diff.files.first() else {
-                app.status_message = Some("no diff to anchor comment to".to_owned());
-                return;
-            };
-            LineTarget {
-                file: file.display_path().to_owned(),
-                rendered_index: 0,
-                source_line: None,
-                target_line: None,
-                target_text: String::new(),
-                hunk_header: String::new(),
-                context_before: Vec::new(),
-                context_after: Vec::new(),
-            }
-        }
+        | BuildTargetResult::NoView => None,
     };
+    let stack_available = stack_snapshot(app);
+    let change_description = change_description_for_target(app, &target_change_id);
+    let scope = match initial {
+        OverviewInitialScope::Stack => match stack_available.clone() {
+            Some(s) => ComposerScope::Stack(s),
+            None => fallback_scope(line_available.clone()),
+        },
+        OverviewInitialScope::Change => ComposerScope::Change,
+    };
+    let init = ComposerInit {
+        scope,
+        severity: default_severity(app.last_severity),
+        change_id: target_change_id,
+        change_description,
+        line_available,
+        stack_available,
+        description_available: None,
+    };
+    app.screen = Screen::Composer(Box::new(Composer::new(init)));
+}
 
-    let contexts = composer_contexts_for_change(app, line_target, target_change_id);
-    let severity = default_severity(app.last_severity);
-    let mut composer = Composer::new(contexts, severity);
-    composer.scope = scope;
-    app.screen = Screen::Composer(Box::new(composer));
+/// Pick the next-best scope when the requested one has no backing snapshot.
+/// `Line` if the cursor was on a commentable line; otherwise `Change`
+/// (always available because the `change_id` is universal).
+fn fallback_scope(line_available: Option<LineTarget>) -> ComposerScope {
+    match line_available {
+        Some(line) => ComposerScope::Line(line),
+        None => ComposerScope::Change,
+    }
+}
+
+fn stack_snapshot(app: &App) -> Option<StackContextSnapshot> {
+    app.stack.as_ref().map(|s| StackContextSnapshot {
+        revset: s.revset.clone(),
+        revset_hash: s.revset_hash,
+    })
+}
+
+/// The Change-scope chrome shows the change's description text. We carry it
+/// only for the current change (the only one whose body is loaded in
+/// `app.details`); for non-current changes the description is empty.
+fn change_description_for_target(app: &App, target: &ChangeId) -> String {
+    if *target == app.details.change_id {
+        app.details.description.clone()
+    } else {
+        String::new()
+    }
 }
 
 /// Open the composer in edit mode for a stack-level comment.
@@ -1816,73 +1861,90 @@ fn open_overview_change_comment_editor(app: &mut App, change_idx: usize, comment
     open_meta_comment_editor(app, &comment);
 }
 
-/// Open the composer in edit mode for an existing comment. Routes the
-/// `Anchor` variant to the matching `ComposerScope` and populates the
-/// corresponding context snapshot.
+/// Open the composer in edit mode for an existing comment. Builds the
+/// matching `ComposerScope` variant directly from the source `Anchor` so the
+/// scope payload is non-synthetic.
 fn open_meta_comment_editor(app: &mut App, comment: &Comment) {
-    let scope = match &comment.anchor {
-        Anchor::Change { .. } => ComposerScope::Change,
-        Anchor::Stack { .. } => ComposerScope::Stack,
-        Anchor::Description { .. } => ComposerScope::Description,
-        Anchor::Line { .. } => ComposerScope::Line,
-    };
-
-    let line_target = match build_line_target(app) {
-        BuildTargetResult::Ready(t) => t,
-        BuildTargetResult::DescriptionLine { .. }
-        | BuildTargetResult::NonCommentable
-        | BuildTargetResult::NoView => {
-            let Some(file) = app.details.diff.files.first() else {
-                app.status_message = Some("no diff to anchor comment to".to_owned());
-                return;
-            };
-            LineTarget {
-                file: file.display_path().to_owned(),
-                rendered_index: 0,
-                source_line: None,
-                target_line: None,
-                target_text: String::new(),
-                hunk_header: String::new(),
-                context_before: Vec::new(),
-                context_after: Vec::new(),
-            }
-        }
-    };
-
-    // Bind the contexts' change_id to the source comment when it is a
-    // change-scoped record on a non-current change; otherwise use the current
-    // change. The composer overlay's title and the build_comment path read
-    // from `composer.contexts.change.change_id`.
+    // Bind the composer's `change_id` to the source comment's change when it
+    // carries one; otherwise use the current change. Used by the picker label
+    // and the Change-scope save path.
     let target_change_id = match &comment.anchor {
         Anchor::Change { change_id }
         | Anchor::Line { change_id, .. }
         | Anchor::Description { change_id, .. } => change_id.clone(),
         Anchor::Stack { .. } => app.details.change_id.clone(),
     };
-    let mut contexts = composer_contexts_for_change(app, line_target, target_change_id);
-    // For description-scoped edits, populate the description snapshot from the
-    // saved anchor so the composer chrome shows the description context block
-    // and the save path can rebuild a `DescriptionAnchor`.
-    if let Anchor::Description {
-        change_id: anchor_change_id,
-        location,
-    } = &comment.anchor
-    {
-        contexts.description = Some(DescriptionContext {
-            change_id: anchor_change_id.clone(),
-            target_line: location.display_line,
-            target_text: location.target_text.clone(),
-            context_before: location.context_before.clone(),
-            context_after: location.context_after.clone(),
-        });
-    }
-    let edited = EditedComment {
-        contexts,
+
+    let line_available = match build_line_target(app) {
+        BuildTargetResult::Ready(t) => Some(t),
+        BuildTargetResult::DescriptionLine { .. }
+        | BuildTargetResult::NonCommentable
+        | BuildTargetResult::NoView => None,
+    };
+    let stack_available = stack_snapshot(app);
+
+    // Build the scope variant and the description-availability snapshot in
+    // one pass so the Description case carries the same `DescriptionContext`
+    // value into both fields without re-cloning through an `Option` unwrap.
+    let (scope, description_available) = match &comment.anchor {
+        Anchor::Line { location, .. } => {
+            let line_target = LineTarget {
+                file: location.file.clone(),
+                rendered_index: app.line_index,
+                source_line: location.old_line,
+                target_line: location.new_line,
+                target_text: location.target_text.clone(),
+                hunk_header: location.hunk_header.clone(),
+                context_before: location.context_before.clone(),
+                context_after: location.context_after.clone(),
+            };
+            (ComposerScope::Line(line_target), None)
+        }
+        Anchor::Change { .. } => (ComposerScope::Change, None),
+        Anchor::Stack { revset_hash } => {
+            // The saved anchor only carries the revset_hash; the revset string
+            // for the chrome row comes from the running stack context. If the
+            // running session is single-change, fall back to the hash hex so
+            // the chrome doesn't lie about what was loaded.
+            let snapshot = stack_available
+                .clone()
+                .unwrap_or_else(|| StackContextSnapshot {
+                    revset: format!("revset_hash:{}", revset_hash.hex()),
+                    revset_hash: *revset_hash,
+                });
+            (ComposerScope::Stack(snapshot), None)
+        }
+        Anchor::Description {
+            change_id: anchor_change_id,
+            location,
+        } => {
+            let ctx = DescriptionContext {
+                change_id: anchor_change_id.clone(),
+                target_line: location.display_line,
+                target_text: location.target_text.clone(),
+                context_before: location.context_before.clone(),
+                context_after: location.context_after.clone(),
+            };
+            (ComposerScope::Description(ctx.clone()), Some(ctx))
+        }
+    };
+
+    let change_description = change_description_for_target(app, &target_change_id);
+    let init = ComposerInit {
+        scope,
         severity: comment.severity,
+        change_id: target_change_id,
+        change_description,
+        line_available,
+        stack_available,
+        description_available,
+    };
+    let edited = EditedComment {
+        init,
         body: comment.body.clone(),
         identity: comment.created_at,
-        scope,
         original: Some(comment.clone()),
+        original_anchor: comment.anchor.clone(),
     };
     app.screen = Screen::Composer(Box::new(Composer::for_edit(edited)));
 }
@@ -2117,17 +2179,10 @@ fn handle_composer_event(app: &mut App, key: KeyEvent) {
                 app.screen = Screen::Composer(composer);
             }
         },
-        ComposerAction::RefusedScopeChord(scope) => {
-            app.status_message = Some(refused_scope_chord_status(scope).to_owned());
+        ComposerAction::RefusedScopeChord(status) => {
+            app.status_message = Some(status.to_owned());
             app.screen = Screen::Composer(composer);
         }
-    }
-}
-
-fn refused_scope_chord_status(scope: composer::RefusableScope) -> &'static str {
-    match scope {
-        composer::RefusableScope::Description => composer::STATUS_DESCRIPTION_UNAVAILABLE,
-        composer::RefusableScope::Stack => composer::STATUS_STACK_UNAVAILABLE,
     }
 }
 
@@ -2136,14 +2191,18 @@ fn refused_scope_chord_status(scope: composer::RefusableScope) -> &'static str {
 //   string literals catch that.
 #[cfg(test)]
 #[test]
-fn refused_scope_chord_status_returns_expected_strings_per_scope() {
+fn refused_scope_chord_status_strings_are_byte_stable() {
     assert_eq!(
-        refused_scope_chord_status(composer::RefusableScope::Stack),
+        composer::STATUS_STACK_UNAVAILABLE,
         "stack scope unavailable in single-change mode"
     );
     assert_eq!(
-        refused_scope_chord_status(composer::RefusableScope::Description),
+        composer::STATUS_DESCRIPTION_UNAVAILABLE,
         "description scope unavailable: open from a description line"
+    );
+    assert_eq!(
+        composer::STATUS_LINE_UNAVAILABLE,
+        "line scope unavailable: cursor is not on a commentable line"
     );
 }
 
@@ -2157,39 +2216,6 @@ enum SaveOutcome {
     /// Save attempted and the store returned an error. Composer remains open
     /// with body preserved so the reviewer can retry.
     Errored(String),
-}
-
-fn composer_contexts(app: &App, line: LineTarget) -> ComposerContexts {
-    composer_contexts_for_change(app, line, app.details.change_id.clone())
-}
-
-/// Build composer contexts targeting an explicit `change_id`. Used by the
-/// overview screen so the composer's `Change` scope binds to the cursor's
-/// change rather than the change loaded in the main view.
-fn composer_contexts_for_change(
-    app: &App,
-    line: LineTarget,
-    change_id: ChangeId,
-) -> ComposerContexts {
-    let description = if change_id == app.details.change_id {
-        app.details.description.clone()
-    } else {
-        String::new()
-    };
-    let change = ChangeContext {
-        change_id,
-        description,
-    };
-    let stack = app.stack.as_ref().map(|s| StackContextSnapshot {
-        revset: s.revset.clone(),
-        revset_hash: s.revset_hash,
-    });
-    ComposerContexts {
-        line,
-        change,
-        stack,
-        description: None,
-    }
 }
 
 /// On-disk anchor stores the full window (`CONTEXT_MAX` each side); the
@@ -2213,51 +2239,45 @@ fn build_description_context(app: &App, target_line: Option<u32>) -> Description
     }
 }
 
-/// Build composer contexts for a description-line composer. The `line` field
-/// carries a synthetic `LineTarget` so code paths that always read it don't
-/// need special-casing.
-fn composer_contexts_for_description(app: &App) -> ComposerContexts {
-    let synthetic_line = LineTarget {
-        file: PathBuf::new(),
-        rendered_index: app.line_index,
-        source_line: None,
-        target_line: None,
-        target_text: String::new(),
-        hunk_header: String::new(),
-        context_before: Vec::new(),
-        context_after: Vec::new(),
-    };
-    composer_contexts(app, synthetic_line)
-}
-
 fn open_composer(app: &mut App) {
     match build_line_target(app) {
         BuildTargetResult::Ready(target) => {
-            let contexts = composer_contexts(app, target);
+            let init = ComposerInit {
+                scope: ComposerScope::Line(target.clone()),
+                severity: app
+                    .pending_reanchor
+                    .as_ref()
+                    .map(|r| r.severity)
+                    .unwrap_or_else(|| default_severity(app.last_severity)),
+                change_id: app.details.change_id.clone(),
+                change_description: app.details.description.clone(),
+                line_available: Some(target),
+                stack_available: stack_snapshot(app),
+                description_available: None,
+            };
+            let mut composer = Composer::new(init);
             if let Some(reanchor) = app.pending_reanchor.as_ref() {
-                let severity = reanchor.severity;
-                let body = reanchor.body.clone();
-                let mut composer = Composer::new(contexts, severity);
-                for (i, line) in body.lines().enumerate() {
+                for (i, line) in reanchor.body.clone().lines().enumerate() {
                     if i > 0 {
                         composer.body.insert_newline();
                     }
                     composer.body.insert_str(line);
                 }
-                app.screen = Screen::Composer(Box::new(composer));
-            } else {
-                let severity = default_severity(app.last_severity);
-                app.screen = Screen::Composer(Box::new(Composer::new(contexts, severity)));
             }
+            app.screen = Screen::Composer(Box::new(composer));
         }
         BuildTargetResult::DescriptionLine { target_line } => {
             let desc_ctx = build_description_context(app, target_line);
-            let mut contexts = composer_contexts_for_description(app);
-            contexts.description = Some(desc_ctx);
-            let severity = default_severity(app.last_severity);
-            let mut composer = Composer::new(contexts, severity);
-            composer.scope = ComposerScope::Description;
-            app.screen = Screen::Composer(Box::new(composer));
+            let init = ComposerInit {
+                scope: ComposerScope::Description(desc_ctx.clone()),
+                severity: default_severity(app.last_severity),
+                change_id: app.details.change_id.clone(),
+                change_description: app.details.description.clone(),
+                line_available: None,
+                stack_available: stack_snapshot(app),
+                description_available: Some(desc_ctx),
+            };
+            app.screen = Screen::Composer(Box::new(Composer::new(init)));
         }
         BuildTargetResult::NonCommentable => {
             app.status_message = Some("cannot comment on this line".to_owned());
@@ -2289,16 +2309,23 @@ fn open_composer_for_edit(app: &mut App) {
         context_after: location.context_after.clone(),
     };
 
-    let contexts = composer_contexts(app, target);
-    let edited = EditedComment {
-        contexts,
+    let init = ComposerInit {
+        scope: ComposerScope::Line(target.clone()),
         severity: comment.severity,
+        change_id: app.details.change_id.clone(),
+        change_description: app.details.description.clone(),
+        line_available: Some(target),
+        stack_available: stack_snapshot(app),
+        description_available: None,
+    };
+    let edited = EditedComment {
+        init,
         body: comment.body.clone(),
         identity: comment.created_at,
-        scope: ComposerScope::Line,
         // Main-view line-comment edits resolve through `app.loaded_comments`
         // so the latest in-memory anchor (post-re-anchor) is honored.
         original: None,
+        original_anchor: comment.anchor.clone(),
     };
     let composer = Composer::for_edit(edited);
     app.screen = Screen::Composer(Box::new(composer));
@@ -2439,20 +2466,24 @@ fn collect_context_with(
     (before, after)
 }
 
-fn build_location_from_composer(app: &App, composer: &Composer) -> (ChangeId, LineAnchor) {
-    let t = composer.line_target();
-    let side = pick_side(t.source_line, t.target_line);
+/// Build a line anchor from an explicit `LineTarget` carried in the composer's
+/// `Line` scope variant. Pure: takes the `LineTarget` (the scope payload) and
+/// the current change id, returns the (`change_id`, anchor) pair the caller
+/// passes through to the store. Centralizes the source/target → side mapping
+/// so the line-anchor wire shape is built in exactly one place.
+fn build_line_anchor(target: &LineTarget, change_id: ChangeId) -> (ChangeId, LineAnchor) {
+    let side = pick_side(target.source_line, target.target_line);
     let location = LineAnchor {
-        file: PathBuf::from(&t.file),
+        file: PathBuf::from(&target.file),
         side,
-        old_line: t.source_line,
-        new_line: t.target_line,
-        hunk_header: t.hunk_header.clone(),
-        target_text: t.target_text.clone(),
-        context_before: t.context_before.clone(),
-        context_after: t.context_after.clone(),
+        old_line: target.source_line,
+        new_line: target.target_line,
+        hunk_header: target.hunk_header.clone(),
+        target_text: target.target_text.clone(),
+        context_before: target.context_before.clone(),
+        context_after: target.context_after.clone(),
     };
-    (app.details.change_id.clone(), location)
+    (change_id, location)
 }
 
 fn save_composer(app: &mut App, composer: &Composer, now: time::OffsetDateTime) -> SaveOutcome {
@@ -2465,13 +2496,13 @@ fn save_composer(app: &mut App, composer: &Composer, now: time::OffsetDateTime) 
     // know to copy the overflow elsewhere if needed. Save proceeds.
     let oversized = body.chars().count() > crate::comment::BODY_MAX;
 
-    if let Some(created_at) = composer.editing {
+    if let Some(ctx) = composer.editing.as_ref() {
         return persist_update_from_composer(
             app,
             composer,
+            ctx,
             UpdateArgs {
                 body,
-                created_at,
                 now,
                 oversized,
             },
@@ -2479,10 +2510,6 @@ fn save_composer(app: &mut App, composer: &Composer, now: time::OffsetDateTime) 
     }
 
     let comment = build_comment_from_composer(app, composer, body, now);
-    let comment = match comment {
-        Ok(c) => c,
-        Err(refused) => return refused,
-    };
 
     match crate::store::save_comment(&app.repo_root, &comment) {
         Ok(()) => {
@@ -2503,56 +2530,49 @@ fn save_composer(app: &mut App, composer: &Composer, now: time::OffsetDateTime) 
     }
 }
 
+/// Total exhaustive match: each `ComposerScope` variant carries the data
+/// needed to build its `Anchor`, so this function never refuses on a missing
+/// snapshot. Save-time refusals (empty body, etc.) are handled upstream in
+/// `save_composer`.
 fn build_comment_from_composer(
     app: &App,
     composer: &Composer,
     body: String,
     now: time::OffsetDateTime,
-) -> std::result::Result<Comment, SaveOutcome> {
-    let anchor = match composer.scope {
-        ComposerScope::Line => {
-            let (change_id, location) = build_location_from_composer(app, composer);
+) -> Comment {
+    let anchor = match &composer.scope {
+        ComposerScope::Line(target) => {
+            let (change_id, location) = build_line_anchor(target, app.details.change_id.clone());
             Anchor::Line {
                 change_id,
                 location,
             }
         }
-        // Read the target change_id from the composer's snapshot, not from
-        // `app.details`. The two diverge when the composer was opened from the
-        // stack overview cursor pointing at a non-current change.
+        // The composer's `change_id` is the Change-scope save target, set at
+        // open time. Differs from `app.details.change_id` when the composer
+        // was opened from an overview cursor pointing at a non-current change.
         ComposerScope::Change => Anchor::Change {
-            change_id: composer.contexts.change.change_id.clone(),
+            change_id: composer.change_id.clone(),
         },
-        ComposerScope::Stack => {
-            let revset_hash = composer
-                .contexts
-                .stack
-                .as_ref()
-                .map(|s| s.revset_hash)
-                .ok_or_else(|| {
-                    SaveOutcome::Refused("stack-scope requires --stack mode — not saved".to_owned())
-                })?;
-            Anchor::Stack { revset_hash }
-        }
-        ComposerScope::Description => {
-            let desc_ctx = composer.contexts.description.as_ref().ok_or_else(|| {
-                SaveOutcome::Refused("description-scope context missing — not saved".to_owned())
-            })?;
+        ComposerScope::Stack(stack) => Anchor::Stack {
+            revset_hash: stack.revset_hash,
+        },
+        ComposerScope::Description(ctx) => {
             let location = DescriptionAnchor {
-                display_line: desc_ctx.target_line,
-                target_text: desc_ctx.target_text.clone(),
-                context_before: desc_ctx.context_before.clone(),
-                context_after: desc_ctx.context_after.clone(),
+                display_line: ctx.target_line,
+                target_text: ctx.target_text.clone(),
+                context_before: ctx.context_before.clone(),
+                context_after: ctx.context_after.clone(),
             }
             .normalized();
             Anchor::Description {
-                change_id: desc_ctx.change_id.clone(),
+                change_id: ctx.change_id.clone(),
                 location,
             }
         }
     };
 
-    Ok(Comment {
+    Comment {
         schema_version: SchemaVersion,
         anchor,
         repo_root: app.repo_root.clone(),
@@ -2564,12 +2584,11 @@ fn build_comment_from_composer(
         updated_at: None,
         status: Some(Status::Pending),
         mismatch_reason: None,
-    })
+    }
 }
 
 struct UpdateArgs {
     body: String,
-    created_at: time::OffsetDateTime,
     now: time::OffsetDateTime,
     oversized: bool,
 }
@@ -2577,23 +2596,24 @@ struct UpdateArgs {
 fn persist_update_from_composer(
     app: &mut App,
     composer: &Composer,
+    edit_ctx: &composer::EditingContext,
     args: UpdateArgs,
 ) -> SaveOutcome {
     // Two paths:
-    // (1) Edit from main view (`composer.original` is None): source the anchor
-    //     from `app.loaded_comments` keyed by `created_at` so a re-anchor that
+    // (1) Edit from main view (`edit_ctx.original` is None): source the anchor
+    //     from `app.loaded_comments` keyed by `identity` so a re-anchor that
     //     happened between compose-open and compose-submit lands the edit at
     //     the new location.
-    // (2) Edit from stack overview (`composer.original` is Some): the comment
+    // (2) Edit from stack overview (`edit_ctx.original` is Some): the comment
     //     does not appear in `app.loaded_comments` (it belongs to a different
     //     change or to the stack file), so use the original snapshot directly.
-    let source = if let Some(orig) = composer.original.as_ref() {
+    let source = if let Some(orig) = edit_ctx.original.as_ref() {
         orig.clone()
     } else {
         let Some(latest) = app
             .loaded_comments
             .iter()
-            .find(|c| c.created_at == args.created_at)
+            .find(|c| c.created_at == edit_ctx.identity)
             .cloned()
         else {
             return SaveOutcome::Errored(
@@ -2629,40 +2649,28 @@ fn persist_update_from_composer(
 }
 
 fn delete_via_composer(app: &mut App, composer: &Composer) -> SaveOutcome {
-    let Some(created_at) = composer.editing else {
-        return SaveOutcome::Refused(
-            "delete only available in edit mode — this is a bug".to_owned(),
-        );
+    let Some(edit_ctx) = composer.editing.as_ref() else {
+        return SaveOutcome::Refused("delete only available in edit mode".to_owned());
     };
 
     // `delete_comment` keys records by `(anchor, created_at)`. The other
     // `Comment` fields are unused by the store; we still build the full
     // record because the API requires it.
-    //
-    // When `composer.original` is set (edit opened from the stack overview),
-    // delete keys off that snapshot's anchor so stack- and non-current-change
-    // comments resolve to the right JSONL file. Otherwise reconstruct the
-    // line anchor from the composer's contexts (the main-view edit path).
-    let comment = if let Some(orig) = composer.original.as_ref() {
-        orig.clone()
-    } else {
-        let (change_id, location) = build_location_from_composer(app, composer);
-        Comment {
+    let comment = match edit_ctx.original.as_ref() {
+        Some(orig) => orig.clone(),
+        None => Comment {
             schema_version: SchemaVersion,
-            anchor: Anchor::Line {
-                change_id,
-                location,
-            },
+            anchor: edit_ctx.original_anchor.clone(),
             repo_root: app.repo_root.clone(),
             revset: app.revset.clone(),
             commit_id: Some(app.details.commit_id.clone()),
             body: composer.body_text(),
             severity: composer.severity,
-            created_at,
+            created_at: edit_ctx.identity,
             updated_at: None,
             status: Some(Status::Pending),
             mismatch_reason: None,
-        }
+        },
     };
 
     match crate::store::delete_comment(&app.repo_root, &comment) {
@@ -3185,30 +3193,64 @@ mod tests {
         }
     }
 
-    fn make_contexts_for_test(target: LineTarget) -> ComposerContexts {
-        ComposerContexts {
-            line: target,
-            change: ChangeContext {
-                change_id: ChangeId::parse("abc12345").unwrap(),
-                description: "test change".to_owned(),
-            },
-            stack: None,
-            description: None,
+    /// Build a stand-alone `ComposerInit` for a synthetic `LineTarget` with no
+    /// app context. Used by tests that exercise paths which don't depend on
+    /// the surrounding `App` (e.g., delete-via-composer error branches).
+    fn make_init_for_test(target: LineTarget) -> ComposerInit {
+        ComposerInit {
+            scope: ComposerScope::Line(target.clone()),
+            severity: Severity::Note,
+            change_id: ChangeId::parse("abc12345").unwrap(),
+            change_description: "test change".to_owned(),
+            line_available: Some(target),
+            stack_available: None,
+            description_available: None,
         }
     }
 
-    /// Build a composer whose change-context `change_id` matches `app.details.change_id`.
-    /// Use this when the test will assert against `app.details.change_id` in the
-    /// store (i.e., `Change` or `Line` scope tests).
+    /// Build an `init` whose `change_id`/`change_description` come from `app`
+    /// and whose `line_available` is the given `target`. Mirrors what the
+    /// production main-view path constructs.
+    fn make_init_from_app(app: &App, target: LineTarget, severity: Severity) -> ComposerInit {
+        ComposerInit {
+            scope: ComposerScope::Line(target.clone()),
+            severity,
+            change_id: app.details.change_id.clone(),
+            change_description: app.details.description.clone(),
+            line_available: Some(target),
+            stack_available: stack_snapshot(app),
+            description_available: None,
+        }
+    }
+
+    /// Build a composer whose `change_id` matches `app.details.change_id`.
+    /// Use this when the test will assert against `app.details.change_id` in
+    /// the store (i.e., `Change` or `Line` scope tests).
     fn make_composer_with_body(app: &App, target: LineTarget, body: &str) -> Composer {
-        let contexts = composer_contexts(app, target);
-        let mut composer = Composer::new(contexts, Severity::Suggestion);
+        let init = make_init_from_app(app, target, Severity::Suggestion);
+        let mut composer = Composer::new(init);
         for ch in body.chars() {
             composer
                 .body
                 .input(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
         }
         composer
+    }
+
+    /// Reconstruct a `ComposerInit` from an existing composer. Used in the
+    /// edit-save tests where the composer's snapshot fields are cloned into
+    /// a fresh `for_edit` instance. Centralized so adding a field to
+    /// `ComposerInit` only requires one test-helper update.
+    fn init_from_composer(c: &Composer) -> ComposerInit {
+        ComposerInit {
+            scope: c.scope.clone(),
+            severity: c.severity,
+            change_id: c.change_id.clone(),
+            change_description: c.change_description.clone(),
+            line_available: c.line_available.clone(),
+            stack_available: c.stack_available.clone(),
+            description_available: c.description_available.clone(),
+        }
     }
 
     #[test]
@@ -3260,16 +3302,20 @@ mod tests {
         let BuildTargetResult::Ready(target) = build_line_target(&app) else {
             panic!("expected Ready");
         };
-        // Build contexts via the production helper so stack snapshot mirrors
-        // what the running app would carry into the composer.
-        let contexts = composer_contexts(&app, target);
-        let mut composer = Composer::new(contexts, Severity::Suggestion);
+        // Build the init via the production stack snapshot helper so the
+        // composer carries the same stack availability the running app would.
+        let init = make_init_from_app(&app, target, Severity::Suggestion);
+        let stack = init
+            .stack_available
+            .clone()
+            .expect("stack snapshot must be present in stack mode");
+        let mut composer = Composer::new(init);
         for ch in "stack-level concern".chars() {
             composer
                 .body
                 .input(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
         }
-        composer.scope = ComposerScope::Stack;
+        composer.scope = ComposerScope::Stack(stack);
 
         let outcome = save_composer(&mut app, &composer, time::OffsetDateTime::UNIX_EPOCH);
         assert!(
@@ -3300,25 +3346,36 @@ mod tests {
         assert!(stack_path.exists(), "_stack.jsonl should exist");
     }
 
+    // In single-change mode the composer carries `stack_available: None`, so
+    // the Alt+K chord refuses up-front and the save path never sees a Stack
+    // scope without a backing snapshot. Pin that property at the dispatcher
+    // level: from a single-change app, opening the composer and pressing
+    // Alt+K leaves the scope unchanged and surfaces the unavailable status.
     #[test]
-    fn save_composer_stack_scope_refuses_in_single_change_mode() {
+    fn alt_k_in_single_change_mode_refuses_chord_and_does_not_switch_scope() {
         let mut app = make_app_with_single_file(sample_diff_file());
         app.line_index = 2;
-        let BuildTargetResult::Ready(target) = build_line_target(&app) else {
-            panic!("expected Ready");
+        assert!(
+            app.stack.is_none(),
+            "single-change app starts with no stack"
+        );
+        open_composer(&mut app);
+        handle_composer_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::ALT),
+        );
+        let Screen::Composer(ref composer) = app.screen else {
+            panic!("composer remains open after refused chord");
         };
-        let mut composer = make_composer_with_body(&app, target, "hello");
-        composer.scope = ComposerScope::Stack;
-        let outcome = save_composer(&mut app, &composer, time::OffsetDateTime::UNIX_EPOCH);
-        match outcome {
-            SaveOutcome::Refused(msg) => {
-                assert!(
-                    msg.contains("stack-scope requires --stack mode"),
-                    "got message: {msg}"
-                );
-            }
-            SaveOutcome::Saved | SaveOutcome::Errored(_) => panic!("expected Refused"),
-        }
+        assert!(
+            matches!(composer.scope, ComposerScope::Line(_)),
+            "scope must not change when stack chord is refused"
+        );
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some(composer::STATUS_STACK_UNAVAILABLE),
+            "status message must surface the stack-unavailable hint",
+        );
     }
 
     #[test]
@@ -3445,13 +3502,16 @@ mod tests {
             let Screen::Composer(ref c) = app.screen else {
                 unreachable!()
             };
+            let ctx = c
+                .editing
+                .as_ref()
+                .expect("for_edit-built composer carries an EditingContext");
             Composer::for_edit(EditedComment {
-                contexts: c.contexts.clone(),
-                severity: c.severity,
+                init: init_from_composer(c),
                 body: c.body_text(),
-                identity: c.editing.unwrap(),
-                scope: c.scope,
-                original: c.original.clone(),
+                identity: ctx.identity,
+                original: ctx.original.clone(),
+                original_anchor: ctx.original_anchor.clone(),
             })
         };
         let save_time = time::OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(60);
@@ -3533,8 +3593,7 @@ mod tests {
         let BuildTargetResult::Ready(target) = build_line_target(&app) else {
             panic!("expected Ready");
         };
-        let contexts = make_contexts_for_test(target);
-        let composer = Composer::new(contexts, Severity::Note);
+        let composer = Composer::new(make_init_for_test(target));
         let outcome = delete_via_composer(&mut app, &composer);
         assert!(
             matches!(outcome, SaveOutcome::Refused(_)),
@@ -3564,13 +3623,16 @@ mod tests {
             let Screen::Composer(ref c) = app.screen else {
                 unreachable!()
             };
+            let ctx = c
+                .editing
+                .as_ref()
+                .expect("for_edit-built composer carries an EditingContext");
             Composer::for_edit(EditedComment {
-                contexts: c.contexts.clone(),
-                severity: c.severity,
+                init: init_from_composer(c),
                 body: c.body_text(),
-                identity: c.editing.unwrap(),
-                scope: c.scope,
-                original: c.original.clone(),
+                identity: ctx.identity,
+                original: ctx.original.clone(),
+                original_anchor: ctx.original_anchor.clone(),
             })
         };
 
@@ -3620,13 +3682,16 @@ mod tests {
             let Screen::Composer(ref c) = app.screen else {
                 unreachable!()
             };
+            let ctx = c
+                .editing
+                .as_ref()
+                .expect("for_edit-built composer carries an EditingContext");
             Composer::for_edit(EditedComment {
-                contexts: c.contexts.clone(),
-                severity: c.severity,
+                init: init_from_composer(c),
                 body: c.body_text(),
-                identity: c.editing.unwrap(),
-                scope: c.scope,
-                original: c.original.clone(),
+                identity: ctx.identity,
+                original: ctx.original.clone(),
+                original_anchor: ctx.original_anchor.clone(),
             })
         };
 
@@ -3686,13 +3751,16 @@ mod tests {
             let Screen::Composer(ref c) = app.screen else {
                 panic!("expected Composer screen");
             };
+            let ctx = c
+                .editing
+                .as_ref()
+                .expect("for_edit-built composer carries an EditingContext");
             Composer::for_edit(EditedComment {
-                contexts: c.contexts.clone(),
-                severity: c.severity,
+                init: init_from_composer(c),
                 body: c.body_text(),
-                identity: c.editing.unwrap(),
-                scope: c.scope,
-                original: c.original.clone(),
+                identity: ctx.identity,
+                original: ctx.original.clone(),
+                original_anchor: ctx.original_anchor.clone(),
             })
         };
 
@@ -3724,13 +3792,16 @@ mod tests {
             let Screen::Composer(ref c) = app.screen else {
                 panic!("expected Composer screen");
             };
+            let ctx = c
+                .editing
+                .as_ref()
+                .expect("for_edit-built composer carries an EditingContext");
             Composer::for_edit(EditedComment {
-                contexts: c.contexts.clone(),
-                severity: c.severity,
+                init: init_from_composer(c),
                 body: c.body_text(),
-                identity: c.editing.unwrap(),
-                scope: c.scope,
-                original: c.original.clone(),
+                identity: ctx.identity,
+                original: ctx.original.clone(),
+                original_anchor: ctx.original_anchor.clone(),
             })
         };
 
@@ -3748,6 +3819,380 @@ mod tests {
             }
             SaveOutcome::Saved | SaveOutcome::Refused(_) => panic!("expected Errored"),
         }
+    }
+
+    // -- Open a main-view line-comment edit, swap to a non-Line scope via
+    //   chord (Alt+C, then Alt+K when stack is available), then press Ctrl+D.
+    //   Delete must operate on the original line anchor — not on any of the
+    //   swapped scopes — because the scope picker is a viewing / composing
+    //   aid, not a re-anchor mechanism.
+    #[test]
+    fn delete_via_composer_after_chord_swap_deletes_original_anchor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = make_app_with_comment_on_disk(dir.path());
+        // Stack mode so Alt+K is available; otherwise the chord refuses.
+        let revset_hash = RevsetHash::from_revset("trunk()..@");
+        app.stack = Some(StackContext {
+            entries: vec![StackEntry {
+                change_id: app.details.change_id.clone(),
+                commit_id: app.details.commit_id.clone(),
+                description: String::new(),
+            }],
+            current_index: 0,
+            revset: "trunk()..@".to_owned(),
+            revset_hash,
+        });
+
+        // Open the line-comment edit; original_anchor is set at open time.
+        open_composer_for_edit(&mut app);
+        // Swap scope first to Change, then to Stack. Both must NOT touch
+        // original_anchor.
+        handle_composer_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::ALT),
+        );
+        handle_composer_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::ALT),
+        );
+        // Confirm the scope did swap (not a refusal that left it on Line).
+        if let Screen::Composer(ref c) = app.screen {
+            assert!(
+                matches!(c.scope, ComposerScope::Stack(_)),
+                "scope should have swapped to Stack; got {:?}",
+                c.scope
+            );
+            assert!(
+                c.editing.is_some(),
+                "editing context (carrying original_anchor) must persist across chord swaps"
+            );
+        } else {
+            panic!("composer should still be open");
+        }
+
+        // Ctrl+D — delete the original line comment regardless of swapped scope.
+        handle_composer_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+        );
+
+        assert!(
+            matches!(app.screen, Screen::Main),
+            "composer closes on successful delete"
+        );
+        // The original line-anchored comment is gone from disk.
+        let loaded =
+            crate::store::load_change_comments(&app.repo_root, &app.details.change_id).unwrap();
+        assert!(
+            loaded.is_empty(),
+            "original line comment should be deleted from disk; got {loaded:?}"
+        );
+        // No stack comment was created (delete must not write the swapped scope).
+        let stack_loaded = crate::store::load_stack_comments(&app.repo_root, &revset_hash).unwrap();
+        assert!(
+            stack_loaded.is_empty(),
+            "no stack comment should exist after delete; got {stack_loaded:?}"
+        );
+        // The status message announces the delete (not a refusal).
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("comment deleted"),
+            "status must be 'comment deleted'; got {:?}",
+            app.status_message
+        );
+    }
+
+    // -- T2: stack-anchor edit in single-change mode + chord swap.
+    //   `open_meta_comment_editor` with `Anchor::Stack` builds the
+    //   synthetic-revset path because `stack_available` is None. Alt+L
+    //   succeeds (line is available from the cursor); Alt+K refuses because
+    //   `stack_available` is None even though scope was already Stack at
+    //   open time. Pins the asymmetric availability state.
+    #[test]
+    fn edit_stack_anchor_in_single_change_mode_alt_k_after_alt_l_refuses_with_status() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = make_app_with_single_file(sample_diff_file());
+        app.repo_root = dir.path().to_path_buf();
+        // Cursor on a commentable line so `line_available` is populated.
+        app.line_index = 2;
+        assert!(
+            app.stack.is_none(),
+            "single-change app must have no stack to exercise the synthetic path"
+        );
+        let revset_hash = RevsetHash::from_revset("trunk()..@");
+        let original = Comment {
+            schema_version: SchemaVersion,
+            anchor: Anchor::Stack { revset_hash },
+            repo_root: dir.path().to_path_buf(),
+            revset: "trunk()..@".to_owned(),
+            commit_id: None,
+            body: "stack body".to_owned(),
+            severity: Severity::Note,
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
+            updated_at: None,
+            status: None,
+            mismatch_reason: None,
+        };
+        crate::store::save_comment(dir.path(), &original).unwrap();
+
+        open_meta_comment_editor(&mut app, &original);
+        if let Screen::Composer(ref c) = app.screen {
+            assert!(
+                matches!(c.scope, ComposerScope::Stack(_)),
+                "open should set Stack scope from the saved anchor"
+            );
+            assert!(
+                c.stack_available.is_none(),
+                "single-change session has no stack_available even when editing Stack-anchored"
+            );
+            assert!(
+                c.line_available.is_some(),
+                "cursor on a commentable line populates line_available"
+            );
+        } else {
+            panic!("composer should be open");
+        }
+
+        // Alt+L succeeds — line is available.
+        handle_composer_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('l'), KeyModifiers::ALT),
+        );
+        if let Screen::Composer(ref c) = app.screen {
+            assert!(
+                matches!(c.scope, ComposerScope::Line(_)),
+                "Alt+L must swap to Line scope"
+            );
+        } else {
+            panic!("composer should still be open");
+        }
+
+        // Alt+K refuses — stack_available is None.
+        handle_composer_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::ALT),
+        );
+        if let Screen::Composer(ref c) = app.screen {
+            assert!(
+                matches!(c.scope, ComposerScope::Line(_)),
+                "scope must remain Line when Alt+K is refused"
+            );
+            assert_eq!(
+                c.refusal_status,
+                Some(composer::STATUS_STACK_UNAVAILABLE),
+                "refusal_status must surface the stack-unavailable hint"
+            );
+        } else {
+            panic!("composer should still be open");
+        }
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some(composer::STATUS_STACK_UNAVAILABLE)
+        );
+    }
+
+    // -- T3: Ctrl+K reaches the textarea (was previously intercepted as a
+    //   scope chord, killing the dialog instead of killing-to-EOL inside
+    //   the body). Pin the user-reported bug fix: the keypress flows
+    //   through to tui-textarea, which performs its kill-to-EOL.
+    #[test]
+    fn ctrl_k_inside_composer_body_forwards_to_textarea_and_kills_to_eol() {
+        let mut app = make_app_with_single_file(sample_diff_file());
+        app.line_index = 2;
+        open_composer(&mut app);
+        // Type "hello world" then a newline then "second line".
+        for ch in "hello world".chars() {
+            handle_composer_event(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+            );
+        }
+        handle_composer_event(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        for ch in "second line".chars() {
+            handle_composer_event(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+            );
+        }
+        // Move cursor to row 0, after "hello " (col 6).
+        handle_composer_event(&mut app, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        handle_composer_event(&mut app, KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        for _ in 0..6 {
+            handle_composer_event(&mut app, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        }
+        // Ctrl+K — tui-textarea kills from cursor to end of line.
+        handle_composer_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+        );
+        let Screen::Composer(ref composer) = app.screen else {
+            panic!("composer should remain open");
+        };
+        assert_eq!(
+            composer.body_text(),
+            "hello \nsecond line",
+            "Ctrl+K must reach the textarea and kill the rest of row 0"
+        );
+        // Scope is unchanged (Ctrl+K is no longer a chord).
+        assert!(matches!(composer.scope, ComposerScope::Line(_)));
+    }
+
+    // -- T4: `fallback_scope` branches.
+    #[test]
+    fn fallback_scope_returns_line_when_target_present() {
+        let target = LineTarget {
+            file: PathBuf::from("foo.rs"),
+            rendered_index: 0,
+            source_line: None,
+            target_line: Some(1),
+            target_text: "x".to_owned(),
+            hunk_header: "@@".to_owned(),
+            context_before: vec![],
+            context_after: vec![],
+        };
+        match fallback_scope(Some(target.clone())) {
+            ComposerScope::Line(carried) => {
+                assert_eq!(carried.file, target.file);
+                assert_eq!(carried.target_line, target.target_line);
+            }
+            ComposerScope::Change | ComposerScope::Stack(_) | ComposerScope::Description(_) => {
+                panic!("fallback_scope must yield Line when target is Some");
+            }
+        }
+    }
+
+    #[test]
+    fn fallback_scope_returns_change_when_target_absent() {
+        assert!(matches!(fallback_scope(None), ComposerScope::Change));
+    }
+
+    // -- T5: edit-mode `*_available` mirroring symmetry.
+    //   `open_meta_comment_editor` populates the matching `*_available` for
+    //   the scope variant carried in the saved anchor, AND mirrors the scope
+    //   payload (same value lives in both places). This pins the contract
+    //   documented on `Composer::*_available`.
+    #[test]
+    fn open_meta_comment_editor_line_anchor_populates_line_available_with_target() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = make_app_with_comment_on_disk(dir.path());
+        let original = app.loaded_comments[0].clone();
+        let Anchor::Line {
+            location: ref orig_loc,
+            ..
+        } = original.anchor
+        else {
+            panic!("setup expects Line anchor");
+        };
+        // Park the cursor on a commentable line so `build_line_target`
+        // resolves and `line_available` is populated. The default cursor
+        // from `make_app_with_comment_on_disk` lands on the InlineCommentMeta
+        // row, which is non-commentable.
+        app.line_index = 2;
+
+        open_meta_comment_editor(&mut app, &original);
+        let Screen::Composer(ref c) = app.screen else {
+            panic!("composer should be open");
+        };
+        let ComposerScope::Line(scope_target) = &c.scope else {
+            panic!("scope must be Line");
+        };
+        let avail = c
+            .line_available
+            .as_ref()
+            .expect("line_available must be Some when scope is Line");
+        // Mirroring contract: the scope payload reflects the saved anchor
+        // (path/lines from the on-disk record), while line_available
+        // reflects the cursor's position. Both must be Some, but the
+        // values can differ (the saved anchor's file may not match the
+        // cursor's file). What's load-bearing is that the variant carries
+        // the saved location and the availability snapshot covers the
+        // cursor.
+        assert_eq!(scope_target.file, orig_loc.file);
+        assert_eq!(scope_target.target_line, orig_loc.new_line);
+        // line_available is constructed from the cursor's diff line.
+        assert!(
+            avail.target_line.is_some() || avail.source_line.is_some(),
+            "line_available must point at a real diff line; got {avail:?}"
+        );
+    }
+
+    #[test]
+    fn open_meta_comment_editor_stack_anchor_populates_stack_available_with_snapshot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut app, _id_a, _id_b) = make_stack_app_with_two_changes(dir.path());
+        let revset_hash = app.stack.as_ref().unwrap().revset_hash;
+        let original = Comment {
+            schema_version: SchemaVersion,
+            anchor: Anchor::Stack { revset_hash },
+            repo_root: dir.path().to_path_buf(),
+            revset: "trunk()..@".to_owned(),
+            commit_id: None,
+            body: "stack body".to_owned(),
+            severity: Severity::Note,
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
+            updated_at: None,
+            status: None,
+            mismatch_reason: None,
+        };
+        crate::store::save_comment(dir.path(), &original).unwrap();
+
+        open_meta_comment_editor(&mut app, &original);
+        let Screen::Composer(ref c) = app.screen else {
+            panic!("composer should be open");
+        };
+        let ComposerScope::Stack(scope_snapshot) = &c.scope else {
+            panic!("scope must be Stack");
+        };
+        let avail = c
+            .stack_available
+            .as_ref()
+            .expect("stack_available must be Some in stack mode");
+        // Mirroring: same revset_hash in both. (revset string mirrors too in
+        // the running-stack-mode branch — single-change synthesizes a
+        // sentinel string and is exercised by the asymmetric T2 test.)
+        assert_eq!(scope_snapshot.revset_hash, avail.revset_hash);
+        assert_eq!(scope_snapshot.revset_hash, revset_hash);
+    }
+
+    #[test]
+    fn open_meta_comment_editor_change_anchor_populates_no_availability_for_other_scopes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = make_app_with_single_file(sample_diff_file());
+        app.repo_root = dir.path().to_path_buf();
+        // Cursor on a non-commentable line so `line_available` is None.
+        app.line_index = 0;
+        let original = Comment {
+            schema_version: SchemaVersion,
+            anchor: Anchor::Change {
+                change_id: app.details.change_id.clone(),
+            },
+            repo_root: dir.path().to_path_buf(),
+            revset: "@".to_owned(),
+            commit_id: None,
+            body: "change body".to_owned(),
+            severity: Severity::Note,
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
+            updated_at: None,
+            status: Some(Status::Pending),
+            mismatch_reason: None,
+        };
+        crate::store::save_comment(dir.path(), &original).unwrap();
+
+        open_meta_comment_editor(&mut app, &original);
+        let Screen::Composer(ref c) = app.screen else {
+            panic!("composer should be open");
+        };
+        // Change is unit — no payload to mirror.
+        assert!(matches!(c.scope, ComposerScope::Change));
+        // Change scope doesn't populate any availability snapshot beyond
+        // what the cursor / app context independently support. With the
+        // cursor on a non-commentable line and no stack, all three are None.
+        assert!(c.line_available.is_none(), "non-commentable cursor → None");
+        assert!(c.stack_available.is_none(), "single-change app → None");
+        assert!(
+            c.description_available.is_none(),
+            "non-Description anchor → None"
+        );
     }
 
     /// D3. `d` delete error path through the TUI dispatcher. Save a comment,
@@ -5049,8 +5494,8 @@ mod tests {
     }
 
     // -- B2: editing a Description-anchored comment via `open_meta_comment_editor`
-    //   must open the composer in `Description` scope (not Line) and populate
-    //   `composer.contexts.description` from the saved anchor's window.
+    //   must open the composer in `Description` scope (not Line) carrying the
+    //   saved anchor's window directly in the variant payload.
     #[test]
     fn open_meta_comment_editor_description_scope_populates_description_context() {
         use crate::comment::DescriptionAnchor;
@@ -5082,16 +5527,20 @@ mod tests {
         let Screen::Composer(ref composer) = app.screen else {
             panic!("expected composer screen");
         };
-        assert_eq!(composer.scope, ComposerScope::Description);
-        let desc_ctx = composer
-            .contexts
-            .description
-            .as_ref()
-            .expect("description context must be populated");
+        let ComposerScope::Description(desc_ctx) = &composer.scope else {
+            panic!("expected Description scope; got {:?}", composer.scope);
+        };
         assert_eq!(desc_ctx.target_line, Some(2));
         assert_eq!(desc_ctx.target_text, "second line");
         assert_eq!(desc_ctx.context_before, vec!["first line".to_owned()]);
         assert_eq!(desc_ctx.context_after, vec!["third line".to_owned()]);
+        // The same window is also exposed as the availability snapshot so a
+        // subsequent Alt+D round-trip remains a no-op.
+        let avail = composer
+            .description_available
+            .as_ref()
+            .expect("description_available must mirror the scope payload");
+        assert_eq!(avail.target_line, Some(2));
         assert_eq!(composer.severity, Severity::Suggestion);
         assert_eq!(composer.body_text(), "review the wording here");
     }
@@ -5288,9 +5737,9 @@ mod tests {
             panic!("expected composer");
         };
         // The composer must have its target change_id set to B (not A).
-        assert_eq!(composer.contexts.change.change_id, id_b);
+        assert_eq!(composer.change_id, id_b);
         // Scope auto-selected to Change.
-        assert_eq!(composer.scope, ComposerScope::Change);
+        assert!(matches!(composer.scope, ComposerScope::Change));
         for ch in "new on B".chars() {
             composer
                 .body
@@ -5457,8 +5906,8 @@ mod tests {
         let BuildTargetResult::Ready(target) = build_line_target(&app) else {
             panic!("expected Ready");
         };
-        let contexts = composer_contexts(&app, target);
-        let mut composer = Composer::new(contexts, Severity::Required);
+        let init = make_init_from_app(&app, target, Severity::Required);
+        let mut composer = Composer::new(init);
         for ch in "required comment".chars() {
             composer
                 .body
@@ -5472,8 +5921,8 @@ mod tests {
         let BuildTargetResult::Ready(target2) = build_line_target(&app) else {
             panic!("expected Ready");
         };
-        let contexts2 = composer_contexts(&app, target2);
-        let mut composer2 = Composer::new(contexts2, Severity::Note);
+        let init2 = make_init_from_app(&app, target2, Severity::Note);
+        let mut composer2 = Composer::new(init2);
         for ch in "note comment".chars() {
             composer2
                 .body

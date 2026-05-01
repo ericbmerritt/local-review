@@ -9,7 +9,7 @@ use ratatui::Frame;
 use crate::comment::{Anchor, Comment, Severity, Status};
 use crate::packet::Packet;
 
-use super::composer::ComposerScope;
+use super::composer::ScopeTag;
 use super::composer_overlay::centered_rect;
 use super::{severity_color, severity_label};
 
@@ -31,7 +31,7 @@ pub(super) struct ConfirmData {
 }
 
 pub(super) struct ScopeSeverityRow {
-    pub(super) scope: ComposerScope,
+    pub(super) scope: ScopeTag,
     pub(super) severity: Severity,
     pub(super) count: usize,
 }
@@ -59,7 +59,7 @@ pub(super) fn compute_scope_severity_grid(packet: &Packet) -> Vec<ScopeSeverityR
         let count = pending_count(&packet.stack_comments, severity);
         if count > 0 {
             rows.push(ScopeSeverityRow {
-                scope: ComposerScope::Stack,
+                scope: ScopeTag::Stack,
                 severity,
                 count,
             });
@@ -71,7 +71,7 @@ pub(super) fn compute_scope_severity_grid(packet: &Packet) -> Vec<ScopeSeverityR
             let count = pending_count(&cp.change_comments, severity);
             if count > 0 {
                 rows.push(ScopeSeverityRow {
-                    scope: ComposerScope::Change,
+                    scope: ScopeTag::Change,
                     severity,
                     count,
                 });
@@ -84,7 +84,7 @@ pub(super) fn compute_scope_severity_grid(packet: &Packet) -> Vec<ScopeSeverityR
             let count = pending_count(&cp.line_comments, severity);
             if count > 0 {
                 rows.push(ScopeSeverityRow {
-                    scope: ComposerScope::Line,
+                    scope: ScopeTag::Line,
                     severity,
                     count,
                 });
@@ -127,12 +127,12 @@ pub(super) fn compute_files_affected(packet: &Packet) -> Vec<FileCountRow> {
         .collect()
 }
 
-fn scope_label(scope: ComposerScope) -> &'static str {
+fn scope_label(scope: ScopeTag) -> &'static str {
     match scope {
-        ComposerScope::Stack => "stack",
-        ComposerScope::Change => "change",
-        ComposerScope::Line => "line",
-        ComposerScope::Description => "description",
+        ScopeTag::Stack => "stack",
+        ScopeTag::Change => "change",
+        ScopeTag::Line => "line",
+        ScopeTag::Description => "description",
     }
 }
 
@@ -403,23 +403,23 @@ mod tests {
 
         assert_eq!(rows.len(), 5, "expected 5 rows; got {}", rows.len());
 
-        assert_eq!(rows[0].scope, ComposerScope::Stack);
+        assert_eq!(rows[0].scope, ScopeTag::Stack);
         assert_eq!(rows[0].severity, Severity::Suggestion);
         assert_eq!(rows[0].count, 1);
 
-        assert_eq!(rows[1].scope, ComposerScope::Change);
+        assert_eq!(rows[1].scope, ScopeTag::Change);
         assert_eq!(rows[1].severity, Severity::Required);
         assert_eq!(rows[1].count, 1);
 
-        assert_eq!(rows[2].scope, ComposerScope::Line);
+        assert_eq!(rows[2].scope, ScopeTag::Line);
         assert_eq!(rows[2].severity, Severity::Required);
         assert_eq!(rows[2].count, 2);
 
-        assert_eq!(rows[3].scope, ComposerScope::Line);
+        assert_eq!(rows[3].scope, ScopeTag::Line);
         assert_eq!(rows[3].severity, Severity::Suggestion);
         assert_eq!(rows[3].count, 1);
 
-        assert_eq!(rows[4].scope, ComposerScope::Line);
+        assert_eq!(rows[4].scope, ScopeTag::Line);
         assert_eq!(rows[4].severity, Severity::Note);
         assert_eq!(rows[4].count, 1);
     }

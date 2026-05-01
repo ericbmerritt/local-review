@@ -72,10 +72,10 @@ Send to Claude  (press C from main view)
     Esc                   cancel
 
 In comment composer
-    ^L ^C ^K              scope:    line / change / stack
-    M-d                   scope:    description (only when opened on a description line)
-    M-r M-s M-n           severity: required / suggestion / note  (Alt + r/s/n)
+    M-l M-c M-k M-d       scope:    line / change / stack / description
+                          (M-d only when opened on a description line)
+    M-r M-s M-n           severity: required / suggestion / note
     ^X                    save
     ^D                    delete (edit mode only)
-    Esc                   cancel  (^C inside the composer is captured as scope)
+    Esc                   cancel
 ";

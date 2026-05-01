@@ -6,7 +6,9 @@ use ratatui::Frame;
 
 use crate::comment::Severity;
 
-use super::composer::{Composer, ComposerScope, STATUS_STACK_UNAVAILABLE};
+use super::composer::{
+    Composer, ComposerScope, DescriptionContext, LineTarget, ScopeTag, StackContextSnapshot,
+};
 use super::diff_view::DiffView;
 
 /// Truncation indicators surface visibly so a reviewer can tell context was
@@ -119,21 +121,20 @@ fn render_composer_context(
     composer: &Composer,
     view: Option<&DiffView>,
 ) {
-    match composer.scope {
-        ComposerScope::Line => render_line_context(frame, area, composer, view),
+    match &composer.scope {
+        ComposerScope::Line(line) => render_line_context(frame, area, line, view),
         ComposerScope::Change => render_change_context(frame, area, composer),
-        ComposerScope::Stack => render_stack_context(frame, area, composer),
-        ComposerScope::Description => render_description_context(frame, area, composer),
+        ComposerScope::Stack(stack) => render_stack_context(frame, area, stack),
+        ComposerScope::Description(ctx) => render_description_context(frame, area, ctx),
     }
 }
 
 fn render_line_context(
     frame: &mut Frame<'_>,
     area: Rect,
-    composer: &Composer,
+    line_target: &LineTarget,
     view: Option<&DiffView>,
 ) {
-    let line_target = composer.line_target();
     let idx = line_target.rendered_index;
 
     let context_lines: Vec<TuiLine<'_>> = if let Some(view) = view {
@@ -179,19 +180,18 @@ fn truncate_for_chrome(s: &str, area_width: u16) -> String {
 }
 
 fn render_change_context(frame: &mut Frame<'_>, area: Rect, composer: &Composer) {
-    let ctx = &composer.contexts.change;
-    let desc = truncate_for_chrome(&ctx.description, area.width);
-    let id_line = TuiLine::from(format!("  change  {}", ctx.change_id));
+    let desc = truncate_for_chrome(&composer.change_description, area.width);
+    let id_line = TuiLine::from(format!("  change  {}", composer.change_id));
     let desc_line = TuiLine::from(format!("  {desc}"));
     let widget = Paragraph::new(Text::from(vec![id_line, desc_line]));
     frame.render_widget(widget, area);
 }
 
-fn render_stack_context(frame: &mut Frame<'_>, area: Rect, composer: &Composer) {
-    let text = match &composer.contexts.stack {
-        Some(ctx) => format!("  revset  {}", truncate_for_chrome(&ctx.revset, area.width)),
-        None => format!("  {STATUS_STACK_UNAVAILABLE}"),
-    };
+fn render_stack_context(frame: &mut Frame<'_>, area: Rect, stack: &StackContextSnapshot) {
+    let text = format!(
+        "  revset  {}",
+        truncate_for_chrome(&stack.revset, area.width)
+    );
     let widget = Paragraph::new(text.as_str());
     frame.render_widget(widget, area);
 }
@@ -235,15 +235,12 @@ fn description_context_lines(
     items
 }
 
-fn render_description_context(frame: &mut Frame<'_>, area: Rect, composer: &Composer) {
-    let lines: Vec<TuiLine<'_>> = if let Some(ctx) = &composer.contexts.description {
+fn render_description_context(frame: &mut Frame<'_>, area: Rect, ctx: &DescriptionContext) {
+    let lines: Vec<TuiLine<'_>> =
         description_context_lines(&ctx.target_text, &ctx.context_before, &ctx.context_after)
             .into_iter()
             .map(TuiLine::from)
-            .collect()
-    } else {
-        vec![TuiLine::from("  <description>")]
-    };
+            .collect();
     let widget = Paragraph::new(lines);
     frame.render_widget(widget, area);
 }
@@ -259,36 +256,36 @@ fn short_change_id(s: &str) -> String {
 
 /// Each tuple is `(mark, label, is_active)`. Mark is `"[x]"`/`"[ ]"`; label
 /// is the scope name (Change appends ` · {short_id}`).
-fn picker_segments(scope: ComposerScope, change_id: &str) -> [(&'static str, String, bool); 4] {
-    let mark = |s: ComposerScope| if scope == s { "[x]" } else { "[ ]" };
+fn picker_segments(active: ScopeTag, change_id: &str) -> [(&'static str, String, bool); 4] {
+    let mark = |tag: ScopeTag| if active == tag { "[x]" } else { "[ ]" };
     let change_short = short_change_id(change_id);
     [
         (
-            mark(ComposerScope::Line),
+            mark(ScopeTag::Line),
             "line".to_owned(),
-            scope == ComposerScope::Line,
+            active == ScopeTag::Line,
         ),
         (
-            mark(ComposerScope::Change),
+            mark(ScopeTag::Change),
             format!("change · {change_short}"),
-            scope == ComposerScope::Change,
+            active == ScopeTag::Change,
         ),
         (
-            mark(ComposerScope::Stack),
+            mark(ScopeTag::Stack),
             "stack".to_owned(),
-            scope == ComposerScope::Stack,
+            active == ScopeTag::Stack,
         ),
         (
-            mark(ComposerScope::Description),
+            mark(ScopeTag::Description),
             "description".to_owned(),
-            scope == ComposerScope::Description,
+            active == ScopeTag::Description,
         ),
     ]
 }
 
 #[cfg(test)]
-fn scope_picker_text(scope: ComposerScope, change_id: &str) -> String {
-    let segs = picker_segments(scope, change_id);
+fn scope_picker_text(active: ScopeTag, change_id: &str) -> String {
+    let segs = picker_segments(active, change_id);
     let mut out = String::from("  scope    ");
     for (i, (mark, label, _)) in segs.iter().enumerate() {
         if i > 0 {
@@ -301,8 +298,8 @@ fn scope_picker_text(scope: ComposerScope, change_id: &str) -> String {
     out
 }
 
-fn scope_picker_spans(scope: ComposerScope, change_id: &str) -> Vec<Span<'static>> {
-    let segs = picker_segments(scope, change_id);
+fn scope_picker_spans(active: ScopeTag, change_id: &str) -> Vec<Span<'static>> {
+    let segs = picker_segments(active, change_id);
     let mut spans: Vec<Span<'static>> = Vec::with_capacity(segs.len() * 2 + 1);
     spans.push(Span::raw("  scope    ".to_owned()));
     for (i, (mark, label, is_active)) in segs.into_iter().enumerate() {
@@ -325,7 +322,7 @@ fn scope_picker_spans(scope: ComposerScope, change_id: &str) -> Vec<Span<'static
 }
 
 fn render_scope_picker(frame: &mut Frame<'_>, area: Rect, composer: &Composer) {
-    let spans = scope_picker_spans(composer.scope, composer.contexts.change.change_id.as_str());
+    let spans = scope_picker_spans(ScopeTag::of(&composer.scope), composer.change_id.as_str());
     let widget = Paragraph::new(TuiLine::from(spans));
     frame.render_widget(widget, area);
 }
@@ -381,7 +378,7 @@ fn render_body_editor(frame: &mut Frame<'_>, area: Rect, composer: &Composer) {
 // Plain-text footer rendition exposed for width pinning. The renderer reads
 // from this to keep tests and rendering aligned.
 fn footer_lines(editing: bool) -> [&'static str; 2] {
-    let line1 = "  ^L line  ^C change  ^K stack  M-d description";
+    let line1 = "  M-l line  M-c change  M-k stack  M-d description";
     let line2 = if editing {
         "  M-r required  M-s suggestion  M-n note  ^D delete  ^X save"
     } else {
@@ -421,19 +418,19 @@ mod tests {
     //   `short_change_id`).
     #[test]
     fn scope_picker_text_fits_in_modal_interior_for_every_scope() {
-        let scopes = [
-            ComposerScope::Line,
-            ComposerScope::Change,
-            ComposerScope::Stack,
-            ComposerScope::Description,
+        let tags = [
+            ScopeTag::Line,
+            ScopeTag::Change,
+            ScopeTag::Stack,
+            ScopeTag::Description,
         ];
         let interior = interior_width();
-        for scope in scopes {
-            let text = scope_picker_text(scope, "abcdefgh");
+        for tag in tags {
+            let text = scope_picker_text(tag, "abcdefgh");
             let cols = text.chars().count();
             assert!(
                 cols <= interior,
-                "scope picker row for {scope:?} is {cols} cols, must be <= {interior}: {text:?}"
+                "scope picker row for {tag:?} is {cols} cols, must be <= {interior}: {text:?}"
             );
         }
     }
@@ -533,7 +530,7 @@ mod tests {
     //   distinguishable on monochrome terminals; severity keeps BOLD+color.
     #[test]
     fn scope_picker_spans_reverses_active_scope_label() {
-        let spans = scope_picker_spans(ComposerScope::Description, "abcdefgh");
+        let spans = scope_picker_spans(ScopeTag::Description, "abcdefgh");
         let active = spans
             .iter()
             .find(|s| s.content.contains("description"))

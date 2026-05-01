@@ -5,40 +5,65 @@ use time::OffsetDateTime;
 use tui_textarea::TextArea;
 
 use crate::change_id::ChangeId;
-use crate::comment::{Comment, Severity};
+use crate::comment::{Anchor, Comment, Severity};
 use crate::stack::RevsetHash;
 
 const SECS_PER_MIN: i64 = 60;
 const SECS_PER_HOUR: i64 = 60 * SECS_PER_MIN;
 const SECS_PER_DAY: i64 = 24 * SECS_PER_HOUR;
 
-/// Where the comment is being anchored (what the scope picker shows).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Where the comment is being anchored. Each variant carries the data needed
+/// to build its `Anchor` at save time, so a variant cannot exist without its
+/// backing context. The `Change` variant is a unit because the `change_id`
+/// and description live on `Composer` directly (always rendered in the
+/// picker label, not just when the scope is `Change`).
+#[derive(Debug, Clone)]
 pub(crate) enum ComposerScope {
+    Line(LineTarget),
+    Change,
+    Stack(StackContextSnapshot),
+    Description(DescriptionContext),
+}
+
+/// Discriminator-only view of `ComposerScope`. Variant set mirrors
+/// `ComposerScope`; [`ScopeTag::of`] is the canonical projection and is
+/// exhaustive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum ScopeTag {
     Line,
     Change,
     Stack,
     Description,
 }
 
-/// Subset of `ComposerScope` whose chord can be refused at keypress time.
-/// Line/Change have no context-absent failure mode (they are always populated
-/// from the cursor / current change), so they are not part of this enum.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RefusableScope {
-    Stack,
-    Description,
+impl ScopeTag {
+    /// The tag corresponding to a borrowed scope. Pure: depends only on the
+    /// enum discriminator.
+    #[must_use]
+    pub(crate) fn of(scope: &ComposerScope) -> Self {
+        match scope {
+            ComposerScope::Line(_) => Self::Line,
+            ComposerScope::Change => Self::Change,
+            ComposerScope::Stack(_) => Self::Stack,
+            ComposerScope::Description(_) => Self::Description,
+        }
+    }
 }
 
-/// Status hint surfaced when ^K is pressed in single-change mode (no `stack`
-/// snapshot). Shared between the chord refusal path and the chrome-time
-/// "stack scope unavailable" line in `composer_overlay`.
+/// Status hint surfaced when Alt+K is pressed in single-change mode (no
+/// stack availability).
 pub(crate) const STATUS_STACK_UNAVAILABLE: &str = "stack scope unavailable in single-change mode";
 
-/// Status hint surfaced when Alt+D is pressed without a description snapshot
-/// (composer not opened from a description line).
+/// Status hint surfaced when Alt+D is pressed without a description
+/// availability snapshot (composer not opened from a description line).
 pub(crate) const STATUS_DESCRIPTION_UNAVAILABLE: &str =
     "description scope unavailable: open from a description line";
+
+/// Status hint surfaced when Alt+L is pressed without a line availability
+/// snapshot (composer opened from a non-commentable cursor — e.g., the
+/// overview screen, or a description-only context).
+pub(crate) const STATUS_LINE_UNAVAILABLE: &str =
+    "line scope unavailable: cursor is not on a commentable line";
 
 /// All data needed to build a `LineAnchor` once the composer saves.
 /// Naming note: `source_line`/`target_line` map to `old_line`/`new_line` in
@@ -55,19 +80,6 @@ pub(crate) struct LineTarget {
     pub(crate) context_after: Vec<String>,
 }
 
-/// Snapshot of change-level context captured at composer open time.
-///
-/// `change_id` is the typed `ChangeId` of the change the comment will attach to
-/// when scope is `ComposerScope::Change`. For composers opened from the main
-/// view this is `app.details.change_id`; for composers opened from the stack
-/// overview it is the `change_id` of the cursor row (which may differ from the
-/// currently loaded change).
-#[derive(Debug, Clone)]
-pub(crate) struct ChangeContext {
-    pub(crate) change_id: ChangeId,
-    pub(crate) description: String,
-}
-
 /// Snapshot of stack-level context captured at composer open time.
 #[derive(Debug, Clone)]
 pub(crate) struct StackContextSnapshot {
@@ -75,10 +87,11 @@ pub(crate) struct StackContextSnapshot {
     pub(crate) revset_hash: RevsetHash,
 }
 
-/// Description-scope context captured at composer open time. Mirrors
-/// `ChangeContext`/`StackContextSnapshot`; carries the cursor's 1-based line
-/// number plus the surrounding context window used to build a
-/// `DescriptionAnchor` on save.
+/// Description-scope context captured at composer open time. Carries the
+/// cursor's 1-based line number plus the surrounding context window used to
+/// build a `DescriptionAnchor` on save. The `change_id` may differ from the
+/// composer's top-level `change_id` when editing a description-anchored
+/// comment that belongs to a non-current change.
 #[derive(Debug, Clone)]
 pub(crate) struct DescriptionContext {
     pub(crate) change_id: ChangeId,
@@ -88,79 +101,106 @@ pub(crate) struct DescriptionContext {
     pub(crate) context_after: Vec<String>,
 }
 
-/// Per-scope context snapshots, captured at composer open time so the chrome
-/// block can swap immediately when the reviewer presses ^L/^C/^K without
-/// needing to reach back into App.
-#[derive(Debug, Clone)]
-pub(crate) struct ComposerContexts {
-    /// Always present; for Description scope, a synthetic `LineTarget` with
-    /// empty path is used (the description view has no diff line).
-    pub(crate) line: LineTarget,
-    pub(crate) change: ChangeContext,
-    /// `None` in single-change mode; stack ^K save will refuse if None.
-    pub(crate) stack: Option<StackContextSnapshot>,
-    /// `None` when the composer was not opened from a description line. Present
-    /// when the cursor was on a `DescriptionLine` at open time.
-    pub(crate) description: Option<DescriptionContext>,
+/// Construction data for a new composer. The `*_available` snapshots advertise
+/// "you can switch to this scope at chord time"; the chosen `scope` carries
+/// the payload for the currently active scope. `change_id` and
+/// `change_description` live on the composer regardless of scope because the
+/// scope picker label always shows the change's short id, and the
+/// Change-scope chrome reads the description.
+pub(crate) struct ComposerInit {
+    pub(crate) scope: ComposerScope,
+    pub(crate) severity: Severity,
+    pub(crate) change_id: ChangeId,
+    pub(crate) change_description: String,
+    pub(crate) line_available: Option<LineTarget>,
+    pub(crate) stack_available: Option<StackContextSnapshot>,
+    pub(crate) description_available: Option<DescriptionContext>,
+}
+
+/// Edit-mode coupling for `Composer`. When the composer is in edit mode
+/// (vs. composing a new comment), all three fields are populated together:
+/// `identity` keys the on-disk record by `created_at`, `original_anchor` is
+/// the anchor of the comment being edited at open time (load-bearing for
+/// delete, which never re-anchors regardless of chord-time scope swaps),
+/// and `original` carries the full source `Comment` for paths that can't
+/// resolve the record through `App::loaded_comments` (i.e., the stack
+/// overview's edit path).
+pub(crate) struct EditingContext {
+    pub(crate) identity: OffsetDateTime,
+    pub(crate) original_anchor: Anchor,
+    pub(crate) original: Option<Comment>,
 }
 
 /// State for the comment composer modal.
+///
+/// `*_available` advertises whether the matching scope variant is
+/// constructible from current state — `Some(...)` means "constructible,"
+/// `None` means the cursor or app context can't supply the required payload.
+///
+/// When `scope` is the matching variant, `*_available` may or may not also
+/// be `Some(...)` — they refer to *different* sources. `scope` carries the
+/// payload for the active scope (which may have been built from a stored
+/// anchor at edit time or synthesized for the single-change Stack case);
+/// `*_available` carries the payload that Alt+<scope> would re-resolve to
+/// from the current cursor. They can disagree on values, and Alt+<scope>
+/// always re-resolves from `*_available` (even if scope is already that
+/// variant).
 pub(crate) struct Composer {
-    pub(crate) contexts: ComposerContexts,
     pub(crate) scope: ComposerScope,
     pub(crate) severity: Severity,
     pub(crate) body: TextArea<'static>,
-    /// When `Some(created_at)`, the composer is in edit mode and `^X` will
-    /// call `update_comment` instead of `save_comment`. The timestamp
-    /// identifies the record on disk.
-    pub(crate) editing: Option<OffsetDateTime>,
-    /// In edit mode, the source `Comment` snapshot when the editor was opened
-    /// from a context that doesn't expose the record through `loaded_comments`
-    /// (i.e., the stack overview). Save/delete use this snapshot's anchor
-    /// directly. `None` for new comments and for main-view line-comment edits.
-    pub(crate) original: Option<Comment>,
+    /// `Some` when the composer is in edit mode; `None` for new comments.
+    /// The folded payload keeps the edit-mode fields impossible to drift
+    /// out of sync.
+    pub(crate) editing: Option<EditingContext>,
     /// In-modal status hint, set when a chord is refused (Alt+D without
-    /// description snapshot, ^K without stack snapshot). Cleared on the next
-    /// keypress so the hint doesn't linger after the user moves on.
+    /// description availability, Alt+K without stack availability, Alt+L
+    /// without line availability). Cleared on the next keypress so the hint
+    /// doesn't linger after the user moves on.
     pub(crate) refusal_status: Option<&'static str>,
-}
-
-impl Composer {
-    /// Convenience accessor: the line target from the contexts.
-    pub(crate) fn line_target(&self) -> &LineTarget {
-        &self.contexts.line
-    }
+    /// Target change for `Change`-scope save and the picker-row's short-id
+    /// label. Differs from `app.details.change_id` when the composer was
+    /// opened from an overview cursor pointing at a non-current change.
+    pub(crate) change_id: ChangeId,
+    /// Description text rendered as chrome on the Change-scope context block.
+    /// Empty when the target change is not the current change (the body is
+    /// not loaded for non-current changes).
+    pub(crate) change_description: String,
+    /// Line-scope payload available from current cursor; `None` means cursor is on a non-commentable row.
+    pub(crate) line_available: Option<LineTarget>,
+    /// Stack-scope payload available from current app state; `None` in single-change mode.
+    pub(crate) stack_available: Option<StackContextSnapshot>,
+    /// Description-scope payload available from current cursor; `None` when cursor is not on a description line.
+    pub(crate) description_available: Option<DescriptionContext>,
 }
 
 /// Bundle of fields drawn from a single `Comment` to seed an edit-mode
 /// composer. Constructing this in the caller keeps `severity`, `body`, and
-/// the `identity` timestamp from drifting apart at the `for_edit` boundary.
-///
-/// `original`, when `Some`, carries the full source `Comment` so save/delete
-/// from contexts that don't have the comment in `App::loaded_comments` (i.e.,
-/// the stack overview) can route through the store using the original anchor.
-/// `None` is used for line-comment edits opened from the main view, where the
-/// in-memory `loaded_comments` lookup keyed by `created_at` is the source of
-/// truth.
+/// the edit-mode coupling fields from drifting apart at the `for_edit`
+/// boundary. `original_anchor` is mandatory; `original` is `Some` only when
+/// the source record lives outside `App::loaded_comments` (the stack
+/// overview's edit path).
 pub(crate) struct EditedComment {
-    pub(crate) contexts: ComposerContexts,
-    pub(crate) severity: Severity,
+    pub(crate) init: ComposerInit,
     pub(crate) body: String,
     pub(crate) identity: OffsetDateTime,
-    pub(crate) scope: ComposerScope,
     pub(crate) original: Option<Comment>,
+    pub(crate) original_anchor: Anchor,
 }
 
 impl Composer {
-    pub(crate) fn new(contexts: ComposerContexts, severity: Severity) -> Self {
+    pub(crate) fn new(init: ComposerInit) -> Self {
         Self {
-            contexts,
-            scope: default_scope_for_cursor(),
-            severity,
+            scope: init.scope,
+            severity: init.severity,
             body: TextArea::default(),
             editing: None,
-            original: None,
             refusal_status: None,
+            change_id: init.change_id,
+            change_description: init.change_description,
+            line_available: init.line_available,
+            stack_available: init.stack_available,
+            description_available: init.description_available,
         }
     }
 
@@ -173,13 +213,20 @@ impl Composer {
             textarea.insert_str(line);
         }
         Self {
-            contexts: edited.contexts,
-            scope: edited.scope,
-            severity: edited.severity,
+            scope: edited.init.scope,
+            severity: edited.init.severity,
             body: textarea,
-            editing: Some(edited.identity),
-            original: edited.original,
+            editing: Some(EditingContext {
+                identity: edited.identity,
+                original_anchor: edited.original_anchor,
+                original: edited.original,
+            }),
             refusal_status: None,
+            change_id: edited.init.change_id,
+            change_description: edited.init.change_description,
+            line_available: edited.init.line_available,
+            stack_available: edited.init.stack_available,
+            description_available: edited.init.description_available,
         }
     }
 
@@ -190,29 +237,20 @@ impl Composer {
         } else {
             "Comment"
         };
-        match self.scope {
-            ComposerScope::Line => {
-                let file = self.contexts.line.file.display();
-                let line = self
-                    .contexts
-                    .line
-                    .target_line
-                    .or(self.contexts.line.source_line)
-                    .unwrap_or(0);
-                format!("{prefix} · {file}:{line}")
+        match &self.scope {
+            ComposerScope::Line(line) => {
+                let file = line.file.display();
+                let line_no = line.target_line.or(line.source_line).unwrap_or(0);
+                format!("{prefix} · {file}:{line_no}")
             }
             ComposerScope::Change => {
-                let id = self.contexts.change.change_id.as_str();
+                let id = self.change_id.as_str();
                 format!("{prefix} · change {id}")
             }
-            ComposerScope::Stack => format!("{prefix} · stack"),
-            ComposerScope::Description => {
-                if let Some(ctx) = &self.contexts.description {
-                    let line = ctx.target_line.unwrap_or(0);
-                    format!("{prefix} · description:{line}")
-                } else {
-                    format!("{prefix} · description")
-                }
+            ComposerScope::Stack(_) => format!("{prefix} · stack"),
+            ComposerScope::Description(ctx) => {
+                let line = ctx.target_line.unwrap_or(0);
+                format!("{prefix} · description:{line}")
             }
         }
     }
@@ -234,31 +272,33 @@ pub(crate) enum ComposerAction {
     /// `^D` pressed while in edit mode; caller should delete the original
     /// comment and close the composer.
     Delete,
-    /// Scope chord pressed without a backing context snapshot.
-    RefusedScopeChord(RefusableScope),
+    /// Scope chord pressed without a backing availability snapshot. The
+    /// payload is the status string the dispatcher should surface; it
+    /// matches `composer.refusal_status` for the same keypress.
+    RefusedScopeChord(&'static str),
 }
 
 /// Handle a key event inside the composer.
 ///
-/// Scope chords (`^L`, `^C`, `^K`) and save/delete (`^X`, `^D`) are Ctrl-
-/// chorded; severity chords (`Alt+R`, `Alt+S`, `Alt+N`) plus description
-/// scope (`Alt+D`) are Alt-chorded because `Ctrl+digit` is unreliable across
-/// terminals (Ctrl+3 = ESC, Ctrl+2 = NUL) and Ctrl-letter chords for
-/// severity collide with Sublime/VS Code-style "save" interception (Ctrl+S)
-/// and tui-textarea's next-line binding (Ctrl+N). All intercepted keys are
+/// Scope chords (`Alt+L`, `Alt+C`, `Alt+K`, `Alt+D`) and severity chords
+/// (`Alt+R`, `Alt+S`, `Alt+N`) are Alt-chorded; save/delete (`^X`, `^D`)
+/// remain Ctrl-chorded. The scope chords moved off Ctrl because `^K` is
+/// intercepted by tui-textarea ("delete to end of line"), `^C` is
+/// inconsistently delivered as SIGINT vs. as a Char key across terminals,
+/// and `^L` collides with redraw bindings in some hosts; under raw mode the
+/// Alt prefix avoids those collisions entirely. All intercepted keys are
 /// consumed before being passed to tui-textarea; everything else flows
 /// through.
 ///
-/// Scope chords whose context snapshot is absent (`^K` in single-change mode
-/// without a `stack` snapshot, `Alt+D` outside the description view without
-/// a `description` snapshot) return `RefusedScopeChord(scope)` so the caller
+/// Scope chords whose availability snapshot is absent (`Alt+L` without
+/// `line_available`, `Alt+K` without `stack_available`, `Alt+D` without
+/// `description_available`) return `RefusedScopeChord(status)` so the caller
 /// can surface a status hint. The scope itself is left unchanged — the radio
-/// never points at a scope without backing context.
-///
-/// `^C` is captured as scope=Change — NOT as SIGINT.
+/// never points at a scope without backing context. `Alt+C` (Change) is
+/// unconditional because `change_id` lives on the composer directly.
 #[expect(
     clippy::wildcard_enum_match_arm,
-    reason = "unhandled Ctrl+KeyCode variants are intentionally ignored; forwarded to textarea"
+    reason = "unhandled Alt+/Ctrl+ KeyCode variants are intentionally ignored; forwarded to textarea"
 )]
 pub(crate) fn handle_composer_key(composer: &mut Composer, key: KeyEvent) -> ComposerAction {
     // Any keypress (including refusal-producing chords below, which overwrite
@@ -267,22 +307,6 @@ pub(crate) fn handle_composer_key(composer: &mut Composer, key: KeyEvent) -> Com
 
     if key.modifiers == KeyModifiers::CONTROL {
         match key.code {
-            KeyCode::Char('l') => {
-                composer.scope = ComposerScope::Line;
-                return ComposerAction::Continue;
-            }
-            KeyCode::Char('c') => {
-                composer.scope = ComposerScope::Change;
-                return ComposerAction::Continue;
-            }
-            KeyCode::Char('k') => {
-                if composer.contexts.stack.is_some() {
-                    composer.scope = ComposerScope::Stack;
-                    return ComposerAction::Continue;
-                }
-                composer.refusal_status = Some(STATUS_STACK_UNAVAILABLE);
-                return ComposerAction::RefusedScopeChord(RefusableScope::Stack);
-            }
             KeyCode::Char('x') => {
                 return ComposerAction::Save;
             }
@@ -295,6 +319,26 @@ pub(crate) fn handle_composer_key(composer: &mut Composer, key: KeyEvent) -> Com
 
     if key.modifiers == KeyModifiers::ALT {
         match key.code {
+            KeyCode::Char('l' | 'L') => {
+                if let Some(line) = composer.line_available.clone() {
+                    composer.scope = ComposerScope::Line(line);
+                    return ComposerAction::Continue;
+                }
+                composer.refusal_status = Some(STATUS_LINE_UNAVAILABLE);
+                return ComposerAction::RefusedScopeChord(STATUS_LINE_UNAVAILABLE);
+            }
+            KeyCode::Char('c' | 'C') => {
+                composer.scope = ComposerScope::Change;
+                return ComposerAction::Continue;
+            }
+            KeyCode::Char('k' | 'K') => {
+                if let Some(stack) = composer.stack_available.clone() {
+                    composer.scope = ComposerScope::Stack(stack);
+                    return ComposerAction::Continue;
+                }
+                composer.refusal_status = Some(STATUS_STACK_UNAVAILABLE);
+                return ComposerAction::RefusedScopeChord(STATUS_STACK_UNAVAILABLE);
+            }
             KeyCode::Char('r' | 'R') => {
                 composer.severity = Severity::Required;
                 return ComposerAction::Continue;
@@ -308,12 +352,12 @@ pub(crate) fn handle_composer_key(composer: &mut Composer, key: KeyEvent) -> Com
                 return ComposerAction::Continue;
             }
             KeyCode::Char('d' | 'D') => {
-                if composer.contexts.description.is_some() {
-                    composer.scope = ComposerScope::Description;
+                if let Some(desc) = composer.description_available.clone() {
+                    composer.scope = ComposerScope::Description(desc);
                     return ComposerAction::Continue;
                 }
                 composer.refusal_status = Some(STATUS_DESCRIPTION_UNAVAILABLE);
-                return ComposerAction::RefusedScopeChord(RefusableScope::Description);
+                return ComposerAction::RefusedScopeChord(STATUS_DESCRIPTION_UNAVAILABLE);
             }
             _ => {}
         }
@@ -325,11 +369,6 @@ pub(crate) fn handle_composer_key(composer: &mut Composer, key: KeyEvent) -> Com
 
     composer.body.input(key);
     ComposerAction::Continue
-}
-
-#[must_use]
-pub(crate) fn default_scope_for_cursor() -> ComposerScope {
-    ComposerScope::Line
 }
 
 /// Choose the opening severity for a new comment.
@@ -380,7 +419,7 @@ pub(crate) fn format_age_secs(secs: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::comment::Severity;
+    use crate::comment::{LineAnchor, Severity, Side};
 
     fn make_target() -> LineTarget {
         LineTarget {
@@ -398,23 +437,40 @@ mod tests {
         }
     }
 
-    fn make_contexts() -> ComposerContexts {
-        ComposerContexts {
-            line: make_target(),
-            change: ChangeContext {
-                change_id: ChangeId::parse("abc12345").unwrap(),
-                description: "Add retry policy".to_owned(),
-            },
-            stack: Some(StackContextSnapshot {
+    fn make_init(severity: Severity) -> ComposerInit {
+        let target = make_target();
+        ComposerInit {
+            scope: ComposerScope::Line(target.clone()),
+            severity,
+            change_id: ChangeId::parse("abc12345").unwrap(),
+            change_description: "Add retry policy".to_owned(),
+            line_available: Some(target),
+            stack_available: Some(StackContextSnapshot {
                 revset: "trunk()..@".to_owned(),
                 revset_hash: RevsetHash::from_revset("trunk()..@"),
             }),
-            description: None,
+            description_available: None,
         }
     }
 
     fn make_composer(severity: Severity) -> Composer {
-        Composer::new(make_contexts(), severity)
+        Composer::new(make_init(severity))
+    }
+
+    fn make_line_anchor() -> Anchor {
+        Anchor::Line {
+            change_id: ChangeId::parse("abc12345").unwrap(),
+            location: LineAnchor {
+                file: PathBuf::from("src/client.rs"),
+                side: Side::New,
+                old_line: None,
+                new_line: Some(142),
+                hunk_header: "@@ -138,8 +138,14 @@ impl Client {".to_owned(),
+                target_text: ".execute(|| self.inner.request(req.clone()))".to_owned(),
+                context_before: vec![],
+                context_after: vec![],
+            },
+        }
     }
 
     #[test]
@@ -429,11 +485,6 @@ mod tests {
     #[test]
     fn default_severity_falls_back_to_suggestion() {
         assert_eq!(default_severity(None), Severity::Suggestion);
-    }
-
-    #[test]
-    fn default_scope_for_cursor_returns_line() {
-        assert_eq!(default_scope_for_cursor(), ComposerScope::Line);
     }
 
     #[test]
@@ -482,31 +533,65 @@ mod tests {
     }
 
     #[test]
-    fn handle_composer_key_ctrl_l_sets_line_scope() {
+    fn handle_composer_key_alt_l_sets_line_scope() {
+        let mut c = make_composer(Severity::Suggestion);
+        c.scope = ComposerScope::Change;
+        let key = KeyEvent::new(KeyCode::Char('l'), KeyModifiers::ALT);
+        let action = handle_composer_key(&mut c, key);
+        assert_eq!(action, ComposerAction::Continue);
+        assert!(matches!(c.scope, ComposerScope::Line(_)));
+    }
+
+    #[test]
+    fn handle_composer_key_alt_c_sets_change_scope() {
+        let mut c = make_composer(Severity::Suggestion);
+        let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::ALT);
+        let action = handle_composer_key(&mut c, key);
+        assert_eq!(action, ComposerAction::Continue);
+        assert!(matches!(c.scope, ComposerScope::Change));
+    }
+
+    #[test]
+    fn handle_composer_key_alt_k_sets_stack_scope() {
+        let mut c = make_composer(Severity::Suggestion);
+        let key = KeyEvent::new(KeyCode::Char('k'), KeyModifiers::ALT);
+        let action = handle_composer_key(&mut c, key);
+        assert_eq!(action, ComposerAction::Continue);
+        assert!(matches!(c.scope, ComposerScope::Stack(_)));
+    }
+
+    // Pin the regression: under CONTROL, L/C/K must NOT trigger a scope
+    // switch (Ctrl+K collides with tui-textarea's "delete to end of line",
+    // and Ctrl+C is delivered inconsistently across terminals). The keys are
+    // forwarded to the textarea; the action is `Continue`.
+    #[test]
+    fn handle_composer_key_ctrl_k_does_not_switch_scope() {
+        let mut c = make_composer(Severity::Suggestion);
+        c.scope = ComposerScope::Change;
+        let key = KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL);
+        let action = handle_composer_key(&mut c, key);
+        assert_eq!(action, ComposerAction::Continue);
+        assert!(matches!(c.scope, ComposerScope::Change));
+    }
+
+    #[test]
+    fn handle_composer_key_ctrl_l_does_not_switch_scope() {
         let mut c = make_composer(Severity::Suggestion);
         c.scope = ComposerScope::Change;
         let key = KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL);
         let action = handle_composer_key(&mut c, key);
         assert_eq!(action, ComposerAction::Continue);
-        assert_eq!(c.scope, ComposerScope::Line);
+        assert!(matches!(c.scope, ComposerScope::Change));
     }
 
     #[test]
-    fn handle_composer_key_ctrl_c_sets_change_scope() {
+    fn handle_composer_key_ctrl_c_does_not_switch_scope() {
         let mut c = make_composer(Severity::Suggestion);
+        // Start with the default (Line); Ctrl+C must not flip to Change.
         let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         let action = handle_composer_key(&mut c, key);
         assert_eq!(action, ComposerAction::Continue);
-        assert_eq!(c.scope, ComposerScope::Change);
-    }
-
-    #[test]
-    fn handle_composer_key_ctrl_k_sets_stack_scope() {
-        let mut c = make_composer(Severity::Suggestion);
-        let key = KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL);
-        let action = handle_composer_key(&mut c, key);
-        assert_eq!(action, ComposerAction::Continue);
-        assert_eq!(c.scope, ComposerScope::Stack);
+        assert!(matches!(c.scope, ComposerScope::Line(_)));
     }
 
     #[test]
@@ -578,45 +663,54 @@ mod tests {
     #[test]
     fn composer_title_new_mode_stack_scope() {
         let mut c = make_composer(Severity::Suggestion);
-        c.scope = ComposerScope::Stack;
+        let stack = c
+            .stack_available
+            .clone()
+            .expect("test fixture sets stack_available");
+        c.scope = ComposerScope::Stack(stack);
         assert_eq!(c.title(), "Comment · stack");
     }
 
     #[test]
     fn composer_title_edit_mode() {
         let c = Composer::for_edit(EditedComment {
-            contexts: make_contexts(),
-            severity: Severity::Required,
+            init: make_init(Severity::Required),
             body: "existing body".to_owned(),
             identity: OffsetDateTime::UNIX_EPOCH,
-            scope: ComposerScope::Line,
             original: None,
+            original_anchor: make_line_anchor(),
         });
         assert_eq!(c.title(), "Edit comment · src/client.rs:142");
     }
 
     #[test]
     fn composer_title_edit_mode_change_scope() {
+        let mut init = make_init(Severity::Required);
+        init.scope = ComposerScope::Change;
         let c = Composer::for_edit(EditedComment {
-            contexts: make_contexts(),
-            severity: Severity::Required,
+            init,
             body: "existing body".to_owned(),
             identity: OffsetDateTime::UNIX_EPOCH,
-            scope: ComposerScope::Change,
             original: None,
+            original_anchor: make_line_anchor(),
         });
         assert_eq!(c.title(), "Edit comment · change abc12345");
     }
 
     #[test]
     fn composer_title_edit_mode_stack_scope() {
+        let mut init = make_init(Severity::Required);
+        let stack = init
+            .stack_available
+            .clone()
+            .expect("test fixture sets stack_available");
+        init.scope = ComposerScope::Stack(stack);
         let c = Composer::for_edit(EditedComment {
-            contexts: make_contexts(),
-            severity: Severity::Required,
+            init,
             body: "existing body".to_owned(),
             identity: OffsetDateTime::UNIX_EPOCH,
-            scope: ComposerScope::Stack,
             original: None,
+            original_anchor: make_line_anchor(),
         });
         assert_eq!(c.title(), "Edit comment · stack");
     }
@@ -624,28 +718,30 @@ mod tests {
     #[test]
     fn for_edit_prepopulates_body_and_severity() {
         let c = Composer::for_edit(EditedComment {
-            contexts: make_contexts(),
-            severity: Severity::Required,
+            init: make_init(Severity::Required),
             body: "line one\nline two".to_owned(),
             identity: OffsetDateTime::UNIX_EPOCH,
-            scope: ComposerScope::Line,
             original: None,
+            original_anchor: make_line_anchor(),
         });
         assert_eq!(c.body_text(), "line one\nline two");
         assert_eq!(c.severity, Severity::Required);
-        assert_eq!(c.editing, Some(OffsetDateTime::UNIX_EPOCH));
-        assert_eq!(c.scope, ComposerScope::Line);
+        let ctx = c
+            .editing
+            .as_ref()
+            .expect("for_edit-built composer is in edit mode");
+        assert_eq!(ctx.identity, OffsetDateTime::UNIX_EPOCH);
+        assert!(matches!(c.scope, ComposerScope::Line(_)));
     }
 
     #[test]
     fn ctrl_d_in_edit_mode_returns_delete() {
         let mut c = Composer::for_edit(EditedComment {
-            contexts: make_contexts(),
-            severity: Severity::Note,
+            init: make_init(Severity::Note),
             body: "body".to_owned(),
             identity: OffsetDateTime::UNIX_EPOCH,
-            scope: ComposerScope::Line,
             original: None,
+            original_anchor: make_line_anchor(),
         });
         let key = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
         let action = handle_composer_key(&mut c, key);
@@ -670,48 +766,67 @@ mod tests {
         }
     }
 
-    // -- B5: Alt+D switches to Description scope when a description context
-    //   snapshot is present.
+    // -- B5: Alt+D switches to Description scope when a description
+    //   availability snapshot is present.
     #[test]
     fn handle_composer_key_alt_d_sets_description_scope_when_snapshot_present() {
         let mut c = make_composer(Severity::Suggestion);
-        c.contexts.description = Some(make_description_context());
+        c.description_available = Some(make_description_context());
         let key = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::ALT);
         let action = handle_composer_key(&mut c, key);
         assert_eq!(action, ComposerAction::Continue);
-        assert_eq!(c.scope, ComposerScope::Description);
+        assert!(matches!(c.scope, ComposerScope::Description(_)));
     }
 
-    // -- U3: Alt+D without a snapshot returns RefusedScopeChord(Description)
-    //   so the caller can surface a status hint. Scope is unchanged.
+    // -- U3: Alt+D without a snapshot returns RefusedScopeChord with the
+    //   description-unavailable status. Scope is unchanged.
     #[test]
     fn handle_composer_key_alt_d_emits_refusal_status_when_snapshot_absent() {
         let mut c = make_composer(Severity::Suggestion);
-        c.scope = ComposerScope::Line;
-        assert!(c.contexts.description.is_none());
+        c.scope = ComposerScope::Change;
+        assert!(c.description_available.is_none());
         let key = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::ALT);
         let action = handle_composer_key(&mut c, key);
         assert_eq!(
             action,
-            ComposerAction::RefusedScopeChord(RefusableScope::Description)
+            ComposerAction::RefusedScopeChord(STATUS_DESCRIPTION_UNAVAILABLE)
         );
-        assert_eq!(c.scope, ComposerScope::Line);
+        assert!(matches!(c.scope, ComposerScope::Change));
     }
 
-    // -- U3: ^K without a stack snapshot returns RefusedScopeChord(Stack).
-    //   Single-change mode has `stack: None`.
+    // -- U3: Alt+K without a stack snapshot returns
+    //   RefusedScopeChord(STATUS_STACK_UNAVAILABLE). Single-change mode has
+    //   `stack_available: None`.
     #[test]
-    fn handle_composer_key_ctrl_k_emits_refusal_status_when_stack_unavailable() {
+    fn handle_composer_key_alt_k_emits_refusal_status_when_stack_unavailable() {
         let mut c = make_composer(Severity::Suggestion);
-        c.contexts.stack = None;
-        c.scope = ComposerScope::Line;
-        let key = KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL);
+        c.stack_available = None;
+        c.scope = ComposerScope::Change;
+        let key = KeyEvent::new(KeyCode::Char('k'), KeyModifiers::ALT);
         let action = handle_composer_key(&mut c, key);
         assert_eq!(
             action,
-            ComposerAction::RefusedScopeChord(RefusableScope::Stack)
+            ComposerAction::RefusedScopeChord(STATUS_STACK_UNAVAILABLE)
         );
-        assert_eq!(c.scope, ComposerScope::Line);
+        assert!(matches!(c.scope, ComposerScope::Change));
+    }
+
+    // -- Alt+L without a line snapshot returns
+    //   RefusedScopeChord(STATUS_LINE_UNAVAILABLE). Composers opened from a
+    //   non-commentable cursor (overview, description-only) carry
+    //   `line_available: None`.
+    #[test]
+    fn handle_composer_key_alt_l_emits_refusal_status_when_line_unavailable() {
+        let mut c = make_composer(Severity::Suggestion);
+        c.line_available = None;
+        c.scope = ComposerScope::Change;
+        let key = KeyEvent::new(KeyCode::Char('l'), KeyModifiers::ALT);
+        let action = handle_composer_key(&mut c, key);
+        assert_eq!(
+            action,
+            ComposerAction::RefusedScopeChord(STATUS_LINE_UNAVAILABLE)
+        );
+        assert!(matches!(c.scope, ComposerScope::Change));
     }
 
     // -- E2: refusal hint stored on `composer.refusal_status` so the modal can
@@ -719,7 +834,7 @@ mod tests {
     #[test]
     fn composer_refusal_status_visible_in_modal_when_alt_d_pressed_without_snapshot() {
         let mut c = make_composer(Severity::Suggestion);
-        assert!(c.contexts.description.is_none());
+        assert!(c.description_available.is_none());
         assert!(c.refusal_status.is_none(), "starts unset");
         handle_composer_key(&mut c, KeyEvent::new(KeyCode::Char('d'), KeyModifiers::ALT));
         assert_eq!(c.refusal_status, Some(STATUS_DESCRIPTION_UNAVAILABLE));
@@ -731,16 +846,13 @@ mod tests {
         assert_eq!(c.refusal_status, None);
     }
 
-    // -- T-E2-stack-clear: ^K refusal pins both set AND clear, symmetric with
-    //   the Alt+D test.
+    // -- T-E2-stack-clear: Alt+K refusal pins both set AND clear, symmetric
+    //   with the Alt+D test.
     #[test]
-    fn composer_refusal_status_set_on_ctrl_k_without_stack() {
+    fn composer_refusal_status_set_on_alt_k_without_stack() {
         let mut c = make_composer(Severity::Suggestion);
-        c.contexts.stack = None;
-        handle_composer_key(
-            &mut c,
-            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
-        );
+        c.stack_available = None;
+        handle_composer_key(&mut c, KeyEvent::new(KeyCode::Char('k'), KeyModifiers::ALT));
         assert_eq!(c.refusal_status, Some(STATUS_STACK_UNAVAILABLE));
         // Next non-refusing keypress clears the hint.
         handle_composer_key(
@@ -757,14 +869,11 @@ mod tests {
     fn status_row_height_zero_when_refusal_status_none_and_reclaims_after_clear() {
         use crate::tui::composer_overlay::{status_row_height, STATUS_ROWS_FOR_TEST};
         let mut c = make_composer(Severity::Suggestion);
-        c.contexts.stack = None;
+        c.stack_available = None;
         // Initial state: no refusal → 0 rows.
         assert_eq!(status_row_height(&c), 0);
-        // ^K without stack → refusal hint set → STATUS_ROWS_FOR_TEST.
-        handle_composer_key(
-            &mut c,
-            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
-        );
+        // Alt+K without stack → refusal hint set → STATUS_ROWS_FOR_TEST.
+        handle_composer_key(&mut c, KeyEvent::new(KeyCode::Char('k'), KeyModifiers::ALT));
         assert_eq!(status_row_height(&c), STATUS_ROWS_FOR_TEST);
         // Next non-refusing keypress → cleared → 0 rows again.
         handle_composer_key(
@@ -772,5 +881,58 @@ mod tests {
             KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
         );
         assert_eq!(status_row_height(&c), 0);
+    }
+
+    // Sum-type guarantees: each scope variant carries the data needed to
+    // build its `Anchor` at save time. These tests don't exercise behavior at
+    // runtime — they pin that the type forces callers to provide the payload
+    // by construction (the test would not compile if a payload were missing).
+    #[test]
+    fn composer_scope_line_carries_line_target() {
+        let target = make_target();
+        let scope = ComposerScope::Line(target.clone());
+        match scope {
+            ComposerScope::Line(carried) => {
+                assert_eq!(carried.file, target.file);
+                assert_eq!(carried.target_line, target.target_line);
+            }
+            ComposerScope::Change | ComposerScope::Stack(_) | ComposerScope::Description(_) => {
+                unreachable!("constructed Line variant")
+            }
+        }
+    }
+
+    #[test]
+    fn composer_scope_stack_carries_stack_context() {
+        let snapshot = StackContextSnapshot {
+            revset: "trunk()..@".to_owned(),
+            revset_hash: RevsetHash::from_revset("trunk()..@"),
+        };
+        let scope = ComposerScope::Stack(snapshot.clone());
+        match scope {
+            ComposerScope::Stack(carried) => {
+                assert_eq!(carried.revset, snapshot.revset);
+                assert_eq!(carried.revset_hash, snapshot.revset_hash);
+            }
+            ComposerScope::Line(_) | ComposerScope::Change | ComposerScope::Description(_) => {
+                unreachable!("constructed Stack variant")
+            }
+        }
+    }
+
+    #[test]
+    fn composer_scope_description_carries_description_context() {
+        let ctx = make_description_context();
+        let scope = ComposerScope::Description(ctx.clone());
+        match scope {
+            ComposerScope::Description(carried) => {
+                assert_eq!(carried.change_id, ctx.change_id);
+                assert_eq!(carried.target_line, ctx.target_line);
+                assert_eq!(carried.target_text, ctx.target_text);
+            }
+            ComposerScope::Line(_) | ComposerScope::Change | ComposerScope::Stack(_) => {
+                unreachable!("constructed Description variant")
+            }
+        }
     }
 }
