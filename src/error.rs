@@ -106,4 +106,9 @@ pub enum JjrError {
         exit_code.map_or_else(|| "signal".to_owned(), |c| c.to_string())
     ))]
     ClaudeFailed { exit_code: Option<i32> },
+
+    #[snafu(display(
+        "review packet ({size} bytes) exceeds {limit}-byte argv limit; chunk the stack or omit context"
+    ))]
+    PromptTooLarge { size: usize, limit: usize },
 }

@@ -619,9 +619,12 @@ These are related but distinct:
 - `jjr packet [revset]` generates the review packet and writes it to stdout (or
   `-o <path>`). It does not invoke Claude. Useful for inspection, debugging, and
   piping.
-- `jjr claude [revset]` generates the same packet and invokes Claude CLI with
-  it. Equivalent to `jjr packet [revset] | claude -p -`, but managed by the tool
-  so working-copy state and exit handling are consistent.
+- `jjr claude [revset]` generates the same packet and invokes Claude CLI with it
+  interactively. Roughly equivalent to `claude "$(jjr packet [revset])"`, but
+  managed by the tool so working-copy state and exit handling are consistent.
+  Claude runs interactively (no `-p`) so the user can approve edits in real
+  time; Claude takes over the terminal for the session and returns control on
+  exit.
 
 `jjr packet` is the inspectable artifact. `jjr claude` is the action.
 
