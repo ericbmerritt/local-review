@@ -23,6 +23,7 @@ use crate::comment::{
 use crate::cursor;
 use crate::error::{JjrError, Result};
 use crate::jj::{self, ChangeDetails};
+use crate::reviewed::{ReviewTarget, ReviewedState};
 use crate::stack::{ResolvedStack, RevsetHash, StackEntry};
 use crate::util::{clamp_with_delta, page_size, pluralize, truncate};
 
@@ -103,6 +104,10 @@ const STATUS_AT_FIRST_FILE: &str = "already at the first file";
 /// files), so cycling cannot move in either direction.
 const STATUS_ONLY_ONE_FILE: &str = "only one file";
 
+/// Suffix appended to the file-header title when the active view has been
+/// auto-marked reviewed.
+const REVIEWED_TITLE_SUFFIX: &str = "(reviewed)";
+
 /// Severity -> terminal color.
 pub(super) fn severity_color(severity: Severity) -> Color {
     match severity {
@@ -151,6 +156,34 @@ pub fn run_stack(
             .map(|v| !v.is_empty())
             .unwrap_or(false)
     };
+
+    // Smart-resume rule: when the stored cursor change is missing from the
+    // current stack (or the cursor file is absent / corrupt), walk LATEST→
+    // OLDEST and pick the most-recent change that is NOT fully reviewed.
+    // The reviewed-state needed to answer that question lives in
+    // `.jj-review/reviewed.json`; load it once for the resume decision and
+    // hand the entry IDs to a closure that asks the store about each.
+    let reviewed_state = ReviewedState::load(repo_root).unwrap_or_default();
+    let entries_by_id: std::collections::HashMap<ChangeId, &StackEntry> = resolved
+        .entries
+        .iter()
+        .map(|e| (e.change_id.clone(), e))
+        .collect();
+    let is_fully_reviewed = |id: &ChangeId| -> bool {
+        let Some(entry) = entries_by_id.get(id) else {
+            return false;
+        };
+        let diff_paths = match jj::diff_for_change(id) {
+            Ok(diff) => diff
+                .files
+                .iter()
+                .map(|f| f.display_path().to_owned())
+                .collect::<Vec<_>>(),
+            Err(_) => return false,
+        };
+        reviewed_state.is_marked_fully_reviewed(id, &entry.commit_id, &diff_paths)
+    };
+
     let start_index = cursor::resume_index(
         repo_root,
         resolved.revset_hash,
@@ -160,6 +193,7 @@ pub fn run_stack(
             .map(|e| e.change_id.clone())
             .collect::<Vec<_>>(),
         &has_comments,
+        &is_fully_reviewed,
     );
 
     let entry = &resolved.entries[start_index];
@@ -342,6 +376,10 @@ struct App {
     /// invalid and must be rebuilt the next time the overview is opened.
     overview_cache: Option<OverviewCommentSet>,
     severity_filter: Option<Severity>,
+    /// Persistent reviewed-bits, one entry per `(change_id, commit_id)`.
+    /// Auto-marked whenever the user lands on a file via Tab/Shift-Tab,
+    /// file picker, refresh, or stack-mode change-load.
+    reviewed: ReviewedState,
 }
 
 impl App {
@@ -354,6 +392,12 @@ impl App {
     ) -> Self {
         let rendered_per_file = build_rendered_views(&details);
         let annotated_per_file = rendered_per_file.clone();
+        // A load failure on `.jj-review/reviewed.json` should not block the
+        // TUI — fall back to an empty state so the reviewer still gets a
+        // working session, and any subsequent mark + save will overwrite the
+        // bad file. The atomic-rename save can't preserve corruption, so the
+        // file self-heals on the next mark.
+        let reviewed = ReviewedState::load(&repo_root).unwrap_or_default();
         Self {
             details,
             repo_root,
@@ -375,6 +419,7 @@ impl App {
             pending_reanchor: None,
             overview_cache: None,
             severity_filter: None,
+            reviewed,
         }
     }
 
@@ -384,6 +429,67 @@ impl App {
 
     fn current_line_count(&self) -> usize {
         self.current_view().map_or(0, |v| v.lines.len())
+    }
+
+    /// Resolve the current `(file_index)` to a [`ReviewTarget`]. `file_index`
+    /// 0 is the synthetic description view; indices 1.. map onto
+    /// `details.diff.files[i - 1]`. Returns `None` only when `file_index` is
+    /// past the end (degenerate state — no diff files and no description).
+    fn current_review_target(&self) -> Option<ReviewTarget> {
+        if self.file_index == 0 {
+            return Some(ReviewTarget::Description);
+        }
+        let diff_file_idx = self.file_index - 1;
+        let path = self
+            .details
+            .diff
+            .files
+            .get(diff_file_idx)?
+            .display_path()
+            .to_owned();
+        Some(ReviewTarget::File(path))
+    }
+
+    /// Auto-mark the active view (description or file) as reviewed for the
+    /// current `(change_id, commit_id)`. Persists immediately so a crash
+    /// before the next event loop iteration does not lose the bit.
+    ///
+    /// A persist failure is recorded in `status_message` only when nothing
+    /// else has claimed it on this tick — Tab-at-boundary, "refreshed", and
+    /// other purpose-set messages must not be silently clobbered by an
+    /// auto-mark side effect. The in-memory state remains authoritative for
+    /// the running session regardless.
+    fn mark_current_file_reviewed(&mut self) {
+        let Some(target) = self.current_review_target() else {
+            return;
+        };
+        let change_id = self.details.change_id.clone();
+        let commit_id = self.details.commit_id.clone();
+        self.reviewed.mark(change_id, commit_id, target);
+        if let Err(e) = self.reviewed.save(&self.repo_root) {
+            if self.status_message.is_none() {
+                self.status_message = Some(format!(
+                    "warning: could not save reviewed state: {}",
+                    sanitize_for_status(&e.to_string())
+                ));
+            }
+        }
+    }
+
+    fn is_view_reviewed(&self, file_index: usize) -> bool {
+        let Some(entry) = self.reviewed.entries.get(&self.details.change_id) else {
+            return false;
+        };
+        if entry.commit_id != self.details.commit_id {
+            return false;
+        }
+        if file_index == 0 {
+            return entry.description_reviewed;
+        }
+        let Some(file) = self.details.diff.files.get(file_index - 1) else {
+            return false;
+        };
+        entry.reviewed_files.contains(file.display_path())
     }
 
     fn refresh_inline_comments(&mut self) {
@@ -524,6 +630,10 @@ impl App {
             self.status_message = Some(STATUS_ONLY_ONE_FILE.to_owned());
             self.line_index = 0;
             self.scroll = 0;
+            // Single-view changes still count as a landing event — mark the
+            // sole view reviewed so the change can flip to fully-reviewed
+            // without requiring a Tab that has nowhere to go.
+            self.mark_current_file_reviewed();
             return;
         }
         let max_index = count - 1;
@@ -539,6 +649,7 @@ impl App {
         self.file_index = new_index;
         self.line_index = 0;
         self.scroll = 0;
+        self.mark_current_file_reviewed();
     }
 
     fn ensure_cursor_visible(&mut self, viewport_rows: u16) {
@@ -647,12 +758,29 @@ impl App {
             })
             .collect();
 
+        // Load each change's diff once at overview-open time. Best-effort: a
+        // failure for one change leaves an empty path list, which makes the
+        // reviewed-status predicate return "description-only" — better than
+        // refusing to render the overview entirely.
+        let diff_paths_per_change: Vec<Vec<PathBuf>> = entries
+            .iter()
+            .map(|entry| match jj::diff_for_change(&entry.change_id) {
+                Ok(diff) => diff
+                    .files
+                    .iter()
+                    .map(|f| f.display_path().to_owned())
+                    .collect(),
+                Err(_) => Vec::new(),
+            })
+            .collect();
+
         let orphaned = collect_orphaned_comments(&repo_root, &entries);
 
         self.overview_cache = Some(OverviewCommentSet {
             stack_level,
             per_change,
             orphaned,
+            diff_paths_per_change,
         });
     }
 
@@ -695,6 +823,7 @@ impl App {
         }
 
         self.refresh_inline_comments();
+        self.mark_current_file_reviewed();
 
         if advance {
             let _ = cursor::record(&self.repo_root, revset_hash, &revset, &change_id);
@@ -807,6 +936,10 @@ fn run_app(
     let transition_mode = load_transition_mode(&repo_root);
     let mut app = App::new(details, repo_root, revset, stack, transition_mode);
     app.refresh_inline_comments();
+    // The reviewer just landed on the initial file_index (0 = description).
+    // Treat that as a review event so a single-view change can flip to
+    // fully-reviewed without requiring further navigation.
+    app.mark_current_file_reviewed();
 
     while !app.should_quit {
         terminal
@@ -985,7 +1118,16 @@ fn file_header_label(app: &App) -> String {
 fn render_file_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let label = file_header_label(app);
     let block = Block::default().borders(Borders::ALL).title("File");
-    let widget = Paragraph::new(label).block(block);
+    let line = if app.is_view_reviewed(app.file_index) {
+        TuiLine::from(vec![
+            Span::raw(label),
+            Span::raw(" "),
+            Span::styled(REVIEWED_TITLE_SUFFIX, Style::default().fg(Color::Green)),
+        ])
+    } else {
+        TuiLine::from(label)
+    };
+    let widget = Paragraph::new(line).block(block);
     frame.render_widget(widget, area);
 }
 
@@ -1505,6 +1647,7 @@ fn view_in_source(app: &mut App) {
     } else {
         app.line_index = 0;
     }
+    app.mark_current_file_reviewed();
 }
 
 fn enter_reanchor_mode(app: &mut App) {
@@ -1540,6 +1683,7 @@ fn enter_reanchor_mode(app: &mut App) {
             app.file_index = fidx + 1;
             app.line_index = 0;
             app.scroll = 0;
+            app.mark_current_file_reviewed();
         }
         None => {
             app.status_message = Some(
@@ -1737,16 +1881,7 @@ fn invoke_claude_from_tui(app: &mut App) -> Result<()> {
 
     match outcome? {
         crate::claude::ClaudeOutcome::Success => match jj::show(&change_id) {
-            Ok(details) => {
-                app.rendered_per_file = build_rendered_views(&details);
-                app.annotated_per_file = app.rendered_per_file.clone();
-                app.details = details;
-                app.file_index = 0;
-                app.line_index = 0;
-                app.scroll = 0;
-                app.overview_cache = None;
-                app.refresh_inline_comments();
-            }
+            Ok(details) => apply_post_claude_reload(app, details),
             Err(e) => {
                 app.status_message = Some(format!(
                     "claude completed; could not reload diff: {}",
@@ -1762,6 +1897,19 @@ fn invoke_claude_from_tui(app: &mut App) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Pure in-memory side of `invoke_claude_from_tui`'s post-Claude success
+/// path. Claude may have rewritten anything in the change, so reset the
+/// cursor to the description before rebuilding so the reviewer doesn't
+/// land mid-file in code that no longer corresponds to where they were.
+/// Extracted so the auto-mark wiring is unit-testable without spawning
+/// claude or `jj show`.
+fn apply_post_claude_reload(app: &mut App, details: ChangeDetails) {
+    app.file_index = 0;
+    app.line_index = 0;
+    app.scroll = 0;
+    rebuild_views_and_mark(app, details);
 }
 
 fn suspend_tui() -> Result<()> {
@@ -2883,7 +3031,16 @@ fn build_rendered_views(details: &ChangeDetails) -> Vec<DiffView> {
 }
 
 fn open_file_picker(app: &mut App) {
-    let entries = build_file_picker_entries(&app.details.diff.files, &app.loaded_comments);
+    // Snapshot the current change_id+commit_id and reviewed entry once, so
+    // the closure handed to `build_entries` resolves view-by-view without
+    // re-borrowing `app` per row.
+    let reviewed_view_indices: std::collections::HashSet<usize> = (0..app.rendered_per_file.len())
+        .filter(|i| app.is_view_reviewed(*i))
+        .collect();
+    let entries =
+        build_file_picker_entries(&app.details.diff.files, &app.loaded_comments, &|view_idx| {
+            reviewed_view_indices.contains(&view_idx)
+        });
     app.screen = Screen::FilePicker(FilePickerState {
         selected_index: 0,
         scroll_offset: 0,
@@ -2938,6 +3095,7 @@ fn file_picker_enter(app: &mut App) {
     if is_binary {
         app.status_message = Some("binary file — no commentable lines".to_owned());
         app.line_index = 0;
+        app.mark_current_file_reviewed();
         return;
     }
     let first_commentable = app
@@ -2956,17 +3114,14 @@ fn file_picker_enter(app: &mut App) {
         })
         .unwrap_or(0);
     app.line_index = first_commentable;
+    app.mark_current_file_reviewed();
 }
 
 fn refresh_current_change(app: &mut App) {
     let change_id = app.details.change_id.clone();
     match jj::show(&change_id) {
         Ok(details) => {
-            app.rendered_per_file = build_rendered_views(&details);
-            app.annotated_per_file = app.rendered_per_file.clone();
-            app.details = details;
-            app.overview_cache = None;
-            app.refresh_inline_comments();
+            apply_refreshed_change(app, details);
             app.status_message = Some("refreshed".to_owned());
         }
         Err(e) => {
@@ -2976,6 +3131,26 @@ fn refresh_current_change(app: &mut App) {
             ));
         }
     }
+}
+
+/// Shared rebuild + mark sequence used by both the refresh path
+/// (preserves cursor; reviewer is mid-thought) and the post-Claude reload
+/// path (resets cursor; Claude may have rewritten the file under them).
+/// Caller is responsible for any cursor-reset bookkeeping BEFORE calling.
+fn rebuild_views_and_mark(app: &mut App, details: ChangeDetails) {
+    app.rendered_per_file = build_rendered_views(&details);
+    app.annotated_per_file = app.rendered_per_file.clone();
+    app.details = details;
+    app.overview_cache = None;
+    app.refresh_inline_comments();
+    app.mark_current_file_reviewed();
+}
+
+/// Pure in-memory side of `refresh_current_change`. Refresh preserves the
+/// cursor position because the reviewer is mid-thought. Pulled out so the
+/// auto-mark wiring is unit-testable without spawning `jj show`.
+fn apply_refreshed_change(app: &mut App, details: ChangeDetails) {
+    rebuild_views_and_mark(app, details);
 }
 
 fn toggle_severity_filter(app: &mut App, severity: Severity) {
@@ -7289,5 +7464,410 @@ mod tests {
             overview_first_change_row_has_idx(&buf_fit),
             "outer width 100 should render the idx column regardless of overflow"
         );
+    }
+
+    /// Build an `App` rooted at `repo_root` (a writable tempdir) with one
+    /// description plus `files` worth of diff files. Used by the reviewed-
+    /// status tests so `mark_current_file_reviewed` actually persists rather
+    /// than tripping the read-only-`/repo` short-circuit.
+    fn make_app_in_dir(repo_root: PathBuf, files: Vec<DiffFile>) -> App {
+        let details = ChangeDetails {
+            change_id: ChangeId::parse(&"a".repeat(32)).unwrap(),
+            commit_id: CommitId::parse(&"a".repeat(40)).unwrap(),
+            description: "desc".to_owned(),
+            diff: Diff { files },
+        };
+        App::new(
+            details,
+            repo_root,
+            "@".to_owned(),
+            None,
+            TransitionMode::Never,
+        )
+    }
+
+    #[test]
+    fn is_view_reviewed_returns_false_initially() {
+        let app = make_app_with_single_file(sample_diff_file());
+        assert!(!app.is_view_reviewed(0));
+        assert!(!app.is_view_reviewed(1));
+    }
+
+    #[test]
+    fn mark_current_file_reviewed_sets_description_bit_on_index_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = make_app_in_dir(dir.path().to_owned(), vec![sample_diff_file()]);
+        app.file_index = 0;
+        app.mark_current_file_reviewed();
+        assert!(app.is_view_reviewed(0));
+        assert!(!app.is_view_reviewed(1));
+    }
+
+    #[test]
+    fn mark_current_file_reviewed_sets_file_bit_on_diff_file_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = make_app_in_dir(dir.path().to_owned(), vec![sample_diff_file()]);
+        app.file_index = 1;
+        app.mark_current_file_reviewed();
+        assert!(app.is_view_reviewed(1));
+        assert!(!app.is_view_reviewed(0));
+    }
+
+    #[test]
+    fn mark_current_file_reviewed_persists_across_load() {
+        // Round-trip: mark, load fresh state from disk, mark survives.
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = make_app_in_dir(dir.path().to_owned(), vec![sample_diff_file()]);
+        app.file_index = 0;
+        app.mark_current_file_reviewed();
+
+        // Re-load into a brand-new App and confirm the bit is still set.
+        let app2 = make_app_in_dir(dir.path().to_owned(), vec![sample_diff_file()]);
+        assert!(app2.is_view_reviewed(0));
+    }
+
+    #[test]
+    fn cycle_file_auto_marks_landed_view_as_reviewed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = make_app_in_dir(
+            dir.path().to_owned(),
+            vec![sample_diff_file(), sample_diff_file_b()],
+        );
+        // Start at description (file_index=0). Cycle forward to the first
+        // diff file; that view must auto-mark as reviewed.
+        app.file_index = 0;
+        app.cycle_file(1);
+        assert_eq!(app.file_index, 1);
+        assert!(
+            app.is_view_reviewed(1),
+            "cycle_file landing must auto-mark the new file"
+        );
+    }
+
+    #[test]
+    fn file_header_label_renders_without_reviewed_suffix_in_pure_text() {
+        // The (reviewed) suffix is added at the Span level inside
+        // `render_file_header`. The pure label helper stays untouched so
+        // existing width/positioning tests don't have to plumb reviewed
+        // state through.
+        let app = make_app_with_single_file(sample_diff_file());
+        let label = file_header_label(&app);
+        assert!(!label.contains(REVIEWED_TITLE_SUFFIX));
+    }
+
+    fn sample_diff_file_b() -> DiffFile {
+        DiffFile::Modified {
+            path: PathBuf::from("bar.txt"),
+            hunks: vec![Hunk {
+                header: "@@ -1,1 +1,1 @@".to_owned(),
+                function_context: None,
+                source_start: 1,
+                source_length: 1,
+                target_start: 1,
+                target_length: 1,
+                lines: vec![Line {
+                    kind: LineKind::Context,
+                    text: "ctx".to_owned(),
+                    source_line: Some(1),
+                    target_line: Some(1),
+                }],
+            }],
+        }
+    }
+
+    // ---- T1: initial-land mark on run_app ----
+
+    /// `run_app` calls `mark_current_file_reviewed` immediately after the
+    /// first `refresh_inline_comments`. We can't drive `run_app` in a unit
+    /// test (it owns the terminal), but the wiring is `App::new` →
+    /// `refresh_inline_comments` → `mark_current_file_reviewed`. Pin the
+    /// composed effect: after that sequence, the description bit is set.
+    #[test]
+    fn initial_land_marks_description_reviewed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = make_app_in_dir(dir.path().to_owned(), vec![sample_diff_file()]);
+        // file_index starts at 0 (description). Drive the same two calls
+        // run_app makes before the event loop.
+        app.refresh_inline_comments();
+        app.mark_current_file_reviewed();
+
+        let entry = app.reviewed.entries.get(&app.details.change_id).unwrap();
+        assert!(
+            entry.description_reviewed,
+            "initial land must mark description reviewed"
+        );
+    }
+
+    // ---- T2: save-failure status warning + is_none() guard ----
+
+    /// Read-only repo root → save fails. With `status_message=None`, the
+    /// warning IS set. Pins that real save failures DO surface to the user
+    /// when nothing else has claimed the line.
+    #[test]
+    fn mark_current_file_reviewed_surfaces_save_failure_when_status_is_none() {
+        // `/repo` doesn't exist on a normal test box, so atomic_write_bytes
+        // can't `create_dir_all` it (the macOS sandbox refuses to write
+        // outside the user's tree). That's the same scenario the existing
+        // `make_app_with_single_file` helper uses to provoke save failures
+        // in other tests.
+        let mut app = make_app_with_single_file(sample_diff_file());
+        app.status_message = None;
+        app.file_index = 1;
+        app.mark_current_file_reviewed();
+        assert!(
+            app.status_message
+                .as_ref()
+                .is_some_and(|m| m.contains("could not save reviewed state")),
+            "save failure must surface when nothing else has claimed status; got: {:?}",
+            app.status_message
+        );
+    }
+
+    /// With `status_message` already set, `mark_current_file_reviewed` must
+    /// NOT clobber it on save failure — purpose-set messages survive.
+    #[test]
+    fn mark_current_file_reviewed_preserves_existing_status_on_save_failure() {
+        let mut app = make_app_with_single_file(sample_diff_file());
+        app.status_message = Some("already at the last file".to_owned());
+        app.file_index = 1;
+        app.mark_current_file_reviewed();
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("already at the last file"),
+            "existing status must survive save-failure warning"
+        );
+    }
+
+    // ---- T3: navigation-site auto-mark coverage ----
+
+    /// `enter_reanchor_mode` resolves the comment's file in the diff,
+    /// updates `file_index`, and must auto-mark. Drive the same code path
+    /// directly: build a stale-screen state with a comment whose file is
+    /// in the diff, then invoke `enter_reanchor_mode`.
+    #[test]
+    fn enter_reanchor_mode_auto_marks_landed_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = make_app_in_dir(dir.path().to_owned(), vec![sample_diff_file()]);
+        // Build a stale comment anchored at foo.txt (the path on
+        // sample_diff_file).
+        let stale = Comment {
+            schema_version: SchemaVersion,
+            anchor: Anchor::Line {
+                change_id: app.details.change_id.clone(),
+                location: LineAnchor {
+                    file: PathBuf::from("foo.txt"),
+                    side: Side::New,
+                    old_line: None,
+                    new_line: Some(1),
+                    hunk_header: "@@ -1,2 +1,3 @@".to_owned(),
+                    target_text: "ctx".to_owned(),
+                    context_before: vec![],
+                    context_after: vec![],
+                },
+            },
+            repo_root: PathBuf::from("/repo"),
+            revset: "@".to_owned(),
+            commit_id: None,
+            body: "stale".to_owned(),
+            severity: Severity::Note,
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
+            updated_at: None,
+            status: Some(Status::Stale),
+            mismatch_reason: None,
+        };
+        app.loaded_comments = vec![stale];
+        app.screen = Screen::Stale(StaleScreenState {
+            selected_index: 0,
+            stale_indices: vec![0],
+            scroll_offset: 0,
+        });
+
+        enter_reanchor_mode(&mut app);
+
+        // file_index moved to the foo.txt diff view (index 1) and that
+        // view's path is in reviewed_files.
+        assert_eq!(app.file_index, 1);
+        assert!(
+            app.is_view_reviewed(1),
+            "enter_reanchor_mode must auto-mark"
+        );
+    }
+
+    /// `file_picker_enter` on a non-binary entry sets `file_index`, picks
+    /// a commentable line, and must auto-mark.
+    #[test]
+    fn file_picker_enter_non_binary_auto_marks_landed_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = make_app_in_dir(dir.path().to_owned(), vec![sample_diff_file()]);
+        let entries = file_picker::build_entries(&app.details.diff.files, &[], &|_| false);
+        // Pick the foo.txt entry (view_index=1).
+        let target_idx = entries
+            .iter()
+            .position(|e| e.view_index == 1)
+            .expect("foo.txt entry must exist");
+        app.screen = Screen::FilePicker(FilePickerState {
+            selected_index: target_idx,
+            scroll_offset: 0,
+            entries,
+        });
+
+        file_picker_enter(&mut app);
+
+        assert_eq!(app.file_index, 1);
+        assert!(app.is_view_reviewed(1));
+    }
+
+    /// `file_picker_enter` on a binary entry sets the status and MUST
+    /// still auto-mark — the user "landed" on the view even though there
+    /// are no commentable lines.
+    #[test]
+    fn file_picker_enter_binary_auto_marks_landed_view() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary_file = DiffFile::Binary {
+            path: PathBuf::from("image.png"),
+        };
+        let mut app = make_app_in_dir(dir.path().to_owned(), vec![binary_file]);
+        let entries = file_picker::build_entries(&app.details.diff.files, &[], &|_| false);
+        let bin_idx = entries
+            .iter()
+            .position(|e| e.view_index == 1)
+            .expect("binary entry must exist");
+        app.screen = Screen::FilePicker(FilePickerState {
+            selected_index: bin_idx,
+            scroll_offset: 0,
+            entries,
+        });
+
+        file_picker_enter(&mut app);
+
+        assert_eq!(app.file_index, 1);
+        assert!(
+            app.is_view_reviewed(1),
+            "binary file landing must still auto-mark"
+        );
+    }
+
+    // ---- T6: is_view_reviewed App-level commit_id mismatch ----
+
+    /// `App::is_view_reviewed` has its own `commit_id`-mismatch check.
+    /// Pin it: an entry whose stored `commit_id` no longer matches the
+    /// live `commit_id` must report unreviewed even though the entry
+    /// exists.
+    #[test]
+    fn is_view_reviewed_returns_false_when_app_commit_id_mismatches_stored() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = make_app_in_dir(dir.path().to_owned(), vec![sample_diff_file()]);
+        // Mark file_index=1 reviewed under the current commit_id.
+        app.file_index = 1;
+        app.mark_current_file_reviewed();
+        assert!(app.is_view_reviewed(1));
+
+        // Simulate the change being amended: live commit_id flips, but
+        // the stored entry still references the old one.
+        let new_commit = CommitId::parse(&"b".repeat(40)).unwrap();
+        app.details.commit_id = new_commit;
+
+        assert!(
+            !app.is_view_reviewed(1),
+            "commit_id mismatch must mask the stored bits at the App layer"
+        );
+        assert!(
+            !app.is_view_reviewed(0),
+            "description bit also masked by commit_id mismatch"
+        );
+    }
+
+    // ---- T1: 3 missing mutation site tests ----
+
+    /// Pin the auto-mark wiring on the count==1 `cycle_file` shortcut. A
+    /// description-only change (no diff files) has
+    /// `rendered_per_file.len() == 1`, which exercises the early-return
+    /// branch. Pressing Tab on that change must still mark the view
+    /// reviewed even though `file_index` doesn't change.
+    #[test]
+    fn cycle_file_single_file_shortcut_marks_current_file_reviewed() {
+        let dir = tempfile::tempdir().unwrap();
+        // No diff files → only the description view remains, so
+        // `rendered_per_file.len() == 1`. Use a constructor that doesn't
+        // pre-mark by skipping the initial App::new auto-mark via making a
+        // fresh state by hand.
+        let mut app = make_app_in_dir(dir.path().to_owned(), vec![]);
+        // Clear the post-construction state so we can observe cycle_file's
+        // own mark in isolation.
+        app.reviewed = ReviewedState::default();
+        assert_eq!(app.rendered_per_file.len(), 1, "expected single-view setup");
+        app.file_index = 0;
+
+        app.cycle_file(1);
+
+        let entry = app
+            .reviewed
+            .entries
+            .get(&app.details.change_id)
+            .expect("cycle_file count==1 branch must mark the description");
+        assert!(entry.description_reviewed);
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some(STATUS_ONLY_ONE_FILE),
+            "the only-one-file hint must still surface"
+        );
+    }
+
+    /// Pin auto-mark on `refresh_current_change`'s in-memory side
+    /// (`apply_refreshed_change`). After a refresh, the active view must
+    /// be marked reviewed even if the change id is unchanged.
+    #[test]
+    fn refresh_current_change_marks_current_file_reviewed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = make_app_in_dir(dir.path().to_owned(), vec![sample_diff_file()]);
+        // Position on the diff file (view_index=1) and clear prior state so
+        // the post-refresh mark is observable.
+        app.file_index = 1;
+        app.reviewed = ReviewedState::default();
+
+        // Build a fresh ChangeDetails (same shape) and apply.
+        let new_details = ChangeDetails {
+            change_id: app.details.change_id.clone(),
+            commit_id: app.details.commit_id.clone(),
+            description: app.details.description.clone(),
+            diff: app.details.diff.clone(),
+        };
+        apply_refreshed_change(&mut app, new_details);
+
+        assert!(
+            app.is_view_reviewed(1),
+            "refresh_current_change must auto-mark the active view"
+        );
+    }
+
+    /// Pin auto-mark on the post-Claude reload path
+    /// (`apply_post_claude_reload`). Claude may have rewritten files;
+    /// reload resets `file_index` to 0 (description), which counts as a
+    /// landing event and must auto-mark.
+    #[test]
+    fn invoke_claude_from_tui_post_reload_marks_current_file_reviewed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = make_app_in_dir(dir.path().to_owned(), vec![sample_diff_file()]);
+        app.file_index = 1; // pretend the user was viewing the diff
+        app.reviewed = ReviewedState::default();
+
+        let new_details = ChangeDetails {
+            change_id: app.details.change_id.clone(),
+            commit_id: app.details.commit_id.clone(),
+            description: app.details.description.clone(),
+            diff: app.details.diff.clone(),
+        };
+        apply_post_claude_reload(&mut app, new_details);
+
+        assert_eq!(
+            app.file_index, 0,
+            "post-Claude reload must reset to description"
+        );
+        let entry = app
+            .reviewed
+            .entries
+            .get(&app.details.change_id)
+            .expect("post-reload must mark the description");
+        assert!(entry.description_reviewed);
     }
 }

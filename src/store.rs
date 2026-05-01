@@ -1,12 +1,11 @@
 use std::io::{self, BufRead, Write as _};
 use std::path::{Path, PathBuf};
 
-use tempfile::NamedTempFile;
-
 use crate::change_id::ChangeId;
 use crate::comment::{format_rfc3339, Anchor, Comment, Status, SCHEMA_VERSION_VALUE};
 use crate::error::{JjrError, Result};
 use crate::stack::{ResolvedStack, RevsetHash};
+use crate::util::log_warning;
 
 /// Filename reserved for stack-scoped comments. jj change IDs never start with
 /// `_`, so there is no collision risk.
@@ -302,31 +301,20 @@ fn delete_by_timestamp(existing: Vec<Comment>, key: &str, path: &Path) -> Result
     }
 }
 
-/// Write `comments` to `path` atomically via a same-directory temp file;
-/// same-directory placement ensures the rename stays on one filesystem.
+/// Serialize `comments` to JSONL bytes and write to `path` atomically.
 fn write_file(path: &Path, comments: &[Comment]) -> Result<()> {
     let dir = path.parent().ok_or_else(|| JjrError::Io {
         source: io::Error::other(format!("path has no parent directory: {}", path.display())),
     })?;
-
-    let mut tmp = NamedTempFile::new_in(dir).map_err(|source| JjrError::Io { source })?;
+    let mut buf: Vec<u8> = Vec::new();
     for comment in comments {
         let line = serde_json::to_string(comment).map_err(|e| JjrError::Io {
             source: io::Error::other(e),
         })?;
-        writeln!(tmp, "{line}").map_err(|source| JjrError::Io { source })?;
+        buf.extend_from_slice(line.as_bytes());
+        buf.push(b'\n');
     }
-    tmp.flush().map_err(|source| JjrError::Io { source })?;
-    tmp.persist(path).map_err(|e| JjrError::Io {
-        source: io::Error::other(e),
-    })?;
-    Ok(())
-}
-
-fn log_warning(msg: &str) {
-    let stderr = io::stderr();
-    let mut handle = stderr.lock();
-    let _ = writeln!(handle, "warning: {msg}");
+    crate::util::atomic_write_bytes(dir, path, &buf)
 }
 
 /// Walk `.jj-review/comments/` and return the `ChangeId` for every
@@ -1280,12 +1268,15 @@ mod tests {
         let path = change_file(dir.path(), &id);
         let before = std::fs::read_to_string(&path).unwrap();
 
-        // Force write_file to fail by passing a path whose parent does not
-        // exist. NamedTempFile::new_in will reject the missing directory and
-        // the function must return an Err without disturbing the real file.
-        let bogus = dir.path().join("does/not/exist/sentinel.jsonl");
+        // Force write_file to fail by pointing at a path whose "parent"
+        // is actually a regular file. `create_dir_all` cannot turn that
+        // into a directory, so atomic_write_bytes returns Io and the real
+        // file must remain untouched.
+        let blocker = dir.path().join("blocker.txt");
+        std::fs::write(&blocker, b"i am a file, not a directory").unwrap();
+        let bogus = blocker.join("sentinel.jsonl");
         let err = write_file(&bogus, std::slice::from_ref(&comment));
-        assert!(err.is_err(), "expected Io error from missing parent dir");
+        assert!(err.is_err(), "expected Io error when parent is a file");
 
         let after = std::fs::read_to_string(&path).unwrap();
         assert_eq!(

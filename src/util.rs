@@ -41,6 +41,48 @@ pub(crate) fn truncate(input: &str, max: usize) -> String {
     result
 }
 
+/// Emit a `warning: <msg>` line to stderr, locked for the duration of the
+/// write so concurrent calls do not interleave. Mirrors `store.rs`'s prior
+/// in-place helper; centralizing here keeps the wire format ("warning: …")
+/// in one place and gives reviewed-state load failures the same surface.
+pub(crate) fn log_warning(msg: &str) {
+    use std::io::Write as _;
+    let stderr = std::io::stderr();
+    let mut handle = stderr.lock();
+    let _ = writeln!(handle, "warning: {msg}");
+}
+
+/// Atomically write `bytes` to `path`, creating `dir` if needed.
+///
+/// Three call sites (cursor, comment store, reviewed-state) used to inline
+/// the same `create_dir_all + tempfile + write_all + flush + persist`
+/// sequence; centralizing the idiom here keeps the crash-safety contract in
+/// one named place. `dir` must be the parent directory of `path` (passed
+/// explicitly so the caller can hold an owned `PathBuf` for both without an
+/// extra `parent()` round-trip).
+///
+/// Crash safety: writes go to a randomized sibling temp file, which `persist`
+/// renames into place; same-directory placement keeps the rename on a single
+/// filesystem so the OS can guarantee atomicity.
+pub(crate) fn atomic_write_bytes(
+    dir: &std::path::Path,
+    path: &std::path::Path,
+    bytes: &[u8],
+) -> crate::error::Result<()> {
+    use std::io::Write as _;
+    std::fs::create_dir_all(dir).map_err(|source| crate::error::JjrError::Io { source })?;
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)
+        .map_err(|source| crate::error::JjrError::Io { source })?;
+    tmp.write_all(bytes)
+        .map_err(|source| crate::error::JjrError::Io { source })?;
+    tmp.flush()
+        .map_err(|source| crate::error::JjrError::Io { source })?;
+    tmp.persist(path).map_err(|e| crate::error::JjrError::Io {
+        source: std::io::Error::other(e),
+    })?;
+    Ok(())
+}
+
 /// Append `s` to `word` when `count != 1`. English plurals only; deliberately
 /// simple — the only words this serves are short, regular nouns ("comment",
 /// "change", "suggestion", "note").
@@ -171,6 +213,38 @@ mod tests {
         assert!(!confirm_response("nope"));
         assert!(!confirm_response("sure"));
         assert!(!confirm_response("1"));
+    }
+
+    #[test]
+    fn atomic_write_bytes_writes_payload_and_creates_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("subdir");
+        let target = nested.join("out.txt");
+        atomic_write_bytes(&nested, &target, b"hello").unwrap();
+        let read = std::fs::read(&target).unwrap();
+        assert_eq!(read, b"hello");
+    }
+
+    #[test]
+    fn atomic_write_bytes_replaces_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("out.txt");
+        std::fs::write(&target, b"old").unwrap();
+        atomic_write_bytes(dir.path(), &target, b"new").unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"new");
+    }
+
+    #[test]
+    fn atomic_write_bytes_leaves_no_temp_files_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("out.txt");
+        atomic_write_bytes(dir.path(), &target, b"x").unwrap();
+        let extras: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .filter(|n| n != "out.txt")
+            .collect();
+        assert!(extras.is_empty(), "stray files: {extras:?}");
     }
 
     #[test]

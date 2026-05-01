@@ -1,9 +1,9 @@
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use crate::change_id::ChangeId;
 use crate::error::Result;
 use crate::jj;
+use crate::util::log_warning;
 
 /// RAII guard that restores the jj working copy to its prior position on drop.
 ///
@@ -37,17 +37,15 @@ impl WorkingCopyGuard {
 impl Drop for WorkingCopyGuard {
     fn drop(&mut self) {
         if let Err(e) = jj::edit(&self.repo_root, &self.prior_change) {
-            let mut stderr = std::io::stderr();
-            let _ = writeln!(
-                stderr,
-                "warning: failed to restore working copy to {}: {e}",
-                self.prior_change.as_str()
-            );
-            let _ = writeln!(
-                stderr,
-                "         run `jj edit {}` manually to restore your position",
-                self.prior_change.as_str()
-            );
+            // Concatenate the warning + remediation hint into a single
+            // `\n`-separated message so the whole crash diagnostic stays in
+            // one log entry. The remediation line is indented to mirror the
+            // prior two-writeln visual layout.
+            let prior = self.prior_change.as_str();
+            log_warning(&format!(
+                "failed to restore working copy to {prior}: {e}\n\
+                 \x20        run `jj edit {prior}` manually to restore your position"
+            ));
         }
     }
 }

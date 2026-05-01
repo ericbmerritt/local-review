@@ -187,6 +187,10 @@ pub(super) struct OverviewCommentSet {
     /// current UI; held for future `jjr orphans` surfacing.
     #[expect(dead_code, reason = "held for future jjr orphans surfacing")]
     pub(super) orphaned: Vec<Comment>,
+    /// Per-change diff file paths, parallel to `per_change`. Used to test
+    /// "is this change fully reviewed?" without re-running `jj show` on
+    /// every render.
+    pub(super) diff_paths_per_change: Vec<Vec<std::path::PathBuf>>,
 }
 
 impl OverviewCommentSet {
@@ -411,6 +415,43 @@ struct ChangeRowArgs<'e> {
     budget: ColumnBudget,
     is_current: bool,
     is_selected: bool,
+    /// True iff every file (description + diff files) has been visited for
+    /// this `(change_id, commit_id)`. Drives the leading `✓ ` glyph on the
+    /// row.
+    is_fully_reviewed: bool,
+}
+
+/// Width (chars) of the reviewed-status prefix prepended to every change
+/// row. Fixed at two cells so the column lines up regardless of state.
+const REVIEWED_PREFIX_WIDTH: usize = 2;
+
+/// `✓ ` when fully reviewed, two spaces when not.
+fn reviewed_prefix_text(is_fully_reviewed: bool) -> &'static str {
+    if is_fully_reviewed {
+        "\u{2713} "
+    } else {
+        "  "
+    }
+}
+
+/// Pure budget calculation: how many chars are available for the truncated
+/// description column given the layout decisions above. Pulled out so
+/// `render_change_row_line` stays under the project's 80-line cap.
+fn change_row_desc_budget(budget: ColumnBudget, dot_str: &str) -> usize {
+    let fixed_before_desc = REVIEWED_PREFIX_WIDTH
+        + 2
+        + if budget.show_idx { IDX_WIDTH + 2 } else { 0 }
+        + CHANGE_ID_WIDTH
+        + 2;
+    let right_fixed = if dot_str.is_empty() {
+        3
+    } else {
+        2 + dot_str.chars().count() + 1
+    };
+    budget
+        .inner_width
+        .saturating_sub(fixed_before_desc)
+        .saturating_sub(right_fixed)
 }
 
 /// Render a change row in the table.
@@ -428,7 +469,6 @@ fn render_change_row_line(args: ChangeRowArgs<'_>) -> TuiLine<'_> {
     } else {
         String::new()
     };
-
     let change_id_str: String = args
         .entry
         .change_id
@@ -443,39 +483,21 @@ fn render_change_row_line(args: ChangeRowArgs<'_>) -> TuiLine<'_> {
         .unwrap_or(&[]);
     let hist = SeverityHistogram::from_comments(comments);
     let ds = dot_string(hist);
-
-    let fixed_before_desc =
-        2 + if args.budget.show_idx {
-            IDX_WIDTH + 2
-        } else {
-            0
-        } + CHANGE_ID_WIDTH
-            + 2;
-    let right_fixed = if ds.is_empty() {
-        3
-    } else {
-        2 + ds.chars().count() + 1
-    };
-    let desc_budget = args
-        .budget
-        .inner_width
-        .saturating_sub(fixed_before_desc)
-        .saturating_sub(right_fixed);
-    let desc = truncate(&args.entry.description, desc_budget);
-
+    let desc = truncate(
+        &args.entry.description,
+        change_row_desc_budget(args.budget, &ds),
+    );
     let right_col = if ds.is_empty() {
         "\u{2713}".to_owned()
     } else {
-        ds.clone()
+        ds
     };
 
-    let left_part = if args.budget.show_idx {
+    let left_part_no_prefix = if args.budget.show_idx {
         format!("{cursor}{idx_str}  {change_id_str}  {desc}")
     } else {
         format!("{cursor}{change_id_str}  {desc}")
     };
-    let left_len = left_part.chars().count();
-    let right_len = right_col.chars().count();
     // Pad with " ".repeat(N) plus the literal "  " separator. Subtract 2 to
     // account for the literal separator so total line length equals
     // `inner_width` exactly. Without the subtraction the line is 2 chars
@@ -483,18 +505,31 @@ fn render_change_row_line(args: ChangeRowArgs<'_>) -> TuiLine<'_> {
     let pad = args
         .budget
         .inner_width
-        .saturating_sub(left_len)
-        .saturating_sub(right_len)
+        .saturating_sub(REVIEWED_PREFIX_WIDTH + left_part_no_prefix.chars().count())
+        .saturating_sub(right_col.chars().count())
         .saturating_sub(2);
     let padding = " ".repeat(pad);
-    let text = format!("{left_part}{padding}  {right_col}");
 
-    let style = if args.is_selected {
+    let base_style = if args.is_selected {
         Style::default().add_modifier(Modifier::REVERSED)
     } else {
         Style::default()
     };
-    TuiLine::from(Span::styled(text, style))
+    let prefix_style = if args.is_fully_reviewed {
+        base_style.fg(Color::Green)
+    } else {
+        base_style
+    };
+    TuiLine::from(vec![
+        Span::styled(
+            reviewed_prefix_text(args.is_fully_reviewed).to_owned(),
+            prefix_style,
+        ),
+        Span::styled(
+            format!("{left_part_no_prefix}{padding}  {right_col}"),
+            base_style,
+        ),
+    ])
 }
 
 /// Render a change-level comment inset row (`◆ change · severity · body`).
@@ -573,6 +608,10 @@ struct RowsCtx<'a> {
     budget: ColumnBudget,
     stale_count: usize,
     total_count: usize,
+    /// Parallel to `entries`: true iff change at index `i` is fully reviewed.
+    /// Pre-computed in the caller so the per-row renderer stays a pure
+    /// function of its arguments.
+    fully_reviewed: &'a [bool],
 }
 
 fn rows_to_lines<'a>(rows: &'a [OverviewRow], ctx: &'a RowsCtx<'a>) -> Vec<TuiLine<'a>> {
@@ -601,6 +640,11 @@ fn rows_to_lines<'a>(rows: &'a [OverviewRow], ctx: &'a RowsCtx<'a>) -> Vec<TuiLi
                             budget: ctx.budget,
                             is_current: *ci == ctx.current_change_idx,
                             is_selected,
+                            is_fully_reviewed: ctx
+                                .fully_reviewed
+                                .get(*ci)
+                                .copied()
+                                .unwrap_or(false),
                         })
                     })
                 }
@@ -664,6 +708,25 @@ pub(super) fn render(
     let (body_area, scrollbar_area, mut sb_state) =
         scrollbar_layout_for_view(inner, rows.len(), state.scroll_offset);
 
+    // Pre-compute "fully reviewed" per stack entry so the per-row renderer
+    // stays a pure function of `ChangeRowArgs`. The reviewed-state lives on
+    // `App` and is keyed by `(change_id, commit_id)` — both available on
+    // each `StackEntry`.
+    let fully_reviewed: Vec<bool> = ctx
+        .entries
+        .iter()
+        .enumerate()
+        .map(|(idx, entry)| {
+            let diff_paths = cache
+                .diff_paths_per_change
+                .get(idx)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            app.reviewed
+                .is_marked_fully_reviewed(&entry.change_id, &entry.commit_id, diff_paths)
+        })
+        .collect();
+
     let rows_ctx = RowsCtx {
         selected_row: state.selected_row,
         cache,
@@ -672,6 +735,7 @@ pub(super) fn render(
         budget,
         stale_count,
         total_count,
+        fully_reviewed: &fully_reviewed,
     };
     let lines = rows_to_lines(&rows, &rows_ctx);
 
@@ -748,10 +812,12 @@ mod tests {
     }
 
     fn make_cache(stack_level: Vec<Comment>, per_change: Vec<Vec<Comment>>) -> OverviewCommentSet {
+        let diff_paths_per_change = vec![Vec::new(); per_change.len()];
         OverviewCommentSet {
             stack_level,
             per_change,
             orphaned: vec![],
+            diff_paths_per_change,
         }
     }
 
@@ -1089,6 +1155,14 @@ mod tests {
     /// exactly `inner_width` chars wide. Earlier the line was 2 chars long
     /// because the literal `"  "` separator was uncounted, causing ratatui
     /// to clip the trailing dots/count.
+    /// Concat all spans on a `TuiLine` into a single string for width assertions.
+    fn line_text(line: &TuiLine<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>()
+    }
+
     #[test]
     fn render_change_row_line_width_matches_inner_width_at_80_cols() {
         let entry = make_entry("abc11111", "short desc");
@@ -1102,13 +1176,14 @@ mod tests {
             budget,
             is_current: false,
             is_selected: false,
+            is_fully_reviewed: false,
         });
-        let span = &line.spans[0];
-        let len = span.content.chars().count();
+        let text = line_text(&line);
+        let len = text.chars().count();
         assert_eq!(
             len, budget.inner_width,
             "rendered line must be exactly inner_width ({}) chars; got {}: {:?}",
-            budget.inner_width, len, span.content
+            budget.inner_width, len, text
         );
     }
 
@@ -1124,11 +1199,12 @@ mod tests {
             budget,
             is_current: false,
             is_selected: false,
+            is_fully_reviewed: false,
         });
-        let span = &line.spans[0];
-        assert_eq!(span.content.chars().count(), budget.inner_width);
-        // Zero-comment row should show ✓.
-        assert!(span.content.contains('\u{2713}'));
+        let text = line_text(&line);
+        assert_eq!(text.chars().count(), budget.inner_width);
+        // Zero-comment row should show the no-comments ✓ on the right edge.
+        assert!(text.contains('\u{2713}'));
     }
 
     #[test]
@@ -1144,6 +1220,7 @@ mod tests {
             budget,
             is_current: false,
             is_selected: true,
+            is_fully_reviewed: false,
         });
         let current_only = render_change_row_line(ChangeRowArgs {
             entry: &entry,
@@ -1152,17 +1229,69 @@ mod tests {
             budget,
             is_current: true,
             is_selected: false,
+            is_fully_reviewed: false,
         });
-        let s_text = &selected_only.spans[0].content;
-        let c_text = &current_only.spans[0].content;
+        // Strip the leading 2-char reviewed prefix; the cursor glyph follows.
+        let s_text = line_text(&selected_only);
+        let c_text = line_text(&current_only);
+        let s_after_prefix: String = s_text.chars().skip(REVIEWED_PREFIX_WIDTH).collect();
+        let c_after_prefix: String = c_text.chars().skip(REVIEWED_PREFIX_WIDTH).collect();
         // Selection cursor is U+25B6 (▶); current-change indicator is U+25B8 (▸).
         assert!(
-            s_text.starts_with('\u{25b6}'),
-            "selected row must start with ▶: {s_text:?}"
+            s_after_prefix.starts_with('\u{25b6}'),
+            "selected row must start with ▶ after prefix: {s_after_prefix:?}"
         );
         assert!(
-            c_text.starts_with('\u{25b8}'),
-            "current-change row must start with ▸: {c_text:?}"
+            c_after_prefix.starts_with('\u{25b8}'),
+            "current-change row must start with ▸ after prefix: {c_after_prefix:?}"
         );
+    }
+
+    #[test]
+    fn render_change_row_line_prefixes_check_when_fully_reviewed() {
+        let entry = make_entry("abc11111", "desc");
+        let per_change: Vec<Vec<Comment>> = vec![vec![]];
+        let budget = column_layout(120);
+        let line = render_change_row_line(ChangeRowArgs {
+            entry: &entry,
+            change_idx: 0,
+            per_change_comments: &per_change,
+            budget,
+            is_current: false,
+            is_selected: false,
+            is_fully_reviewed: true,
+        });
+        // The first span carries the reviewed prefix; its content must
+        // begin with ✓ (Color::Green is applied via Style — not asserted
+        // here because text_only assertions stay agnostic to color).
+        assert_eq!(line.spans[0].content.as_ref(), "\u{2713} ");
+    }
+
+    #[test]
+    fn render_change_row_line_prefixes_blank_when_not_fully_reviewed() {
+        let entry = make_entry("abc11111", "desc");
+        let per_change: Vec<Vec<Comment>> = vec![vec![]];
+        let budget = column_layout(120);
+        let line = render_change_row_line(ChangeRowArgs {
+            entry: &entry,
+            change_idx: 0,
+            per_change_comments: &per_change,
+            budget,
+            is_current: false,
+            is_selected: false,
+            is_fully_reviewed: false,
+        });
+        // Two-space prefix preserves alignment.
+        assert_eq!(line.spans[0].content.as_ref(), "  ");
+    }
+
+    #[test]
+    fn reviewed_prefix_text_returns_check_when_reviewed() {
+        assert_eq!(reviewed_prefix_text(true), "\u{2713} ");
+    }
+
+    #[test]
+    fn reviewed_prefix_text_returns_blank_when_not_reviewed() {
+        assert_eq!(reviewed_prefix_text(false), "  ");
     }
 }

@@ -8,6 +8,7 @@ pub mod error;
 pub mod export;
 pub mod jj;
 pub mod packet;
+pub mod reviewed;
 pub mod stack;
 pub mod store;
 pub mod tui;

@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line as TuiLine, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
@@ -30,9 +30,17 @@ pub(super) struct FilePickerEntry {
     /// Index 0 is the synthetic description view; indices 1+ are diff files.
     pub(super) view_index: usize,
     pub(super) comment_count: usize,
+    /// Whether the user has already landed on this view in the current
+    /// `(change_id, commit_id)` pair. Drives the `[✓]` / `[ ]` indicator on
+    /// the right edge of each row.
+    pub(super) reviewed: bool,
 }
 
-pub(super) fn build_entries(files: &[DiffFile], comments: &[Comment]) -> Vec<FilePickerEntry> {
+pub(super) fn build_entries(
+    files: &[DiffFile],
+    comments: &[Comment],
+    is_reviewed: &dyn Fn(usize) -> bool,
+) -> Vec<FilePickerEntry> {
     let mut entries = Vec::with_capacity(files.len() + 1);
 
     let description_comments = comments
@@ -48,6 +56,7 @@ pub(super) fn build_entries(files: &[DiffFile], comments: &[Comment]) -> Vec<Fil
         display_path: PathBuf::from("<description>"),
         view_index: 0,
         comment_count: description_comments,
+        reviewed: is_reviewed(0),
     });
 
     for (diff_file_index, file) in files.iter().enumerate() {
@@ -64,10 +73,12 @@ pub(super) fn build_entries(files: &[DiffFile], comments: &[Comment]) -> Vec<Fil
                 location.file.as_path() == display_path.as_path()
             })
             .count();
+        let view_index = diff_file_index + 1;
         entries.push(FilePickerEntry {
             display_path,
-            view_index: diff_file_index + 1,
+            view_index,
             comment_count,
+            reviewed: is_reviewed(view_index),
         });
     }
 
@@ -110,25 +121,37 @@ pub(super) fn render(frame: &mut Frame<'_>, state: &FilePickerState) {
         } else {
             "  "
         };
+        let reviewed_part = format!("  {}", reviewed_indicator_text(entry.reviewed));
         let count_part = if entry.comment_count > 0 {
             format!("  [{}]", entry.comment_count)
         } else {
             String::new()
         };
         let cursor_chars = cursor.chars().count();
+        let reviewed_chars = reviewed_part.chars().count();
         let count_chars = count_part.chars().count();
         let path_budget = inner_width
             .saturating_sub(cursor_chars)
+            .saturating_sub(reviewed_chars)
             .saturating_sub(count_chars);
         let raw_path = entry.display_path.display().to_string();
         let path = truncate_path_for_width(&raw_path, path_budget);
-        let text = format!("{cursor}{path}{count_part}");
-        let style = if idx == state.selected_index {
+
+        let base_style = if idx == state.selected_index {
             Style::default().add_modifier(Modifier::REVERSED)
         } else {
             Style::default()
         };
-        lines.push(TuiLine::from(Span::styled(text, style)));
+        let reviewed_style = if entry.reviewed {
+            base_style.fg(Color::Green)
+        } else {
+            base_style
+        };
+        lines.push(TuiLine::from(vec![
+            Span::styled(format!("{cursor}{path}"), base_style),
+            Span::styled(reviewed_part, reviewed_style),
+            Span::styled(count_part, base_style),
+        ]));
     }
 
     let widget = Paragraph::new(lines).scroll((scroll, 0));
@@ -137,6 +160,16 @@ pub(super) fn render(frame: &mut Frame<'_>, state: &FilePickerState) {
 
     let footer_widget = Paragraph::new(FILE_PICKER_FOOTER);
     frame.render_widget(footer_widget, footer_area);
+}
+
+/// `[✓]` when reviewed, `[ ]` when not — both variants render brackets so
+/// the column stays aligned across rows.
+pub(super) fn reviewed_indicator_text(reviewed: bool) -> String {
+    if reviewed {
+        "[\u{2713}]".to_owned()
+    } else {
+        "[ ]".to_owned()
+    }
 }
 
 /// Move cursor up or down, clamping to valid range.
@@ -260,7 +293,7 @@ mod tests {
             make_comment("bar.rs", Some(Status::Pending)),
             make_comment("foo.rs", Some(Status::Stale)),
         ];
-        let entries = build_entries(&files, &comments);
+        let entries = build_entries(&files, &comments, &|_| false);
         // entry 0 is the description view
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].display_path, PathBuf::from("<description>"));
@@ -280,7 +313,7 @@ mod tests {
             make_comment("foo.rs", Some(Status::Stale)),
             make_comment("foo.rs", Some(Status::Orphaned)),
         ];
-        let entries = build_entries(&files, &comments);
+        let entries = build_entries(&files, &comments, &|_| false);
         // entry 0 is description, entries 1+ are diff files
         assert_eq!(entries[1].comment_count, 0);
     }
@@ -288,8 +321,30 @@ mod tests {
     #[test]
     fn build_entries_empty_comments_all_zero() {
         let files = diff_files();
-        let entries = build_entries(&files, &[]);
+        let entries = build_entries(&files, &[], &|_| false);
         assert!(entries.iter().all(|e| e.comment_count == 0));
+    }
+
+    #[test]
+    fn build_entries_reviewed_flag_propagates_per_view_index() {
+        let files = diff_files();
+        // Mark only `foo.rs` (view_index=1) reviewed.
+        let entries = build_entries(&files, &[], &|view_idx| view_idx == 1);
+        assert!(!entries[0].reviewed, "description must be unreviewed");
+        assert!(entries[1].reviewed, "foo.rs must be reviewed");
+        assert!(!entries[2].reviewed, "bar.rs must be unreviewed");
+    }
+
+    #[test]
+    fn reviewed_indicator_text_uses_check_when_reviewed() {
+        assert_eq!(reviewed_indicator_text(true), "[\u{2713}]");
+    }
+
+    #[test]
+    fn reviewed_indicator_text_uses_blank_when_unreviewed() {
+        // Both brackets must render even when unmarked, so the ✓/space
+        // column lines up across rows.
+        assert_eq!(reviewed_indicator_text(false), "[ ]");
     }
 
     #[test]
@@ -298,7 +353,7 @@ mod tests {
         let mut state = FilePickerState {
             selected_index: 0,
             scroll_offset: 0,
-            entries: build_entries(&files, &[]),
+            entries: build_entries(&files, &[], &|_| false),
         };
         move_cursor(&mut state, 1);
         assert_eq!(state.selected_index, 1);
@@ -310,7 +365,7 @@ mod tests {
         let mut state = FilePickerState {
             selected_index: 0,
             scroll_offset: 0,
-            entries: build_entries(&files, &[]),
+            entries: build_entries(&files, &[], &|_| false),
         };
         move_cursor(&mut state, -1);
         assert_eq!(state.selected_index, 0);
@@ -319,7 +374,7 @@ mod tests {
     #[test]
     fn move_cursor_down_clamps_at_last() {
         let files = diff_files();
-        let entries = build_entries(&files, &[]);
+        let entries = build_entries(&files, &[], &|_| false);
         let entry_count = entries.len();
         let mut state = FilePickerState {
             selected_index: entry_count - 1,
@@ -333,7 +388,7 @@ mod tests {
     #[test]
     fn build_entries_view_indices_start_at_zero_for_description() {
         let files = diff_files();
-        let entries = build_entries(&files, &[]);
+        let entries = build_entries(&files, &[], &|_| false);
         // entry 0 is description (view_index 0); diff files follow at 1, 2, ...
         assert_eq!(entries[0].view_index, 0);
         for (i, entry) in entries[1..].iter().enumerate() {
@@ -412,6 +467,7 @@ mod tests {
                 },
                 view_index: i,
                 comment_count: 0,
+                reviewed: false,
             })
             .collect();
         FilePickerState {
