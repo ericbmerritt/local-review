@@ -46,6 +46,13 @@ Views
 Actions
     C                     send current change to Claude
 
+Review tracking
+    U                     toggle reviewed status on current file
+                          (description or diff file under cursor)
+    ✓                     reviewed indicator: file picker, stack overview
+                          right edge, main-view title. Auto-marked on land;
+                          U is the escape hatch.
+
 Stack overview  (press s from main view)
     ↑ ↓     k j           select row
     Enter                 open change (on change row) / edit comment (on comment row)
@@ -79,3 +86,49 @@ In comment composer
     ^D                    delete (edit mode only)
     Esc                   cancel
 ";
+
+#[cfg(test)]
+mod tests {
+    use super::HELP_BODY;
+
+    #[test]
+    fn help_body_contains_review_tracking_section_header() {
+        assert!(
+            HELP_BODY.contains("Review tracking"),
+            "help must list a `Review tracking` section after Saskia's redesign"
+        );
+    }
+
+    #[test]
+    fn help_body_documents_u_keybind_for_toggle() {
+        // The chord and its semantic must both appear so users learn what
+        // U does without having to press it. Pinned together so a future
+        // edit can't drop the explanation while keeping the chord (or
+        // vice-versa).
+        assert!(HELP_BODY.contains('U'), "help must mention the U keybind");
+        assert!(
+            HELP_BODY.contains("toggle reviewed status"),
+            "help must explain what U does"
+        );
+    }
+
+    #[test]
+    fn help_body_documents_check_glyph_legend() {
+        // Users see ✓ in three places (file picker, stack overview, file
+        // header). The legend names all three so a glyph spotted anywhere
+        // can be looked up here.
+        assert!(HELP_BODY.contains("\u{2713}"), "help must show the ✓ glyph");
+        assert!(
+            HELP_BODY.contains("file picker"),
+            "help must list `file picker` as a ✓ surface"
+        );
+        assert!(
+            HELP_BODY.contains("stack overview"),
+            "help must list `stack overview` as a ✓ surface"
+        );
+        assert!(
+            HELP_BODY.contains("main-view title"),
+            "help must list `main-view title` as a ✓ surface"
+        );
+    }
+}

@@ -23,7 +23,7 @@ use crate::comment::{
 use crate::cursor;
 use crate::error::{JjrError, Result};
 use crate::jj::{self, ChangeDetails};
-use crate::reviewed::{ReviewTarget, ReviewedState};
+use crate::reviewed::{MarkOutcome, ReviewTarget, ReviewedState};
 use crate::stack::{ResolvedStack, RevsetHash, StackEntry};
 use crate::util::{clamp_with_delta, page_size, pluralize, truncate};
 
@@ -104,9 +104,25 @@ const STATUS_AT_FIRST_FILE: &str = "already at the first file";
 /// files), so cycling cannot move in either direction.
 const STATUS_ONLY_ONE_FILE: &str = "only one file";
 
-/// Suffix appended to the file-header title when the active view has been
-/// auto-marked reviewed.
-const REVIEWED_TITLE_SUFFIX: &str = "(reviewed)";
+/// Trailing glyph appended (`DarkGray`) to the file-header title when the
+/// active view is reviewed. A glyph reads as "done, move on" rather than
+/// `(reviewed)` text, which felt achievement-y.
+const REVIEWED_TITLE_GLYPH: &str = "\u{2713}";
+
+/// Status surfaced when [`App::mark_current_file_reviewed`] detects the
+/// stored entry's `commit_id` no longer matches the live commit (the
+/// change was amended/rebased) and drops the prior reviewed bits as a
+/// result. Distinct from the no-prior-state "first encounter" case, which
+/// stays silent.
+const STATUS_REVIEWED_RESET: &str = "change amended; reviewed state reset";
+
+/// Status set by the manual `U` toggle when the active file goes from
+/// unreviewed to reviewed.
+const STATUS_MARKED_REVIEWED: &str = "file marked as reviewed";
+
+/// Status set by the manual `U` toggle when the active file goes from
+/// reviewed to unreviewed.
+const STATUS_MARKED_UNREVIEWED: &str = "file marked as unreviewed";
 
 /// Severity -> terminal color.
 pub(super) fn severity_color(severity: Severity) -> Color {
@@ -465,7 +481,20 @@ impl App {
         };
         let change_id = self.details.change_id.clone();
         let commit_id = self.details.commit_id.clone();
-        self.reviewed.mark(change_id, commit_id, target);
+        let outcome = self.reviewed.mark(change_id, commit_id, target);
+        // Surface a one-shot toast when the call invalidated a stale entry
+        // for this change (the change was amended/rebased between sessions).
+        // First-encounter marks (no prior entry) stay silent — there is
+        // nothing to "reset". Same `is_none()` guard as the save-failure
+        // warning so purpose-set messages survive. The match is exhaustive
+        // so any future variant added to `MarkOutcome` forces this site to
+        // make an explicit decision.
+        match outcome {
+            MarkOutcome::ResetDueToCommitMismatch if self.status_message.is_none() => {
+                self.status_message = Some(STATUS_REVIEWED_RESET.to_owned());
+            }
+            MarkOutcome::ResetDueToCommitMismatch | MarkOutcome::NoReset => {}
+        }
         if let Err(e) = self.reviewed.save(&self.repo_root) {
             if self.status_message.is_none() {
                 self.status_message = Some(format!(
@@ -473,6 +502,39 @@ impl App {
                     sanitize_for_status(&e.to_string())
                 ));
             }
+        }
+    }
+
+    /// Toggle the reviewed bit for the active view (description or file).
+    /// The escape hatch for cases where auto-mark fired prematurely (the
+    /// reviewer Tabbed past a file without actually reviewing it).
+    ///
+    /// Persists immediately and sets [`STATUS_MARKED_REVIEWED`] /
+    /// [`STATUS_MARKED_UNREVIEWED`] as appropriate.
+    fn toggle_current_file_reviewed(&mut self) {
+        let Some(target) = self.current_review_target() else {
+            return;
+        };
+        let change_id = self.details.change_id.clone();
+        let commit_id = self.details.commit_id.clone();
+        let was_reviewed = self.is_view_reviewed(self.file_index);
+        if was_reviewed {
+            self.reviewed.unmark(&change_id, &commit_id, &target);
+            self.status_message = Some(STATUS_MARKED_UNREVIEWED.to_owned());
+        } else {
+            self.reviewed.mark(change_id, commit_id, target);
+            self.status_message = Some(STATUS_MARKED_REVIEWED.to_owned());
+        }
+        if let Err(e) = self.reviewed.save(&self.repo_root) {
+            // The toggle's own status message conveys the user-facing
+            // outcome; a save failure is a secondary warning. Override
+            // (not ignore) the toggle message so the user sees the
+            // failure — losing the persistence is the more important
+            // thing to surface.
+            self.status_message = Some(format!(
+                "warning: could not save reviewed state: {}",
+                sanitize_for_status(&e.to_string())
+            ));
         }
     }
 
@@ -1122,7 +1184,7 @@ fn render_file_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
         TuiLine::from(vec![
             Span::raw(label),
             Span::raw(" "),
-            Span::styled(REVIEWED_TITLE_SUFFIX, Style::default().fg(Color::Green)),
+            Span::styled(REVIEWED_TITLE_GLYPH, Style::default().fg(Color::DarkGray)),
         ])
     } else {
         TuiLine::from(label)
@@ -1522,6 +1584,7 @@ fn handle_main_key(app: &mut App, key: KeyEvent) -> Result<()> {
         KeyCode::Char('1') => toggle_severity_filter(app, Severity::Required),
         KeyCode::Char('2') => toggle_severity_filter(app, Severity::Suggestion),
         KeyCode::Char('3') => toggle_severity_filter(app, Severity::Note),
+        KeyCode::Char('U') => app.toggle_current_file_reviewed(),
         _ => {}
     }
     Ok(())
@@ -7545,14 +7608,78 @@ mod tests {
     }
 
     #[test]
-    fn file_header_label_renders_without_reviewed_suffix_in_pure_text() {
-        // The (reviewed) suffix is added at the Span level inside
+    fn file_header_label_renders_without_reviewed_glyph_in_pure_text() {
+        // The trailing ✓ glyph is added at the Span level inside
         // `render_file_header`. The pure label helper stays untouched so
         // existing width/positioning tests don't have to plumb reviewed
         // state through.
         let app = make_app_with_single_file(sample_diff_file());
         let label = file_header_label(&app);
-        assert!(!label.contains(REVIEWED_TITLE_SUFFIX));
+        assert!(!label.contains(REVIEWED_TITLE_GLYPH));
+        // And no leftover "(reviewed)" text — Saskia's redesign drops it.
+        assert!(!label.contains("(reviewed)"));
+    }
+
+    #[test]
+    fn render_file_header_appends_check_glyph_when_reviewed() {
+        use ratatui::backend::TestBackend;
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = make_app_in_dir(dir.path().to_owned(), vec![sample_diff_file()]);
+        app.file_index = 1;
+        app.mark_current_file_reviewed();
+        assert!(app.is_view_reviewed(1));
+
+        // Render only the file header into a wide single-row strip so the
+        // ✓ glyph is unambiguously locatable.
+        let backend = TestBackend::new(80, 3);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                render_file_header(frame, frame.area(), &app);
+            })
+            .expect("draw");
+        let buf = terminal.backend().buffer().clone();
+        // Walk the inner row (y=1; the block borders are at y=0 and y=2).
+        let mut glyph_pos: Option<u16> = None;
+        for x in 0..80 {
+            if buf[(x, 1)].symbol() == REVIEWED_TITLE_GLYPH {
+                glyph_pos = Some(x);
+                break;
+            }
+        }
+        let x = glyph_pos.expect(
+            "trailing ✓ glyph must render in the file header when the active view is reviewed",
+        );
+        // Saskia's affect: the ✓ must be DarkGray, not bright Green.
+        assert_eq!(
+            buf[(x, 1)].fg,
+            Color::DarkGray,
+            "trailing ✓ in file header must be DarkGray"
+        );
+    }
+
+    #[test]
+    fn render_file_header_omits_check_glyph_when_unreviewed() {
+        use ratatui::backend::TestBackend;
+        let app = make_app_with_single_file(sample_diff_file());
+        // Default: nothing is marked reviewed for this change_id.
+        assert!(!app.is_view_reviewed(app.file_index));
+
+        let backend = TestBackend::new(80, 3);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                render_file_header(frame, frame.area(), &app);
+            })
+            .expect("draw");
+        let buf = terminal.backend().buffer().clone();
+        for x in 0..80 {
+            assert_ne!(
+                buf[(x, 1)].symbol(),
+                REVIEWED_TITLE_GLYPH,
+                "no ✓ must render when the view is unreviewed"
+            );
+        }
     }
 
     fn sample_diff_file_b() -> DiffFile {
@@ -7869,5 +7996,195 @@ mod tests {
             .get(&app.details.change_id)
             .expect("post-reload must mark the description");
         assert!(entry.description_reviewed);
+    }
+
+    // ---- Saskia tweaks: U keybind toggle ----
+
+    /// Pressing `U` on a file currently marked reviewed unmarks it and sets
+    /// the unreviewed status message.
+    #[test]
+    fn toggle_current_file_reviewed_clears_when_currently_reviewed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = make_app_in_dir(dir.path().to_owned(), vec![sample_diff_file()]);
+        app.file_index = 1;
+        app.mark_current_file_reviewed();
+        assert!(app.is_view_reviewed(1));
+        app.status_message = None;
+
+        app.toggle_current_file_reviewed();
+
+        assert!(
+            !app.is_view_reviewed(1),
+            "U on a reviewed file must unmark it"
+        );
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some(STATUS_MARKED_UNREVIEWED)
+        );
+    }
+
+    /// Pressing `U` on a file currently NOT marked reviewed marks it.
+    /// Symmetric escape hatch — the auto-mark fallback when something
+    /// upstream missed the file.
+    #[test]
+    fn toggle_current_file_reviewed_sets_when_currently_unreviewed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = make_app_in_dir(dir.path().to_owned(), vec![sample_diff_file()]);
+        app.file_index = 1;
+        app.reviewed = ReviewedState::default();
+        assert!(!app.is_view_reviewed(1));
+
+        app.toggle_current_file_reviewed();
+
+        assert!(
+            app.is_view_reviewed(1),
+            "U on an unreviewed file must mark it"
+        );
+        assert_eq!(app.status_message.as_deref(), Some(STATUS_MARKED_REVIEWED));
+    }
+
+    /// Toggle persists immediately — a fresh `App` constructed against the
+    /// same repo root sees the inverted state.
+    #[test]
+    fn toggle_current_file_reviewed_persists_to_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = make_app_in_dir(dir.path().to_owned(), vec![sample_diff_file()]);
+        app.file_index = 1;
+        app.toggle_current_file_reviewed();
+        assert!(app.is_view_reviewed(1));
+
+        let app2 = make_app_in_dir(dir.path().to_owned(), vec![sample_diff_file()]);
+        assert!(
+            app2.is_view_reviewed(1),
+            "toggle must persist across an App reload"
+        );
+    }
+
+    /// Toggle works on the description view (`file_index` == 0) too.
+    #[test]
+    fn toggle_current_file_reviewed_handles_description_view() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = make_app_in_dir(dir.path().to_owned(), vec![sample_diff_file()]);
+        app.file_index = 0;
+        app.reviewed = ReviewedState::default();
+
+        app.toggle_current_file_reviewed();
+        assert!(app.is_view_reviewed(0));
+
+        app.toggle_current_file_reviewed();
+        assert!(!app.is_view_reviewed(0));
+    }
+
+    /// `U` is wired through the main key dispatcher.
+    #[test]
+    fn u_key_from_main_toggles_current_file_reviewed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = make_app_in_dir(dir.path().to_owned(), vec![sample_diff_file()]);
+        app.file_index = 1;
+        app.reviewed = ReviewedState::default();
+
+        let key = KeyEvent::new(KeyCode::Char('U'), KeyModifiers::NONE);
+        handle_main_key(&mut app, key).unwrap();
+
+        assert!(
+            app.is_view_reviewed(1),
+            "U keybind must mark the current file"
+        );
+    }
+
+    // ---- Saskia tweaks: commit_id invalidation toast ----
+
+    /// Touching a known change with a different `commit_id` (the change
+    /// was amended/rebased) drops the prior reviewed bits AND surfaces a
+    /// status toast naming the reset.
+    #[test]
+    fn mark_current_file_reviewed_surfaces_reset_toast_on_commit_id_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = make_app_in_dir(dir.path().to_owned(), vec![sample_diff_file()]);
+        // First, mark the description reviewed under the original commit_id.
+        app.file_index = 0;
+        app.mark_current_file_reviewed();
+        // Simulate the change being amended: live commit_id flips.
+        let new_commit = CommitId::parse(&"b".repeat(40)).unwrap();
+        app.details.commit_id = new_commit;
+        app.status_message = None;
+
+        // Now mark again — `mark()` will see the stored commit_id
+        // mismatches the live one, drop the entry, and report the reset.
+        app.mark_current_file_reviewed();
+
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some(STATUS_REVIEWED_RESET),
+            "reset toast must surface when commit_id mismatch invalidates prior bits"
+        );
+    }
+
+    /// First-encounter mark on a change with no prior entry must NOT
+    /// surface the reset toast — there was nothing to reset, so the toast
+    /// would be misleading.
+    #[test]
+    fn mark_current_file_reviewed_silent_on_first_touch_unknown_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = make_app_in_dir(dir.path().to_owned(), vec![sample_diff_file()]);
+        app.file_index = 0;
+        app.reviewed = ReviewedState::default();
+        app.status_message = None;
+
+        app.mark_current_file_reviewed();
+
+        assert!(
+            app.status_message.is_none(),
+            "first-touch mark on a fresh change must stay silent; got: {:?}",
+            app.status_message
+        );
+    }
+
+    /// Re-marking the same `(change_id, commit_id)` (the user re-lands on
+    /// the same view) must NOT surface the reset toast — the `commit_id`
+    /// matches, so nothing was invalidated.
+    #[test]
+    fn mark_current_file_reviewed_silent_on_repeat_mark_same_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = make_app_in_dir(dir.path().to_owned(), vec![sample_diff_file()]);
+        app.file_index = 0;
+        app.mark_current_file_reviewed();
+        app.status_message = None;
+
+        // Re-mark — same change_id, same commit_id. No invalidation.
+        app.mark_current_file_reviewed();
+
+        assert!(
+            app.status_message.is_none(),
+            "repeat mark with matching commit_id must stay silent; got: {:?}",
+            app.status_message
+        );
+    }
+
+    /// The reset toast respects the same `is_none()` guard as the
+    /// save-failure warning: a purpose-set status message (e.g.,
+    /// Tab-at-boundary) must NOT be clobbered when a commit_id-mismatch
+    /// fires on the same tick.
+    #[test]
+    fn mark_current_file_reviewed_does_not_clobber_existing_status_on_reset() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = make_app_in_dir(dir.path().to_owned(), vec![sample_diff_file()]);
+        // Plant a prior entry under the original commit_id so the next
+        // mark sees a mismatch.
+        app.file_index = 0;
+        app.mark_current_file_reviewed();
+        // Simulate amend.
+        let new_commit = CommitId::parse(&"b".repeat(40)).unwrap();
+        app.details.commit_id = new_commit;
+        // Pretend Tab-at-boundary already set a purpose-set status.
+        app.status_message = Some("already at the last file".to_owned());
+
+        app.mark_current_file_reviewed();
+
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("already at the last file"),
+            "purpose-set status must survive even when a reset would otherwise toast"
+        );
     }
 }

@@ -416,42 +416,79 @@ struct ChangeRowArgs<'e> {
     is_current: bool,
     is_selected: bool,
     /// True iff every file (description + diff files) has been visited for
-    /// this `(change_id, commit_id)`. Drives the leading `✓ ` glyph on the
-    /// row.
+    /// this `(change_id, commit_id)`. Drives the right-edge `✓` glyph
+    /// (`DarkGray`) — see [`RightCol`] for the four-state matrix.
     is_fully_reviewed: bool,
 }
 
-/// Width (chars) of the reviewed-status prefix prepended to every change
-/// row. Fixed at two cells so the column lines up regardless of state.
-const REVIEWED_PREFIX_WIDTH: usize = 2;
+/// Right-edge column structure. Reviewed-status owns the right edge after
+/// Saskia's redesign; "no comments" no longer renders any glyph (the empty
+/// dot column already conveys that). Encoding the four states as a typed
+/// enum lets the renderer pattern-match directly on the variant and emit
+/// styled spans without parsing a formatted string back apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RightCol<'a> {
+    /// No comments, not fully reviewed: nothing on the right edge.
+    Empty,
+    /// No comments, fully reviewed: just the `DarkGray` ✓.
+    CheckOnly,
+    /// Has comments, not fully reviewed: dot column only.
+    Dots(&'a str),
+    /// Has comments, fully reviewed: dot column followed by a space + `DarkGray` ✓.
+    DotsAndCheck(&'a str),
+}
 
-/// `✓ ` when fully reviewed, two spaces when not.
-fn reviewed_prefix_text(is_fully_reviewed: bool) -> &'static str {
-    if is_fully_reviewed {
-        "\u{2713} "
-    } else {
-        "  "
+/// Build the [`RightCol`] for a row.
+pub(super) fn right_col(
+    has_comments: bool,
+    is_fully_reviewed: bool,
+    dot_str: &str,
+) -> RightCol<'_> {
+    match (has_comments, is_fully_reviewed) {
+        (false, false) => RightCol::Empty,
+        (false, true) => RightCol::CheckOnly,
+        (true, false) => RightCol::Dots(dot_str),
+        (true, true) => RightCol::DotsAndCheck(dot_str),
+    }
+}
+
+impl RightCol<'_> {
+    /// Rendered character width of this right-edge column. Used by
+    /// [`change_row_desc_budget`] to reserve the correct slot regardless
+    /// of which variant a row will land in this frame.
+    fn width(self) -> usize {
+        match self {
+            RightCol::Empty => 0,
+            RightCol::CheckOnly => 1,
+            RightCol::Dots(s) => s.chars().count(),
+            // dot_str + " " + ✓
+            RightCol::DotsAndCheck(s) => s.chars().count() + 2,
+        }
     }
 }
 
 /// Pure budget calculation: how many chars are available for the truncated
-/// description column given the layout decisions above. Pulled out so
-/// `render_change_row_line` stays under the project's 80-line cap.
+/// description column. The right-edge slot reserves space for the longest
+/// possible variant on this row (`DotsAndCheck` when comments exist,
+/// `CheckOnly` when they don't) so the description column doesn't shift as
+/// reviewed-status flips. Pulled out so `render_change_row_line` stays
+/// under the project's 80-line cap.
 fn change_row_desc_budget(budget: ColumnBudget, dot_str: &str) -> usize {
-    let fixed_before_desc = REVIEWED_PREFIX_WIDTH
-        + 2
-        + if budget.show_idx { IDX_WIDTH + 2 } else { 0 }
-        + CHANGE_ID_WIDTH
-        + 2;
-    let right_fixed = if dot_str.is_empty() {
-        3
+    let fixed_before_desc =
+        2 + if budget.show_idx { IDX_WIDTH + 2 } else { 0 } + CHANGE_ID_WIDTH + 2;
+    // Reserve worst-case width for this row's comment shape. With comments
+    // the worst case is `Dots + " ✓"`; without comments it's `CheckOnly`.
+    // The `+ 2` is the literal "  " column separator that prefixes the
+    // right column.
+    let worst_case_right = if dot_str.is_empty() {
+        RightCol::CheckOnly.width()
     } else {
-        2 + dot_str.chars().count() + 1
+        RightCol::DotsAndCheck(dot_str).width()
     };
     budget
         .inner_width
         .saturating_sub(fixed_before_desc)
-        .saturating_sub(right_fixed)
+        .saturating_sub(2 + worst_case_right)
 }
 
 /// Render a change row in the table.
@@ -487,26 +524,22 @@ fn render_change_row_line(args: ChangeRowArgs<'_>) -> TuiLine<'_> {
         &args.entry.description,
         change_row_desc_budget(args.budget, &ds),
     );
-    let right_col = if ds.is_empty() {
-        "\u{2713}".to_owned()
-    } else {
-        ds
-    };
+    let rcol = right_col(!ds.is_empty(), args.is_fully_reviewed, &ds);
 
-    let left_part_no_prefix = if args.budget.show_idx {
+    let left_part = if args.budget.show_idx {
         format!("{cursor}{idx_str}  {change_id_str}  {desc}")
     } else {
         format!("{cursor}{change_id_str}  {desc}")
     };
-    // Pad with " ".repeat(N) plus the literal "  " separator. Subtract 2 to
-    // account for the literal separator so total line length equals
-    // `inner_width` exactly. Without the subtraction the line is 2 chars
-    // longer than the budget and ratatui clips the trailing dots/count.
+    // Pad so the total rendered width equals inner_width. The `  ` between
+    // padding and the right column is the literal column separator (2
+    // chars), so the calculation subtracts both the right column's width
+    // and 2 for the separator.
     let pad = args
         .budget
         .inner_width
-        .saturating_sub(REVIEWED_PREFIX_WIDTH + left_part_no_prefix.chars().count())
-        .saturating_sub(right_col.chars().count())
+        .saturating_sub(left_part.chars().count())
+        .saturating_sub(rcol.width())
         .saturating_sub(2);
     let padding = " ".repeat(pad);
 
@@ -515,21 +548,25 @@ fn render_change_row_line(args: ChangeRowArgs<'_>) -> TuiLine<'_> {
     } else {
         Style::default()
     };
-    let prefix_style = if args.is_fully_reviewed {
-        base_style.fg(Color::Green)
-    } else {
-        base_style
+    // The trailing ✓ (when fully reviewed) is DarkGray; the dot column
+    // (severity dots + count) keeps its existing styling. Pattern-match on
+    // the typed `RightCol` so the renderer emits the correct spans without
+    // round-tripping through a formatted string.
+    let dark = base_style.fg(Color::DarkGray);
+    let prefix = format!("{left_part}{padding}  ");
+    let spans: Vec<Span<'_>> = match rcol {
+        RightCol::Empty => vec![Span::styled(prefix, base_style)],
+        RightCol::CheckOnly => vec![
+            Span::styled(prefix, base_style),
+            Span::styled("\u{2713}", dark),
+        ],
+        RightCol::Dots(s) => vec![Span::styled(format!("{prefix}{s}"), base_style)],
+        RightCol::DotsAndCheck(s) => vec![
+            Span::styled(format!("{prefix}{s}"), base_style),
+            Span::styled(" \u{2713}", dark),
+        ],
     };
-    TuiLine::from(vec![
-        Span::styled(
-            reviewed_prefix_text(args.is_fully_reviewed).to_owned(),
-            prefix_style,
-        ),
-        Span::styled(
-            format!("{left_part_no_prefix}{padding}  {right_col}"),
-            base_style,
-        ),
-    ])
+    TuiLine::from(spans)
 }
 
 /// Render a change-level comment inset row (`◆ change · severity · body`).
@@ -1203,8 +1240,31 @@ mod tests {
         });
         let text = line_text(&line);
         assert_eq!(text.chars().count(), budget.inner_width);
-        // Zero-comment row should show the no-comments ✓ on the right edge.
-        assert!(text.contains('\u{2713}'));
+    }
+
+    /// Right-edge semantics after Saskia's redesign: a no-comments row
+    /// that is NOT fully reviewed renders no glyph on the right edge. The
+    /// empty dot column already conveys "no comments"; doubling that with
+    /// a ✓ would collide with the new fully-reviewed glyph.
+    #[test]
+    fn render_change_row_line_no_comments_unreviewed_renders_no_right_glyph() {
+        let entry = make_entry("abc11111", "desc");
+        let per_change: Vec<Vec<Comment>> = vec![vec![]];
+        let budget = column_layout(120);
+        let line = render_change_row_line(ChangeRowArgs {
+            entry: &entry,
+            change_idx: 0,
+            per_change_comments: &per_change,
+            budget,
+            is_current: false,
+            is_selected: false,
+            is_fully_reviewed: false,
+        });
+        let text = line_text(&line);
+        assert!(
+            !text.contains('\u{2713}'),
+            "unreviewed no-comments row must not render any ✓ glyph; got: {text:?}"
+        );
     }
 
     #[test]
@@ -1231,24 +1291,26 @@ mod tests {
             is_selected: false,
             is_fully_reviewed: false,
         });
-        // Strip the leading 2-char reviewed prefix; the cursor glyph follows.
         let s_text = line_text(&selected_only);
         let c_text = line_text(&current_only);
-        let s_after_prefix: String = s_text.chars().skip(REVIEWED_PREFIX_WIDTH).collect();
-        let c_after_prefix: String = c_text.chars().skip(REVIEWED_PREFIX_WIDTH).collect();
         // Selection cursor is U+25B6 (▶); current-change indicator is U+25B8 (▸).
+        // After Saskia's redesign there is no left-edge reviewed prefix, so
+        // the cursor glyph is the first character on the row.
         assert!(
-            s_after_prefix.starts_with('\u{25b6}'),
-            "selected row must start with ▶ after prefix: {s_after_prefix:?}"
+            s_text.starts_with('\u{25b6}'),
+            "selected row must start with ▶: {s_text:?}"
         );
         assert!(
-            c_after_prefix.starts_with('\u{25b8}'),
-            "current-change row must start with ▸ after prefix: {c_after_prefix:?}"
+            c_text.starts_with('\u{25b8}'),
+            "current-change row must start with ▸: {c_text:?}"
         );
     }
 
+    /// Saskia's redesign: when a no-comments change is fully reviewed,
+    /// the right edge renders just a ✓ (`DarkGray`). The left edge no
+    /// longer carries a reviewed prefix.
     #[test]
-    fn render_change_row_line_prefixes_check_when_fully_reviewed() {
+    fn render_change_row_line_fully_reviewed_no_comments_renders_check_on_right() {
         let entry = make_entry("abc11111", "desc");
         let per_change: Vec<Vec<Comment>> = vec![vec![]];
         let budget = column_layout(120);
@@ -1261,14 +1323,112 @@ mod tests {
             is_selected: false,
             is_fully_reviewed: true,
         });
-        // The first span carries the reviewed prefix; its content must
-        // begin with ✓ (Color::Green is applied via Style — not asserted
-        // here because text_only assertions stay agnostic to color).
-        assert_eq!(line.spans[0].content.as_ref(), "\u{2713} ");
+        let text = line_text(&line);
+        assert!(
+            text.ends_with('\u{2713}'),
+            "fully-reviewed no-comments row must end in ✓: {text:?}"
+        );
+        // The cursor glyph is the first character — no left-edge prefix
+        // remains.
+        assert!(
+            text.starts_with("  "),
+            "no left-edge reviewed prefix anymore: {text:?}"
+        );
+    }
+
+    /// When a row has comments AND is fully reviewed the right edge
+    /// renders `●●  N ✓` — dots + count + space + ✓. The dots/count
+    /// portion keeps its existing styling so severity counts still pop.
+    #[test]
+    fn render_change_row_line_fully_reviewed_with_comments_appends_check_after_count() {
+        let entry = make_entry("abc11111", "desc");
+        let id = cid("abc11111");
+        let per_change = vec![vec![make_comment(&id, Severity::Required, "r")]];
+        let budget = column_layout(120);
+        let line = render_change_row_line(ChangeRowArgs {
+            entry: &entry,
+            change_idx: 0,
+            per_change_comments: &per_change,
+            budget,
+            is_current: false,
+            is_selected: false,
+            is_fully_reviewed: true,
+        });
+        let text = line_text(&line);
+        // The ✓ must appear AFTER the dot column / count.
+        let check_pos = text.find('\u{2713}').expect("✓ must render");
+        let dot_pos = text.find('●').expect("severity dot must render");
+        assert!(
+            check_pos > dot_pos,
+            "✓ must follow the dot column: {text:?}"
+        );
+        // The count `1` must come before the ✓.
+        let count_pos = text.find('1').expect("count must render");
+        assert!(count_pos < check_pos, "count must precede ✓: {text:?}");
+    }
+
+    /// Width invariant: the rendered line must still match `inner_width`
+    /// even for the longest reviewed-aware variant (`●●  N ✓`).
+    #[test]
+    fn render_change_row_line_width_matches_inner_width_when_reviewed_with_comments_at_80() {
+        let entry = make_entry("abc11111", "short desc");
+        let id = cid("abc11111");
+        let per_change = vec![vec![make_comment(&id, Severity::Required, "r")]];
+        let budget = column_layout(80);
+        let line = render_change_row_line(ChangeRowArgs {
+            entry: &entry,
+            change_idx: 0,
+            per_change_comments: &per_change,
+            budget,
+            is_current: false,
+            is_selected: false,
+            is_fully_reviewed: true,
+        });
+        let text = line_text(&line);
+        assert_eq!(text.chars().count(), budget.inner_width);
     }
 
     #[test]
-    fn render_change_row_line_prefixes_blank_when_not_fully_reviewed() {
+    fn right_col_no_comments_unreviewed_is_empty() {
+        assert_eq!(right_col(false, false, ""), RightCol::Empty);
+    }
+
+    #[test]
+    fn right_col_no_comments_reviewed_is_check_only() {
+        assert_eq!(right_col(false, true, ""), RightCol::CheckOnly);
+    }
+
+    #[test]
+    fn right_col_with_comments_unreviewed_is_dots() {
+        assert_eq!(right_col(true, false, "●●  2"), RightCol::Dots("●●  2"));
+    }
+
+    #[test]
+    fn right_col_with_comments_reviewed_is_dots_and_check() {
+        assert_eq!(
+            right_col(true, true, "●●  2"),
+            RightCol::DotsAndCheck("●●  2")
+        );
+    }
+
+    #[test]
+    fn right_col_width_matches_rendered_chars() {
+        // The width helper must match what each variant actually renders.
+        assert_eq!(RightCol::Empty.width(), 0);
+        assert_eq!(RightCol::CheckOnly.width(), "\u{2713}".chars().count());
+        assert_eq!(RightCol::Dots("●●  2").width(), "●●  2".chars().count());
+        assert_eq!(
+            RightCol::DotsAndCheck("●●  2").width(),
+            "●●  2 \u{2713}".chars().count()
+        );
+    }
+
+    /// Saskia's affect: the right-edge ✓ glyph must be `DarkGray`
+    /// ("done, move on") — never bright Green ("achievement"). Pin the
+    /// style on the trailing Span so a future refactor can't silently
+    /// revert.
+    #[test]
+    fn render_change_row_line_check_only_span_is_dark_gray() {
         let entry = make_entry("abc11111", "desc");
         let per_change: Vec<Vec<Comment>> = vec![vec![]];
         let budget = column_layout(120);
@@ -1279,19 +1439,50 @@ mod tests {
             budget,
             is_current: false,
             is_selected: false,
-            is_fully_reviewed: false,
+            is_fully_reviewed: true,
         });
-        // Two-space prefix preserves alignment.
-        assert_eq!(line.spans[0].content.as_ref(), "  ");
+        // CheckOnly variant: the trailing Span carries the ✓ in DarkGray.
+        let last = line.spans.last().expect("at least one span");
+        assert_eq!(last.content.as_ref(), "\u{2713}");
+        assert_eq!(
+            last.style.fg,
+            Some(Color::DarkGray),
+            "right-edge ✓ must be DarkGray"
+        );
     }
 
     #[test]
-    fn reviewed_prefix_text_returns_check_when_reviewed() {
-        assert_eq!(reviewed_prefix_text(true), "\u{2713} ");
-    }
-
-    #[test]
-    fn reviewed_prefix_text_returns_blank_when_not_reviewed() {
-        assert_eq!(reviewed_prefix_text(false), "  ");
+    fn render_change_row_line_dots_and_check_split_span_styling() {
+        let entry = make_entry("abc11111", "desc");
+        let id = cid("abc11111");
+        let per_change = vec![vec![make_comment(&id, Severity::Required, "r")]];
+        let budget = column_layout(120);
+        let line = render_change_row_line(ChangeRowArgs {
+            entry: &entry,
+            change_idx: 0,
+            per_change_comments: &per_change,
+            budget,
+            is_current: false,
+            is_selected: false,
+            is_fully_reviewed: true,
+        });
+        // DotsAndCheck variant: trailing Span is " ✓" with DarkGray; the
+        // leading Span (containing the dot column + count) keeps its
+        // existing neutral style so severity counts still pop.
+        let last = line.spans.last().expect("at least one span");
+        assert_eq!(last.content.as_ref(), " \u{2713}");
+        assert_eq!(
+            last.style.fg,
+            Some(Color::DarkGray),
+            "trailing ✓ must be DarkGray"
+        );
+        // The first span carries the dot column; it must NOT be DarkGray
+        // (so the loud severity counts retain their styling).
+        let first = line.spans.first().expect("at least one span");
+        assert_ne!(
+            first.style.fg,
+            Some(Color::DarkGray),
+            "dot column must keep its existing styling, not the DarkGray applied to the trailing ✓"
+        );
     }
 }

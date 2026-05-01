@@ -31,8 +31,9 @@ pub(super) struct FilePickerEntry {
     pub(super) view_index: usize,
     pub(super) comment_count: usize,
     /// Whether the user has already landed on this view in the current
-    /// `(change_id, commit_id)` pair. Drives the `[✓]` / `[ ]` indicator on
-    /// the right edge of each row.
+    /// `(change_id, commit_id)` pair. Drives the `✓` glyph on the row;
+    /// unreviewed rows render an equivalent-width blank so the path column
+    /// stays aligned across states.
     pub(super) reviewed: bool,
 }
 
@@ -121,18 +122,18 @@ pub(super) fn render(frame: &mut Frame<'_>, state: &FilePickerState) {
         } else {
             "  "
         };
-        let reviewed_part = format!("  {}", reviewed_indicator_text(entry.reviewed));
+        let indicator_part = reviewed_indicator_text(entry.reviewed);
         let count_part = if entry.comment_count > 0 {
             format!("  [{}]", entry.comment_count)
         } else {
             String::new()
         };
         let cursor_chars = cursor.chars().count();
-        let reviewed_chars = reviewed_part.chars().count();
+        let indicator_chars = indicator_part.chars().count();
         let count_chars = count_part.chars().count();
         let path_budget = inner_width
             .saturating_sub(cursor_chars)
-            .saturating_sub(reviewed_chars)
+            .saturating_sub(indicator_chars)
             .saturating_sub(count_chars);
         let raw_path = entry.display_path.display().to_string();
         let path = truncate_path_for_width(&raw_path, path_budget);
@@ -142,15 +143,15 @@ pub(super) fn render(frame: &mut Frame<'_>, state: &FilePickerState) {
         } else {
             Style::default()
         };
-        let reviewed_style = if entry.reviewed {
-            base_style.fg(Color::Green)
+        let indicator_style = if entry.reviewed {
+            base_style.fg(Color::DarkGray)
         } else {
             base_style
         };
         lines.push(TuiLine::from(vec![
-            Span::styled(format!("{cursor}{path}"), base_style),
-            Span::styled(reviewed_part, reviewed_style),
-            Span::styled(count_part, base_style),
+            Span::styled(cursor.to_owned(), base_style),
+            Span::styled(indicator_part, indicator_style),
+            Span::styled(format!("{path}{count_part}"), base_style),
         ]));
     }
 
@@ -162,13 +163,15 @@ pub(super) fn render(frame: &mut Frame<'_>, state: &FilePickerState) {
     frame.render_widget(footer_widget, footer_area);
 }
 
-/// `[✓]` when reviewed, `[ ]` when not — both variants render brackets so
-/// the column stays aligned across rows.
+/// `✓ ` when reviewed, two spaces when not. Both variants are exactly two
+/// columns wide so the path column stays aligned across rows regardless of
+/// reviewed state. Empty `[ ]` brackets read as visual noise (gh and lazygit
+/// both omit them); only the affirmative ✓ glyph is rendered.
 pub(super) fn reviewed_indicator_text(reviewed: bool) -> String {
     if reviewed {
-        "[\u{2713}]".to_owned()
+        "\u{2713} ".to_owned()
     } else {
-        "[ ]".to_owned()
+        "  ".to_owned()
     }
 }
 
@@ -337,14 +340,24 @@ mod tests {
 
     #[test]
     fn reviewed_indicator_text_uses_check_when_reviewed() {
-        assert_eq!(reviewed_indicator_text(true), "[\u{2713}]");
+        assert_eq!(reviewed_indicator_text(true), "\u{2713} ");
     }
 
     #[test]
     fn reviewed_indicator_text_uses_blank_when_unreviewed() {
-        // Both brackets must render even when unmarked, so the ✓/space
-        // column lines up across rows.
-        assert_eq!(reviewed_indicator_text(false), "[ ]");
+        // Two-space blank keeps the path column aligned across rows when
+        // the row is unreviewed; empty `[ ]` brackets are visual noise so
+        // only the affirmative ✓ renders any glyph.
+        assert_eq!(reviewed_indicator_text(false), "  ");
+    }
+
+    #[test]
+    fn reviewed_indicator_text_widths_match_across_states() {
+        assert_eq!(
+            reviewed_indicator_text(true).chars().count(),
+            reviewed_indicator_text(false).chars().count(),
+            "indicator widths must match so the path column lines up"
+        );
     }
 
     #[test]
@@ -541,6 +554,80 @@ mod tests {
         assert!(
             thumb_top < thumb_bot,
             "thumb must move down as scroll_offset advances; top={thumb_top}, bottom={thumb_bot}"
+        );
+    }
+
+    /// Picker body geometry: an 80x30 terminal anchors the overlay at x=4,
+    /// y=5; the block's inner is x=5, y=6. The cursor occupies inner col 0;
+    /// the indicator slot is inner col 2..4 (two cells wide); the path
+    /// starts at inner col 4 regardless of reviewed state.
+    const PICKER_INNER_X: u16 = 5;
+    const PICKER_INNER_Y: u16 = 6;
+    /// Inner column where the indicator's first cell renders (after the
+    /// 2-cell cursor slot).
+    const INDICATOR_INNER_COL: u16 = 2;
+    /// Inner column where the path's first character renders. Must be the
+    /// same across reviewed/unreviewed so paths line up.
+    const PATH_INNER_COL: u16 = 4;
+
+    fn buf_symbol_at(buf: &ratatui::buffer::Buffer, inner_x: u16, inner_y: u16) -> String {
+        buf[(PICKER_INNER_X + inner_x, PICKER_INNER_Y + inner_y)]
+            .symbol()
+            .to_owned()
+    }
+
+    #[test]
+    fn render_reviewed_row_shows_check_glyph_before_path() {
+        let mut state = make_state_with_entries(3, 0, 0);
+        // Mark the second row reviewed; first row is the cursor row, picking
+        // row 1 keeps the assertion away from the selection cursor.
+        state.entries[1].reviewed = true;
+        let buf = render_picker_to_buffer(&state, 80, 30);
+        // Row 1 → inner_y = 1 (row 0 is the description sentinel).
+        assert_eq!(buf_symbol_at(&buf, INDICATOR_INNER_COL, 1), "\u{2713}");
+        assert_eq!(
+            buf_symbol_at(&buf, INDICATOR_INNER_COL + 1, 1),
+            " ",
+            "the cell after ✓ must be a space so path stays aligned"
+        );
+    }
+
+    #[test]
+    fn render_unreviewed_row_keeps_indicator_slot_blank() {
+        let state = make_state_with_entries(3, 0, 0);
+        let buf = render_picker_to_buffer(&state, 80, 30);
+        // Row 1 → inner_y = 1; default reviewed=false in make_state_with_entries.
+        assert_eq!(buf_symbol_at(&buf, INDICATOR_INNER_COL, 1), " ");
+        assert_eq!(buf_symbol_at(&buf, INDICATOR_INNER_COL + 1, 1), " ");
+    }
+
+    #[test]
+    fn render_path_starts_at_same_column_for_both_reviewed_states() {
+        let mut state = make_state_with_entries(3, 0, 0);
+        state.entries[1].reviewed = true;
+        let buf = render_picker_to_buffer(&state, 80, 30);
+        // Row 1 has reviewed=true, row 2 has reviewed=false. file_1.rs and
+        // file_2.rs both start with `f`, so the same character at PATH_INNER_COL
+        // proves the column is aligned.
+        assert_eq!(buf_symbol_at(&buf, PATH_INNER_COL, 1), "f");
+        assert_eq!(buf_symbol_at(&buf, PATH_INNER_COL, 2), "f");
+    }
+
+    /// Saskia's affect: the reviewed ✓ glyph is `DarkGray` ("done, move on"),
+    /// not bright Green ("achievement"). Pin the cell style so a future
+    /// refactor can't silently revert.
+    #[test]
+    fn render_reviewed_indicator_cell_is_dark_gray() {
+        let mut state = make_state_with_entries(3, 0, 0);
+        state.entries[1].reviewed = true;
+        let buf = render_picker_to_buffer(&state, 80, 30);
+        // The ✓ cell at row 1, indicator col.
+        let cell = &buf[(PICKER_INNER_X + INDICATOR_INNER_COL, PICKER_INNER_Y + 1)];
+        assert_eq!(cell.symbol(), "\u{2713}");
+        assert_eq!(
+            cell.fg,
+            Color::DarkGray,
+            "reviewed indicator must be DarkGray, not Green"
         );
     }
 }

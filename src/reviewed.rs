@@ -102,7 +102,15 @@ impl ReviewedState {
     /// dropped and a fresh one is created. The reviewed bit set here is the
     /// only bit on the new entry — by construction, the user just landed on
     /// `target` for the new commit, so anything else has not been re-reviewed.
-    pub(crate) fn mark(&mut self, change_id: ChangeId, commit_id: CommitId, target: ReviewTarget) {
+    ///
+    /// Returns a [`MarkOutcome`] describing whether invalidation just fired
+    /// so the caller can surface a one-shot status toast.
+    pub(crate) fn mark(
+        &mut self,
+        change_id: ChangeId,
+        commit_id: CommitId,
+        target: ReviewTarget,
+    ) -> MarkOutcome {
         // Auto-invalidation: if the stored entry's commit_id no longer
         // matches, replace it with a fresh entry for the new commit. By
         // construction the only bit set on the new entry is the `target`
@@ -125,8 +133,61 @@ impl ReviewedState {
                 entry.reviewed_files.insert(path);
             }
         }
+        if needs_reset {
+            MarkOutcome::ResetDueToCommitMismatch
+        } else {
+            MarkOutcome::NoReset
+        }
     }
 
+    /// Clear the reviewed bit for `target` on the entry for
+    /// `(change_id, commit_id)`. No-op when the entry is missing or its
+    /// stored `commit_id` does not match (the bit being asked about
+    /// belongs to an old, invalidated entry).
+    ///
+    /// Used by the manual `U` keybind so the reviewer can correct an
+    /// auto-mark that fired prematurely.
+    pub(crate) fn unmark(
+        &mut self,
+        change_id: &ChangeId,
+        commit_id: &CommitId,
+        target: &ReviewTarget,
+    ) {
+        let Some(entry) = self.entries.get_mut(change_id) else {
+            return;
+        };
+        if &entry.commit_id != commit_id {
+            return;
+        }
+        match target {
+            ReviewTarget::Description => entry.description_reviewed = false,
+            ReviewTarget::File(path) => {
+                entry.reviewed_files.remove(path);
+            }
+        }
+    }
+}
+
+/// Outcome of [`ReviewedState::mark`]. Tells the caller whether the call
+/// dropped a stale entry for the same `change_id` (`commit_id` mismatch) so
+/// the TUI can surface a status toast distinguishing "first encounter"
+/// (silent) from "amended; reviewed state reset" (toast).
+///
+/// Today there are exactly two reachable outcomes; if a third reset reason
+/// arrives, add a variant and pattern-match exhaustiveness will route every
+/// caller through the new case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MarkOutcome {
+    /// Either no prior entry existed for this `change_id`, or the prior
+    /// entry's `commit_id` matched — nothing was invalidated.
+    NoReset,
+    /// A prior entry for this `change_id` carried a different `commit_id`
+    /// (the change was amended/rebased) and was dropped before the new
+    /// mark was applied.
+    ResetDueToCommitMismatch,
+}
+
+impl ReviewedState {
     /// True iff the user has actually marked this `(change_id, commit_id)`
     /// fully reviewed: an entry exists, its `commit_id` matches the live
     /// commit, AND every file in the live diff is in `reviewed_files`.
@@ -436,6 +497,107 @@ mod tests {
             "only the new mark survives invalidation"
         );
         assert!(entry.reviewed_files.contains(&PathBuf::from("b.rs")));
+    }
+
+    #[test]
+    fn mark_first_touch_returns_no_reset_outcome() {
+        let mut state = ReviewedState::default();
+        let outcome = state.mark(cid("abc12345"), coid("deadbeef"), ReviewTarget::Description);
+        assert_eq!(
+            outcome,
+            MarkOutcome::NoReset,
+            "first-touch must not report a reset"
+        );
+    }
+
+    #[test]
+    fn mark_repeat_same_commit_returns_no_reset_outcome() {
+        let mut state = ReviewedState::default();
+        state.mark(cid("abc12345"), coid("deadbeef"), ReviewTarget::Description);
+        let outcome = state.mark(
+            cid("abc12345"),
+            coid("deadbeef"),
+            ReviewTarget::File(PathBuf::from("a.rs")),
+        );
+        assert_eq!(
+            outcome,
+            MarkOutcome::NoReset,
+            "matching commit_id must not report a reset"
+        );
+    }
+
+    #[test]
+    fn mark_commit_id_mismatch_returns_reset_outcome() {
+        let mut state = ReviewedState::default();
+        state.mark(cid("abc12345"), coid("deadbeef"), ReviewTarget::Description);
+        let outcome = state.mark(cid("abc12345"), coid("11223344"), ReviewTarget::Description);
+        assert_eq!(
+            outcome,
+            MarkOutcome::ResetDueToCommitMismatch,
+            "amended commit_id must report a reset"
+        );
+    }
+
+    #[test]
+    fn unmark_clears_description_bit() {
+        let mut state = ReviewedState::default();
+        state.mark(cid("abc12345"), coid("deadbeef"), ReviewTarget::Description);
+        state.unmark(
+            &cid("abc12345"),
+            &coid("deadbeef"),
+            &ReviewTarget::Description,
+        );
+        let entry = state.entries.get(&cid("abc12345")).unwrap();
+        assert!(!entry.description_reviewed);
+    }
+
+    #[test]
+    fn unmark_removes_file_from_reviewed_files() {
+        let mut state = ReviewedState::default();
+        let path = PathBuf::from("src/foo.rs");
+        state.mark(
+            cid("abc12345"),
+            coid("deadbeef"),
+            ReviewTarget::File(path.clone()),
+        );
+        state.unmark(
+            &cid("abc12345"),
+            &coid("deadbeef"),
+            &ReviewTarget::File(path.clone()),
+        );
+        let entry = state.entries.get(&cid("abc12345")).unwrap();
+        assert!(!entry.reviewed_files.contains(&path));
+    }
+
+    #[test]
+    fn unmark_is_noop_for_unknown_change_id() {
+        let mut state = ReviewedState::default();
+        // Nothing exists; unmark must not panic and must not create an entry.
+        state.unmark(
+            &cid("abc12345"),
+            &coid("deadbeef"),
+            &ReviewTarget::Description,
+        );
+        assert!(state.entries.is_empty());
+    }
+
+    #[test]
+    fn unmark_is_noop_when_commit_id_mismatches() {
+        // Stored entry under one commit_id; caller asks to unmark with a
+        // different commit_id. Treat as no-op — the bit they think they're
+        // unmarking belongs to an old, invalidated entry.
+        let mut state = ReviewedState::default();
+        state.mark(cid("abc12345"), coid("deadbeef"), ReviewTarget::Description);
+        state.unmark(
+            &cid("abc12345"),
+            &coid("11223344"),
+            &ReviewTarget::Description,
+        );
+        let entry = state.entries.get(&cid("abc12345")).unwrap();
+        assert!(
+            entry.description_reviewed,
+            "unmark with mismatched commit_id must not touch stored bits"
+        );
     }
 
     #[test]
