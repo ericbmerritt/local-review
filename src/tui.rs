@@ -90,6 +90,19 @@ const TRANSITION_DESC_BUDGET: usize = 36;
 /// The numeric count stays accurate so the user still sees the true total.
 pub(super) const DOT_BUDGET: usize = 5;
 
+/// Status hint surfaced when Tab is pressed at the last file (or description+files
+/// boundary) — the file index is already at its max and cannot advance further.
+const STATUS_AT_LAST_FILE: &str = "already at the last file";
+
+/// Status hint surfaced when Shift-Tab is pressed at `file_index` 0 — there is
+/// no previous file to retreat to.
+const STATUS_AT_FIRST_FILE: &str = "already at the first file";
+
+/// Status hint surfaced when Tab/Shift-Tab is pressed and the change has only
+/// one navigable view (typical for a description-only change with no diff
+/// files), so cycling cannot move in either direction.
+const STATUS_ONLY_ONE_FILE: &str = "only one file";
+
 /// Severity -> terminal color.
 pub(super) fn severity_color(severity: Severity) -> Color {
     match severity {
@@ -507,8 +520,23 @@ impl App {
         if count == 0 {
             return;
         }
+        if count == 1 {
+            self.status_message = Some(STATUS_ONLY_ONE_FILE.to_owned());
+            self.line_index = 0;
+            self.scroll = 0;
+            return;
+        }
         let max_index = count - 1;
-        self.file_index = clamp_with_delta(self.file_index, delta, max_index);
+        let previous_index = self.file_index;
+        let new_index = clamp_with_delta(previous_index, delta, max_index);
+        if new_index == previous_index {
+            if delta > 0 {
+                self.status_message = Some(STATUS_AT_LAST_FILE.to_owned());
+            } else if delta < 0 {
+                self.status_message = Some(STATUS_AT_FIRST_FILE.to_owned());
+            }
+        }
+        self.file_index = new_index;
         self.line_index = 0;
         self.scroll = 0;
     }
@@ -6501,6 +6529,165 @@ mod tests {
         assert!(
             thumb_row < midpoint,
             "thumb must reset to the top half after switching files; got row {thumb_row}, midpoint {midpoint}"
+        );
+    }
+
+    /// Build an app with the description view plus two diff files.
+    /// `file_index` starts at 0 (description) so each test can position it
+    /// explicitly.
+    fn make_app_with_two_diff_files() -> App {
+        let details = ChangeDetails {
+            change_id: ChangeId::parse(&"a".repeat(32)).unwrap(),
+            commit_id: CommitId::parse(&"a".repeat(40)).unwrap(),
+            description: String::new(),
+            diff: Diff {
+                files: vec![
+                    sample_diff_file(),
+                    DiffFile::Modified {
+                        path: PathBuf::from("bar.rs"),
+                        hunks: vec![Hunk {
+                            header: "@@ -1,1 +1,1 @@".to_owned(),
+                            function_context: None,
+                            source_start: 1,
+                            source_length: 1,
+                            target_start: 1,
+                            target_length: 1,
+                            lines: vec![Line {
+                                kind: LineKind::Context,
+                                text: "x".to_owned(),
+                                source_line: Some(1),
+                                target_line: Some(1),
+                            }],
+                        }],
+                    },
+                ],
+            },
+        };
+        App::new(
+            details,
+            PathBuf::from("/repo"),
+            "@".to_owned(),
+            None,
+            TransitionMode::Never,
+        )
+    }
+
+    /// Build an app whose change has no diff files. `rendered_per_file` ends
+    /// up with exactly one entry (the synthetic description view).
+    fn make_app_description_only() -> App {
+        let details = ChangeDetails {
+            change_id: ChangeId::parse(&"a".repeat(32)).unwrap(),
+            commit_id: CommitId::parse(&"a".repeat(40)).unwrap(),
+            description: String::new(),
+            diff: Diff { files: vec![] },
+        };
+        App::new(
+            details,
+            PathBuf::from("/repo"),
+            "@".to_owned(),
+            None,
+            TransitionMode::Never,
+        )
+    }
+
+    #[test]
+    fn cycle_file_sets_status_at_last_file_when_already_at_max() {
+        // Three views (description + two diff files). At the last index a
+        // forward Tab cannot advance, so the footer must surface the boundary.
+        let mut app = make_app_with_two_diff_files();
+        app.file_index = app.rendered_per_file.len() - 1;
+
+        app.cycle_file(1);
+
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some(STATUS_AT_LAST_FILE),
+            "Tab at last file must set the boundary status"
+        );
+    }
+
+    #[test]
+    fn cycle_file_sets_status_at_first_file_when_already_at_zero() {
+        // file_index 0 is the description view; Shift-Tab there has nowhere
+        // earlier to go.
+        let mut app = make_app_with_two_diff_files();
+        app.file_index = 0;
+
+        app.cycle_file(-1);
+
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some(STATUS_AT_FIRST_FILE),
+            "Shift-Tab at file_index 0 must set the boundary status"
+        );
+    }
+
+    #[test]
+    fn cycle_file_sets_status_only_one_file_when_count_is_one_in_either_direction() {
+        // Description-only changes have a single navigable view; Tab and
+        // Shift-Tab both hit the degenerate boundary.
+        let mut app = make_app_description_only();
+        assert_eq!(app.rendered_per_file.len(), 1);
+
+        app.cycle_file(1);
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some(STATUS_ONLY_ONE_FILE),
+            "Tab with one view must surface the only-one-file hint"
+        );
+
+        app.status_message = None;
+        app.cycle_file(-1);
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some(STATUS_ONLY_ONE_FILE),
+            "Shift-Tab with one view must surface the only-one-file hint"
+        );
+    }
+
+    #[test]
+    fn cycle_file_clears_or_replaces_status_on_normal_movement() {
+        // When Tab actually advances the file, no boundary message should
+        // linger from a previous keystroke. handle_main_key clears
+        // status_message before dispatch, so cycle_file's contract is just
+        // "do not set a boundary message on successful movement".
+        let mut app = make_app_with_two_diff_files();
+        app.file_index = 0;
+        app.status_message = Some("stale".to_owned());
+
+        app.cycle_file(1);
+
+        assert_eq!(app.file_index, 1, "Tab from index 0 must advance");
+        let boundary_messages = [
+            STATUS_AT_LAST_FILE,
+            STATUS_AT_FIRST_FILE,
+            STATUS_ONLY_ONE_FILE,
+        ];
+        if let Some(msg) = app.status_message.as_deref() {
+            assert!(
+                !boundary_messages.contains(&msg),
+                "successful movement must not leave a boundary message; got {msg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cycle_file_does_not_panic_on_count_zero() {
+        // The early-return for an empty rendered_per_file is defensive — real
+        // construction always pushes the description view. Pin it so a future
+        // refactor cannot reintroduce a zero-count panic via underflow on
+        // `count - 1`.
+        let mut app = make_app_with_single_file(sample_diff_file());
+        app.rendered_per_file.clear();
+        app.annotated_per_file.clear();
+        app.file_index = 0;
+
+        app.cycle_file(1);
+        app.cycle_file(-1);
+
+        assert!(
+            app.status_message.is_none(),
+            "count==0 must early-return without setting a boundary status"
         );
     }
 
