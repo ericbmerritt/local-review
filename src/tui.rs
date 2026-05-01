@@ -2240,14 +2240,24 @@ fn open_send_to_claude(app: &mut App) {
     let change_id = app.details.change_id.clone();
     let revset_hash = app.stack.as_ref().map(|s| s.revset_hash);
 
-    let resolved = ResolvedStack {
-        revset_hash: revset_hash.unwrap_or_else(|| RevsetHash::from_revset(&app.revset)),
-        revset: app.revset.clone(),
-        entries: vec![StackEntry {
+    // In stack mode, the packet must reflect the WHOLE stack so per-change and
+    // line-level comments anchored to other changes (B/C/D) ride along with
+    // those on the current change (A). A single-entry stack here would silently
+    // drop them, surfacing as "no comments to send" when the user is sitting on
+    // a change with no comments of its own.
+    let entries = match app.stack.as_ref() {
+        Some(stack) => stack.entries.clone(),
+        None => vec![StackEntry {
             change_id: change_id.clone(),
             commit_id: app.details.commit_id.clone(),
             description: app.details.description.clone(),
         }],
+    };
+
+    let resolved = ResolvedStack {
+        revset_hash: revset_hash.unwrap_or_else(|| RevsetHash::from_revset(&app.revset)),
+        revset: app.revset.clone(),
+        entries,
     };
 
     let packet = match crate::packet::build_packet(
@@ -6655,6 +6665,200 @@ mod tests {
                 panic!("expected Anchor::Change targeting B; got {other:?}")
             }
         }
+    }
+
+    /// Regression: pressing `C` while sitting on change A in a multi-change
+    /// stack must include comments anchored on change B in the packet. A
+    /// fabricated single-entry resolved stack would silently drop B's
+    /// comments and surface "no comments to send".
+    #[test]
+    fn send_to_claude_in_stack_mode_includes_other_changes_comments() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut app, id_a, id_b) = make_stack_app_with_two_changes(dir.path());
+        // Sanity: main view holds A; the comment we save targets B.
+        assert_eq!(app.details.change_id, id_a);
+
+        let on_b = Comment {
+            schema_version: SchemaVersion,
+            anchor: Anchor::Change {
+                change_id: id_b.clone(),
+            },
+            repo_root: dir.path().to_path_buf(),
+            revset: "trunk()..@".to_owned(),
+            commit_id: None,
+            body: "concern on B".to_owned(),
+            severity: Severity::Required,
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
+            updated_at: None,
+            status: Some(Status::Pending),
+            mismatch_reason: None,
+        };
+        crate::store::save_comment(dir.path(), &on_b).unwrap();
+
+        open_send_to_claude(&mut app);
+
+        // The screen must transition to SendToClaude (not stay on Main with a
+        // "no comments to send" status).
+        let Screen::SendToClaude(ref state) = app.screen else {
+            panic!(
+                "expected SendToClaude screen; got status {:?}",
+                app.status_message
+            );
+        };
+        let SendToClaudeState::Confirm(ref data) = state.as_ref() else {
+            panic!("expected Confirm variant");
+        };
+        // The packet only includes changes that have comments; A is empty, so
+        // only B should appear — and crucially, B must NOT be silently dropped.
+        let change_ids: Vec<_> = data
+            .packet
+            .changes
+            .iter()
+            .map(|cp| cp.change_id.clone())
+            .collect();
+        assert!(
+            change_ids.contains(&id_b),
+            "packet must include change B's entry; got {change_ids:?}"
+        );
+        // And B's change-scoped comment must be present.
+        let b_packet = data
+            .packet
+            .changes
+            .iter()
+            .find(|cp| cp.change_id == id_b)
+            .expect("B's ChangePacket must be in the packet");
+        assert_eq!(
+            b_packet.change_comments.len(),
+            1,
+            "B's comment must ride along"
+        );
+        assert_eq!(b_packet.change_comments[0].body, "concern on B");
+    }
+
+    /// In single-change mode (`app.stack` is None), only the current change's
+    /// comments make it into the packet — the resolved stack stays a
+    /// single-entry shape so unrelated changes are never loaded.
+    #[test]
+    fn send_to_claude_in_single_change_mode_uses_only_current_change() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = make_app_with_single_file(sample_diff_file());
+        app.repo_root = dir.path().to_path_buf();
+        assert!(app.stack.is_none(), "test requires single-change mode");
+
+        // Save a change-scoped comment on the current change so the packet
+        // has something to render; this confirms the screen opens.
+        let on_current = Comment {
+            schema_version: SchemaVersion,
+            anchor: Anchor::Change {
+                change_id: app.details.change_id.clone(),
+            },
+            repo_root: dir.path().to_path_buf(),
+            revset: "@".to_owned(),
+            commit_id: None,
+            body: "current-change concern".to_owned(),
+            severity: Severity::Note,
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
+            updated_at: None,
+            status: Some(Status::Pending),
+            mismatch_reason: None,
+        };
+        crate::store::save_comment(dir.path(), &on_current).unwrap();
+
+        // Save a comment on an unrelated change_id; in single-change mode it
+        // must NOT be loaded into the packet.
+        let unrelated_id = ChangeId::parse(&"f".repeat(32)).unwrap();
+        let on_unrelated = Comment {
+            schema_version: SchemaVersion,
+            anchor: Anchor::Change {
+                change_id: unrelated_id.clone(),
+            },
+            repo_root: dir.path().to_path_buf(),
+            revset: "@".to_owned(),
+            commit_id: None,
+            body: "should-not-appear".to_owned(),
+            severity: Severity::Note,
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
+            updated_at: None,
+            status: Some(Status::Pending),
+            mismatch_reason: None,
+        };
+        crate::store::save_comment(dir.path(), &on_unrelated).unwrap();
+
+        open_send_to_claude(&mut app);
+
+        let Screen::SendToClaude(ref state) = app.screen else {
+            panic!("expected SendToClaude screen");
+        };
+        let SendToClaudeState::Confirm(ref data) = state.as_ref() else {
+            panic!("expected Confirm variant");
+        };
+        let change_ids: Vec<_> = data
+            .packet
+            .changes
+            .iter()
+            .map(|cp| cp.change_id.clone())
+            .collect();
+        assert_eq!(
+            change_ids,
+            vec![app.details.change_id.clone()],
+            "single-change mode must include only the current change"
+        );
+        assert!(
+            !change_ids.contains(&unrelated_id),
+            "unrelated change_id must not appear in single-change mode"
+        );
+    }
+
+    /// Stack with exactly one entry: the new full-stack path must produce the
+    /// same packet shape as the old single-entry path. Pins the equivalence
+    /// at the boundary so a future "simplify" pass cannot regress the bug.
+    #[test]
+    fn send_to_claude_stack_with_one_entry_matches_single_change_shape() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = make_app_with_single_file(sample_diff_file());
+        app.repo_root = dir.path().to_path_buf();
+        let entry = StackEntry {
+            change_id: app.details.change_id.clone(),
+            commit_id: app.details.commit_id.clone(),
+            description: app.details.description.clone(),
+        };
+        let revset = "trunk()..@".to_owned();
+        let revset_hash = RevsetHash::from_revset(&revset);
+        app.stack = Some(StackContext {
+            entries: vec![entry],
+            current_index: 0,
+            revset: revset.clone(),
+            revset_hash,
+        });
+        app.revset = revset;
+
+        let on_current = Comment {
+            schema_version: SchemaVersion,
+            anchor: Anchor::Change {
+                change_id: app.details.change_id.clone(),
+            },
+            repo_root: dir.path().to_path_buf(),
+            revset: "trunk()..@".to_owned(),
+            commit_id: None,
+            body: "single entry".to_owned(),
+            severity: Severity::Note,
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
+            updated_at: None,
+            status: Some(Status::Pending),
+            mismatch_reason: None,
+        };
+        crate::store::save_comment(dir.path(), &on_current).unwrap();
+
+        open_send_to_claude(&mut app);
+
+        let Screen::SendToClaude(ref state) = app.screen else {
+            panic!("expected SendToClaude screen");
+        };
+        let SendToClaudeState::Confirm(ref data) = state.as_ref() else {
+            panic!("expected Confirm variant");
+        };
+        assert_eq!(data.packet.changes.len(), 1);
+        assert_eq!(data.packet.changes[0].change_id, app.details.change_id);
     }
 
     #[test]
