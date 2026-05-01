@@ -8,7 +8,10 @@ use crate::comment::Comment;
 use crate::stack::StackEntry;
 use crate::util::truncate;
 
-use super::{render_dots_mixed, severity_color, severity_label, App, SeverityHistogram};
+use super::{
+    render_dots_mixed, render_view_scrollbar, scrollbar_layout_for_view, severity_color,
+    severity_label, App, SeverityHistogram,
+};
 
 /// Box-drawing Unicode block: U+2500..=U+257F.
 const BOX_DRAWING_START: char = '\u{2500}';
@@ -643,7 +646,6 @@ pub(super) fn render(
     let inner = block.inner(layout[0]);
     frame.render_widget(block, layout[0]);
 
-    let budget = column_layout(area.width);
     let stale_count = cache.stale_count();
     let total_count = cache.total_count();
 
@@ -652,6 +654,15 @@ pub(super) fn render(
     state.selected_row = clamp_selected(&rows, state.selected_row);
     state.scroll_offset =
         compute_scroll_offset(state.selected_row, inner.height, state.scroll_offset);
+
+    // `column_layout` takes the OUTER terminal width and derives inner-width
+    // and threshold decisions internally (see its doc). Pass `area.width`
+    // directly so the column-budget decision is independent of whether the
+    // scrollbar is visible — otherwise the show_idx / show_inset_body
+    // thresholds would flicker as content crosses the overflow boundary.
+    let budget = column_layout(area.width);
+    let (body_area, scrollbar_area, mut sb_state) =
+        scrollbar_layout_for_view(inner, rows.len(), state.scroll_offset);
 
     let rows_ctx = RowsCtx {
         selected_row: state.selected_row,
@@ -665,7 +676,8 @@ pub(super) fn render(
     let lines = rows_to_lines(&rows, &rows_ctx);
 
     let widget = Paragraph::new(lines).scroll((state.scroll_offset, 0));
-    frame.render_widget(widget, inner);
+    frame.render_widget(widget, body_area);
+    render_view_scrollbar(frame, sb_state.as_mut(), scrollbar_area);
 
     frame.render_widget(Paragraph::new(OVERVIEW_FOOTER_TEXT), layout[1]);
 }

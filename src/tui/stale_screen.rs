@@ -8,7 +8,9 @@ use crate::comment::{Anchor, Comment, MismatchReason, Side, Status};
 use crate::diff::Diff;
 use crate::util::truncate;
 
-use super::{severity_color, severity_label, App};
+use super::{
+    render_view_scrollbar, scrollbar_layout_for_view, severity_color, severity_label, App,
+};
 
 const STALE_MIN_COLS: u16 = 60;
 
@@ -23,12 +25,19 @@ const BODY_PREVIEW_MAX: usize = 74;
 /// Maximum `was:` / `now:` text characters shown inline.
 const LINE_TEXT_MAX: usize = 60;
 
-/// Rendered line count per stale entry, used by scroll-offset computation. Must
-/// match what `render_entries` actually emits per entry (header + reason line
-/// when narrow + separator + severity + body + was + now + blank). Wide layout
-/// drops one line (reason inlined into header).
+/// Rendered row count for an `Anchor::Line` stale entry. Wide layout: header,
+/// separator, severity, body, was, now, blank = 7. Narrow layout: same plus
+/// a dedicated reason row = 8. Must match `render_entries`'s emit-count for
+/// the line-anchor branch.
 const ENTRY_LINES_WIDE: u16 = 7;
 const ENTRY_LINES_NARROW: u16 = 8;
+
+/// Rendered row count for a non-`Anchor::Line` stale entry. `render_entries`
+/// early-continues for these after the body row, so it emits header,
+/// separator, severity, body, blank = 5 (wide) and the same plus a reason
+/// row = 6 (narrow). Must match the non-line render path's emit-count.
+const NON_LINE_ENTRY_LINES_WIDE: u16 = 5;
+const NON_LINE_ENTRY_LINES_NARROW: u16 = 6;
 
 pub(super) const STALE_FOOTER_TEXT: &str =
     " \u{2191}\u{2193} select  Enter view in source  d delete  e edit & re-anchor  q back";
@@ -86,20 +95,54 @@ pub(super) fn current_line_at(comment: &Comment, diff: &Diff) -> NowLine {
     NowLine::NotPresent
 }
 
-pub(super) fn compute_scroll_offset(
+/// Rendered row count for one stale entry, branching on its anchor shape.
+/// `Anchor::Line` is the full render path; everything else (Description /
+/// Change / Stack) early-continues after the body row, dropping the `was:`
+/// and `now:` lines. The scrollbar's `content_length` and the scroll-offset
+/// computation must use this so the thumb reflects what the user actually
+/// sees.
+pub(super) fn rendered_rows_for_anchor(anchor: &Anchor, is_wide: bool) -> u16 {
+    if matches!(anchor, Anchor::Line { .. }) {
+        if is_wide {
+            ENTRY_LINES_WIDE
+        } else {
+            ENTRY_LINES_NARROW
+        }
+    } else if is_wide {
+        NON_LINE_ENTRY_LINES_WIDE
+    } else {
+        NON_LINE_ENTRY_LINES_NARROW
+    }
+}
+
+pub(super) fn compute_scroll_offset<'a, I>(
+    anchors: I,
     selected_index: usize,
     inner_rows: u16,
     is_wide: bool,
     current_offset: u16,
-) -> u16 {
-    let per_entry = if is_wide {
-        ENTRY_LINES_WIDE
-    } else {
-        ENTRY_LINES_NARROW
-    };
-    let selected = u16::try_from(selected_index).unwrap_or(u16::MAX);
-    let entry_top = selected.saturating_mul(per_entry);
-    let entry_bottom = entry_top.saturating_add(per_entry);
+) -> u16
+where
+    I: IntoIterator<Item = &'a Anchor>,
+{
+    let mut entry_top: u16 = 0;
+    let mut entry_height: u16 = 0;
+    let mut found = false;
+    for (i, anchor) in anchors.into_iter().enumerate() {
+        let h = rendered_rows_for_anchor(anchor, is_wide);
+        if i == selected_index {
+            entry_height = h;
+            found = true;
+            break;
+        }
+        entry_top = entry_top.saturating_add(h);
+    }
+    if !found {
+        // selected_index out of range — leave offset as-is rather than scroll
+        // to a phantom location.
+        return current_offset;
+    }
+    let entry_bottom = entry_top.saturating_add(entry_height);
 
     if entry_top < current_offset {
         return entry_top;
@@ -109,6 +152,19 @@ pub(super) fn compute_scroll_offset(
         return entry_bottom.saturating_sub(inner_rows);
     }
     current_offset
+}
+
+/// Total rendered row count for the given stale-entry anchors at the given
+/// layout. The scrollbar takes this as `total_lines` so the thumb's length
+/// reflects rendered rows, matching `scroll_offset`'s row-based semantics.
+pub(super) fn total_rendered_rows<'a, I>(anchors: I, is_wide: bool) -> usize
+where
+    I: IntoIterator<Item = &'a Anchor>,
+{
+    anchors
+        .into_iter()
+        .map(|a| usize::from(rendered_rows_for_anchor(a, is_wide)))
+        .sum()
 }
 
 pub(super) fn render(frame: &mut Frame<'_>, state: &mut StaleScreenState, app: &App) {
@@ -133,28 +189,46 @@ pub(super) fn render(frame: &mut Frame<'_>, state: &mut StaleScreenState, app: &
         frame.render_widget(empty_msg, inner);
     } else {
         let is_wide = inner.width >= WIDE_INNER_THRESHOLD;
+        // Collect the anchors of the visible stale entries once. Both the
+        // scroll-offset calc and the scrollbar's content_length need to walk
+        // these to honor variable per-entry row counts (Description / Change
+        // / Stack anchors render shorter than Line anchors).
+        let anchors: Vec<&Anchor> = state
+            .stale_indices
+            .iter()
+            .filter_map(|&idx| app.loaded_comments.get(idx))
+            .map(|c| &c.anchor)
+            .collect();
+
         state.scroll_offset = compute_scroll_offset(
+            anchors.iter().copied(),
             state.selected_index,
             inner.height,
             is_wide,
             state.scroll_offset,
         );
-        render_entries(frame, inner, state, app, is_wide);
+
+        let total_rows = total_rendered_rows(anchors.iter().copied(), is_wide);
+        let (body_area, scrollbar_area, mut sb_state) =
+            scrollbar_layout_for_view(inner, total_rows, state.scroll_offset);
+        render_entries(frame, body_area, state, app, is_wide);
+        render_view_scrollbar(frame, sb_state.as_mut(), scrollbar_area);
     }
 
     let footer = Paragraph::new(STALE_FOOTER_TEXT);
     frame.render_widget(footer, layout[1]);
 }
 
-fn render_entries(
-    frame: &mut Frame<'_>,
-    area: ratatui::layout::Rect,
+/// Build the ratatui line list `render_entries` would push to the paragraph
+/// for the given state/app/layout. Pure (no `Frame`) so tests can pin the
+/// emit count against [`total_rendered_rows`] without a `TestBackend`.
+pub(super) fn build_entry_lines<'a>(
+    width: u16,
     state: &StaleScreenState,
-    app: &App,
+    app: &'a App,
     is_wide: bool,
-) {
-    let width = area.width;
-    let mut lines: Vec<TuiLine<'_>> = Vec::new();
+) -> Vec<TuiLine<'a>> {
+    let mut lines: Vec<TuiLine<'a>> = Vec::new();
 
     for (display_idx, &comment_idx) in state.stale_indices.iter().enumerate() {
         let Some(comment) = app.loaded_comments.get(comment_idx) else {
@@ -229,6 +303,17 @@ fn render_entries(
         lines.push(TuiLine::default());
     }
 
+    lines
+}
+
+fn render_entries(
+    frame: &mut Frame<'_>,
+    area: ratatui::layout::Rect,
+    state: &StaleScreenState,
+    app: &App,
+    is_wide: bool,
+) {
+    let lines = build_entry_lines(area.width, state, app, is_wide);
     let widget = Paragraph::new(lines).scroll((state.scroll_offset, 0));
     frame.render_widget(widget, area);
 }
@@ -469,38 +554,102 @@ mod tests {
         );
     }
 
+    /// Build `n` line-anchor stale comments so scroll-offset and total-rows
+    /// tests can pass a real `&[Anchor]` slice into the row-walking helpers.
+    fn line_anchors(n: usize) -> Vec<Anchor> {
+        (0..n)
+            .map(|i| Anchor::Line {
+                change_id: cid(),
+                location: LineAnchor {
+                    file: PathBuf::from(format!("file_{i}.rs")),
+                    side: Side::New,
+                    old_line: None,
+                    new_line: Some(u32::try_from(i + 1).unwrap_or(1)),
+                    hunk_header: "@@ -1,1 +1,1 @@".to_owned(),
+                    target_text: "t".to_owned(),
+                    context_before: vec![],
+                    context_after: vec![],
+                },
+            })
+            .collect()
+    }
+
+    fn description_anchor() -> Anchor {
+        use crate::comment::DescriptionAnchor;
+        Anchor::Description {
+            change_id: cid(),
+            location: DescriptionAnchor {
+                display_line: Some(1),
+                target_text: "t".to_owned(),
+                context_before: vec![],
+                context_after: vec![],
+            },
+        }
+    }
+
     #[test]
     fn compute_scroll_offset_first_entry_no_scroll() {
-        let offset = compute_scroll_offset(0, 24, true, 0);
+        let anchors = line_anchors(10);
+        let offset = compute_scroll_offset(anchors.iter(), 0, 24, true, 0);
         assert_eq!(offset, 0);
     }
 
     #[test]
     fn compute_scroll_offset_below_viewport_scrolls_down() {
-        let offset = compute_scroll_offset(5, 14, true, 0);
+        let anchors = line_anchors(10);
+        let offset = compute_scroll_offset(anchors.iter(), 5, 14, true, 0);
         assert!(offset > 0, "expected scroll > 0 for entry 5, got {offset}");
         assert!(offset >= 28, "offset {offset} should be >= 28");
     }
 
     #[test]
     fn compute_scroll_offset_above_viewport_scrolls_up() {
-        let offset = compute_scroll_offset(0, 14, true, 30);
+        let anchors = line_anchors(10);
+        let offset = compute_scroll_offset(anchors.iter(), 0, 14, true, 30);
         assert_eq!(offset, 0, "selecting entry 0 should snap offset to 0");
     }
 
     #[test]
     fn compute_scroll_offset_already_visible_no_change() {
-        let offset = compute_scroll_offset(1, 14, true, 0);
+        let anchors = line_anchors(10);
+        let offset = compute_scroll_offset(anchors.iter(), 1, 14, true, 0);
         assert_eq!(offset, 0);
     }
 
     #[test]
     fn compute_scroll_offset_narrow_layout_uses_taller_per_entry() {
-        let wide = compute_scroll_offset(5, 14, true, 0);
-        let narrow = compute_scroll_offset(5, 14, false, 0);
+        let anchors = line_anchors(10);
+        let wide = compute_scroll_offset(anchors.iter(), 5, 14, true, 0);
+        let narrow = compute_scroll_offset(anchors.iter(), 5, 14, false, 0);
         assert!(
             narrow > wide,
             "narrow ({narrow}) should require more scroll than wide ({wide})"
         );
+    }
+
+    #[test]
+    fn rendered_rows_for_anchor_line_matches_constants() {
+        let line = &line_anchors(1)[0];
+        assert_eq!(rendered_rows_for_anchor(line, true), ENTRY_LINES_WIDE);
+        assert_eq!(rendered_rows_for_anchor(line, false), ENTRY_LINES_NARROW);
+    }
+
+    #[test]
+    fn rendered_rows_for_anchor_description_drops_was_now_lines() {
+        let desc = description_anchor();
+        // Wide non-line: 5 rows (header, sep, sev, body, blank). Narrow: 6
+        // (extra reason row).
+        assert_eq!(rendered_rows_for_anchor(&desc, true), 5);
+        assert_eq!(rendered_rows_for_anchor(&desc, false), 6);
+    }
+
+    #[test]
+    fn total_rendered_rows_sums_per_anchor_height_for_mixed_entries() {
+        let mut anchors = line_anchors(2);
+        anchors.push(description_anchor());
+        // Wide: 7 + 7 + 5 = 19.
+        assert_eq!(total_rendered_rows(anchors.iter(), true), 19);
+        // Narrow: 8 + 8 + 6 = 22.
+        assert_eq!(total_rendered_rows(anchors.iter(), false), 22);
     }
 }

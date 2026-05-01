@@ -58,10 +58,11 @@ const BLOCK_BORDER_COLS: u16 = 2;
 /// real diff area height. Overwritten by `render_main` on every frame.
 const FALLBACK_VIEWPORT_ROWS: u16 = 20;
 
-/// Width (cells) of the diff-pane length indicator (vertical scrollbar). The
-/// scrollbar widget renders into a single column on the right edge of the
-/// diff body when the diff overflows the viewport.
-const SCROLLBAR_WIDTH: u16 = 1;
+/// Width (cells) of a length-indicator (vertical scrollbar). The scrollbar
+/// widget renders into a single column on the right edge of a paginated body
+/// (diff pane, file picker, stale list, stack overview) when content overflows
+/// the viewport.
+pub(super) const SCROLLBAR_WIDTH: u16 = 1;
 
 /// Stack depth at which `transition_screen = "auto"` starts firing. Per spec,
 /// deep stacks get the beat between changes; short ones don't need the pause.
@@ -967,8 +968,8 @@ fn render_diff(frame: &mut Frame<'_>, area: Rect, app: &App) {
         return;
     };
 
-    let mut sb_state = scrollbar_state_for_diff(view.lines.len(), app.scroll, area.height);
-    let (body_area, scrollbar_area) = split_diff_body_for_scrollbar(area, sb_state.is_some());
+    let (body_area, scrollbar_area, mut sb_state) =
+        scrollbar_layout_for_view(area, view.lines.len(), app.scroll);
 
     let width = body_area.width;
     let lines: Vec<TuiLine<'_>> = view
@@ -981,21 +982,19 @@ fn render_diff(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let widget = Paragraph::new(lines).scroll((app.scroll, 0));
     frame.render_widget(widget, body_area);
 
-    if let (Some(state), Some(sb_area)) = (sb_state.as_mut(), scrollbar_area) {
-        let scrollbar = Scrollbar::default()
-            .orientation(ScrollbarOrientation::VerticalRight)
-            .track_style(Style::default().fg(Color::DarkGray))
-            .thumb_style(Style::default().fg(Color::Gray))
-            .begin_style(Style::default().fg(Color::DarkGray))
-            .end_style(Style::default().fg(Color::DarkGray));
-        frame.render_stateful_widget(scrollbar, sb_area, state);
-    }
+    render_view_scrollbar(frame, sb_state.as_mut(), scrollbar_area);
 }
 
-/// Pure numeric core for the diff scrollbar: returns `Some((content_length,
-/// position))` when the diff overflows the viewport, `None` otherwise.
+/// Pure numeric core for a paginated-view scrollbar: returns
+/// `Some((content_length, position))` when the content overflows the viewport,
+/// `None` otherwise.
 ///
-/// `content_length` is the number of distinct *scroll positions* (top-line
+/// `total_lines` is the count of distinct rows the body can scroll across —
+/// for the diff pane that is rendered diff lines, for an entry list that is
+/// the entry count (or summed per-entry rows when entries vary in height).
+/// The math is identical regardless of what each row represents.
+///
+/// `content_length` is the number of distinct *scroll positions* (top-row
 /// indices the user can land at), which is `max_scroll + 1` where
 /// `max_scroll = total_lines - viewport_rows`. `position` is `scroll` clamped
 /// to `[0, max_scroll]`.
@@ -1003,7 +1002,7 @@ fn render_diff(frame: &mut Frame<'_>, area: Rect, app: &App) {
 /// The clamp is defensive against future ratatui changes — current ratatui
 /// also clamps internally — and gives us a tuple shape the tests can pin
 /// numerically without rendering.
-fn scrollbar_overflow_for_diff(
+pub(super) fn scrollbar_overflow_for_view(
     total_lines: usize,
     scroll: u16,
     viewport_rows: u16,
@@ -1021,23 +1020,23 @@ fn scrollbar_overflow_for_diff(
     Some((content_length, position))
 }
 
-/// Build the [`ScrollbarState`] for a diff body of `total_lines` rendered lines
+/// Build the [`ScrollbarState`] for a paginated body of `total_lines` rows
 /// with topmost-visible row `scroll` in a viewport `viewport_rows` rows tall.
 ///
-/// Returns `None` when the diff fits in the viewport (or the viewport is
+/// Returns `None` when the content fits in the viewport (or the viewport is
 /// degenerate); the caller should skip the scrollbar in that case so it does
 /// not waste a column on noise.
 ///
-/// Thin shell over [`scrollbar_overflow_for_diff`]: pinning the numeric
+/// Thin shell over [`scrollbar_overflow_for_view`]: pinning the numeric
 /// behavior happens against the pure helper; this function just lifts the
 /// tuple into ratatui's `ScrollbarState`.
-fn scrollbar_state_for_diff(
+pub(super) fn scrollbar_state_for_view(
     total_lines: usize,
     scroll: u16,
     viewport_rows: u16,
 ) -> Option<ScrollbarState> {
     let (content_length, position) =
-        scrollbar_overflow_for_diff(total_lines, scroll, viewport_rows)?;
+        scrollbar_overflow_for_view(total_lines, scroll, viewport_rows)?;
     Some(ScrollbarState::new(content_length).position(position))
 }
 
@@ -1048,13 +1047,59 @@ fn scrollbar_state_for_diff(
 /// scrollbar was requested (`with_scrollbar = false`) **or** when the area is
 /// too narrow to host both the body and a scrollbar column. In both cases the
 /// body keeps the full original area.
-fn split_diff_body_for_scrollbar(area: Rect, with_scrollbar: bool) -> (Rect, Option<Rect>) {
+pub(super) fn split_body_for_scrollbar(area: Rect, with_scrollbar: bool) -> (Rect, Option<Rect>) {
     if !with_scrollbar || area.width <= SCROLLBAR_WIDTH {
         return (area, None);
     }
     let split =
         Layout::horizontal([Constraint::Min(0), Constraint::Length(SCROLLBAR_WIDTH)]).split(area);
     (split[0], Some(split[1]))
+}
+
+/// Build the right-edge scrollbar widget shared by every paginated view.
+/// Centralizes the orientation and per-element style choices so all screens
+/// render the same glyphs and colors.
+pub(super) fn view_scrollbar() -> Scrollbar<'static> {
+    Scrollbar::default()
+        .orientation(ScrollbarOrientation::VerticalRight)
+        .track_style(Style::default().fg(Color::DarkGray))
+        .thumb_style(Style::default().fg(Color::Gray))
+        .begin_style(Style::default().fg(Color::DarkGray))
+        .end_style(Style::default().fg(Color::DarkGray))
+}
+
+/// One-shot layout helper for paginated views that want a scrollbar.
+///
+/// Combines [`scrollbar_state_for_view`] and [`split_body_for_scrollbar`] so
+/// each call site collapses to "compute layout, render body into `body`,
+/// hand `(state, sb_area)` to [`render_view_scrollbar`]." The helper returns
+/// `(body, sb_area, sb_state)`:
+///
+/// - `body` is always the area into which the view's content is rendered. It
+///   shrinks by [`SCROLLBAR_WIDTH`] when a scrollbar will be drawn.
+/// - `sb_area` and `sb_state` are both `Some` together (overflow + room for
+///   the strip) or both `None` (no overflow, or area too narrow).
+pub(super) fn scrollbar_layout_for_view(
+    area: Rect,
+    total_lines: usize,
+    scroll: u16,
+) -> (Rect, Option<Rect>, Option<ScrollbarState>) {
+    let sb_state = scrollbar_state_for_view(total_lines, scroll, area.height);
+    let (body, sb_area) = split_body_for_scrollbar(area, sb_state.is_some());
+    (body, sb_area, sb_state)
+}
+
+/// Render the right-edge scrollbar into `sb_area` if both the area and the
+/// state were produced by [`scrollbar_layout_for_view`]. Either both are
+/// `Some` together or both are `None`; in the latter case this is a no-op.
+pub(super) fn render_view_scrollbar(
+    frame: &mut Frame<'_>,
+    sb_state: Option<&mut ScrollbarState>,
+    sb_area: Option<Rect>,
+) {
+    if let (Some(state), Some(area)) = (sb_state, sb_area) {
+        frame.render_stateful_widget(view_scrollbar(), area, state);
+    }
 }
 
 fn render_rendered_line(line: &RenderedLine, focused: bool, width: u16) -> TuiLine<'_> {
@@ -2935,6 +2980,48 @@ fn anchor_line_index(app: &App, comment: &Comment) -> Option<usize> {
         Side::Old => l.source_line == location.old_line && location.old_line.is_some(),
         Side::New => l.target_line == location.new_line && location.new_line.is_some(),
     })
+}
+
+/// Test-only helpers for inspecting rendered scrollbars across every screen.
+/// Lives at the parent-module level so all four screens' tests can share one
+/// copy of the buffer-walk logic — the helpers were independently re-derived
+/// in three submodules during initial scrollbar adoption, which is exactly
+/// the duplication a shared module exists to prevent.
+#[cfg(test)]
+pub(super) mod scrollbar_test_helpers {
+    /// Whether `col` of `buf` contains any glyph drawn by ratatui's
+    /// `Scrollbar` widget (the begin/end arrows, the thumb, or the track).
+    pub(in crate::tui) fn col_contains_scrollbar_glyph(
+        buf: &ratatui::buffer::Buffer,
+        col: u16,
+    ) -> bool {
+        (0..buf.area.height).any(|row| {
+            matches!(
+                buf[(col, row)].symbol(),
+                "\u{25b2}" | "\u{25bc}" | "\u{2588}" | "\u{2551}"
+            )
+        })
+    }
+
+    /// Find the row of the topmost thumb (`█`) glyph in `col` of `buf`.
+    pub(in crate::tui) fn scrollbar_thumb_row(
+        buf: &ratatui::buffer::Buffer,
+        col: u16,
+    ) -> Option<u16> {
+        (0..buf.area.height).find(|&row| buf[(col, row)].symbol() == "\u{2588}")
+    }
+
+    /// Find the row of the bottommost thumb (`█`) glyph in `col` of `buf`.
+    /// Useful when the thumb spans multiple rows and the bottom edge is the
+    /// load-bearing assertion (e.g., scrolled to end on small content).
+    pub(in crate::tui) fn scrollbar_thumb_last_row(
+        buf: &ratatui::buffer::Buffer,
+        col: u16,
+    ) -> Option<u16> {
+        (0..buf.area.height)
+            .rev()
+            .find(|&row| buf[(col, row)].symbol() == "\u{2588}")
+    }
 }
 
 #[cfg(test)]
@@ -6218,16 +6305,16 @@ mod tests {
     // glyphs where expected at the right edge of the diff area.
 
     #[test]
-    fn scrollbar_state_for_diff_returns_none_when_diff_fits_viewport() {
-        // Equal length is the boundary: viewport can show the entire diff in
+    fn scrollbar_state_for_view_returns_none_when_content_fits_viewport() {
+        // Equal length is the boundary: viewport can show the entire body in
         // one screen, so the indicator is informational noise — hide it.
-        assert!(scrollbar_state_for_diff(20, 0, 20).is_none());
-        assert!(scrollbar_state_for_diff(5, 0, 20).is_none());
+        assert!(scrollbar_state_for_view(20, 0, 20).is_none());
+        assert!(scrollbar_state_for_view(5, 0, 20).is_none());
     }
 
     #[test]
-    fn scrollbar_state_for_diff_returns_some_when_diff_overflows_viewport() {
-        let state = scrollbar_state_for_diff(100, 0, 20)
+    fn scrollbar_state_for_view_returns_some_when_content_overflows_viewport() {
+        let state = scrollbar_state_for_view(100, 0, 20)
             .expect("100 lines in 20-row viewport must produce a scrollbar");
         // Sanity: the state is non-degenerate. Internal fields are private,
         // so we cannot assert on them directly — the rendering tests below
@@ -6236,17 +6323,17 @@ mod tests {
     }
 
     #[test]
-    fn scrollbar_state_for_diff_returns_none_for_zero_viewport() {
+    fn scrollbar_state_for_view_returns_none_for_zero_viewport() {
         // Defensive: a zero-row viewport is a transient resize state. Don't
         // try to allocate a scrollbar against it — the math would divide-by-
         // zero on the renderer side.
-        assert!(scrollbar_state_for_diff(100, 0, 0).is_none());
+        assert!(scrollbar_state_for_view(100, 0, 0).is_none());
     }
 
     #[test]
-    fn split_diff_body_for_scrollbar_reserves_one_col_on_the_right() {
+    fn split_body_for_scrollbar_reserves_one_col_on_the_right() {
         let area = Rect::new(0, 0, 80, 24);
-        let (body, sb) = split_diff_body_for_scrollbar(area, true);
+        let (body, sb) = split_body_for_scrollbar(area, true);
         assert_eq!(body.width, 79, "body keeps width minus one col");
         assert_eq!(body.x, 0);
         let sb_rect = sb.expect("scrollbar slot must exist when requested");
@@ -6256,18 +6343,18 @@ mod tests {
     }
 
     #[test]
-    fn split_diff_body_for_scrollbar_skips_when_not_requested() {
+    fn split_body_for_scrollbar_skips_when_not_requested() {
         let area = Rect::new(0, 0, 80, 24);
-        let (body, sb) = split_diff_body_for_scrollbar(area, false);
+        let (body, sb) = split_body_for_scrollbar(area, false);
         assert_eq!(body, area, "body keeps the full area when no scrollbar");
         assert!(sb.is_none());
     }
 
     #[test]
-    fn split_diff_body_for_scrollbar_skips_when_area_too_narrow() {
+    fn split_body_for_scrollbar_skips_when_area_too_narrow() {
         // Width of 1 cannot host both body and scrollbar; keep the body.
         let area = Rect::new(0, 0, 1, 24);
-        let (body, sb) = split_diff_body_for_scrollbar(area, true);
+        let (body, sb) = split_body_for_scrollbar(area, true);
         assert_eq!(body, area);
         assert!(sb.is_none());
     }
@@ -6297,28 +6384,25 @@ mod tests {
         }
     }
 
-    /// Render the main view into a [`TestBackend`] of the given size and
-    /// return the resulting [`Buffer`] for inspection.
-    fn render_main_to_buffer(app: &mut App, cols: u16, rows: u16) -> ratatui::buffer::Buffer {
+    /// Render whichever screen `app` is currently on (`Main`, `Stale`,
+    /// `Overview`, `FilePicker`, `Composer`, etc.) into a [`TestBackend`] of
+    /// the given size and return the resulting [`Buffer`] for inspection.
+    /// `render(frame, app)` dispatches on `app.screen` and falls through to
+    /// `render_main` when on `Screen::Main`, so this single helper covers
+    /// every screen test.
+    fn render_to_buffer(app: &mut App, cols: u16, rows: u16) -> ratatui::buffer::Buffer {
         use ratatui::backend::TestBackend;
         let backend = TestBackend::new(cols, rows);
         let mut terminal = Terminal::new(backend).expect("test terminal must construct");
         terminal
-            .draw(|frame| render_main(frame, app))
+            .draw(|frame| render(frame, app))
             .expect("test draw must succeed");
         terminal.backend().buffer().clone()
     }
 
-    /// True when any cell in column `col` of `buf` contains one of the
-    /// scrollbar glyphs (`▲`, `▼`, `█`, `║`).
-    fn col_contains_scrollbar_glyph(buf: &ratatui::buffer::Buffer, col: u16) -> bool {
-        (0..buf.area.height).any(|row| {
-            matches!(
-                buf[(col, row)].symbol(),
-                "\u{25b2}" | "\u{25bc}" | "\u{2588}" | "\u{2551}"
-            )
-        })
-    }
+    use super::scrollbar_test_helpers::{
+        col_contains_scrollbar_glyph, scrollbar_thumb_last_row, scrollbar_thumb_row,
+    };
 
     #[test]
     fn scrollbar_renders_when_diff_overflows_viewport() {
@@ -6326,7 +6410,7 @@ mod tests {
         // the terminal height minus stack/file/footer rows, far smaller than
         // 80, so the scrollbar must appear.
         let mut app = make_app_with_single_file(long_diff_file(80));
-        let buf = render_main_to_buffer(&mut app, 80, 24);
+        let buf = render_to_buffer(&mut app, 80, 24);
         assert!(
             col_contains_scrollbar_glyph(&buf, 79),
             "scrollbar glyphs must appear in the rightmost column when the diff overflows the viewport"
@@ -6338,28 +6422,11 @@ mod tests {
         // A 2-line diff fits in any reasonable viewport; the rightmost column
         // must contain none of the scrollbar glyphs.
         let mut app = make_app_with_single_file(long_diff_file(2));
-        let buf = render_main_to_buffer(&mut app, 80, 24);
+        let buf = render_to_buffer(&mut app, 80, 24);
         assert!(
             !col_contains_scrollbar_glyph(&buf, 79),
             "scrollbar must not render when the diff fits the viewport"
         );
-    }
-
-    /// Return the (0-based) row offset of the FIRST thumb (`█`) cell within
-    /// the scrollbar column of `buf`. Returns `None` if no thumb glyph is
-    /// found.
-    fn scrollbar_thumb_row(buf: &ratatui::buffer::Buffer, col: u16) -> Option<u16> {
-        (0..buf.area.height).find(|&row| buf[(col, row)].symbol() == "\u{2588}")
-    }
-
-    /// Return the (0-based) row offset of the LAST thumb (`█`) cell within
-    /// the scrollbar column of `buf`. Returns `None` if no thumb glyph is
-    /// found. Useful when the thumb spans multiple rows and we care about
-    /// the bottom edge (e.g., "scrolled to end" tests on small content).
-    fn scrollbar_thumb_last_row(buf: &ratatui::buffer::Buffer, col: u16) -> Option<u16> {
-        (0..buf.area.height)
-            .rev()
-            .find(|&row| buf[(col, row)].symbol() == "\u{2588}")
     }
 
     /// (`top_row`, `bottom_row`) of the diff area inside the main view, given
@@ -6381,7 +6448,7 @@ mod tests {
         // diff area. Pins "where am I in the diff" to "top".
         let mut app = make_app_with_single_file(long_diff_file(200));
         app.line_index = 0;
-        let buf = render_main_to_buffer(&mut app, 80, 24);
+        let buf = render_to_buffer(&mut app, 80, 24);
         let thumb_row =
             scrollbar_thumb_row(&buf, 79).expect("thumb glyph must appear when scrollbar renders");
         let (diff_top, diff_bottom) = diff_area_rows(24);
@@ -6399,7 +6466,7 @@ mod tests {
         // the thumb must land in the bottom half of the track.
         let mut app = make_app_with_single_file(long_diff_file(200));
         app.line_index = app.current_line_count() - 1;
-        let buf = render_main_to_buffer(&mut app, 80, 24);
+        let buf = render_to_buffer(&mut app, 80, 24);
         let thumb_row =
             scrollbar_thumb_row(&buf, 79).expect("thumb glyph must appear when scrollbar renders");
         let (diff_top, diff_bottom) = diff_area_rows(24);
@@ -6421,12 +6488,12 @@ mod tests {
         let mut app = make_app_with_single_file(long_diff_file(200));
         app.line_index = app.current_line_count() - 1;
         // Ensure scroll moves to the bottom before the cycle.
-        let _ = render_main_to_buffer(&mut app, 80, 24);
+        let _ = render_to_buffer(&mut app, 80, 24);
         app.cycle_file(-1); // back to description (file_index 0)
         app.cycle_file(1); // forward to diff file
         assert_eq!(app.line_index, 0);
         assert_eq!(app.scroll, 0);
-        let buf = render_main_to_buffer(&mut app, 80, 24);
+        let buf = render_to_buffer(&mut app, 80, 24);
         let thumb_row =
             scrollbar_thumb_row(&buf, 79).expect("thumb glyph must appear when scrollbar renders");
         let (diff_top, diff_bottom) = diff_area_rows(24);
@@ -6438,7 +6505,7 @@ mod tests {
     }
 
     #[test]
-    fn scrollbar_overflow_for_diff_clamps_scroll_past_end_to_max() {
+    fn scrollbar_overflow_for_view_clamps_scroll_past_end_to_max() {
         // Helper clamp pinned numerically — ratatui 0.29 also clamps
         // internally, but we own the clamp at the helper boundary so a
         // future ratatui change cannot regress the contract. The tuple
@@ -6446,35 +6513,35 @@ mod tests {
         //
         // total=30, viewport=10 → max_scroll = 20, content_length = 21.
         assert_eq!(
-            scrollbar_overflow_for_diff(30, 50, 10),
+            scrollbar_overflow_for_view(30, 50, 10),
             Some((21, 20)),
             "stale scroll past end must clamp to max_scroll"
         );
         assert_eq!(
-            scrollbar_overflow_for_diff(30, 20, 10),
+            scrollbar_overflow_for_view(30, 20, 10),
             Some((21, 20)),
             "scroll exactly at max passes through"
         );
         assert_eq!(
-            scrollbar_overflow_for_diff(30, 5, 10),
+            scrollbar_overflow_for_view(30, 5, 10),
             Some((21, 5)),
             "scroll below max passes through unmodified"
         );
         assert_eq!(
-            scrollbar_overflow_for_diff(30, 0, 10),
+            scrollbar_overflow_for_view(30, 0, 10),
             Some((21, 0)),
             "scroll at top yields position 0"
         );
     }
 
     #[test]
-    fn scrollbar_state_for_diff_renders_thumb_at_bottom_when_scroll_past_end() {
+    fn scrollbar_state_for_view_renders_thumb_at_bottom_when_scroll_past_end() {
         use ratatui::backend::TestBackend;
         // Integration shim: confirm the helper-clamp tuple lifts into a
         // ScrollbarState that renders the thumb at the bottom of the track.
         // The numeric clamp is pinned by the tuple test above; this test
         // covers the rendering wiring.
-        let mut state = scrollbar_state_for_diff(30, 50, 10)
+        let mut state = scrollbar_state_for_view(30, 50, 10)
             .expect("30 lines vs 10-row viewport must produce a scrollbar");
         let backend = TestBackend::new(1, 8);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -6509,7 +6576,7 @@ mod tests {
         let mut app = make_app_with_single_file(long_diff_file(100));
         // Scroll cursor to near the bottom so app.scroll lands well past 20.
         app.line_index = app.current_line_count() - 1;
-        let _ = render_main_to_buffer(&mut app, 80, 24);
+        let _ = render_to_buffer(&mut app, 80, 24);
         assert!(app.scroll > 20, "precondition: scroll moved past 20");
 
         // Simulate a refresh that shrinks the diff to 20 lines without
@@ -6537,14 +6604,14 @@ mod tests {
             .lines
             .len();
         assert_eq!(
-            scrollbar_overflow_for_diff(new_total, app.scroll, 17),
+            scrollbar_overflow_for_view(new_total, app.scroll, 17),
             Some((5, 4)),
             "stale scroll past end must clamp to max_scroll at the helper boundary"
         );
 
         // Integration pin: rendering the same state lands the thumb's last
         // row on the last track row (just above the end-arrow ▼).
-        let buf = render_main_to_buffer(&mut app, 80, 24);
+        let buf = render_to_buffer(&mut app, 80, 24);
         let thumb_last = scrollbar_thumb_last_row(&buf, 79)
             .expect("scrollbar thumb must render even when scroll is past the end");
         let (_diff_top, diff_bottom) = diff_area_rows(24);
@@ -6561,7 +6628,7 @@ mod tests {
         // `load_stack_entry` performs, the scrollbar lands at the top.
         let mut app = make_app_with_single_file(long_diff_file(200));
         app.line_index = app.current_line_count() - 1;
-        let _ = render_main_to_buffer(&mut app, 80, 24);
+        let _ = render_to_buffer(&mut app, 80, 24);
         assert!(app.scroll > 0, "precondition: scroll moved off zero");
 
         // Mirror the field resets in `load_stack_entry`. The scrollbar reads
@@ -6573,7 +6640,7 @@ mod tests {
         // Cycle back to the diff file (file_index 0 is the description view).
         app.file_index = 1;
 
-        let buf = render_main_to_buffer(&mut app, 80, 24);
+        let buf = render_to_buffer(&mut app, 80, 24);
         let thumb_row = scrollbar_thumb_row(&buf, 79)
             .expect("scrollbar thumb must appear after revision-navigation reset");
         let (diff_top, diff_bottom) = diff_area_rows(24);
@@ -6615,46 +6682,46 @@ mod tests {
         // Pick a viewport size that fits the original (19 rendered lines)
         // but not the augmented (24).
         assert!(augmented.lines.len() > 20);
-        assert!(scrollbar_state_for_diff(augmented.lines.len(), 0, 20).is_some());
+        assert!(scrollbar_state_for_view(augmented.lines.len(), 0, 20).is_some());
     }
 
     #[test]
-    fn scrollbar_state_for_diff_returns_none_for_zero_line_buffer() {
+    fn scrollbar_state_for_view_returns_none_for_zero_line_buffer() {
         // Empty buffer is the absolute floor — `total <= viewport` covers
         // it, but pin the boundary so a future predicate change is intentional.
-        assert!(scrollbar_state_for_diff(0, 0, 20).is_none());
-        assert!(scrollbar_state_for_diff(0, 0, 1).is_none());
+        assert!(scrollbar_state_for_view(0, 0, 20).is_none());
+        assert!(scrollbar_state_for_view(0, 0, 1).is_none());
     }
 
     #[test]
-    fn scrollbar_state_for_diff_renders_at_exactly_one_line_overflow() {
+    fn scrollbar_state_for_view_renders_at_exactly_one_line_overflow() {
         // The off-by-one cliff: total == viewport + 1 must produce a
         // scrollbar (the predicate is `<=`, so == is the floor of overflow).
-        assert!(scrollbar_state_for_diff(21, 0, 20).is_some());
+        assert!(scrollbar_state_for_view(21, 0, 20).is_some());
         // And the negative side: total == viewport must NOT produce one.
-        assert!(scrollbar_state_for_diff(20, 0, 20).is_none());
+        assert!(scrollbar_state_for_view(20, 0, 20).is_none());
     }
 
     #[test]
-    fn split_diff_body_for_scrollbar_handles_width_two_boundary() {
+    fn split_body_for_scrollbar_handles_width_two_boundary() {
         // Width 2: `area.width <= SCROLLBAR_WIDTH` is `2 <= 1` (false), so
         // we DO split — body keeps 1 col, scrollbar takes 1 col.
         let area_2 = Rect::new(0, 0, 2, 24);
-        let (body, sb) = split_diff_body_for_scrollbar(area_2, true);
+        let (body, sb) = split_body_for_scrollbar(area_2, true);
         assert_eq!(body.width, 1);
         let sb_rect = sb.expect("width=2 must yield a scrollbar slot");
         assert_eq!(sb_rect.width, 1);
 
         // Width 1: too narrow to host both; body keeps the full area.
         let area_1 = Rect::new(0, 0, 1, 24);
-        let (body, sb) = split_diff_body_for_scrollbar(area_1, true);
+        let (body, sb) = split_body_for_scrollbar(area_1, true);
         assert_eq!(body, area_1);
         assert!(sb.is_none());
 
         // Width 0: pathological (resize race). Must not panic; returns no
         // scrollbar slot.
         let area_0 = Rect::new(0, 0, 0, 24);
-        let (body, sb) = split_diff_body_for_scrollbar(area_0, true);
+        let (body, sb) = split_body_for_scrollbar(area_0, true);
         assert_eq!(body, area_0);
         assert!(sb.is_none());
     }
@@ -6684,10 +6751,356 @@ mod tests {
             TransitionMode::Never,
         );
         app.file_index = 0;
-        let buf = render_main_to_buffer(&mut app, 80, 24);
+        let buf = render_to_buffer(&mut app, 80, 24);
         assert!(
             col_contains_scrollbar_glyph(&buf, 79),
             "scrollbar must render against the synthetic description view when its content overflows"
+        );
+    }
+
+    // -- Stale-screen scrollbar tests --------------------------------------
+    //
+    // Each stale entry consumes 7 (wide) or 8 (narrow) rendered rows. The
+    // scrollbar takes total rendered rows so the thumb honestly reflects how
+    // much of the body is on screen.
+
+    /// Seed the comment store with `count` stale comments at distinct lines
+    /// of `foo.txt` and return an [`App`] with the stale screen open.
+    fn stale_app_with_n_comments(dir: &std::path::Path, count: u32) -> App {
+        let mut app = make_app_with_single_file(long_diff_file(count + 10));
+        app.repo_root = dir.to_owned();
+        for i in 1..=count {
+            let comment = make_stale_comment_on_file(
+                dir,
+                app.details.change_id.clone(),
+                "foo.txt",
+                i,
+                &format!("stale {i}"),
+                time::OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(i64::from(i)),
+            );
+            crate::store::save_comment(dir, &comment).unwrap();
+        }
+        app.refresh_inline_comments();
+        open_stale_screen(&mut app);
+        app
+    }
+
+    #[test]
+    fn stale_screen_scrollbar_renders_when_entries_overflow_viewport() {
+        let dir = tempfile::tempdir().unwrap();
+        // 20 stale entries × 7 rows/entry (wide) = 140 rows; the body is
+        // roughly terminal_rows - 3 (border + footer), well under 140.
+        let mut app = stale_app_with_n_comments(dir.path(), 20);
+        let buf = render_to_buffer(&mut app, 100, 24);
+        assert!(
+            col_contains_scrollbar_glyph(&buf, 98),
+            "scrollbar must render in the rightmost stale-screen body column when entries overflow"
+        );
+    }
+
+    #[test]
+    fn stale_screen_scrollbar_hidden_when_entries_fit_viewport() {
+        let dir = tempfile::tempdir().unwrap();
+        // 1 stale entry × 7 rows fits comfortably in a 24-row terminal.
+        let mut app = stale_app_with_n_comments(dir.path(), 1);
+        let buf = render_to_buffer(&mut app, 100, 24);
+        assert!(
+            !col_contains_scrollbar_glyph(&buf, 98),
+            "scrollbar must be hidden when stale entries fit the body"
+        );
+    }
+
+    #[test]
+    fn stale_screen_scrollbar_thumb_position_reflects_scroll_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = stale_app_with_n_comments(dir.path(), 20);
+
+        // selected=0 → scroll_offset stays at 0; thumb sits at the top.
+        let buf_top = render_to_buffer(&mut app, 100, 24);
+        let thumb_top = scrollbar_thumb_row(&buf_top, 98)
+            .expect("thumb glyph must appear when entries overflow");
+
+        // Move selection deep into the list to drive scroll_offset down.
+        for _ in 0..19 {
+            handle_stale_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        let buf_bot = render_to_buffer(&mut app, 100, 24);
+        let thumb_bot = scrollbar_thumb_row(&buf_bot, 98)
+            .expect("thumb glyph must appear when entries overflow");
+
+        assert!(
+            thumb_top < thumb_bot,
+            "thumb must move down as scroll_offset advances; top={thumb_top}, bottom={thumb_bot}"
+        );
+    }
+
+    // -- Overview-screen scrollbar tests -----------------------------------
+    //
+    // The overview's scroll model is row-based (each `OverviewRow` is one
+    // rendered line), so the scrollbar's `total_lines` is `rows.len()`.
+
+    /// Seed the comment store with `count` change-level comments on `id` so
+    /// the overview cache loads more rows than the body can display.
+    fn overview_app_with_n_change_comments(dir: &std::path::Path, count: u32) -> App {
+        let (mut app, id_a, _id_b) = make_stack_app_with_two_changes(dir);
+        for i in 0..count {
+            let comment = Comment {
+                schema_version: SchemaVersion,
+                anchor: Anchor::Change {
+                    change_id: id_a.clone(),
+                },
+                repo_root: dir.to_path_buf(),
+                revset: "trunk()..@".to_owned(),
+                commit_id: None,
+                body: format!("change comment {i}"),
+                severity: Severity::Note,
+                created_at: time::OffsetDateTime::UNIX_EPOCH
+                    + time::Duration::seconds(i64::from(i)),
+                updated_at: None,
+                status: Some(Status::Pending),
+                mismatch_reason: None,
+            };
+            crate::store::save_comment(dir, &comment).unwrap();
+        }
+        open_overview_screen(&mut app);
+        app
+    }
+
+    #[test]
+    fn overview_screen_scrollbar_renders_when_rows_overflow_viewport() {
+        let dir = tempfile::tempdir().unwrap();
+        // 60 change-level comments + stack headers + change rows + summary
+        // footer easily exceeds a 24-row terminal's body.
+        let mut app = overview_app_with_n_change_comments(dir.path(), 60);
+        let buf = render_to_buffer(&mut app, 100, 24);
+        assert!(
+            col_contains_scrollbar_glyph(&buf, 98),
+            "scrollbar must render in the rightmost overview-screen body column when rows overflow"
+        );
+    }
+
+    #[test]
+    fn overview_screen_scrollbar_hidden_when_rows_fit_viewport() {
+        let dir = tempfile::tempdir().unwrap();
+        // No extra comments → just header + separator + 2 change rows; the
+        // body is plenty large.
+        let mut app = overview_app_with_n_change_comments(dir.path(), 0);
+        let buf = render_to_buffer(&mut app, 100, 24);
+        assert!(
+            !col_contains_scrollbar_glyph(&buf, 98),
+            "scrollbar must be hidden when overview rows fit the body"
+        );
+    }
+
+    #[test]
+    fn overview_screen_scrollbar_thumb_position_reflects_scroll_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = overview_app_with_n_change_comments(dir.path(), 60);
+
+        // Selected at the top → thumb at the top of the track.
+        let buf_top = render_to_buffer(&mut app, 100, 24);
+        let thumb_top =
+            scrollbar_thumb_row(&buf_top, 98).expect("thumb glyph must appear when rows overflow");
+
+        // Move selection well past the viewport to drive scroll_offset down.
+        for _ in 0..50 {
+            handle_overview_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+                .expect("overview down arrow must not error");
+        }
+        let buf_bot = render_to_buffer(&mut app, 100, 24);
+        let thumb_bot =
+            scrollbar_thumb_row(&buf_bot, 98).expect("thumb glyph must appear when rows overflow");
+
+        assert!(
+            thumb_top < thumb_bot,
+            "thumb must move down as scroll_offset advances; top={thumb_top}, bottom={thumb_bot}"
+        );
+    }
+
+    // -- Variable-row pinning for stale_screen ----------------------------
+    //
+    // Description / Change / Stack anchors render shorter than Line anchors
+    // (no `was:` / `now:` rows). The scrollbar's `total_lines` and the
+    // scroll-offset walker both consult `total_rendered_rows` /
+    // `rendered_rows_for_anchor`; this test pins those helpers against what
+    // `build_entry_lines` actually emits, so a future tweak to either side
+    // can't drift apart silently.
+
+    /// Build a stale comment whose anchor is `Anchor::Description`. Mirrors
+    /// `make_stale_comment_on_file` but for the description side, exercising
+    /// the non-line render path.
+    fn make_stale_description_comment(
+        change_id: ChangeId,
+        body: &str,
+        created_at: time::OffsetDateTime,
+    ) -> Comment {
+        Comment {
+            schema_version: SchemaVersion,
+            anchor: Anchor::Description {
+                change_id,
+                location: DescriptionAnchor {
+                    display_line: Some(1),
+                    target_text: "old line".to_owned(),
+                    context_before: vec![],
+                    context_after: vec![],
+                },
+            },
+            repo_root: PathBuf::from("/repo"),
+            revset: "@".to_owned(),
+            commit_id: None,
+            body: body.to_owned(),
+            severity: Severity::Required,
+            created_at,
+            updated_at: None,
+            status: Some(Status::Stale),
+            mismatch_reason: Some(crate::comment::MismatchReason::TargetTextChanged),
+        }
+    }
+
+    #[test]
+    fn build_entry_lines_count_matches_total_rendered_rows_for_description_anchor() {
+        // Without this pin, `total_rendered_rows` happily over-reports
+        // content_length whenever a Description-anchored stale comment is
+        // present (the original implementation multiplied entry_count by 7
+        // unconditionally), undersizing the scrollbar thumb and overshooting
+        // bottom scrolls.
+        let mut app = make_app_with_single_file(sample_diff_file());
+        let comment = make_stale_description_comment(
+            app.details.change_id.clone(),
+            "desc body",
+            time::OffsetDateTime::UNIX_EPOCH,
+        );
+        app.loaded_comments = vec![comment];
+
+        let state = StaleScreenState {
+            selected_index: 0,
+            stale_indices: vec![0],
+            scroll_offset: 0,
+        };
+
+        for is_wide in [true, false] {
+            let lines = stale_screen::build_entry_lines(80, &state, &app, is_wide);
+            let anchors: Vec<&Anchor> = state
+                .stale_indices
+                .iter()
+                .map(|&i| &app.loaded_comments[i].anchor)
+                .collect();
+            let expected = stale_screen::total_rendered_rows(anchors.iter().copied(), is_wide);
+            assert_eq!(
+                lines.len(),
+                expected,
+                "build_entry_lines emit count must match total_rendered_rows \
+                 (is_wide={is_wide}, lines.len()={}, expected={expected})",
+                lines.len()
+            );
+        }
+    }
+
+    #[test]
+    fn build_entry_lines_count_matches_total_rendered_rows_for_mixed_anchors() {
+        // Mixed list (Line + Description) is the realistic shape and the
+        // case the reviewer's bug report called out — the anchor walker
+        // and the render path must agree on the per-entry height for every
+        // entry, not just the all-Line case.
+        let mut app = make_app_with_single_file(sample_diff_file());
+        let line = make_stale_comment_on_file(
+            std::path::Path::new("/repo"),
+            app.details.change_id.clone(),
+            "foo.txt",
+            2,
+            "line body",
+            time::OffsetDateTime::UNIX_EPOCH,
+        );
+        let desc = make_stale_description_comment(
+            app.details.change_id.clone(),
+            "desc body",
+            time::OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1),
+        );
+        app.loaded_comments = vec![line, desc];
+
+        let state = StaleScreenState {
+            selected_index: 0,
+            stale_indices: vec![0, 1],
+            scroll_offset: 0,
+        };
+
+        for is_wide in [true, false] {
+            let lines = stale_screen::build_entry_lines(80, &state, &app, is_wide);
+            let anchors: Vec<&Anchor> = state
+                .stale_indices
+                .iter()
+                .map(|&i| &app.loaded_comments[i].anchor)
+                .collect();
+            let expected = stale_screen::total_rendered_rows(anchors.iter().copied(), is_wide);
+            assert_eq!(lines.len(), expected, "is_wide={is_wide}");
+        }
+    }
+
+    // -- column_layout threshold stability across scrollbar visibility -----
+    //
+    // C1 fix: column_layout takes the OUTER terminal width, so its threshold
+    // decisions (show_idx at >= 100, show_inset_body at >= 80) must NOT
+    // depend on whether the scrollbar happens to be visible. Earlier the
+    // implementation passed `body_area.width + 2`, which equals `area.width`
+    // when no scrollbar but `area.width - 1` when one was drawn — content
+    // would cliff into a different layout the moment a row was added.
+
+    /// Render the overview screen at `cols x rows` against `app` and return
+    /// the resulting [`Buffer`].
+    fn render_overview_to_buffer(app: &mut App, cols: u16, rows: u16) -> ratatui::buffer::Buffer {
+        render_to_buffer(app, cols, rows)
+    }
+
+    /// Whether the rendered overview's leftmost change-row column shows the
+    /// numeric idx column. Pinned by checking for an idx digit at the column
+    /// the layout reserves for it (after the cursor glyph + spacing).
+    ///
+    /// At outer width >= 100, `show_idx = true` and a 2-char idx (e.g. ` 1`)
+    /// appears starting at column 4 of the inner area (cursor 2 + cursor pad
+    /// = 2 + 2; inner starts at col 1 so absolute col 5..6).
+    fn overview_first_change_row_has_idx(buf: &ratatui::buffer::Buffer) -> bool {
+        // Walk every row, find the first change row (it begins with either
+        // the selection-cursor U+25B6 followed by a space, the
+        // current-change-mark U+25B8, or two leading spaces — and is
+        // followed by an idx digit then more spaces then a change_id).
+        // Keep this simple: a row containing two spaces, a digit, two
+        // spaces, then 8 hex chars, is the show_idx layout. We test by
+        // looking for a contiguous span " 1  " in the early columns.
+        for row in 0..buf.area.height {
+            let mut line = String::new();
+            for col in 0..buf.area.width {
+                line.push_str(buf[(col, row)].symbol());
+            }
+            if line.contains(" 1  ") && line.contains("aaaaaaaa") {
+                return true;
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn column_layout_thresholds_do_not_flicker_with_scrollbar_visibility() {
+        // Build two overview snapshots at the SAME outer width 100 (where
+        // show_idx = true). One has 0 extra comments (rows fit, scrollbar
+        // hidden); the other has 60 extra change comments (rows overflow,
+        // scrollbar visible). Both must render the idx column the same way
+        // — the column-budget decision must NOT depend on overflow state.
+        let dir_fit = tempfile::tempdir().unwrap();
+        let mut app_fit = overview_app_with_n_change_comments(dir_fit.path(), 0);
+        let buf_fit = render_overview_to_buffer(&mut app_fit, 100, 24);
+
+        let dir_overflow = tempfile::tempdir().unwrap();
+        let mut app_overflow = overview_app_with_n_change_comments(dir_overflow.path(), 60);
+        let buf_overflow = render_overview_to_buffer(&mut app_overflow, 100, 24);
+
+        assert_eq!(
+            overview_first_change_row_has_idx(&buf_fit),
+            overview_first_change_row_has_idx(&buf_overflow),
+            "show_idx must NOT flicker when the scrollbar appears at outer width 100"
+        );
+        assert!(
+            overview_first_change_row_has_idx(&buf_fit),
+            "outer width 100 should render the idx column regardless of overflow"
         );
     }
 }

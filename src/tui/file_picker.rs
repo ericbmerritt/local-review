@@ -9,6 +9,7 @@ use crate::comment::{Comment, Status};
 use crate::diff::DiffFile;
 
 use super::composer_overlay::centered_rect;
+use super::{render_view_scrollbar, scrollbar_layout_for_view};
 
 const PICKER_WIDTH: u16 = 72;
 const PICKER_HEIGHT: u16 = 20;
@@ -85,9 +86,22 @@ pub(super) fn render(frame: &mut Frame<'_>, state: &FilePickerState) {
     frame.render_widget(block, overlay);
 
     let body_height = inner.height.saturating_sub(1);
-    let inner_width = usize::from(inner.width);
     let scroll = state.scroll_offset;
     let visible = &state.entries;
+
+    let body_area = ratatui::layout::Rect {
+        height: body_height,
+        ..inner
+    };
+    let footer_area = ratatui::layout::Rect {
+        y: inner.y + body_height,
+        height: 1,
+        ..inner
+    };
+
+    let (text_area, scrollbar_area, mut sb_state) =
+        scrollbar_layout_for_view(body_area, visible.len(), scroll);
+    let inner_width = usize::from(text_area.width);
 
     let mut lines: Vec<TuiLine<'_>> = Vec::with_capacity(visible.len());
     for (idx, entry) in visible.iter().enumerate() {
@@ -117,18 +131,10 @@ pub(super) fn render(frame: &mut Frame<'_>, state: &FilePickerState) {
         lines.push(TuiLine::from(Span::styled(text, style)));
     }
 
-    let body_area = ratatui::layout::Rect {
-        height: body_height,
-        ..inner
-    };
-    let footer_area = ratatui::layout::Rect {
-        y: inner.y + body_height,
-        height: 1,
-        ..inner
-    };
-
     let widget = Paragraph::new(lines).scroll((scroll, 0));
-    frame.render_widget(widget, body_area);
+    frame.render_widget(widget, text_area);
+    render_view_scrollbar(frame, sb_state.as_mut(), scrollbar_area);
+
     let footer_widget = Paragraph::new(FILE_PICKER_FOOTER);
     frame.render_widget(footer_widget, footer_area);
 }
@@ -386,5 +392,99 @@ mod tests {
         assert_eq!(result.chars().count(), 2);
         assert!(result.starts_with('\u{2026}'));
         assert!(result.ends_with('s'), "got: {result:?}");
+    }
+
+    /// Build a [`FilePickerState`] with `entry_count` synthetic entries so
+    /// scrollbar tests can pick a count that overflows or fits the picker
+    /// body. The first entry mirrors the synthetic `<description>` row to
+    /// match what `build_entries` produces.
+    fn make_state_with_entries(
+        entry_count: usize,
+        selected_index: usize,
+        scroll_offset: u16,
+    ) -> FilePickerState {
+        let entries = (0..entry_count)
+            .map(|i| FilePickerEntry {
+                display_path: if i == 0 {
+                    PathBuf::from("<description>")
+                } else {
+                    PathBuf::from(format!("file_{i}.rs"))
+                },
+                view_index: i,
+                comment_count: 0,
+            })
+            .collect();
+        FilePickerState {
+            selected_index,
+            scroll_offset,
+            entries,
+        }
+    }
+
+    /// Render the file picker to a [`ratatui::buffer::Buffer`] sized
+    /// `cols x rows` so tests can inspect glyph placement.
+    fn render_picker_to_buffer(
+        state: &FilePickerState,
+        cols: u16,
+        rows: u16,
+    ) -> ratatui::buffer::Buffer {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let backend = TestBackend::new(cols, rows);
+        let mut terminal = Terminal::new(backend).expect("test terminal must construct");
+        terminal
+            .draw(|frame| render(frame, state))
+            .expect("test draw must succeed");
+        terminal.backend().buffer().clone()
+    }
+
+    use super::super::scrollbar_test_helpers::{col_contains_scrollbar_glyph, scrollbar_thumb_row};
+
+    /// Picker body geometry. `PICKER_WIDTH` = 72, `PICKER_HEIGHT` = 20. With
+    /// an 80x30 terminal, `centered_rect` anchors the overlay at x=4, y=5;
+    /// the block's inner is x=5, width=70 -> rightmost inner column = 74.
+    const PICKER_RIGHTMOST_INNER_COL: u16 = 74;
+
+    #[test]
+    fn scrollbar_renders_when_entries_overflow_picker_body() {
+        // Body height is PICKER_HEIGHT(20) - borders(2) - footer(1) = 17.
+        // 30 entries far exceeds that → scrollbar must render.
+        let state = make_state_with_entries(30, 0, 0);
+        let buf = render_picker_to_buffer(&state, 80, 30);
+        assert!(
+            col_contains_scrollbar_glyph(&buf, PICKER_RIGHTMOST_INNER_COL),
+            "scrollbar glyphs must appear in the rightmost picker body column when entries overflow"
+        );
+    }
+
+    #[test]
+    fn scrollbar_hidden_when_entries_fit_picker_body() {
+        // 5 entries comfortably fit the 17-row body.
+        let state = make_state_with_entries(5, 0, 0);
+        let buf = render_picker_to_buffer(&state, 80, 30);
+        assert!(
+            !col_contains_scrollbar_glyph(&buf, PICKER_RIGHTMOST_INNER_COL),
+            "scrollbar must be hidden when entries fit the body"
+        );
+    }
+
+    #[test]
+    fn scrollbar_thumb_position_reflects_scroll_offset() {
+        // Scroll near the top: thumb sits in the upper half of the body.
+        let state_top = make_state_with_entries(60, 0, 0);
+        let buf_top = render_picker_to_buffer(&state_top, 80, 30);
+        let thumb_top = scrollbar_thumb_row(&buf_top, PICKER_RIGHTMOST_INNER_COL)
+            .expect("thumb glyph must appear when entries overflow");
+
+        // Scroll near the bottom: thumb sits in the lower half.
+        let state_bot = make_state_with_entries(60, 59, 50);
+        let buf_bot = render_picker_to_buffer(&state_bot, 80, 30);
+        let thumb_bot = scrollbar_thumb_row(&buf_bot, PICKER_RIGHTMOST_INNER_COL)
+            .expect("thumb glyph must appear when entries overflow");
+
+        assert!(
+            thumb_top < thumb_bot,
+            "thumb must move down as scroll_offset advances; top={thumb_top}, bottom={thumb_bot}"
+        );
     }
 }
