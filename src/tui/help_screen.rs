@@ -40,6 +40,8 @@ Views
     r                     refresh diff and comments for current change
     s                     stack overview (stack mode only)
     S                     stale comments view
+    |                     cycle diff layout: auto / unified / side-by-side
+                          (auto picks side-by-side at >=120 cols)
     ?                     this help
     q                     quit
 

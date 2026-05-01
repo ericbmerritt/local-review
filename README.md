@@ -227,7 +227,7 @@ MVP complete. All milestones in the [ladder](specs/jjr-mvp.ladder.md) are landed
 
 Stable: single-change review, stack walking, comment storage, anchoring, packet generation, Claude single-change handoff, JSONL/markdown export.
 
-Not yet implemented (deferred): stack-wide Claude handoff, inter-cycle diff feature, full `jjr orphans` view, syntax highlighting / side-by-side diff rendering, GitHub integration, multi-reviewer support.
+Not yet implemented (deferred): stack-wide Claude handoff, inter-cycle diff feature, full `jjr orphans` view, syntax highlighting, GitHub integration, multi-reviewer support.
 
 See the [engineering design document](specs/local-stack-review-edd.md) for full spec, the [TUI design document](specs/jjr-tui-design.md) for screen layouts, and the [milestone ladder](specs/jjr-mvp.ladder.md) for what's landed and what's planned.
 

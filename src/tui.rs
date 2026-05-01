@@ -41,8 +41,8 @@ use composer::{
     EditedComment, LineTarget, StackContextSnapshot,
 };
 use diff_view::{
-    comment_to_inline, description_comment_to_inline, DiffView, InlineComment, RenderedLine,
-    RenderedLineKind,
+    comment_to_inline, description_comment_to_inline, DiffView, InlineComment, PairedRow,
+    RenderedLine, RenderedLineKind,
 };
 use file_picker::{build_entries as build_file_picker_entries, FilePickerState};
 use overview_screen::{OverviewCommentSet, OverviewScreenState};
@@ -123,6 +123,35 @@ const STATUS_MARKED_REVIEWED: &str = "file marked as reviewed";
 /// Status set by the manual `U` toggle when the active file goes from
 /// reviewed to unreviewed.
 const STATUS_MARKED_UNREVIEWED: &str = "file marked as unreviewed";
+
+/// Resolve the user's `DiffMode` preference plus the current body width and
+/// view index into the layout that this render pass should actually use.
+///
+/// Rules:
+/// - `file_index == 0` is the synthetic description view; it has no two-side
+///   semantic, so it always renders unified regardless of preference.
+/// - `DiffMode::Auto` picks side-by-side iff `body_width >= SIDE_BY_SIDE_MIN_WIDTH`.
+/// - `DiffMode::ForceUnified` and `DiffMode::ForceSideBySide` pin the choice.
+pub(super) fn resolve_diff_mode(
+    pref: DiffMode,
+    body_width: u16,
+    file_index: usize,
+) -> EffectiveDiffMode {
+    if file_index == 0 {
+        return EffectiveDiffMode::Unified;
+    }
+    match pref {
+        DiffMode::Auto => {
+            if body_width >= SIDE_BY_SIDE_MIN_WIDTH {
+                EffectiveDiffMode::SideBySide
+            } else {
+                EffectiveDiffMode::Unified
+            }
+        }
+        DiffMode::ForceUnified => EffectiveDiffMode::Unified,
+        DiffMode::ForceSideBySide => EffectiveDiffMode::SideBySide,
+    }
+}
 
 /// Severity -> terminal color.
 pub(super) fn severity_color(severity: Severity) -> Color {
@@ -355,6 +384,47 @@ enum TransitionMode {
     Always,
 }
 
+/// User preference for unified vs side-by-side diff layout. `Auto` picks based
+/// on terminal width; the explicit modes pin the choice regardless of width.
+/// The toggle key (`|`) cycles `Auto -> ForceUnified -> ForceSideBySide -> Auto`
+/// and the choice persists for the session (no on-disk persistence).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DiffMode {
+    Auto,
+    ForceUnified,
+    ForceSideBySide,
+}
+
+/// Resolved layout for a single render pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum EffectiveDiffMode {
+    Unified,
+    SideBySide,
+}
+
+/// Minimum body width (cells) at which `DiffMode::Auto` switches from unified
+/// to side-by-side. Each side gets ~58 cells + 1 gutter cell + 1 scrollbar
+/// cell. Below this we stay unified — narrower side panes truncate too
+/// aggressively to be useful.
+pub(super) const SIDE_BY_SIDE_MIN_WIDTH: u16 = 120;
+
+/// Width (cells) of the divider between the left and right columns in
+/// side-by-side mode. A single `│` glyph plus one space of padding on each
+/// side (3 cells total) reads as a clear vertical seam without crowding the
+/// content.
+pub(super) const SIDE_BY_SIDE_GUTTER_WIDTH: u16 = 3;
+
+/// Minimum cells per side cell in side-by-side mode: the `+ ` / `- ` prefix
+/// (2 cells) plus 2 cells of content. Below this each cell collapses into
+/// just-the-prefix and the layout stops conveying anything useful.
+pub(super) const MIN_USEFUL_SIDE_CELL_WIDTH: u16 = 4;
+
+/// Below this body width side-by-side rendering falls back to unified mode
+/// at draw time. The user can press `|` to switch back to Auto and let the
+/// width-aware threshold pick again at the next resize.
+pub(super) const MIN_USEFUL_SIDE_BY_SIDE_WIDTH: u16 =
+    SIDE_BY_SIDE_GUTTER_WIDTH + 2 * MIN_USEFUL_SIDE_CELL_WIDTH;
+
 struct App {
     details: ChangeDetails,
     /// Repo root for comment storage; passed from the CLI.
@@ -375,6 +445,10 @@ struct App {
     /// Cached viewport height (set during `render_main`, read in `handle_main_key`).
     /// Overwritten on first render before any key event is processed.
     viewport_rows: u16,
+    /// Cached diff body width (set during `render_diff`, read by navigation
+    /// to resolve the effective layout). Overwritten on every render before
+    /// any key event is processed.
+    diff_body_width: u16,
     /// Severity chosen in the last save; `None` at session start.
     last_severity: Option<Severity>,
     /// One-line status message shown at the bottom of the main view.
@@ -396,6 +470,10 @@ struct App {
     /// Auto-marked whenever the user lands on a file via Tab/Shift-Tab,
     /// file picker, refresh, or stack-mode change-load.
     reviewed: ReviewedState,
+    /// Session-scoped diff layout preference. Toggled by `|`; defaults to
+    /// `Auto`, which picks unified or side-by-side at draw time based on
+    /// the diff pane's body width.
+    diff_mode: DiffMode,
 }
 
 impl App {
@@ -427,6 +505,7 @@ impl App {
             screen: Screen::Main,
             should_quit: false,
             viewport_rows: FALLBACK_VIEWPORT_ROWS,
+            diff_body_width: 0,
             last_severity: None,
             status_message: None,
             stack,
@@ -436,6 +515,7 @@ impl App {
             overview_cache: None,
             severity_filter: None,
             reviewed,
+            diff_mode: DiffMode::Auto,
         }
     }
 
@@ -443,6 +523,36 @@ impl App {
         self.annotated_per_file.get(self.file_index)
     }
 
+    /// Resolve the effective diff layout for the current view + cached body
+    /// width. Reads `diff_body_width`, which `render_diff` sets every frame.
+    fn effective_diff_mode(&self) -> EffectiveDiffMode {
+        resolve_diff_mode(self.diff_mode, self.diff_body_width, self.file_index)
+    }
+
+    /// Cycle the diff layout preference. `Auto -> ForceUnified ->
+    /// ForceSideBySide -> Auto`. The cursor is reset to the top of the
+    /// current view because the unified line index does not translate
+    /// 1-to-1 to a paired row index, and snapping to a stable known
+    /// position is less surprising than landing on a near-miss row.
+    fn cycle_diff_mode(&mut self) {
+        self.diff_mode = match self.diff_mode {
+            DiffMode::Auto => DiffMode::ForceUnified,
+            DiffMode::ForceUnified => DiffMode::ForceSideBySide,
+            DiffMode::ForceSideBySide => DiffMode::Auto,
+        };
+        self.line_index = 0;
+        self.scroll = 0;
+        self.status_message = Some(
+            match self.diff_mode {
+                DiffMode::Auto => "diff layout: auto",
+                DiffMode::ForceUnified => "diff layout: unified",
+                DiffMode::ForceSideBySide => "diff layout: side-by-side",
+            }
+            .to_owned(),
+        );
+    }
+
+    #[cfg(test)]
     fn current_line_count(&self) -> usize {
         self.current_view().map_or(0, |v| v.lines.len())
     }
@@ -642,28 +752,69 @@ impl App {
     }
 
     fn move_line(&mut self, delta: isize) {
-        let count = self.current_line_count();
+        let count = self.current_row_count();
         if count == 0 {
             return;
         }
         let max_index = count - 1;
         let mut next = clamp_with_delta(self.line_index, delta, max_index);
-        // Skip non-navigable lines: hunk separators and comment body continuation
+        // Skip non-navigable rows: hunk separators and comment body continuation
         // lines. InlineCommentMeta lines are navigable — they are the "handle"
-        // the reviewer lands on to press `e` or `d`.
+        // the reviewer lands on to press `e` or `d`. The skip rule applies
+        // identically in unified and side-by-side modes; in side-by-side a
+        // row that resolves to a single Removed/Added pair is always
+        // navigable.
         let step: isize = if delta >= 0 { 1 } else { -1 };
-        while next > 0
-            && next < max_index
-            && self.current_view().is_some_and(|v| {
-                matches!(
-                    v.lines[next].kind,
-                    RenderedLineKind::HunkSeparator | RenderedLineKind::InlineCommentBody,
-                )
-            })
-        {
+        while next > 0 && next < max_index && self.is_skip_row(next) {
             next = clamp_with_delta(next, step, max_index);
         }
         self.line_index = next;
+    }
+
+    /// Number of navigable rows in the active layout: unified line count, or
+    /// paired-row count in side-by-side.
+    fn current_row_count(&self) -> usize {
+        let Some(view) = self.current_view() else {
+            return 0;
+        };
+        match self.effective_diff_mode() {
+            EffectiveDiffMode::Unified => view.lines.len(),
+            EffectiveDiffMode::SideBySide => view.paired_rows.len(),
+        }
+    }
+
+    /// Is the row at `row_idx` non-navigable (separator or comment-body
+    /// continuation)? The check resolves against the row's underlying
+    /// `RenderedLine` kind in either layout.
+    fn is_skip_row(&self, row_idx: usize) -> bool {
+        let Some(view) = self.current_view() else {
+            return false;
+        };
+        match self.effective_diff_mode() {
+            EffectiveDiffMode::Unified => view.lines.get(row_idx).is_some_and(|l| {
+                matches!(
+                    l.kind,
+                    RenderedLineKind::HunkSeparator | RenderedLineKind::InlineCommentBody,
+                )
+            }),
+            EffectiveDiffMode::SideBySide => {
+                let Some(row) = view.paired_rows.get(row_idx) else {
+                    return false;
+                };
+                match row {
+                    PairedRow::Spanning(idx) => view.lines.get(*idx).is_some_and(|l| {
+                        matches!(
+                            l.kind,
+                            RenderedLineKind::HunkSeparator | RenderedLineKind::InlineCommentBody,
+                        )
+                    }),
+                    // `Pair` rows always carry at least one Removed/Added line
+                    // — never a hunk separator or comment continuation — so
+                    // they are always navigable.
+                    PairedRow::Pair { .. } => false,
+                }
+            }
+        }
     }
 
     fn move_page(&mut self, delta: isize) {
@@ -673,7 +824,7 @@ impl App {
     }
 
     fn jump_to(&mut self, end: Edge) {
-        let count = self.current_line_count();
+        let count = self.current_row_count();
         if count == 0 {
             return;
         }
@@ -1193,28 +1344,295 @@ fn render_file_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(widget, area);
 }
 
-fn render_diff(frame: &mut Frame<'_>, area: Rect, app: &App) {
+fn render_diff(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
+    // Snapshot scalars off `app` before borrowing the view: setting
+    // `app.diff_body_width` at the end would otherwise overlap with the
+    // view borrow held by the render path.
+    let scroll = app.scroll;
+    let line_index = app.line_index;
+    let file_index = app.file_index;
+    let diff_mode = app.diff_mode;
+
     let Some(view) = app.current_view() else {
         let widget = Paragraph::new("No files in this change.");
         frame.render_widget(widget, area);
+        app.diff_body_width = area.width;
         return;
     };
 
-    let (body_area, scrollbar_area, mut sb_state) =
-        scrollbar_layout_for_view(area, view.lines.len(), app.scroll);
+    // Compute the effective layout from the body width *after* the scrollbar
+    // is reserved, so the threshold compares against the same width that the
+    // renderer actually sees. Probe with the unified row count first to
+    // decide whether a scrollbar is needed; we will recompute in side-by-side
+    // mode against the paired-row count.
+    let probe_layout = scrollbar_layout_for_view(area, view.lines.len(), scroll);
+    let probe_width = probe_layout.0.width;
+    let mode = resolve_diff_mode(diff_mode, probe_width, file_index);
 
-    let width = body_area.width;
-    let lines: Vec<TuiLine<'_>> = view
-        .lines
-        .iter()
-        .enumerate()
-        .map(|(idx, line)| render_rendered_line(line, idx == app.line_index, width))
-        .collect();
+    let (body_area, scrollbar_area, mut sb_state) = match mode {
+        EffectiveDiffMode::Unified => probe_layout,
+        EffectiveDiffMode::SideBySide => {
+            scrollbar_layout_for_view(area, view.paired_rows.len(), scroll)
+        }
+    };
 
-    let widget = Paragraph::new(lines).scroll((app.scroll, 0));
-    frame.render_widget(widget, body_area);
+    let body_width = body_area.width;
+
+    match mode {
+        EffectiveDiffMode::Unified => {
+            let lines: Vec<TuiLine<'_>> = view
+                .lines
+                .iter()
+                .enumerate()
+                .map(|(idx, line)| render_rendered_line(line, idx == line_index, body_width))
+                .collect();
+
+            let widget = Paragraph::new(lines).scroll((scroll, 0));
+            frame.render_widget(widget, body_area);
+        }
+        EffectiveDiffMode::SideBySide => {
+            render_diff_side_by_side(frame, body_area, view, line_index, scroll);
+        }
+    }
 
     render_view_scrollbar(frame, sb_state.as_mut(), scrollbar_area);
+    app.diff_body_width = body_width;
+}
+
+/// Render the active view as two columns separated by a centered gutter.
+///
+/// Each `PairedRow` produces exactly one terminal row. `Spanning` rows occupy
+/// the entire body width for non-comment lines (hunk headers, separators,
+/// context, notices, description lines) — rendered ONCE across both columns,
+/// not duplicated per side. Inline comment `Spanning` rows occupy a single
+/// column (right by default; left when the comment is `Side::Old`-anchored
+/// and the preceding row has no right cell — i.e. a pure deletion).
+///
+/// `Pair { left, right }` rows put the Removed line in the left column and
+/// the Added line in the right column; either may be `None` and rendered as
+/// blank padding.
+fn render_diff_side_by_side(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    view: &DiffView,
+    cursor_row: usize,
+    scroll: u16,
+) {
+    let total_width = area.width;
+    if total_width < MIN_USEFUL_SIDE_BY_SIDE_WIDTH {
+        let lines: Vec<TuiLine<'_>> = view
+            .lines
+            .iter()
+            .enumerate()
+            .map(|(idx, line)| render_rendered_line(line, idx == cursor_row, total_width))
+            .collect();
+        let widget = Paragraph::new(lines).scroll((scroll, 0));
+        frame.render_widget(widget, area);
+        return;
+    }
+
+    let geom = SideBySideGeometry {
+        side_width: (total_width - SIDE_BY_SIDE_GUTTER_WIDTH) / 2,
+        full_width: total_width,
+    };
+
+    let lines: Vec<TuiLine<'_>> = view
+        .paired_rows
+        .iter()
+        .enumerate()
+        .map(|(row_idx, row)| {
+            render_paired_row(
+                view,
+                PairedRowAt {
+                    row: *row,
+                    row_idx,
+                    rows: &view.paired_rows,
+                },
+                row_idx == cursor_row,
+                geom,
+            )
+        })
+        .collect();
+
+    let widget = Paragraph::new(lines).scroll((scroll, 0));
+    frame.render_widget(widget, area);
+}
+
+/// Where on a side-by-side row an inline comment should land.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InlineCommentColumn {
+    /// `Side::Old` anchor on a row whose right cell is empty (pure deletion):
+    /// the deleted line is on the left, so render the comment there too.
+    Left,
+    /// All other cases — the conversation is forward-looking, so the
+    /// comment lives on the right.
+    Right,
+}
+
+/// Decide which column an inline-comment `Spanning` row should occupy.
+///
+/// `Side::Old` comment + previous row was a pure deletion (`Pair { left:
+/// Some, right: None }`) → render in the LEFT column (mirrors where the
+/// deleted line sits). Otherwise render on the right.
+///
+/// `Side::Old` vs `Side::New` is read from the underlying `RenderedLine`'s
+/// line-number fields (set by `inject_comment_lines` from the originating
+/// `InlineComment`):
+/// - `Side::Old` → `source_line.is_some() && target_line.is_none()`
+/// - `Side::New` → `target_line.is_some()`
+fn inline_comment_column(
+    rows: &[PairedRow],
+    row_idx: usize,
+    comment: &RenderedLine,
+) -> InlineCommentColumn {
+    let is_side_old = comment.source_line.is_some() && comment.target_line.is_none();
+    if !is_side_old {
+        return InlineCommentColumn::Right;
+    }
+    // Walk backward past consecutive comment rows to find the row this
+    // comment is anchored to. A multi-line comment body produces multiple
+    // Spanning(InlineCommentBody) rows after the meta — we want the
+    // anchor row, not a sibling comment line.
+    let mut probe = row_idx;
+    while probe > 0 {
+        probe -= 1;
+        match rows.get(probe) {
+            Some(PairedRow::Spanning(_)) => {}
+            Some(PairedRow::Pair {
+                left: Some(_),
+                right: None,
+            }) => return InlineCommentColumn::Left,
+            Some(_) | None => return InlineCommentColumn::Right,
+        }
+    }
+    InlineCommentColumn::Right
+}
+
+/// Geometry for one side-by-side render pass: per-side cell width and the
+/// full body width (used for non-comment Spanning rows that occupy the
+/// entire row instead of just one column).
+#[derive(Debug, Clone, Copy)]
+struct SideBySideGeometry {
+    side_width: u16,
+    full_width: u16,
+}
+
+/// Position of one row within the side-by-side row list: the row's data,
+/// its index, and the full row vector (used by the inline-comment column
+/// resolver to look back at the preceding anchor row).
+#[derive(Debug, Clone, Copy)]
+struct PairedRowAt<'a> {
+    row: PairedRow,
+    row_idx: usize,
+    rows: &'a [PairedRow],
+}
+
+/// Render a single side-by-side row: `[left] │ [right]` or, for
+/// `Spanning` non-comment rows, a single full-width line.
+fn render_paired_row<'a>(
+    view: &'a DiffView,
+    at: PairedRowAt<'_>,
+    focused: bool,
+    geom: SideBySideGeometry,
+) -> TuiLine<'a> {
+    match at.row {
+        PairedRow::Spanning(idx) => {
+            let Some(line) = view.lines.get(idx) else {
+                return TuiLine::raw("");
+            };
+            if matches!(
+                line.kind,
+                RenderedLineKind::InlineCommentMeta { .. } | RenderedLineKind::InlineCommentBody
+            ) {
+                let column = inline_comment_column(at.rows, at.row_idx, line);
+                render_inline_comment_row(line, column, focused, geom.side_width)
+            } else {
+                // Non-comment Spanning rows (hunk headers, separators, context,
+                // notices, description lines) render ONCE across the full body
+                // width — duplicating per-side would truncate long content
+                // (e.g. hunk headers with function context).
+                render_full_width_row(line, focused, geom.full_width)
+            }
+        }
+        PairedRow::Pair { left, right } => {
+            let left_spans = match left.and_then(|i| view.lines.get(i)) {
+                Some(line) => side_cell_spans(line, geom.side_width, focused),
+                None => blank_cell_spans(geom.side_width, focused),
+            };
+            let right_spans = match right.and_then(|i| view.lines.get(i)) {
+                Some(line) => side_cell_spans(line, geom.side_width, focused),
+                None => blank_cell_spans(geom.side_width, focused),
+            };
+            // Gutter stays calm on focused rows — the cells carry the focus
+            // signal; reverse-videoing the divider too would compete with
+            // content for attention.
+            let gutter = side_by_side_gutter_spans();
+            TuiLine::from([left_spans, gutter, right_spans].concat())
+        }
+    }
+}
+
+/// Render a non-comment `Spanning` row across the full body width as a
+/// single styled span. Focus rule via [`focus_style`].
+fn render_full_width_row(line: &RenderedLine, focused: bool, full_width: u16) -> TuiLine<'_> {
+    let (body, fg_color) = prefix_truncate_pad(line, full_width);
+    TuiLine::from(vec![Span::styled(body, focus_style(fg_color, focused))])
+}
+
+/// Render an inline-comment `Spanning` row. The comment occupies one column
+/// (per `column`); the other column is blank-padded so the gutter aligns
+/// with neighboring rows.
+fn render_inline_comment_row(
+    line: &RenderedLine,
+    column: InlineCommentColumn,
+    focused: bool,
+    side_width: u16,
+) -> TuiLine<'_> {
+    let comment_spans = side_cell_spans(line, side_width, focused);
+    let blank = blank_cell_spans(side_width, focused);
+    let gutter = side_by_side_gutter_spans();
+    let (left, right) = match column {
+        InlineCommentColumn::Left => (comment_spans, blank),
+        InlineCommentColumn::Right => (blank, comment_spans),
+    };
+    TuiLine::from([left, gutter, right].concat())
+}
+
+/// Render a single side cell for a paired row. Body via
+/// [`prefix_truncate_pad`]; focus rule via [`focus_style`].
+fn side_cell_spans(line: &RenderedLine, side_width: u16, focused: bool) -> Vec<Span<'_>> {
+    let (body, fg_color) = prefix_truncate_pad(line, side_width);
+    vec![Span::styled(body, focus_style(fg_color, focused))]
+}
+
+/// Resolve the per-line `Style` from the line's fg color and the focus flag.
+/// Single source of truth for the "REVERSED strips fg" rule applied across
+/// every diff row in both layouts.
+fn focus_style(fg_color: Color, focused: bool) -> Style {
+    if focused {
+        Style::default().add_modifier(Modifier::REVERSED)
+    } else if matches!(fg_color, Color::Reset) {
+        Style::default()
+    } else {
+        Style::default().fg(fg_color)
+    }
+}
+
+fn blank_cell_spans<'a>(side_width: u16, focused: bool) -> Vec<Span<'a>> {
+    let body: String = " ".repeat(usize::from(side_width));
+    vec![Span::styled(body, focus_style(Color::Reset, focused))]
+}
+
+fn side_by_side_gutter_spans<'a>() -> Vec<Span<'a>> {
+    // ` │ ` — single space, vertical bar, single space — matches
+    // `SIDE_BY_SIDE_GUTTER_WIDTH`. The DarkGray fg is the same regardless
+    // of the focus state of the surrounding row: cells carry the focus
+    // signal; reverse-videoing the divider too would compete with content
+    // for attention.
+    vec![Span::styled(
+        " \u{2502} ",
+        Style::default().fg(Color::DarkGray),
+    )]
 }
 
 /// Pure numeric core for a paginated-view scrollbar: returns
@@ -1334,23 +1752,74 @@ pub(super) fn render_view_scrollbar(
     }
 }
 
+/// Visual attributes that the unified and side-by-side renderers share for a
+/// `RenderedLine`. The `prefix` is the two-cell `+ ` / `- ` / `  ` glyph
+/// prepended to the line content; `fg_color` is the foreground used when the
+/// row is not focused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LineVisual {
+    prefix: &'static str,
+    fg_color: Color,
+}
+
+/// Build the rendered body string for a `RenderedLine` at a given cell width:
+/// `prefix + truncated text + space-padding`. Returns the assembled body and
+/// the line's foreground color; callers apply the focus rule via
+/// [`focus_style`].
+fn prefix_truncate_pad(line: &RenderedLine, width: u16) -> (String, Color) {
+    let attrs = line_visual_attrs(line);
+    let prefix_chars = attrs.prefix.chars().count();
+    let max_text_chars = usize::from(width).saturating_sub(prefix_chars);
+    let text = truncate(&line.text, max_text_chars);
+    let used = prefix_chars + text.chars().count();
+    let pad = usize::from(width).saturating_sub(used);
+    (
+        format!("{}{}{}", attrs.prefix, text, " ".repeat(pad)),
+        attrs.fg_color,
+    )
+}
+
+fn line_visual_attrs(line: &RenderedLine) -> LineVisual {
+    match line.kind {
+        RenderedLineKind::Added => LineVisual {
+            prefix: "+ ",
+            fg_color: Color::Green,
+        },
+        RenderedLineKind::Removed => LineVisual {
+            prefix: "- ",
+            fg_color: Color::Red,
+        },
+        RenderedLineKind::InlineCommentMeta { .. } | RenderedLineKind::InlineCommentBody => {
+            // Severity drives the color; the inline comment text already
+            // carries its own decoration glyph (`┃ ●`) so no extra prefix.
+            LineVisual {
+                prefix: "  ",
+                fg_color: line.comment_severity.map_or(Color::Cyan, severity_color),
+            }
+        }
+        RenderedLineKind::HunkHeader
+        | RenderedLineKind::HunkSeparator
+        | RenderedLineKind::Context
+        | RenderedLineKind::Notice
+        | RenderedLineKind::DescriptionLine => LineVisual {
+            prefix: "  ",
+            fg_color: Color::Reset,
+        },
+    }
+}
+
 fn render_rendered_line(line: &RenderedLine, focused: bool, width: u16) -> TuiLine<'_> {
-    // Inline comment lines use a per-severity color (spec principle 6:
-    // severity is color, not text). The `●` sigil in the meta line ensures
-    // NO_COLOR terminals can still distinguish severity by reading the label.
+    // Inline comment lines have no `+`/`-` prefix and don't pad to full
+    // width — their `┃ ●` decoration glyph already establishes the column
+    // anchor, and they only span the natural text length. Focus policy
+    // matches every other row: REVERSED strips fg.
     match line.kind {
         RenderedLineKind::InlineCommentMeta { .. } | RenderedLineKind::InlineCommentBody => {
-            let color = match line.comment_severity {
-                Some(s) => severity_color(s),
-                None => Color::Cyan,
-            };
-            let base_style = Style::default().fg(color);
-            let style = if focused {
-                base_style.add_modifier(Modifier::REVERSED)
-            } else {
-                base_style
-            };
-            return TuiLine::from(vec![Span::styled(line.text.as_str(), style)]);
+            let attrs = line_visual_attrs(line);
+            return TuiLine::from(vec![Span::styled(
+                line.text.as_str(),
+                focus_style(attrs.fg_color, focused),
+            )]);
         }
         RenderedLineKind::HunkHeader
         | RenderedLineKind::HunkSeparator
@@ -1361,47 +1830,15 @@ fn render_rendered_line(line: &RenderedLine, focused: bool, width: u16) -> TuiLi
         | RenderedLineKind::DescriptionLine => {}
     }
 
-    let prefix = match line.kind {
-        RenderedLineKind::Added => "+ ",
-        RenderedLineKind::Removed => "- ",
-        RenderedLineKind::HunkHeader
-        | RenderedLineKind::HunkSeparator
-        | RenderedLineKind::Context
-        | RenderedLineKind::Notice
-        | RenderedLineKind::DescriptionLine => "  ",
-        RenderedLineKind::InlineCommentMeta { .. } | RenderedLineKind::InlineCommentBody => {
-            unreachable!("inline comment kinds returned above")
-        }
-    };
-
-    let content_style = match line.kind {
-        RenderedLineKind::Added => Style::default().fg(Color::Green),
-        RenderedLineKind::Removed => Style::default().fg(Color::Red),
-        RenderedLineKind::HunkHeader
-        | RenderedLineKind::HunkSeparator
-        | RenderedLineKind::Context
-        | RenderedLineKind::Notice
-        | RenderedLineKind::DescriptionLine => Style::default(),
-        RenderedLineKind::InlineCommentMeta { .. } | RenderedLineKind::InlineCommentBody => {
-            unreachable!("inline comment kinds returned above")
-        }
-    };
-
     if focused {
         // Pad to full row width so reverse-video covers the entire line.
-        let prefix_chars = prefix.chars().count();
-        let content_chars = line.text.chars().count();
-        let used = prefix_chars + content_chars;
-        let pad_count = usize::from(width).saturating_sub(used);
-        let padding: String = " ".repeat(pad_count);
-        let padded_text = format!("{}{}", line.text, padding);
-        TuiLine::from(vec![Span::styled(
-            format!("{prefix}{padded_text}"),
-            Style::default().add_modifier(Modifier::REVERSED),
-        )])
+        let (body, fg_color) = prefix_truncate_pad(line, width);
+        TuiLine::from(vec![Span::styled(body, focus_style(fg_color, true))])
     } else {
+        let attrs = line_visual_attrs(line);
+        let content_style = focus_style(attrs.fg_color, false);
         TuiLine::from(vec![
-            Span::raw(prefix),
+            Span::raw(attrs.prefix),
             Span::styled(line.text.as_str(), content_style),
         ])
     }
@@ -1585,6 +2022,7 @@ fn handle_main_key(app: &mut App, key: KeyEvent) -> Result<()> {
         KeyCode::Char('2') => toggle_severity_filter(app, Severity::Suggestion),
         KeyCode::Char('3') => toggle_severity_filter(app, Severity::Note),
         KeyCode::Char('U') => app.toggle_current_file_reviewed(),
+        KeyCode::Char('|') => app.cycle_diff_mode(),
         _ => {}
     }
     Ok(())
@@ -8185,6 +8623,737 @@ mod tests {
             app.status_message.as_deref(),
             Some("already at the last file"),
             "purpose-set status must survive even when a reset would otherwise toast"
+        );
+    }
+
+    // resolve_diff_mode: file_index 0 (description view) is always unified
+    // regardless of width or user preference. Two-side semantics do not
+    // apply to commit messages.
+    #[test]
+    fn resolve_diff_mode_description_view_is_always_unified() {
+        for pref in [
+            DiffMode::Auto,
+            DiffMode::ForceUnified,
+            DiffMode::ForceSideBySide,
+        ] {
+            for width in [80_u16, 119, 120, 200] {
+                assert_eq!(
+                    resolve_diff_mode(pref, width, 0),
+                    EffectiveDiffMode::Unified,
+                    "description view (file_index=0) must stay unified for {pref:?} at width {width}"
+                );
+            }
+        }
+    }
+
+    // resolve_diff_mode: Auto picks side-by-side at exactly 120 cols.
+    #[test]
+    fn resolve_diff_mode_auto_picks_side_by_side_at_threshold() {
+        assert_eq!(
+            resolve_diff_mode(DiffMode::Auto, 120, 1),
+            EffectiveDiffMode::SideBySide,
+            "auto + width=120 must select side-by-side"
+        );
+    }
+
+    // resolve_diff_mode: Auto stays unified one column below the threshold.
+    #[test]
+    fn resolve_diff_mode_auto_stays_unified_below_threshold() {
+        assert_eq!(
+            resolve_diff_mode(DiffMode::Auto, 119, 1),
+            EffectiveDiffMode::Unified,
+            "auto + width=119 must select unified"
+        );
+    }
+
+    // resolve_diff_mode: ForceUnified ignores width.
+    #[test]
+    fn resolve_diff_mode_force_unified_ignores_width() {
+        for width in [60_u16, 119, 120, 500] {
+            assert_eq!(
+                resolve_diff_mode(DiffMode::ForceUnified, width, 1),
+                EffectiveDiffMode::Unified,
+                "ForceUnified at width {width} must select unified"
+            );
+        }
+    }
+
+    // resolve_diff_mode: ForceSideBySide ignores width — even at 60 cols
+    // (which renders very narrow columns) the user's choice is honored.
+    #[test]
+    fn resolve_diff_mode_force_side_by_side_ignores_width() {
+        for width in [60_u16, 119, 120, 500] {
+            assert_eq!(
+                resolve_diff_mode(DiffMode::ForceSideBySide, width, 1),
+                EffectiveDiffMode::SideBySide,
+                "ForceSideBySide at width {width} must select side-by-side"
+            );
+        }
+    }
+
+    // cycle_diff_mode walks Auto -> ForceUnified -> ForceSideBySide -> Auto
+    // and resets the cursor (line_index, scroll) on every transition because
+    // the row-index space differs across modes.
+    #[test]
+    fn cycle_diff_mode_walks_three_states_and_returns_to_auto() {
+        let mut app = make_app_with_single_file(sample_diff_file());
+        assert_eq!(app.diff_mode, DiffMode::Auto);
+
+        app.cycle_diff_mode();
+        assert_eq!(app.diff_mode, DiffMode::ForceUnified);
+        app.cycle_diff_mode();
+        assert_eq!(app.diff_mode, DiffMode::ForceSideBySide);
+        app.cycle_diff_mode();
+        assert_eq!(app.diff_mode, DiffMode::Auto);
+    }
+
+    #[test]
+    fn cycle_diff_mode_resets_cursor_and_scroll() {
+        let mut app = make_app_with_single_file(sample_diff_file());
+        app.line_index = 2;
+        app.scroll = 5;
+        app.cycle_diff_mode();
+        assert_eq!(app.line_index, 0);
+        assert_eq!(app.scroll, 0);
+    }
+
+    #[test]
+    fn cycle_diff_mode_emits_status_message() {
+        let mut app = make_app_with_single_file(sample_diff_file());
+        app.cycle_diff_mode();
+        assert!(
+            app.status_message
+                .as_deref()
+                .is_some_and(|m| m.contains("unified")),
+            "status must announce the new layout"
+        );
+    }
+
+    // Side-by-side mode at 120 cols: rendering must succeed and the
+    // gutter divider glyph (`│`) must appear in the body.
+    #[test]
+    fn render_at_120_cols_in_force_side_by_side_emits_gutter() {
+        let mut app = make_app_with_single_file(sample_diff_file());
+        app.diff_mode = DiffMode::ForceSideBySide;
+        let buf = render_to_buffer(&mut app, 120, 24);
+        let mut found = false;
+        let (top, bottom) = diff_area_rows(24);
+        for y in top..bottom {
+            for x in 0..buf.area().width {
+                if buf[(x, y)].symbol() == "\u{2502}" {
+                    found = true;
+                    break;
+                }
+            }
+        }
+        assert!(found, "gutter glyph must appear when side-by-side renders");
+    }
+
+    // Unified mode at 80 cols: no gutter divider glyph in the body.
+    #[test]
+    fn render_at_80_cols_unified_has_no_gutter_glyph() {
+        let mut app = make_app_with_single_file(sample_diff_file());
+        app.diff_mode = DiffMode::Auto;
+        let buf = render_to_buffer(&mut app, 80, 24);
+        let (top, bottom) = diff_area_rows(24);
+        for y in top..bottom {
+            for x in 0..buf.area().width.saturating_sub(1) {
+                assert_ne!(
+                    buf[(x, y)].symbol(),
+                    "\u{2502}",
+                    "auto mode at width 80 must stay unified — no gutter expected at ({x},{y})"
+                );
+            }
+        }
+    }
+
+    // Description view (file_index=0) must NEVER render side-by-side, even
+    // when the user pinned ForceSideBySide. Pin the file_index=0 carve-out.
+    #[test]
+    fn description_view_never_renders_side_by_side() {
+        let mut app = make_app_description_only();
+        app.diff_mode = DiffMode::ForceSideBySide;
+        // Render at 200 cols where auto would otherwise pick side-by-side.
+        let buf = render_to_buffer(&mut app, 200, 24);
+        let (top, bottom) = diff_area_rows(24);
+        for y in top..bottom {
+            for x in 0..buf.area().width.saturating_sub(1) {
+                assert_ne!(
+                    buf[(x, y)].symbol(),
+                    "\u{2502}",
+                    "description view must not render the side-by-side gutter"
+                );
+            }
+        }
+    }
+
+    // Cursor highlight in side-by-side mode reverses cells but keeps the
+    // gutter calm. On a Pair row (Removed-only / Added-only / paired), both
+    // side cells reverse-video; the divider stays unstyled so it doesn't
+    // compete with cell content. Pin both sides reversed AND the gutter NOT
+    // reversed in a single test.
+    #[test]
+    fn side_by_side_focused_row_reverses_cells_only_keeping_gutter_calm() {
+        let mut app = make_app_with_single_file(sample_diff_file());
+        app.diff_mode = DiffMode::ForceSideBySide;
+        // Sample paired rows: 0=Spanning(HunkHeader), 1=Spanning(Context),
+        // 2=Pair{None, Some(Added)}, 3=Pair{Some(Removed), None}. Land on
+        // row 2 — a Pair row that exercises both columns + gutter.
+        app.line_index = 2;
+        let buf = render_to_buffer(&mut app, 120, 24);
+        let (top, _) = diff_area_rows(24);
+        // Pair rows render at row index → screen row top + 2 (after the two
+        // Spanning rows above).
+        let target_row = top + 2;
+        let total_width = buf.area().width;
+        let body_width = total_width - 1; // minus scrollbar column
+        let side_width = (body_width - SIDE_BY_SIDE_GUTTER_WIDTH) / 2;
+        let gutter_col = side_width; // gutter starts immediately after left cell
+
+        let left_cell = &buf[(0, target_row)];
+        let right_cell = &buf[(side_width + SIDE_BY_SIDE_GUTTER_WIDTH, target_row)];
+        let gutter_cell = &buf[(gutter_col + 1, target_row)]; // middle of " │ "
+
+        assert!(
+            left_cell.style().add_modifier.contains(Modifier::REVERSED),
+            "left cell must reverse-video on focused Pair row"
+        );
+        assert!(
+            right_cell.style().add_modifier.contains(Modifier::REVERSED),
+            "right cell must reverse-video on focused Pair row"
+        );
+        assert!(
+            !gutter_cell
+                .style()
+                .add_modifier
+                .contains(Modifier::REVERSED),
+            "gutter must stay calm (not REVERSED) so it does not compete with cell content"
+        );
+    }
+
+    // C1 — Focus-fg policy is uniform across every render path: when a row
+    // is focused, the fg color is dropped and only `REVERSED` is applied.
+    // A Removed line in side-by-side under focus must NOT carry
+    // `Color::Red` on top of REVERSED — the same render decision unified
+    // mode has always made. Pinning this prevents regressions where one
+    // render path keeps fg under REVERSED and the other doesn't,
+    // producing a visual mismatch when the reviewer toggles `|`.
+    //
+    // Note on ratatui buffer fg: a Span styled with `Style::default()` (no
+    // fg call) lands in the buffer with fg=Some(Reset). A Span styled with
+    // `.fg(Color::Red)` lands with fg=Some(Red). The "no explicit color"
+    // property we want to pin is `fg != Some(Red)` (or any concrete color)
+    // when focused — equivalently, `fg == Some(Reset) || fg == None`.
+    #[test]
+    fn side_by_side_focused_row_strips_fg_color_to_match_unified_render() {
+        let mut app = make_app_with_single_file(sample_diff_file());
+        app.diff_mode = DiffMode::ForceSideBySide;
+        // Row 3 is the Removed-only Pair (left=Some(3), right=None).
+        // The left cell carries the `- removed` glyph; under focus it
+        // must reverse-video without keeping Red as fg.
+        app.line_index = 3;
+        let buf = render_to_buffer(&mut app, 120, 24);
+        let (top, _) = diff_area_rows(24);
+        let target_row = top + 3;
+        let left_cell = &buf[(0, target_row)];
+        assert!(
+            left_cell.style().add_modifier.contains(Modifier::REVERSED),
+            "focused Removed cell must REVERSE",
+        );
+        let focused_fg = left_cell.style().fg;
+        assert!(
+            !matches!(focused_fg, Some(Color::Red)),
+            "focused Removed cell must drop Red fg under REVERSED to match unified render policy; got {focused_fg:?}",
+        );
+
+        // Cross-check: under the SAME conditions but unfocused, the cell
+        // does paint Red. This ensures the test above is not vacuously
+        // true (i.e. fg never set anywhere).
+        app.line_index = 0;
+        let buf2 = render_to_buffer(&mut app, 120, 24);
+        let unfocused_left = &buf2[(0, target_row)];
+        assert!(
+            !unfocused_left
+                .style()
+                .add_modifier
+                .contains(Modifier::REVERSED),
+            "unfocused Removed cell must not REVERSE (precondition for fg check)",
+        );
+        assert_eq!(
+            unfocused_left.style().fg,
+            Some(Color::Red),
+            "unfocused Removed cell must paint Red — focus-fg test is vacuous if this fails",
+        );
+    }
+
+    // Auto mode at 119 cols renders unified; at 120 cols renders side-by-side.
+    // This is the ladder boundary so we pin both directions in one test.
+    #[test]
+    fn auto_mode_threshold_boundary_119_vs_120() {
+        let mut app119 = make_app_with_single_file(sample_diff_file());
+        app119.diff_mode = DiffMode::Auto;
+        let buf119 = render_to_buffer(&mut app119, 119, 24);
+        let (top, bottom) = diff_area_rows(24);
+        let mut has_gutter_at_119 = false;
+        for y in top..bottom {
+            for x in 0..buf119.area().width.saturating_sub(1) {
+                if buf119[(x, y)].symbol() == "\u{2502}" {
+                    has_gutter_at_119 = true;
+                }
+            }
+        }
+        assert!(
+            !has_gutter_at_119,
+            "auto mode at 119 cols must stay unified"
+        );
+
+        let mut app120 = make_app_with_single_file(sample_diff_file());
+        app120.diff_mode = DiffMode::Auto;
+        let buf120 = render_to_buffer(&mut app120, 120, 24);
+        let mut has_gutter_at_120 = false;
+        for y in top..bottom {
+            for x in 0..buf120.area().width.saturating_sub(1) {
+                if buf120[(x, y)].symbol() == "\u{2502}" {
+                    has_gutter_at_120 = true;
+                }
+            }
+        }
+        assert!(
+            has_gutter_at_120,
+            "auto mode at 120 cols must switch to side-by-side"
+        );
+    }
+
+    // move_line in side-by-side mode walks paired-row indices, not unified
+    // line indices. The sample diff produces 4 unified rows but 4 paired
+    // rows too (HunkHeader, Context, Added-only, Removed-only) so we pick
+    // a hunk that compresses (1 Removed + 1 Added pair) to differentiate.
+    #[test]
+    fn move_line_in_side_by_side_walks_paired_rows() {
+        let file = DiffFile::Modified {
+            path: PathBuf::from("foo.txt"),
+            hunks: vec![Hunk {
+                header: "@@ -1,3 +1,3 @@".to_owned(),
+                function_context: None,
+                source_start: 1,
+                source_length: 3,
+                target_start: 1,
+                target_length: 3,
+                lines: vec![
+                    Line {
+                        kind: LineKind::Context,
+                        text: "ctx".to_owned(),
+                        source_line: Some(1),
+                        target_line: Some(1),
+                    },
+                    Line {
+                        kind: LineKind::Removed,
+                        text: "old".to_owned(),
+                        source_line: Some(2),
+                        target_line: None,
+                    },
+                    Line {
+                        kind: LineKind::Added,
+                        text: "new".to_owned(),
+                        source_line: None,
+                        target_line: Some(2),
+                    },
+                    Line {
+                        kind: LineKind::Context,
+                        text: "ctx2".to_owned(),
+                        source_line: Some(3),
+                        target_line: Some(3),
+                    },
+                ],
+            }],
+        };
+        let mut app = make_app_with_single_file(file);
+        app.diff_mode = DiffMode::ForceSideBySide;
+        // Render once so diff_body_width is populated.
+        let _ = render_to_buffer(&mut app, 120, 24);
+
+        // Unified row count: 5 (HunkHeader + Context + Removed + Added + Context).
+        // Paired row count: 4 (HunkHeader, Context, Removed/Added pair, Context).
+        let view = app.current_view().expect("view");
+        assert_eq!(view.lines.len(), 5);
+        assert_eq!(view.paired_rows.len(), 4);
+        assert_eq!(app.current_row_count(), 4);
+
+        // Walk to the bottom: 3 j-presses gets to row index 3 in side-by-side.
+        app.line_index = 0;
+        for _ in 0..10 {
+            app.move_line(1);
+        }
+        assert_eq!(
+            app.line_index, 3,
+            "move_line in side-by-side must clamp at paired_rows.len() - 1"
+        );
+    }
+
+    /// Build a diff file with a single hunk and a long header that exceeds
+    /// `side_width` (~58 cells at width=120). Used by the C1 regression to
+    /// verify Spanning rows render once across full body width instead of
+    /// being duplicated and truncated per side.
+    fn long_header_diff_file(header_function_context: &str) -> DiffFile {
+        DiffFile::Modified {
+            path: PathBuf::from("foo.txt"),
+            hunks: vec![Hunk {
+                header: format!("@@ -1,1 +1,1 @@ {header_function_context}"),
+                function_context: Some(header_function_context.to_owned()),
+                source_start: 1,
+                source_length: 1,
+                target_start: 1,
+                target_length: 1,
+                lines: vec![Line {
+                    kind: LineKind::Context,
+                    text: "ctx".to_owned(),
+                    source_line: Some(1),
+                    target_line: Some(1),
+                }],
+            }],
+        }
+    }
+
+    // C1 — A long hunk header in side-by-side mode renders ONCE across the
+    // full body width, not duplicated/truncated per side. Probe with a
+    // unique sentinel substring so accidental `@@` repetition in the header
+    // text does not inflate the count.
+    #[test]
+    fn render_paired_row_hunk_header_spans_full_body_width_in_side_by_side() {
+        let long_ctx = "SENTINEL_really_really_really_long_function_name_exceeding_one_side";
+        let mut app = make_app_with_single_file(long_header_diff_file(long_ctx));
+        app.diff_mode = DiffMode::ForceSideBySide;
+        let buf = render_to_buffer(&mut app, 200, 24);
+        let (top, _) = diff_area_rows(24);
+
+        let mut header_row = String::new();
+        for x in 0..buf.area().width {
+            header_row.push_str(buf[(x, top)].symbol());
+        }
+
+        // The unique sentinel must appear exactly once — duplication per
+        // column would put a second copy past the gutter.
+        let occurrences = header_row.matches("SENTINEL").count();
+        assert_eq!(
+            occurrences, 1,
+            "long hunk header must render once across full body width, got {occurrences} occurrences in row: {header_row:?}"
+        );
+        // The function context must appear in full (no truncation marker `…`
+        // inserted by the per-side budget).
+        assert!(
+            header_row.contains(long_ctx),
+            "long function-context must appear in full at width 200; row: {header_row:?}"
+        );
+    }
+
+    /// Build an app + a single `Side::Old`-anchored line comment on a removed
+    /// line that has no Added counterpart. Used by the C3 regression and T3
+    /// tests.
+    fn make_app_with_pure_deletion_and_old_comment() -> App {
+        let file = DiffFile::Modified {
+            path: PathBuf::from("foo.txt"),
+            hunks: vec![Hunk {
+                header: "@@ -1,2 +1,1 @@".to_owned(),
+                function_context: None,
+                source_start: 1,
+                source_length: 2,
+                target_start: 1,
+                target_length: 1,
+                lines: vec![
+                    Line {
+                        kind: LineKind::Context,
+                        text: "ctx".to_owned(),
+                        source_line: Some(1),
+                        target_line: Some(1),
+                    },
+                    Line {
+                        kind: LineKind::Removed,
+                        text: "removed_only".to_owned(),
+                        source_line: Some(2),
+                        target_line: None,
+                    },
+                ],
+            }],
+        };
+        let mut app = make_app_with_single_file(file);
+        // Side::Old comment anchored to the removed line.
+        let comment = Comment {
+            schema_version: SchemaVersion,
+            anchor: Anchor::Line {
+                change_id: app.details.change_id.clone(),
+                location: LineAnchor {
+                    file: PathBuf::from("foo.txt"),
+                    side: Side::Old,
+                    old_line: Some(2),
+                    new_line: None,
+                    hunk_header: "@@ -1,2 +1,1 @@".to_owned(),
+                    target_text: "removed_only".to_owned(),
+                    context_before: vec![],
+                    context_after: vec![],
+                },
+            },
+            repo_root: PathBuf::from("/repo"),
+            revset: "@".to_owned(),
+            commit_id: None,
+            body: "deletion comment".to_owned(),
+            severity: Severity::Note,
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
+            updated_at: None,
+            status: Some(Status::Pending),
+            mismatch_reason: None,
+        };
+        app.loaded_comments = vec![comment];
+        app.rebuild_annotated_views();
+        app
+    }
+
+    // C3 — A `Side::Old`-anchored comment on a pure-deletion row (right
+    // column blank) renders in the LEFT column where the deleted line sits,
+    // not in the right column. The "always right" rule is conditional on
+    // there being a right cell to attach to.
+    #[test]
+    fn inline_comment_on_pure_deletion_row_renders_in_left_column_when_anchored_to_old_side() {
+        let mut app = make_app_with_pure_deletion_and_old_comment();
+        app.diff_mode = DiffMode::ForceSideBySide;
+        let buf = render_to_buffer(&mut app, 120, 24);
+        let (top, _) = diff_area_rows(24);
+        let total_width = buf.area().width;
+        let body_width = total_width - 1; // minus scrollbar
+        let side_width = (body_width - SIDE_BY_SIDE_GUTTER_WIDTH) / 2;
+
+        // Find the row containing "deletion comment" by scanning each diff
+        // row for the substring.
+        let comment_row = (top..(top + 10))
+            .find(|y| {
+                let mut s = String::new();
+                for x in 0..total_width {
+                    s.push_str(buf[(x, *y)].symbol());
+                }
+                s.contains("deletion comment")
+            })
+            .expect("comment row must render somewhere in the diff body");
+
+        let mut left_half = String::new();
+        for x in 0..side_width {
+            left_half.push_str(buf[(x, comment_row)].symbol());
+        }
+        let mut right_half = String::new();
+        for x in (side_width + SIDE_BY_SIDE_GUTTER_WIDTH)..total_width {
+            right_half.push_str(buf[(x, comment_row)].symbol());
+        }
+
+        assert!(
+            left_half.contains("deletion comment"),
+            "Side::Old comment on pure-deletion row must render in LEFT column; left_half={left_half:?}"
+        );
+        assert!(
+            !right_half.contains("deletion comment"),
+            "Side::Old comment must NOT also appear in right column; right_half={right_half:?}"
+        );
+    }
+
+    // T3 — Inline-comment-renders-right-column-only buffer probe for the
+    // common case (Side::New anchor on an Added line). Right column carries
+    // the comment text; left column is whitespace-only on the comment row.
+    #[test]
+    fn inline_comment_side_new_renders_in_right_column_only() {
+        let mut app = make_app_with_single_file(sample_diff_file());
+        let comment = Comment {
+            schema_version: SchemaVersion,
+            anchor: Anchor::Line {
+                change_id: app.details.change_id.clone(),
+                location: LineAnchor {
+                    file: PathBuf::from("foo.txt"),
+                    side: Side::New,
+                    old_line: None,
+                    new_line: Some(2),
+                    hunk_header: "@@ -1,2 +1,3 @@".to_owned(),
+                    target_text: "added".to_owned(),
+                    context_before: vec![],
+                    context_after: vec![],
+                },
+            },
+            repo_root: PathBuf::from("/repo"),
+            revset: "@".to_owned(),
+            commit_id: None,
+            body: "addition note".to_owned(),
+            severity: Severity::Note,
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
+            updated_at: None,
+            status: Some(Status::Pending),
+            mismatch_reason: None,
+        };
+        app.loaded_comments = vec![comment];
+        app.rebuild_annotated_views();
+        app.diff_mode = DiffMode::ForceSideBySide;
+        let buf = render_to_buffer(&mut app, 120, 24);
+        let (top, _) = diff_area_rows(24);
+        let total_width = buf.area().width;
+        let body_width = total_width - 1;
+        let side_width = (body_width - SIDE_BY_SIDE_GUTTER_WIDTH) / 2;
+
+        let comment_row = (top..(top + 10))
+            .find(|y| {
+                let mut s = String::new();
+                for x in 0..total_width {
+                    s.push_str(buf[(x, *y)].symbol());
+                }
+                s.contains("addition note")
+            })
+            .expect("comment row must render somewhere in the diff body");
+
+        let mut left_half = String::new();
+        for x in 0..side_width {
+            left_half.push_str(buf[(x, comment_row)].symbol());
+        }
+        let mut right_half = String::new();
+        for x in (side_width + SIDE_BY_SIDE_GUTTER_WIDTH)..total_width {
+            right_half.push_str(buf[(x, comment_row)].symbol());
+        }
+
+        assert!(
+            right_half.contains("addition note"),
+            "Side::New comment must render in RIGHT column; right_half={right_half:?}"
+        );
+        assert!(
+            !left_half.contains("addition note"),
+            "Side::New comment must NOT appear in LEFT column; left_half={left_half:?}"
+        );
+        // Left half must be whitespace + style prefix only (no comment text).
+        let trimmed = left_half.trim();
+        assert!(
+            trimmed.is_empty(),
+            "left half on comment row must be whitespace-only; got {trimmed:?}"
+        );
+    }
+
+    // T1 — Sub-MIN_USEFUL_SIDE_BY_SIDE_WIDTH fallback: even with
+    // ForceSideBySide, a width of 8 cells is below the useful split
+    // threshold. The renderer must fall back to unified rendering, emitting
+    // no gutter glyph and no panic. Pin the contract.
+    //
+    // Skipped: setup_terminal enforces MIN_COLS=60. The test bypasses
+    // setup_terminal via render_to_buffer + TestBackend, so this exercises
+    // the renderer path directly. It also probes a legitimate runtime
+    // condition: a wider terminal can still produce a narrow body when
+    // panes are split or scrollbars eat columns.
+    #[test]
+    fn force_side_by_side_at_width_below_useful_threshold_falls_back_to_unified() {
+        let mut app = make_app_with_single_file(sample_diff_file());
+        app.diff_mode = DiffMode::ForceSideBySide;
+        // Width=8 < MIN_USEFUL_SIDE_BY_SIDE_WIDTH (=11). The renderer
+        // must render without panicking and must NOT emit the gutter glyph.
+        let buf = render_to_buffer(&mut app, 8, 24);
+        let (top, bottom) = diff_area_rows(24);
+        for y in top..bottom {
+            for x in 0..buf.area().width {
+                assert_ne!(
+                    buf[(x, y)].symbol(),
+                    "\u{2502}",
+                    "below-threshold side-by-side must not emit the gutter glyph (fall back to unified)"
+                );
+            }
+        }
+    }
+
+    // T4 — `diff_body_width` is set by `render_diff` to the post-scrollbar
+    // body width every frame so navigation handlers (`move_line`,
+    // `jump_to`, `effective_diff_mode`) resolve against the same width the
+    // renderer actually used. Pin the cache contract.
+    #[test]
+    fn diff_body_width_cache_is_set_after_render() {
+        let mut app = make_app_with_single_file(sample_diff_file());
+        app.diff_mode = DiffMode::Auto;
+        assert_eq!(app.diff_body_width, 0, "cache is zero before any render");
+        let _ = render_to_buffer(&mut app, 120, 24);
+        // 120 total - 1 scrollbar (only if the diff overflows; sample doesn't,
+        // so scrollbar is suppressed and body == full area width = 120).
+        assert!(
+            app.diff_body_width >= 119,
+            "diff_body_width must reflect post-scrollbar body width; got {}",
+            app.diff_body_width
+        );
+        assert!(
+            app.diff_body_width <= 120,
+            "diff_body_width must not exceed area width; got {}",
+            app.diff_body_width
+        );
+    }
+
+    // T5 — Cursor index out-of-range after G-then-resize. line_index points
+    // into the *active layout's* row space. After jumping to bottom in
+    // unified mode then switching to side-by-side (which has fewer rows),
+    // the cursor must not panic on the next move. The renderer's
+    // `current_row_count` clamp via `move_line` is the line of defense.
+    #[test]
+    fn cursor_out_of_range_clamped_when_layout_shrinks() {
+        // Build a diff with paired_rows.len() < lines.len() so the layout
+        // shrinks under side-by-side mode.
+        let file = DiffFile::Modified {
+            path: PathBuf::from("foo.txt"),
+            hunks: vec![Hunk {
+                header: "@@ -1,3 +1,3 @@".to_owned(),
+                function_context: None,
+                source_start: 1,
+                source_length: 3,
+                target_start: 1,
+                target_length: 3,
+                lines: vec![
+                    Line {
+                        kind: LineKind::Removed,
+                        text: "old1".to_owned(),
+                        source_line: Some(1),
+                        target_line: None,
+                    },
+                    Line {
+                        kind: LineKind::Removed,
+                        text: "old2".to_owned(),
+                        source_line: Some(2),
+                        target_line: None,
+                    },
+                    Line {
+                        kind: LineKind::Added,
+                        text: "new1".to_owned(),
+                        source_line: None,
+                        target_line: Some(1),
+                    },
+                    Line {
+                        kind: LineKind::Added,
+                        text: "new2".to_owned(),
+                        source_line: None,
+                        target_line: Some(2),
+                    },
+                ],
+            }],
+        };
+        let mut app = make_app_with_single_file(file);
+
+        // Start unified, render once, then jump to the bottom.
+        app.diff_mode = DiffMode::ForceUnified;
+        let _ = render_to_buffer(&mut app, 200, 24);
+        let unified_rows = app.current_row_count();
+        app.line_index = unified_rows - 1;
+
+        // Switch to side-by-side. paired_rows is shorter than lines because
+        // 2 Removed + 2 Added pair down to 2 Pair rows + 1 HunkHeader = 3.
+        app.diff_mode = DiffMode::ForceSideBySide;
+        // Side-by-side resolution needs a fresh render to update
+        // diff_body_width and let `effective_diff_mode` see SideBySide.
+        let _ = render_to_buffer(&mut app, 200, 24);
+
+        // `cycle_diff_mode` already resets line_index when it cycles, but
+        // direct field assignment bypasses that. Pin the safety net: a
+        // subsequent `move_line` must clamp line_index to the new row count
+        // and must not panic.
+        // Move down once. clamp_with_delta inside move_line clamps to
+        // current_row_count() - 1 = paired_rows.len() - 1.
+        app.move_line(1);
+        let paired_count = app.current_row_count();
+        assert!(
+            app.line_index < paired_count,
+            "line_index must be clamped to current_row_count(); got {} >= {}",
+            app.line_index,
+            paired_count
         );
     }
 }

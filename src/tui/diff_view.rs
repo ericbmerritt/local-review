@@ -12,6 +12,14 @@ const ROWS_PER_INLINE_COMMENT_HINT: usize = 2;
 pub(crate) struct DiffView {
     pub(crate) title: String,
     pub(crate) lines: Vec<RenderedLine>,
+    /// Side-by-side projection of `lines`. Each entry pairs a Removed line
+    /// (left/source) with an Added line (right/target) by index within their
+    /// respective `-`/`+` runs in the same hunk. Non-modification rows
+    /// (context, hunk headers, separators, notices, inline comments) occupy
+    /// a `PairedRow::Spanning` row. Computed eagerly on view construction
+    /// and recomputed whenever `lines` is rebuilt (e.g. after
+    /// `with_inline_comments`).
+    pub(crate) paired_rows: Vec<PairedRow>,
 }
 
 #[derive(Debug, Clone)]
@@ -134,11 +142,44 @@ pub(crate) fn description_comment_to_inline(
     })
 }
 
+/// One row of the side-by-side diff view.
+///
+/// `Spanning(idx)` rows reference a single `RenderedLine` that the renderer
+/// paints across the full body width: hunk headers, separators, context
+/// lines, notices, description lines, and inline comment rows. The renderer
+/// decides whether to expand to full width or restrict to the right column
+/// (for inline comments) based on the `RenderedLine`'s `kind` — that policy
+/// is rendering, not data.
+///
+/// `Pair { left, right }` rows hold up to two `RenderedLine` indices, one for
+/// each column. By construction at least one of `left` or `right` is `Some`;
+/// both `None` is unrepresentable. The constructors only emit Pair rows for
+/// `Removed` / `Added` lines, so the invariants `left.kind == Removed` and
+/// `right.kind == Added` are upheld by `pair_rows` (not by the type system —
+/// see deferred follow-up to NewType-encode the side-specific kinds).
+///
+/// Pairing rule: index pairing within each hunk's `-`/`+` run. The Nth
+/// removed line pairs with the Nth added line. Unequal-length runs leave a
+/// `None` cell on the shorter side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PairedRow {
+    Spanning(usize),
+    Pair {
+        left: Option<usize>,
+        right: Option<usize>,
+    },
+}
+
 impl DiffView {
     pub(crate) fn from_file(file: &DiffFile) -> Self {
         let title = render_title(file);
         let lines = render_lines(file);
-        Self { title, lines }
+        let paired_rows = pair_rows(&lines);
+        Self {
+            title,
+            lines,
+            paired_rows,
+        }
     }
 
     /// Build the synthetic description view that always sits at view index 0,
@@ -146,19 +187,22 @@ impl DiffView {
     /// single `Notice` placeholder row so the pane is never blank.
     pub(crate) fn from_description(description: &str) -> Self {
         if description.trim().is_empty() {
+            let lines = vec![RenderedLine {
+                kind: RenderedLineKind::Notice,
+                text: "(no description)".to_owned(),
+                source_line: None,
+                target_line: None,
+                hunk_header: None,
+                comment_severity: None,
+            }];
+            let paired_rows = pair_rows(&lines);
             return Self {
                 title: "<description>".to_owned(),
-                lines: vec![RenderedLine {
-                    kind: RenderedLineKind::Notice,
-                    text: "(no description)".to_owned(),
-                    source_line: None,
-                    target_line: None,
-                    hunk_header: None,
-                    comment_severity: None,
-                }],
+                lines,
+                paired_rows,
             };
         }
-        let lines = description
+        let lines: Vec<RenderedLine> = description
             .lines()
             .enumerate()
             .map(|(idx, text)| RenderedLine {
@@ -170,9 +214,11 @@ impl DiffView {
                 comment_severity: None,
             })
             .collect();
+        let paired_rows = pair_rows(&lines);
         Self {
             title: "<description>".to_owned(),
             lines,
+            paired_rows,
         }
     }
 
@@ -200,9 +246,11 @@ impl DiffView {
             }
         }
 
+        let paired_rows = pair_rows(&output);
         Self {
             title: self.title,
             lines: output,
+            paired_rows,
         }
     }
 }
@@ -276,6 +324,75 @@ fn push_hunk(output: &mut Vec<RenderedLine>, hunk: &Hunk) {
     }
 }
 
+/// Build the side-by-side row projection from a unified `lines` sequence.
+///
+/// Pairing rule: walk the sequence top-to-bottom. Whenever a contiguous run of
+/// `Removed` lines is immediately followed by a contiguous run of `Added`
+/// lines, pair the Nth removed with the Nth added (index pairing). When one
+/// run is longer than the other, the unpaired tail produces one-side-only
+/// rows (right column blank for extra removed; left column blank for extra
+/// added).
+///
+/// All other line kinds — context, hunk headers, separators, notices,
+/// description lines, and inline comment meta/body rows — produce a
+/// `Spanning(idx)` row holding a single line index. The renderer paints
+/// those rows across the entire body width (or, for inline comment rows, in
+/// the right column only per the side-by-side spec — that decision lives in
+/// the renderer, not the data model).
+///
+/// Inline comment rows that follow a Removed/Added line interrupt the
+/// `-`/`+` run for pairing purposes: a `-` run + comment + `+` run pairs the
+/// comment as a `Spanning` row and the `+` run starts fresh (no pairing
+/// against the earlier `-` run). This keeps comment placement faithful to its
+/// anchor and avoids visually-misleading cross-comment pairings.
+pub(crate) fn pair_rows(lines: &[RenderedLine]) -> Vec<PairedRow> {
+    let mut rows = Vec::with_capacity(lines.len());
+    let mut idx = 0;
+    while idx < lines.len() {
+        let kind = lines[idx].kind;
+        if matches!(kind, RenderedLineKind::Removed) {
+            let removed_start = idx;
+            while idx < lines.len() && matches!(lines[idx].kind, RenderedLineKind::Removed) {
+                idx += 1;
+            }
+            let added_start = idx;
+            while idx < lines.len() && matches!(lines[idx].kind, RenderedLineKind::Added) {
+                idx += 1;
+            }
+            push_paired_run(&mut rows, removed_start..added_start, added_start..idx);
+        } else if matches!(kind, RenderedLineKind::Added) {
+            // A `+` run that is not preceded by a `-` run: every line
+            // is right-side-only.
+            let added_start = idx;
+            while idx < lines.len() && matches!(lines[idx].kind, RenderedLineKind::Added) {
+                idx += 1;
+            }
+            push_paired_run(&mut rows, added_start..added_start, added_start..idx);
+        } else {
+            rows.push(PairedRow::Spanning(idx));
+            idx += 1;
+        }
+    }
+    rows
+}
+
+/// Push paired rows for a contiguous `-` run followed by a `+` run.
+/// Index-pairs the two runs and emits `Pair { left, right }` rows; one side
+/// becomes `None` whenever a run is shorter than the other. Empty input
+/// (both ranges zero-length) emits no rows.
+fn push_paired_run(
+    rows: &mut Vec<PairedRow>,
+    removed: std::ops::Range<usize>,
+    added: std::ops::Range<usize>,
+) {
+    let max = removed.len().max(added.len());
+    for n in 0..max {
+        let left = removed.start.checked_add(n).filter(|i| *i < removed.end);
+        let right = added.start.checked_add(n).filter(|i| *i < added.end);
+        rows.push(PairedRow::Pair { left, right });
+    }
+}
+
 fn render_line(line: &Line, hunk_header: &str) -> RenderedLine {
     let kind = match line.kind {
         LineKind::Context => RenderedLineKind::Context,
@@ -305,13 +422,20 @@ fn inject_comment_lines(output: &mut Vec<RenderedLine>, comment: &InlineComment)
     // `●` sigil pairs with the severity color so NO_COLOR terminals still
     // distinguish severity by reading the label.
     let meta = format!("┃ ● {label} · {}", comment.age);
+    // Propagate the comment's anchor-side line numbers onto the synthetic
+    // rows so the side-by-side renderer can read which side the anchor was
+    // on (Side::Old → source_line.is_some(), Side::New → target_line.is_some()).
+    // This does not change unified-mode behavior — the unified renderer
+    // ignores these fields on inline-comment kinds.
+    let source_line = comment.source_line;
+    let target_line = comment.target_line;
     output.push(RenderedLine {
         kind: RenderedLineKind::InlineCommentMeta {
             comment_index: comment.comment_index,
         },
         text: meta,
-        source_line: None,
-        target_line: None,
+        source_line,
+        target_line,
         hunk_header: None,
         comment_severity: Some(comment.severity),
     });
@@ -319,8 +443,8 @@ fn inject_comment_lines(output: &mut Vec<RenderedLine>, comment: &InlineComment)
         output.push(RenderedLine {
             kind: RenderedLineKind::InlineCommentBody,
             text: format!("┃ {body_line}"),
-            source_line: None,
-            target_line: None,
+            source_line,
+            target_line,
             hunk_header: None,
             comment_severity: Some(comment.severity),
         });
@@ -865,6 +989,429 @@ mod tests {
             augmented.lines.len(),
             original_len,
             "display_line=None must not inject anywhere — pinning silent-drop"
+        );
+    }
+
+    fn line(kind: RenderedLineKind, text: &str) -> RenderedLine {
+        RenderedLine {
+            kind,
+            text: text.to_owned(),
+            source_line: None,
+            target_line: None,
+            hunk_header: None,
+            comment_severity: None,
+        }
+    }
+
+    // pair_rows: a single Removed followed by a single Added pairs by index.
+    #[test]
+    fn pair_rows_pairs_single_removed_with_single_added() {
+        let lines = vec![
+            line(RenderedLineKind::HunkHeader, "@@"),
+            line(RenderedLineKind::Removed, "old"),
+            line(RenderedLineKind::Added, "new"),
+        ];
+        let rows = pair_rows(&lines);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], PairedRow::Spanning(0));
+        assert_eq!(
+            rows[1],
+            PairedRow::Pair {
+                left: Some(1),
+                right: Some(2),
+            }
+        );
+    }
+
+    // pair_rows: a Removed run pairs index-by-index with the following Added run.
+    #[test]
+    fn pair_rows_pairs_multi_line_runs_by_index() {
+        let lines = vec![
+            line(RenderedLineKind::Removed, "old1"),
+            line(RenderedLineKind::Removed, "old2"),
+            line(RenderedLineKind::Added, "new1"),
+            line(RenderedLineKind::Added, "new2"),
+        ];
+        let rows = pair_rows(&lines);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0],
+            PairedRow::Pair {
+                left: Some(0),
+                right: Some(2),
+            }
+        );
+        assert_eq!(
+            rows[1],
+            PairedRow::Pair {
+                left: Some(1),
+                right: Some(3),
+            }
+        );
+    }
+
+    // pair_rows: extra Added lines beyond the Removed run produce
+    // right-only rows for the unpaired tail.
+    #[test]
+    fn pair_rows_unpaired_added_tail_is_right_only() {
+        let lines = vec![
+            line(RenderedLineKind::Removed, "old1"),
+            line(RenderedLineKind::Added, "new1"),
+            line(RenderedLineKind::Added, "new2"),
+            line(RenderedLineKind::Added, "new3"),
+        ];
+        let rows = pair_rows(&lines);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows[0],
+            PairedRow::Pair {
+                left: Some(0),
+                right: Some(1),
+            }
+        );
+        assert_eq!(
+            rows[1],
+            PairedRow::Pair {
+                left: None,
+                right: Some(2),
+            }
+        );
+        assert_eq!(
+            rows[2],
+            PairedRow::Pair {
+                left: None,
+                right: Some(3),
+            }
+        );
+    }
+
+    // pair_rows: extra Removed lines beyond the Added run produce
+    // left-only rows for the unpaired tail.
+    #[test]
+    fn pair_rows_unpaired_removed_tail_is_left_only() {
+        let lines = vec![
+            line(RenderedLineKind::Removed, "old1"),
+            line(RenderedLineKind::Removed, "old2"),
+            line(RenderedLineKind::Removed, "old3"),
+            line(RenderedLineKind::Added, "new1"),
+        ];
+        let rows = pair_rows(&lines);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows[0],
+            PairedRow::Pair {
+                left: Some(0),
+                right: Some(3),
+            }
+        );
+        assert_eq!(
+            rows[1],
+            PairedRow::Pair {
+                left: Some(1),
+                right: None,
+            }
+        );
+        assert_eq!(
+            rows[2],
+            PairedRow::Pair {
+                left: Some(2),
+                right: None,
+            }
+        );
+    }
+
+    // pair_rows: an Added run with no preceding Removed run is fully right-only.
+    #[test]
+    fn pair_rows_added_only_run_is_right_only() {
+        let lines = vec![
+            line(RenderedLineKind::Context, "ctx"),
+            line(RenderedLineKind::Added, "new1"),
+            line(RenderedLineKind::Added, "new2"),
+        ];
+        let rows = pair_rows(&lines);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0], PairedRow::Spanning(0));
+        assert_eq!(
+            rows[1],
+            PairedRow::Pair {
+                left: None,
+                right: Some(1),
+            }
+        );
+        assert_eq!(
+            rows[2],
+            PairedRow::Pair {
+                left: None,
+                right: Some(2),
+            }
+        );
+    }
+
+    // pair_rows: a Removed run with no following Added run is fully left-only.
+    #[test]
+    fn pair_rows_removed_only_run_is_left_only() {
+        let lines = vec![
+            line(RenderedLineKind::Removed, "old1"),
+            line(RenderedLineKind::Removed, "old2"),
+            line(RenderedLineKind::Context, "ctx"),
+        ];
+        let rows = pair_rows(&lines);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows[0],
+            PairedRow::Pair {
+                left: Some(0),
+                right: None,
+            }
+        );
+        assert_eq!(
+            rows[1],
+            PairedRow::Pair {
+                left: Some(1),
+                right: None,
+            }
+        );
+        assert_eq!(rows[2], PairedRow::Spanning(2));
+    }
+
+    // pair_rows: empty input produces no rows.
+    #[test]
+    fn pair_rows_empty_input() {
+        assert!(pair_rows(&[]).is_empty());
+    }
+
+    // pair_rows: an all-context hunk produces N Spanning rows.
+    #[test]
+    fn pair_rows_all_context() {
+        let lines = vec![
+            line(RenderedLineKind::HunkHeader, "@@"),
+            line(RenderedLineKind::Context, "a"),
+            line(RenderedLineKind::Context, "b"),
+            line(RenderedLineKind::Context, "c"),
+        ];
+        let rows = pair_rows(&lines);
+        assert_eq!(rows.len(), 4);
+        assert!(rows.iter().all(|r| matches!(r, PairedRow::Spanning(_))));
+    }
+
+    // pair_rows: an all-removed file produces N left-only Pair rows.
+    #[test]
+    fn pair_rows_all_removed_file() {
+        let lines = vec![
+            line(RenderedLineKind::Removed, "a"),
+            line(RenderedLineKind::Removed, "b"),
+            line(RenderedLineKind::Removed, "c"),
+        ];
+        let rows = pair_rows(&lines);
+        assert_eq!(rows.len(), 3);
+        for r in &rows {
+            assert!(
+                matches!(
+                    r,
+                    PairedRow::Pair {
+                        left: Some(_),
+                        right: None,
+                    }
+                ),
+                "expected Pair{{ left: Some, right: None }}, got {r:?}"
+            );
+        }
+    }
+
+    // pair_rows: an all-added file produces N right-only Pair rows.
+    #[test]
+    fn pair_rows_all_added_file() {
+        let lines = vec![
+            line(RenderedLineKind::Added, "a"),
+            line(RenderedLineKind::Added, "b"),
+            line(RenderedLineKind::Added, "c"),
+        ];
+        let rows = pair_rows(&lines);
+        assert_eq!(rows.len(), 3);
+        for r in &rows {
+            assert!(
+                matches!(
+                    r,
+                    PairedRow::Pair {
+                        left: None,
+                        right: Some(_),
+                    }
+                ),
+                "expected Pair{{ left: None, right: Some }}, got {r:?}"
+            );
+        }
+    }
+
+    // pair_rows: an inline comment row that lands between a `-` run and a
+    // `+` run prevents pairing across the comment. The `-` run becomes
+    // left-only, the comment is Spanning, and the `+` run becomes right-only.
+    #[test]
+    fn pair_rows_comment_breaks_run_pairing() {
+        let lines = vec![
+            line(RenderedLineKind::Removed, "old"),
+            line(
+                RenderedLineKind::InlineCommentMeta { comment_index: 0 },
+                "┃ ● note",
+            ),
+            line(RenderedLineKind::Added, "new"),
+        ];
+        let rows = pair_rows(&lines);
+        // Removed (no following Added in same run) -> left-only.
+        // InlineCommentMeta -> Spanning.
+        // Added (no preceding Removed in same run) -> right-only.
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows[0],
+            PairedRow::Pair {
+                left: Some(0),
+                right: None,
+            }
+        );
+        assert_eq!(rows[1], PairedRow::Spanning(1));
+        assert_eq!(
+            rows[2],
+            PairedRow::Pair {
+                left: None,
+                right: Some(2),
+            }
+        );
+    }
+
+    // DiffView: from_file populates paired_rows alongside lines so the
+    // renderer never has to recompute. The sample has lines in order
+    // [HunkHeader, Context, Added, Removed], so the walker emits
+    // HunkHeader(Spanning), Context(Spanning), Added-only Pair, then
+    // Removed-only Pair — pairing only happens when a Removed run is
+    // immediately followed by an Added run.
+    #[test]
+    fn from_file_populates_paired_rows() {
+        let view = DiffView::from_file(&sample_modified());
+        assert_eq!(view.paired_rows.len(), 4);
+        assert_eq!(view.paired_rows[0], PairedRow::Spanning(0));
+        assert_eq!(view.paired_rows[1], PairedRow::Spanning(1));
+        assert_eq!(
+            view.paired_rows[2],
+            PairedRow::Pair {
+                left: None,
+                right: Some(2),
+            }
+        );
+        assert_eq!(
+            view.paired_rows[3],
+            PairedRow::Pair {
+                left: Some(3),
+                right: None,
+            }
+        );
+    }
+
+    // T2 — Multi-hunk pairing isolation: the last `-` of hunk A must NOT pair
+    // with the first `+` of hunk B. The HunkHeader / HunkSeparator rows that
+    // sit between hunks are non-Removed/non-Added kinds, so the run walker
+    // naturally breaks across them. Pin the regression.
+    #[test]
+    fn pair_rows_does_not_pair_across_hunk_boundary() {
+        let lines = vec![
+            // Hunk A
+            line(RenderedLineKind::HunkHeader, "@@ -1,1 +1,1 @@"),
+            line(RenderedLineKind::Removed, "old_A"),
+            line(RenderedLineKind::HunkSeparator, ""),
+            // Hunk B
+            line(RenderedLineKind::HunkHeader, "@@ -10,1 +10,1 @@"),
+            line(RenderedLineKind::Added, "new_B"),
+        ];
+        let rows = pair_rows(&lines);
+        // 5 rows: HunkHeader (Spanning), Removed-only Pair, HunkSeparator
+        // (Spanning), HunkHeader (Spanning), Added-only Pair.
+        assert_eq!(rows.len(), 5);
+        assert_eq!(rows[0], PairedRow::Spanning(0));
+        assert_eq!(
+            rows[1],
+            PairedRow::Pair {
+                left: Some(1),
+                right: None,
+            },
+            "hunk A's `-` must NOT pair with hunk B's `+`"
+        );
+        assert_eq!(rows[2], PairedRow::Spanning(2));
+        assert_eq!(rows[3], PairedRow::Spanning(3));
+        assert_eq!(
+            rows[4],
+            PairedRow::Pair {
+                left: None,
+                right: Some(4),
+            },
+            "hunk B's `+` must NOT pair with hunk A's `-`"
+        );
+    }
+
+    // T6 — Multi-line comment-broken pairing: a comment between two `-` lines
+    // and two `+` lines splits each run, producing four left-only / right-only
+    // Pair rows around the Spanning comment row. Pins option 2 (comment
+    // breaks the run) which is what `pair_rows` does today.
+    #[test]
+    fn pair_rows_comment_in_middle_of_runs_breaks_each_side() {
+        let lines = vec![
+            line(RenderedLineKind::Removed, "old1"),
+            line(RenderedLineKind::Removed, "old2"),
+            line(
+                RenderedLineKind::InlineCommentMeta { comment_index: 0 },
+                "┃ ● note",
+            ),
+            line(RenderedLineKind::Added, "new1"),
+            line(RenderedLineKind::Added, "new2"),
+        ];
+        let rows = pair_rows(&lines);
+        assert_eq!(rows.len(), 5);
+        assert_eq!(
+            rows[0],
+            PairedRow::Pair {
+                left: Some(0),
+                right: None,
+            },
+        );
+        assert_eq!(
+            rows[1],
+            PairedRow::Pair {
+                left: Some(1),
+                right: None,
+            },
+        );
+        assert_eq!(rows[2], PairedRow::Spanning(2));
+        assert_eq!(
+            rows[3],
+            PairedRow::Pair {
+                left: None,
+                right: Some(3),
+            },
+        );
+        assert_eq!(
+            rows[4],
+            PairedRow::Pair {
+                left: None,
+                right: Some(4),
+            },
+        );
+    }
+
+    // DiffView: with_inline_comments rebuilds paired_rows so a freshly
+    // injected comment row appears in the side-by-side projection.
+    #[test]
+    fn with_inline_comments_rebuilds_paired_rows() {
+        let view = DiffView::from_file(&sample_modified());
+        let before = view.paired_rows.len();
+        let comment = InlineComment {
+            source_line: None,
+            target_line: Some(2),
+            severity: Severity::Required,
+            age: "just now".to_owned(),
+            body_lines: vec!["fix".to_owned()],
+            comment_index: 0,
+        };
+        let augmented = view.with_inline_comments(&[comment]);
+        assert!(
+            augmented.paired_rows.len() > before,
+            "comment injection should add at least one paired row"
         );
     }
 }
