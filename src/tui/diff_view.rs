@@ -14,11 +14,13 @@ pub(crate) struct DiffView {
     pub(crate) lines: Vec<RenderedLine>,
     /// Side-by-side projection of `lines`. Each entry pairs a Removed line
     /// (left/source) with an Added line (right/target) by index within their
-    /// respective `-`/`+` runs in the same hunk. Non-modification rows
-    /// (context, hunk headers, separators, notices, inline comments) occupy
-    /// a `PairedRow::Spanning` row. Computed eagerly on view construction
-    /// and recomputed whenever `lines` is rebuilt (e.g. after
-    /// `with_inline_comments`).
+    /// respective `-`/`+` runs in the same hunk. Context lines emit a
+    /// `Pair { Some(idx), Some(idx) }` so the same source text renders on
+    /// both sides, truncated independently to `side_width`. Genuine metadata
+    /// rows (hunk headers, separators, notices, inline comments) occupy a
+    /// `PairedRow::Spanning` row painted across the full body width.
+    /// Computed eagerly on view construction and recomputed whenever
+    /// `lines` is rebuilt (e.g. after `with_inline_comments`).
     pub(crate) paired_rows: Vec<PairedRow>,
 }
 
@@ -145,18 +147,21 @@ pub(crate) fn description_comment_to_inline(
 /// One row of the side-by-side diff view.
 ///
 /// `Spanning(idx)` rows reference a single `RenderedLine` that the renderer
-/// paints across the full body width: hunk headers, separators, context
-/// lines, notices, description lines, and inline comment rows. The renderer
-/// decides whether to expand to full width or restrict to the right column
-/// (for inline comments) based on the `RenderedLine`'s `kind` — that policy
-/// is rendering, not data.
+/// paints across the full body width: hunk headers, separators, notices,
+/// description lines, and inline comment rows. The renderer decides whether
+/// to expand to full width or restrict to the right column (for inline
+/// comments) based on the `RenderedLine`'s `kind` — that policy is
+/// rendering, not data.
 ///
 /// `Pair { left, right }` rows hold up to two `RenderedLine` indices, one for
 /// each column. By construction at least one of `left` or `right` is `Some`;
-/// both `None` is unrepresentable. The constructors only emit Pair rows for
-/// `Removed` / `Added` lines, so the invariants `left.kind == Removed` and
-/// `right.kind == Added` are upheld by `pair_rows` (not by the type system —
-/// see deferred follow-up to NewType-encode the side-specific kinds).
+/// both `None` is unrepresentable. `pair_rows` emits Pair rows for `Removed`
+/// / `Added` runs (left = Removed, right = Added; unequal-length runs leave
+/// a `None` cell on the shorter side) and for `Context` lines (`left ==
+/// right == Some(idx)` referencing the same line so each side truncates
+/// independently). No other kinds yield Pair rows. The kind invariants are
+/// upheld by `pair_rows`, not the type system — see deferred follow-up to
+/// NewType-encode the side-specific kinds.
 ///
 /// Pairing rule: index pairing within each hunk's `-`/`+` run. The Nth
 /// removed line pairs with the Nth added line. Unequal-length runs leave a
@@ -333,12 +338,18 @@ fn push_hunk(output: &mut Vec<RenderedLine>, hunk: &Hunk) {
 /// rows (right column blank for extra removed; left column blank for extra
 /// added).
 ///
-/// All other line kinds — context, hunk headers, separators, notices,
-/// description lines, and inline comment meta/body rows — produce a
-/// `Spanning(idx)` row holding a single line index. The renderer paints
-/// those rows across the entire body width (or, for inline comment rows, in
-/// the right column only per the side-by-side spec — that decision lives in
-/// the renderer, not the data model).
+/// `Context` lines are unchanged source code: they belong on BOTH sides
+/// (matching `delta` / `vim diffsplit` / Gerrit / Crucible convention), so
+/// they emit a `Pair { left: Some(idx), right: Some(idx) }` row referencing
+/// the same line on each side. The renderer truncates each side independently
+/// to `side_width`, preventing long context text from bleeding past the gutter
+/// into the opposite column.
+///
+/// Genuinely-metadata rows — hunk headers, separators, notices, description
+/// lines, and inline comment meta/body rows — produce a `Spanning(idx)` row
+/// the renderer paints across the entire body width (or, for inline comment
+/// rows, in the right column only per the side-by-side spec — that decision
+/// lives in the renderer, not the data model).
 ///
 /// Inline comment rows that follow a Removed/Added line interrupt the
 /// `-`/`+` run for pairing purposes: a `-` run + comment + `+` run pairs the
@@ -368,6 +379,14 @@ pub(crate) fn pair_rows(lines: &[RenderedLine]) -> Vec<PairedRow> {
                 idx += 1;
             }
             push_paired_run(&mut rows, added_start..added_start, added_start..idx);
+        } else if matches!(kind, RenderedLineKind::Context) {
+            // Context is source content; render on both sides so each column
+            // truncates independently to side_width.
+            rows.push(PairedRow::Pair {
+                left: Some(idx),
+                right: Some(idx),
+            });
+            idx += 1;
         } else {
             rows.push(PairedRow::Spanning(idx));
             idx += 1;
@@ -1130,7 +1149,13 @@ mod tests {
         ];
         let rows = pair_rows(&lines);
         assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0], PairedRow::Spanning(0));
+        assert_eq!(
+            rows[0],
+            PairedRow::Pair {
+                left: Some(0),
+                right: Some(0),
+            }
+        );
         assert_eq!(
             rows[1],
             PairedRow::Pair {
@@ -1171,7 +1196,13 @@ mod tests {
                 right: None,
             }
         );
-        assert_eq!(rows[2], PairedRow::Spanning(2));
+        assert_eq!(
+            rows[2],
+            PairedRow::Pair {
+                left: Some(2),
+                right: Some(2),
+            }
+        );
     }
 
     // pair_rows: empty input produces no rows.
@@ -1180,9 +1211,9 @@ mod tests {
         assert!(pair_rows(&[]).is_empty());
     }
 
-    // pair_rows: an all-context hunk produces N Spanning rows.
+    // pair_rows: a hunk header Spans; the context lines that follow self-pair.
     #[test]
-    fn pair_rows_all_context() {
+    fn pair_rows_hunk_header_spans_and_context_lines_self_pair() {
         let lines = vec![
             line(RenderedLineKind::HunkHeader, "@@"),
             line(RenderedLineKind::Context, "a"),
@@ -1191,7 +1222,28 @@ mod tests {
         ];
         let rows = pair_rows(&lines);
         assert_eq!(rows.len(), 4);
-        assert!(rows.iter().all(|r| matches!(r, PairedRow::Spanning(_))));
+        assert_eq!(rows[0], PairedRow::Spanning(0));
+        assert_eq!(
+            rows[1],
+            PairedRow::Pair {
+                left: Some(1),
+                right: Some(1),
+            }
+        );
+        assert_eq!(
+            rows[2],
+            PairedRow::Pair {
+                left: Some(2),
+                right: Some(2),
+            }
+        );
+        assert_eq!(
+            rows[3],
+            PairedRow::Pair {
+                left: Some(3),
+                right: Some(3),
+            }
+        );
     }
 
     // pair_rows: an all-removed file produces N left-only Pair rows.
@@ -1280,7 +1332,7 @@ mod tests {
     // DiffView: from_file populates paired_rows alongside lines so the
     // renderer never has to recompute. The sample has lines in order
     // [HunkHeader, Context, Added, Removed], so the walker emits
-    // HunkHeader(Spanning), Context(Spanning), Added-only Pair, then
+    // HunkHeader(Spanning), Context(self-Pair), Added-only Pair, then
     // Removed-only Pair — pairing only happens when a Removed run is
     // immediately followed by an Added run.
     #[test]
@@ -1288,7 +1340,13 @@ mod tests {
         let view = DiffView::from_file(&sample_modified());
         assert_eq!(view.paired_rows.len(), 4);
         assert_eq!(view.paired_rows[0], PairedRow::Spanning(0));
-        assert_eq!(view.paired_rows[1], PairedRow::Spanning(1));
+        assert_eq!(
+            view.paired_rows[1],
+            PairedRow::Pair {
+                left: Some(1),
+                right: Some(1),
+            }
+        );
         assert_eq!(
             view.paired_rows[2],
             PairedRow::Pair {
@@ -1303,6 +1361,54 @@ mod tests {
                 right: None,
             }
         );
+    }
+
+    // Bug fix: Context lines must classify as `Pair { Some(idx), Some(idx) }`,
+    // not `Spanning`. A Spanning Context row paints across the full body width
+    // (gutter + both columns), causing long context text to bleed past the
+    // gutter into the right column when the right column is otherwise empty.
+    // Self-pairing forces the renderer to truncate each side independently to
+    // `side_width`.
+    #[test]
+    fn pair_rows_treats_context_as_pair_not_span() {
+        let lines = vec![
+            line(RenderedLineKind::HunkHeader, "@@ -1,3 +1,4 @@"),
+            line(RenderedLineKind::Context, "ctx_before"),
+            line(RenderedLineKind::Removed, "old"),
+            line(RenderedLineKind::Added, "new"),
+            line(RenderedLineKind::Context, "ctx_after"),
+            line(RenderedLineKind::Notice, "(note)"),
+            line(RenderedLineKind::DescriptionLine, "desc"),
+        ];
+        let rows = pair_rows(&lines);
+        assert_eq!(rows.len(), 6);
+        assert_eq!(rows[0], PairedRow::Spanning(0), "HunkHeader must Span");
+        assert_eq!(
+            rows[1],
+            PairedRow::Pair {
+                left: Some(1),
+                right: Some(1),
+            },
+            "Context line must self-pair so each side truncates independently"
+        );
+        assert_eq!(
+            rows[2],
+            PairedRow::Pair {
+                left: Some(2),
+                right: Some(3),
+            },
+            "Removed/Added pair as before"
+        );
+        assert_eq!(
+            rows[3],
+            PairedRow::Pair {
+                left: Some(4),
+                right: Some(4),
+            },
+            "trailing Context must also self-pair"
+        );
+        assert_eq!(rows[4], PairedRow::Spanning(5), "Notice must Span");
+        assert_eq!(rows[5], PairedRow::Spanning(6), "DescriptionLine must Span");
     }
 
     // T2 — Multi-hunk pairing isolation: the last `-` of hunk A must NOT pair

@@ -825,9 +825,9 @@ impl App {
                             RenderedLineKind::HunkSeparator | RenderedLineKind::InlineCommentBody,
                         )
                     }),
-                    // `Pair` rows always carry at least one Removed/Added line
-                    // — never a hunk separator or comment continuation — so
-                    // they are always navigable.
+                    // `Pair` rows reference Removed, Added, or Context lines —
+                    // never HunkSeparator or InlineCommentBody — so they are
+                    // always navigable.
                     PairedRow::Pair { .. } => false,
                 }
             }
@@ -1564,10 +1564,11 @@ fn render_paired_row<'a>(
                 let column = inline_comment_column(at.rows, at.row_idx, line);
                 render_inline_comment_row(line, column, focused, geom.side_width)
             } else {
-                // Non-comment Spanning rows (hunk headers, separators, context,
-                // notices, description lines) render ONCE across the full body
-                // width — duplicating per-side would truncate long content
-                // (e.g. hunk headers with function context).
+                // Non-comment Spanning rows (hunk headers, separators, notices,
+                // description lines) render ONCE across the full body width —
+                // duplicating per-side would truncate long content. Context
+                // lines are NOT in this set: they emit Pair { Some(i), Some(i) }
+                // and truncate per side.
                 render_full_width_row(line, focused, geom.full_width)
             }
         }
@@ -9211,23 +9212,26 @@ mod tests {
         );
     }
 
-    /// Build a diff file with a single hunk and a long header that exceeds
-    /// `side_width` (~58 cells at width=120). Used by the C1 regression to
-    /// verify Spanning rows render once across full body width instead of
-    /// being duplicated and truncated per side.
-    fn long_header_diff_file(header_function_context: &str) -> DiffFile {
+    /// Build a `DiffFile::Modified` with a single one-line hunk. Tests pick
+    /// which axis to stress: `header` (with optional `function_context`) for
+    /// header-rendering probes, `line_text` for Context-rendering probes.
+    fn single_context_line_file(
+        header: &str,
+        function_context: Option<String>,
+        line_text: String,
+    ) -> DiffFile {
         DiffFile::Modified {
             path: PathBuf::from("foo.txt"),
             hunks: vec![Hunk {
-                header: format!("@@ -1,1 +1,1 @@ {header_function_context}"),
-                function_context: Some(header_function_context.to_owned()),
+                header: header.to_owned(),
+                function_context,
                 source_start: 1,
                 source_length: 1,
                 target_start: 1,
                 target_length: 1,
                 lines: vec![Line {
                     kind: LineKind::Context,
-                    text: "ctx".to_owned(),
+                    text: line_text,
                     source_line: Some(1),
                     target_line: Some(1),
                 }],
@@ -9242,7 +9246,11 @@ mod tests {
     #[test]
     fn render_paired_row_hunk_header_spans_full_body_width_in_side_by_side() {
         let long_ctx = "SENTINEL_really_really_really_long_function_name_exceeding_one_side";
-        let mut app = make_app_with_single_file(long_header_diff_file(long_ctx));
+        let mut app = make_app_with_single_file(single_context_line_file(
+            &format!("@@ -1,1 +1,1 @@ {long_ctx}"),
+            Some(long_ctx.to_owned()),
+            "ctx".to_owned(),
+        ));
         app.diff_mode = DiffMode::ForceSideBySide;
         let buf = render_to_buffer(&mut app, 200, 24);
         let (top, _) = diff_area_rows(24);
@@ -9264,6 +9272,81 @@ mod tests {
         assert!(
             header_row.contains(long_ctx),
             "long function-context must appear in full at width 200; row: {header_row:?}"
+        );
+    }
+
+    // Context lines emit Pair { Some(i), Some(i) }; each side must
+    // truncate independently to side_width. A regression that routes
+    // Context back through render_full_width_row would paint past
+    // the gutter into the right column.
+    #[test]
+    fn render_long_context_does_not_bleed_across_gutter() {
+        let mut app = make_app_with_single_file(single_context_line_file(
+            "@@ -1,1 +1,1 @@",
+            None,
+            "x".repeat(200),
+        ));
+        app.diff_mode = DiffMode::ForceSideBySide;
+        let buf = render_to_buffer(&mut app, 120, 24);
+        let (top, _) = diff_area_rows(24);
+        let total_width = buf.area().width;
+        let body_width = total_width - 1; // minus scrollbar
+        let side_width = (body_width - SIDE_BY_SIDE_GUTTER_WIDTH) / 2;
+        let context_row = top + 1;
+
+        let mut left_half = String::new();
+        for x in 0..side_width {
+            left_half.push_str(buf[(x, context_row)].symbol());
+        }
+        let mut gutter = String::new();
+        for x in side_width..(side_width + SIDE_BY_SIDE_GUTTER_WIDTH) {
+            gutter.push_str(buf[(x, context_row)].symbol());
+        }
+        let mut right_half = String::new();
+        for x in (side_width + SIDE_BY_SIDE_GUTTER_WIDTH)..body_width {
+            right_half.push_str(buf[(x, context_row)].symbol());
+        }
+
+        assert_eq!(
+            gutter, " \u{2502} ",
+            "gutter must be intact between independently-truncated sides; \
+             got {gutter:?} at row {context_row}"
+        );
+        assert!(
+            left_half.contains('\u{2026}'),
+            "left side of an over-long context line must end in an ellipsis; \
+             got {left_half:?}"
+        );
+        assert!(
+            right_half.contains('\u{2026}'),
+            "right side of an over-long context line must end in an ellipsis; \
+             got {right_half:?}"
+        );
+        assert!(
+            left_half.contains("xx"),
+            "left side must contain the context payload; got {left_half:?}"
+        );
+        assert!(
+            right_half.contains("xx"),
+            "right side must contain the context payload; got {right_half:?}"
+        );
+        // No `x`-run in the right column may exceed side_width — that
+        // signals left text bled past the gutter.
+        let max_x_run = right_half
+            .chars()
+            .fold((0_usize, 0_usize), |(best, run), c| {
+                if c == 'x' {
+                    let r = run + 1;
+                    (best.max(r), r)
+                } else {
+                    (best, 0)
+                }
+            })
+            .0;
+        assert!(
+            max_x_run <= usize::from(side_width),
+            "right column `x` run length {max_x_run} exceeds side_width \
+             {side_width} — text bled across the gutter; right_half={right_half:?}"
         );
     }
 
