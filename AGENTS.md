@@ -9,8 +9,8 @@ The mental model lives in `specs/local-stack-review-edd.md`. Read the
 **Principles** section first; it constrains every implementation decision.
 Notably:
 
-- The tool is for jj users. Claude edits each change in place. Don't
-  accommodate git-style append-fix-commit instincts.
+- The tool is for jj users. Claude edits each change in place. Don't accommodate
+  git-style append-fix-commit instincts.
 - The review cycle is the unit of progress.
 - Claude addresses comments by editing code. The codebase change is the only
   reply — no decline-with-reasoning, no summary report.
@@ -20,15 +20,15 @@ Notably:
 
 ## Code layout
 
-Functional core in the middle, imperative shell at the edges. Pure modules
-take data and return data — no IO, no subprocess, no clock. Each `.rs` file
-in `src/` carries a module-level doc comment summarising its role; read those
-rather than relying on a list here.
+Functional core in the middle, imperative shell at the edges. Pure modules take
+data and return data — no IO, no subprocess, no clock. Each `.rs` file in `src/`
+carries a module-level doc comment summarising its role; read those rather than
+relying on a list here.
 
 See `specs/jjr-mvp.ladder.md` for current scope and what is still planned.
 
-Layout is flat (`mod_module_files = "deny"`). `tui.rs` is the only module with
-a same-named subdirectory (`tui/`) because the TUI is genuinely multi-file.
+Layout is flat (`mod_module_files = "deny"`). `tui.rs` is the only module with a
+same-named subdirectory (`tui/`) because the TUI is genuinely multi-file.
 
 ## Quality posture
 
@@ -46,9 +46,9 @@ Tests are exempted from `unwrap`/`expect`/`dbg`/`print` denies (see
 
 ## Specs
 
-The `specs/` directory contains the engineering design document, the TUI
-design, and the milestone ladder. Read the EDD and TUI design before
-implementing anything non-trivial.
+The `specs/` directory contains the engineering design document, the TUI design,
+and the milestone ladder. Read the EDD and TUI design before implementing
+anything non-trivial.
 
 ## Workflow
 

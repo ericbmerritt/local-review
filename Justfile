@@ -7,13 +7,16 @@ build:
     cargo build
 
 [parallel]
-check-format: check-for-trailing-whitespace check-format-rust check-format-nix
+check-format: check-for-trailing-whitespace check-format-rust check-format-nix check-format-md
 
 check-format-rust:
     cargo fmt -- --check
 
 check-format-nix:
     rg --files -g '*.nix' -g '!.*' | xargs alejandra -c
+
+check-format-md:
+    prettier --check '**/*.md'
 
 check-for-trailing-whitespace:
     ! rg '\s+$' --glob '!Cargo.lock' --glob '!specs/**'
@@ -35,13 +38,16 @@ test:
       --ignore-filename-regex '(^|/)(tui|jj|main|error)\.rs$|tui/(help_screen|composer|composer_overlay)\.rs$'
 
 [parallel]
-format: remove-trailing-whitespace format-rust format-nix
+format: remove-trailing-whitespace format-rust format-nix format-md
 
 format-rust:
     cargo fmt
 
 format-nix:
     rg --files -g '*.nix' -g '!.*' | xargs alejandra
+
+format-md:
+    prettier --write '**/*.md'
 
 remove-trailing-whitespace:
     files=$(rg -l "\s+$" --glob '!Cargo.lock' --glob '!specs/**' || true); \

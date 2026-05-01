@@ -42,6 +42,7 @@
           cargo-llvm-cov
           cargo-nextest
           ripgrep
+          prettier
         ];
       };
     });
