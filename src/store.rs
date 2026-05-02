@@ -15,8 +15,15 @@ fn comments_dir(repo_root: &Path) -> PathBuf {
     repo_root.join(".jj-review").join("comments")
 }
 
-fn change_file(repo_root: &Path, change_id: &ChangeId) -> PathBuf {
+/// Canonical on-disk path for a per-change comments file.
+pub fn change_file(repo_root: &Path, change_id: &ChangeId) -> PathBuf {
     comments_dir(repo_root).join(format!("{}.jsonl", change_id.to_filename()))
+}
+
+/// Canonical on-disk path for the shared stack-scoped comments file. Records
+/// across multiple stacks share the file; each carries its own `revset_hash`.
+pub fn stack_file(repo_root: &Path) -> PathBuf {
+    comments_dir(repo_root).join(STACK_FILENAME)
 }
 
 fn anchor_file(repo_root: &Path, comment: &Comment) -> PathBuf {
@@ -24,7 +31,7 @@ fn anchor_file(repo_root: &Path, comment: &Comment) -> PathBuf {
         Anchor::Line { change_id, .. }
         | Anchor::Change { change_id }
         | Anchor::Description { change_id, .. } => change_file(repo_root, change_id),
-        Anchor::Stack { .. } => comments_dir(repo_root).join(STACK_FILENAME),
+        Anchor::Stack { .. } => stack_file(repo_root),
     }
 }
 

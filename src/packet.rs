@@ -95,10 +95,28 @@ pub fn build_packet(
     })
 }
 
+#[derive(Copy, Clone, Debug)]
+pub enum PromptMode {
+    /// Used by `jjr packet` for self-contained piped output.
+    Inline,
+    /// Used by the in-process C-key path; references on-disk JSONL files
+    /// instead of inlining comment bodies, keeping the prompt small.
+    JsonlPaths,
+}
+
+/// Inline-mode renderer used by `jjr packet`.
+pub fn render_prompt(packet: &Packet) -> String {
+    render_prompt_with_mode(packet, PromptMode::Inline)
+}
+
 /// Render a `Packet` into the canonical Claude prompt string.
 ///
-/// Same `Packet` input always produces byte-identical output.
-pub fn render_prompt(packet: &Packet) -> String {
+/// Same `(packet, mode)` input always produces byte-identical output.
+///
+/// `Inline` arm splices each change as `header → comments → diff` to keep
+/// `jjr packet`'s output byte-stable. `JsonlPaths` arm omits the comments
+/// section per change since the JSONL files referenced up top carry it.
+pub fn render_prompt_with_mode(packet: &Packet, mode: PromptMode) -> String {
     let mut out = String::new();
 
     out.push_str("You are editing a local jj working copy.\n");
@@ -137,33 +155,123 @@ pub fn render_prompt(packet: &Packet) -> String {
     let _ = writeln!(out, "Repository: {}", packet.repo_root.display());
     let _ = writeln!(out, "Revision: {}", packet.revset);
 
-    if !packet.stack_comments.is_empty() {
-        out.push('\n');
-        out.push_str("## Stack-Level Review Comments\n");
-        for comment in &packet.stack_comments {
-            out.push('\n');
-            out.push_str(&render_stack_comment_block(comment));
-        }
-    }
+    match mode {
+        PromptMode::Inline => {
+            if !packet.stack_comments.is_empty() {
+                out.push('\n');
+                out.push_str("## Stack-Level Review Comments\n");
+                for comment in &packet.stack_comments {
+                    out.push('\n');
+                    out.push_str(&render_stack_comment_block(comment));
+                }
+            }
 
-    if !packet.changes.is_empty() {
-        out.push('\n');
-        out.push_str("## Changes\n");
-        for cp in &packet.changes {
-            out.push_str(&render_change_packet(cp));
+            if !packet.changes.is_empty() {
+                out.push('\n');
+                out.push_str("## Changes\n");
+                for cp in &packet.changes {
+                    out.push_str(&render_change_header(cp));
+                    out.push_str(&render_inline_change_comments(cp));
+                    out.push_str(&render_change_diff_context(cp));
+                }
+            }
+        }
+        PromptMode::JsonlPaths => {
+            let comments_section = render_jsonl_paths_section(packet);
+            if !comments_section.is_empty() {
+                out.push('\n');
+                out.push_str(&comments_section);
+            }
+
+            if !packet.changes.is_empty() {
+                out.push('\n');
+                out.push_str("## Changes\n");
+                for cp in &packet.changes {
+                    out.push_str(&render_change_header(cp));
+                    out.push_str(&render_change_diff_context(cp));
+                }
+            }
         }
     }
 
     out
 }
 
-fn render_change_packet(cp: &ChangePacket) -> String {
+/// Build the "Review comments" section for `JsonlPaths` mode. Returns an
+/// empty string when neither per-change nor stack files would be referenced
+/// — preserves the "no comments" semantics so the prompt doesn't carry a
+/// dangling section heading.
+fn render_jsonl_paths_section(packet: &Packet) -> String {
+    let include_stack = !packet.stack_comments.is_empty();
+
+    let change_paths: Vec<(String, PathBuf)> = packet
+        .changes
+        .iter()
+        .filter(|cp| {
+            !cp.line_comments.is_empty()
+                || !cp.change_comments.is_empty()
+                || !cp.description_comments.is_empty()
+        })
+        .map(|cp| {
+            (
+                cp.change_id.as_str().to_owned(),
+                store::change_file(&packet.repo_root, &cp.change_id),
+            )
+        })
+        .collect();
+
+    if !include_stack && change_paths.is_empty() {
+        return String::new();
+    }
+
+    let mut out = String::new();
+    out.push_str("## Review comments\n");
+    out.push('\n');
+    out.push_str("Comments live in JSONL files. Schema (see src/comment.rs):\n");
+    out.push_str("- `comment`: comment text (body)\n");
+    out.push_str("- `severity`: \"required\" | \"suggestion\" | \"note\"\n");
+    out.push_str("- `created_at`: RFC3339 timestamp\n");
+    out.push_str(
+        "- `status`: \"pending\" | \"stale\" | \"orphaned\" (optional; treat absent as pending)\n",
+    );
+    out.push_str("- `scope`: \"line\" | \"change\" | \"stack\" | \"description\"\n");
+    out.push_str("  - line: { file, side: \"old\"|\"new\", old_line?, new_line?, hunk_header, target_text, context_before, context_after, change_id }\n");
+    out.push_str("  - change: { change_id }\n");
+    out.push_str(
+        "  - stack: { revset_hash } — filter to only records matching this stack's revset_hash\n",
+    );
+    out.push_str("  - description: { display_line?, target_text, context_before, context_after, change_id }\n");
+    out.push_str(
+        "Address only records with status \"pending\" (or absent). Skip records whose status is \"stale\" or \"orphaned\".\n",
+    );
+    out.push('\n');
+    out.push_str("Comment files for this review:\n");
+    for (change_id, path) in &change_paths {
+        let _ = writeln!(out, "- Per-change ({change_id}): `{}`", path.display());
+    }
+    if include_stack {
+        let stack_path = store::stack_file(&packet.repo_root);
+        let _ = writeln!(
+            out,
+            "- Stack-scope: `{}` (filter records by revset_hash)",
+            stack_path.display()
+        );
+    }
+    out
+}
+
+fn render_change_header(cp: &ChangePacket) -> String {
     let mut out = String::new();
     out.push('\n');
     let _ = writeln!(out, "Change ID: {}", cp.change_id.as_str());
     let _ = writeln!(out, "Commit: {}", cp.commit_id.as_str());
     out.push_str("Description:\n");
     write_fenced_block(&mut out, &cp.description);
+    out
+}
+
+fn render_inline_change_comments(cp: &ChangePacket) -> String {
+    let mut out = String::new();
 
     if !cp.change_comments.is_empty() {
         out.push('\n');
@@ -187,6 +295,11 @@ fn render_change_packet(cp: &ChangePacket) -> String {
         }
     }
 
+    out
+}
+
+fn render_change_diff_context(cp: &ChangePacket) -> String {
+    let mut out = String::new();
     if let Some(diff) = &cp.diff {
         if !cp.line_comments.is_empty() {
             out.push('\n');
@@ -195,7 +308,6 @@ fn render_change_packet(cp: &ChangePacket) -> String {
             out.push_str(&render_diff_context(diff, &cp.line_comments));
         }
     }
-
     out
 }
 
@@ -1769,5 +1881,255 @@ mod tests {
         );
         // Comment body still rendered.
         assert!(out.contains("the comment body"));
+    }
+
+    // --- render_prompt_with_mode: JsonlPaths variant ---
+
+    #[test]
+    fn jsonl_mode_per_change_file_replaces_inline_body() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let id = cid("abc11111");
+        let stack = make_resolved_stack(&[("abc11111", "first")]);
+
+        let mut comment = make_change_comment(&id, "secret body text", Severity::Required);
+        comment.repo_root = dir.path().to_owned();
+        store::save_comment(dir.path(), &comment).unwrap();
+
+        let packet = build_packet(dir.path(), "@", &stack, false, no_diff).unwrap();
+        let out = render_prompt_with_mode(&packet, PromptMode::JsonlPaths);
+
+        assert!(
+            out.contains("## Review comments\n"),
+            "Review comments section must be present; got:\n{out}"
+        );
+        assert!(out.contains("`severity`"));
+        assert!(out.contains("`scope`"));
+        assert!(out.contains("\"line\""));
+        assert!(out.contains("\"description\""));
+
+        let expected_path = store::change_file(dir.path(), &id);
+        assert!(expected_path.is_absolute());
+        assert!(
+            out.contains(&expected_path.display().to_string()),
+            "absolute per-change path must appear in prompt; got:\n{out}"
+        );
+        assert!(
+            out.contains("Per-change ("),
+            "per-change bullet must label the change id; got:\n{out}"
+        );
+
+        assert!(
+            !out.contains("secret body text"),
+            "inline comment body must NOT appear in JsonlPaths mode; got:\n{out}"
+        );
+        assert!(
+            !out.contains("### Change-Level Review Comments"),
+            "inline comment headings must be dropped; got:\n{out}"
+        );
+    }
+
+    /// Stack-file bullet appears iff the packet carries stack-scoped comments.
+    /// Renderer derives this from `packet.stack_comments` — no caller-supplied
+    /// flag, no fs probe.
+    #[test]
+    fn jsonl_mode_stack_file_bullet_keyed_off_packet_stack_comments() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let id = cid("abc11111");
+
+        let mut stack_comment = make_stack_comment("cross-cutting", Severity::Required);
+        stack_comment.repo_root = dir.path().to_owned();
+        store::save_comment(dir.path(), &stack_comment).unwrap();
+
+        let mut change_comment = make_change_comment(&id, "change body", Severity::Note);
+        change_comment.repo_root = dir.path().to_owned();
+        store::save_comment(dir.path(), &change_comment).unwrap();
+
+        let stack = make_resolved_stack(&[("abc11111", "first")]);
+        let with_stack = build_packet(dir.path(), "trunk()..@", &stack, false, no_diff).unwrap();
+        let stack_path = store::stack_file(dir.path());
+
+        let stacked_out = render_prompt_with_mode(&with_stack, PromptMode::JsonlPaths);
+        assert!(
+            stacked_out.contains(&stack_path.display().to_string()),
+            "stack file path must appear when packet has stack comments; got:\n{stacked_out}"
+        );
+        assert!(stacked_out.contains("Stack-scope:"));
+        assert!(stacked_out.contains("revset_hash"));
+
+        // Now drop the stack comment from the packet (simulating a single-change
+        // review): no stack-scope bullet must appear.
+        let no_stack = Packet {
+            stack_comments: vec![],
+            ..with_stack
+        };
+        let unstacked_out = render_prompt_with_mode(&no_stack, PromptMode::JsonlPaths);
+        assert!(
+            !unstacked_out.contains("Stack-scope:"),
+            "stack-scope bullet must NOT appear when packet has no stack comments; got:\n{unstacked_out}"
+        );
+        assert!(
+            !unstacked_out.contains(&stack_path.display().to_string()),
+            "stack file path must NOT appear when packet has no stack comments; got:\n{unstacked_out}"
+        );
+    }
+
+    #[test]
+    fn jsonl_mode_keeps_diff_context_inline() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let id = cid("abc11111");
+        let mut line_comment = make_line_comment(
+            &id,
+            "src/client.rs",
+            142,
+            "use retry wrapper",
+            Severity::Required,
+        );
+        line_comment.repo_root = dir.path().to_owned();
+        store::save_comment(dir.path(), &line_comment).unwrap();
+
+        let stack = make_resolved_stack(&[("abc11111", "first")]);
+        let packet = build_packet(dir.path(), "@", &stack, false, |_| Ok(simple_diff())).unwrap();
+
+        let out = render_prompt_with_mode(&packet, PromptMode::JsonlPaths);
+
+        assert!(
+            out.contains("### Relevant Diff Context"),
+            "diff context section must remain inline; got:\n{out}"
+        );
+        assert!(
+            out.contains("@@ -140,7 +140,12 @@ impl Client {"),
+            "hunk header must render inline; got:\n{out}"
+        );
+        assert!(
+            !out.contains("### Line-Level Review Comments"),
+            "inline line-level heading must be dropped; got:\n{out}"
+        );
+        assert!(
+            !out.contains("use retry wrapper"),
+            "inline line-comment body must be dropped; got:\n{out}"
+        );
+    }
+
+    /// Schema instruction must direct claude to skip both stale and orphaned —
+    /// inline mode drops stale via `filter_comments`; `JsonlPaths` mode points
+    /// at JSONL files containing all statuses, so the prompt must enforce the
+    /// equivalent filter.
+    #[test]
+    fn jsonl_mode_schema_excludes_both_stale_and_orphaned() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let id = cid("abc11111");
+        let mut comment = make_change_comment(&id, "body", Severity::Note);
+        comment.repo_root = dir.path().to_owned();
+        store::save_comment(dir.path(), &comment).unwrap();
+        let stack = make_resolved_stack(&[("abc11111", "first")]);
+        let packet = build_packet(dir.path(), "@", &stack, false, no_diff).unwrap();
+
+        let out = render_prompt_with_mode(&packet, PromptMode::JsonlPaths);
+        assert!(
+            out.contains("\"stale\"") && out.contains("\"orphaned\""),
+            "schema filter line must name both stale and orphaned; got:\n{out}"
+        );
+        assert!(
+            out.contains("Skip records whose status is \"stale\" or \"orphaned\""),
+            "schema filter line drift; got:\n{out}"
+        );
+    }
+
+    /// Paths in the prompt must be wrapped in backticks so a path with spaces
+    /// or unusual characters cannot confuse claude's tokenizer.
+    #[test]
+    fn jsonl_mode_quotes_paths_with_backticks() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let id = cid("abc11111");
+        let mut sc = make_stack_comment("cross", Severity::Note);
+        sc.repo_root = dir.path().to_owned();
+        store::save_comment(dir.path(), &sc).unwrap();
+        let mut cc = make_change_comment(&id, "body", Severity::Note);
+        cc.repo_root = dir.path().to_owned();
+        store::save_comment(dir.path(), &cc).unwrap();
+        let stack = make_resolved_stack(&[("abc11111", "first")]);
+        let packet = build_packet(dir.path(), "trunk()..@", &stack, false, no_diff).unwrap();
+
+        let out = render_prompt_with_mode(&packet, PromptMode::JsonlPaths);
+
+        let change_path = store::change_file(dir.path(), &id);
+        let stack_path = store::stack_file(dir.path());
+        assert!(
+            out.contains(&format!("`{}`", change_path.display())),
+            "per-change path must be wrapped in backticks; got:\n{out}"
+        );
+        assert!(
+            out.contains(&format!("`{}`", stack_path.display())),
+            "stack-scope path must be wrapped in backticks; got:\n{out}"
+        );
+    }
+
+    /// A change with only description-scoped comments must still get a
+    /// per-change bullet — description comments live in the same JSONL file
+    /// as line- and change-scoped comments. The renderer keys off the union
+    /// of all three lists, not just `line_comments`.
+    #[test]
+    fn jsonl_mode_description_only_change_still_gets_per_change_bullet() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let id = cid("abc11111");
+        let mut comment = make_description_comment(
+            &id,
+            "tighten wording",
+            Severity::Suggestion,
+            "summary",
+            Some(1),
+        );
+        comment.repo_root = dir.path().to_owned();
+        store::save_comment(dir.path(), &comment).unwrap();
+
+        let stack = make_resolved_stack(&[("abc11111", "first")]);
+        let packet = build_packet(dir.path(), "@", &stack, false, no_diff).unwrap();
+        // Sanity: the change's only comment lives in description_comments.
+        assert!(packet.changes[0].line_comments.is_empty());
+        assert!(packet.changes[0].change_comments.is_empty());
+        assert!(!packet.changes[0].description_comments.is_empty());
+
+        let out = render_prompt_with_mode(&packet, PromptMode::JsonlPaths);
+        let change_path = store::change_file(dir.path(), &id);
+        assert!(
+            out.contains(&format!("`{}`", change_path.display())),
+            "description-only change must still get a per-change bullet; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn inline_mode_still_inlines_comments() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let id = cid("abc11111");
+        let mut comment = make_change_comment(&id, "inline body text", Severity::Suggestion);
+        comment.repo_root = dir.path().to_owned();
+        store::save_comment(dir.path(), &comment).unwrap();
+
+        let stack = make_resolved_stack(&[("abc11111", "first")]);
+        let packet = build_packet(dir.path(), "@", &stack, false, no_diff).unwrap();
+        let out = render_prompt_with_mode(&packet, PromptMode::Inline);
+
+        assert!(out.contains("### Change-Level Review Comments"));
+        assert!(out.contains("inline body text"));
+        assert!(!out.contains("## Review comments\n"));
+    }
+
+    /// Pin `render_prompt` ≡ `render_prompt_with_mode(_, Inline)` so a future
+    /// split cannot silently change `jjr packet`.
+    #[test]
+    fn render_prompt_equals_render_prompt_with_inline_mode() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let id = cid("abc11111");
+        let mut comment = make_change_comment(&id, "body", Severity::Note);
+        comment.repo_root = dir.path().to_owned();
+        store::save_comment(dir.path(), &comment).unwrap();
+
+        let stack = make_resolved_stack(&[("abc11111", "first")]);
+        let packet = build_packet(dir.path(), "@", &stack, false, no_diff).unwrap();
+
+        assert_eq!(
+            render_prompt(&packet),
+            render_prompt_with_mode(&packet, PromptMode::Inline),
+        );
     }
 }
