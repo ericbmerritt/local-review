@@ -43,8 +43,8 @@ use composer::{
     EditedComment, LineTarget, StackContextSnapshot,
 };
 use diff_view::{
-    comment_to_inline, description_comment_to_inline, DiffView, InlineComment, PairedRow,
-    RenderedLine, RenderedLineKind,
+    change_comment_to_inline, comment_to_inline, description_comment_to_inline, DiffView,
+    InlineComment, PairedRow, RenderedLine, RenderedLineKind,
 };
 use file_picker::{build_entries as build_file_picker_entries, FilePickerState};
 use overview_screen::{OverviewCommentSet, OverviewScreenState};
@@ -768,19 +768,34 @@ impl App {
     fn rebuild_annotated_views(&mut self) {
         let now = time::OffsetDateTime::now_utc();
         let severity_filter = self.severity_filter;
+        let target_change_id = self.details.change_id.clone();
         // rendered_per_file[0] is the description view; diff files start at index 1.
         self.annotated_per_file = self
             .rendered_per_file
             .iter()
             .enumerate()
             .map(|(view_idx, base_view)| {
-                let inline: Vec<InlineComment> = if view_idx == 0 {
-                    self.loaded_comments
+                if view_idx == 0 {
+                    let description_inline: Vec<InlineComment> = self
+                        .loaded_comments
                         .iter()
                         .enumerate()
                         .filter_map(|(idx, c)| description_comment_to_inline(c, idx, now))
                         .filter(|ic| severity_filter.is_none_or(|filter| ic.severity == filter))
-                        .collect()
+                        .collect();
+                    let change_inline: Vec<InlineComment> = self
+                        .loaded_comments
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(idx, c)| {
+                            change_comment_to_inline(c, idx, &target_change_id, now)
+                        })
+                        .filter(|ic| severity_filter.is_none_or(|filter| ic.severity == filter))
+                        .collect();
+                    base_view
+                        .clone()
+                        .with_inline_comments(&description_inline)
+                        .with_change_comments_appended(&change_inline)
                 } else {
                     let diff_file_idx = view_idx - 1;
                     let file_path = self
@@ -789,14 +804,15 @@ impl App {
                         .files
                         .get(diff_file_idx)
                         .map(|f| f.display_path().to_owned());
-                    self.loaded_comments
+                    let inline: Vec<InlineComment> = self
+                        .loaded_comments
                         .iter()
                         .enumerate()
                         .filter_map(|(idx, c)| comment_to_inline(c, idx, file_path.as_deref(), now))
                         .filter(|ic| severity_filter.is_none_or(|filter| ic.severity == filter))
-                        .collect()
-                };
-                base_view.clone().with_inline_comments(&inline)
+                        .collect();
+                    base_view.clone().with_inline_comments(&inline)
+                }
             })
             .collect();
     }
@@ -3184,6 +3200,14 @@ fn build_description_context(app: &App, target_line: Option<u32>) -> Description
 }
 
 fn open_composer(app: &mut App) {
+    // New-comment on an existing change-comment row defaults to Change scope.
+    // Line- and description-comment rows fall through to `build_line_target`,
+    // which classifies them as `NonCommentable`.
+    if focused_comment(app).is_some_and(|c| matches!(c.anchor, Anchor::Change { .. })) {
+        let target_change_id = app.details.change_id.clone();
+        open_composer_with_scope(app, OverviewInitialScope::Change, target_change_id);
+        return;
+    }
     match build_line_target(app) {
         BuildTargetResult::Ready(target) => {
             let init = ComposerInit {
@@ -3237,42 +3261,51 @@ fn open_composer_for_edit(app: &mut App) {
         app.status_message = Some("cursor is not on a comment".to_owned());
         return;
     };
-    let Anchor::Line { location, .. } = &comment.anchor else {
-        app.status_message = Some("only line-scoped comments can be edited here".to_owned());
-        return;
-    };
+    match &comment.anchor {
+        Anchor::Line { location, .. } => {
+            let target = LineTarget {
+                file: location.file.clone(),
+                rendered_index: app.line_index,
+                source_line: location.old_line,
+                target_line: location.new_line,
+                target_text: location.target_text.clone(),
+                hunk_header: location.hunk_header.clone(),
+                context_before: location.context_before.clone(),
+                context_after: location.context_after.clone(),
+            };
 
-    let target = LineTarget {
-        file: location.file.clone(),
-        rendered_index: app.line_index,
-        source_line: location.old_line,
-        target_line: location.new_line,
-        target_text: location.target_text.clone(),
-        hunk_header: location.hunk_header.clone(),
-        context_before: location.context_before.clone(),
-        context_after: location.context_after.clone(),
-    };
-
-    let init = ComposerInit {
-        scope: ComposerScope::Line(target.clone()),
-        severity: comment.severity,
-        change_id: app.details.change_id.clone(),
-        change_description: app.details.description.clone(),
-        line_available: Some(target),
-        stack_available: stack_snapshot(app),
-        description_available: None,
-    };
-    let edited = EditedComment {
-        init,
-        body: comment.body.clone(),
-        identity: comment.created_at,
-        // Main-view line-comment edits resolve through `app.loaded_comments`
-        // so the latest in-memory anchor (post-re-anchor) is honored.
-        original: None,
-        original_anchor: comment.anchor.clone(),
-    };
-    let composer = Composer::for_edit(edited);
-    app.screen = Screen::Composer(Box::new(composer));
+            let init = ComposerInit {
+                scope: ComposerScope::Line(target.clone()),
+                severity: comment.severity,
+                change_id: app.details.change_id.clone(),
+                change_description: app.details.description.clone(),
+                line_available: Some(target),
+                stack_available: stack_snapshot(app),
+                description_available: None,
+            };
+            let edited = EditedComment {
+                init,
+                body: comment.body.clone(),
+                identity: comment.created_at,
+                // Main-view line-comment edits resolve through `app.loaded_comments`
+                // so the latest in-memory anchor (post-re-anchor) is honored.
+                original: None,
+                original_anchor: comment.anchor.clone(),
+            };
+            let composer = Composer::for_edit(edited);
+            app.screen = Screen::Composer(Box::new(composer));
+        }
+        Anchor::Change { .. } | Anchor::Description { .. } => {
+            // Clone before borrowing &mut self; `focused_comment` returns a
+            // borrow into `app.loaded_comments`.
+            let comment = comment.clone();
+            open_meta_comment_editor(app, &comment);
+        }
+        Anchor::Stack { .. } => {
+            app.status_message =
+                Some("stack comments are edited from the stack overview (s)".to_owned());
+        }
+    }
 }
 
 /// Single-keystroke delete without confirmation.
@@ -3459,9 +3492,15 @@ fn save_composer(app: &mut App, composer: &Composer, now: time::OffsetDateTime) 
         Ok(()) => {
             app.last_severity = Some(composer.severity);
             app.refresh_inline_comments();
-            if oversized {
-                app.status_message = Some("body truncated to 64 KB on save".to_owned());
-            }
+            // Oversized warning takes priority — the reviewer needs to know
+            // before deciding what to do. Otherwise surface a scope-specific
+            // confirmation so the user sees where their comment landed
+            // (especially Change/Stack, which render off the current view).
+            app.status_message = Some(if oversized {
+                "body truncated to 64 KB on save".to_owned()
+            } else {
+                save_status_message_for_scope(&composer.scope).to_owned()
+            });
             SaveOutcome::Saved
         }
         Err(JjrError::DuplicateCommentTimestamp { .. }) => SaveOutcome::Errored(
@@ -3471,6 +3510,18 @@ fn save_composer(app: &mut App, composer: &Composer, now: time::OffsetDateTime) 
             "save failed: {}",
             sanitize_for_status(&e.to_string())
         )),
+    }
+}
+
+/// Confirmation copy for a successful new-comment save. Change- and
+/// Stack-scoped comments render off the current view, so the message names
+/// where to find them; Line and Description comments are visible inline.
+fn save_status_message_for_scope(scope: &ComposerScope) -> &'static str {
+    match scope {
+        ComposerScope::Line(_) => "comment saved",
+        ComposerScope::Description(_) => "comment saved on description",
+        ComposerScope::Change => "change comment saved (visible in description view)",
+        ComposerScope::Stack(_) => "stack comment saved (visible in stack overview, s key)",
     }
 }
 
@@ -5255,6 +5306,274 @@ mod tests {
             Some("cursor is not on a comment"),
             "status message should describe the failure"
         );
+    }
+
+    fn make_app_with_change_comment_on_disk(dir: &std::path::Path) -> App {
+        let details = ChangeDetails {
+            change_id: ChangeId::parse(&"a".repeat(32)).unwrap(),
+            commit_id: CommitId::parse(&"a".repeat(40)).unwrap(),
+            description: "first line".to_owned(),
+            diff: Diff {
+                files: vec![sample_diff_file()],
+            },
+        };
+        let mut app = App::new(
+            details,
+            dir.to_path_buf(),
+            "@".to_owned(),
+            None,
+            TransitionMode::Never,
+            None,
+        );
+        let comment = Comment {
+            schema_version: SchemaVersion,
+            anchor: Anchor::Change {
+                change_id: app.details.change_id.clone(),
+            },
+            repo_root: dir.to_path_buf(),
+            revset: "@".to_owned(),
+            commit_id: None,
+            body: "split this commit".to_owned(),
+            severity: Severity::Required,
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
+            updated_at: None,
+            status: Some(Status::Pending),
+            mismatch_reason: None,
+        };
+        crate::store::save_comment(dir, &comment).unwrap();
+        app.refresh_inline_comments();
+        app.file_index = 0;
+        let view = app.current_view().expect("description view");
+        let meta_idx = view
+            .lines
+            .iter()
+            .position(|l| matches!(l.kind, RenderedLineKind::InlineCommentMeta { .. }))
+            .expect("change-comment meta row should be present");
+        app.line_index = meta_idx;
+        app
+    }
+
+    #[test]
+    fn change_comment_appears_in_description_view_not_in_file_view() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let app = make_app_with_change_comment_on_disk(dir.path());
+
+        let desc_view = app.annotated_per_file.first().expect("description view");
+        let meta_count = desc_view
+            .lines
+            .iter()
+            .filter(|l| matches!(l.kind, RenderedLineKind::InlineCommentMeta { .. }))
+            .count();
+        assert_eq!(meta_count, 1);
+        let last = desc_view.lines.last().expect("at least one row");
+        assert_eq!(last.kind, RenderedLineKind::InlineCommentBody);
+        assert!(last.text.contains("split this commit"));
+
+        let file_view = app.annotated_per_file.get(1).expect("file view");
+        assert!(file_view
+            .lines
+            .iter()
+            .all(|l| !matches!(l.kind, RenderedLineKind::InlineCommentMeta { .. })));
+    }
+
+    #[test]
+    fn e_on_change_comment_row_opens_edit_composer_with_change_scope() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = make_app_with_change_comment_on_disk(dir.path());
+        open_composer_for_edit(&mut app);
+        let Screen::Composer(ref c) = app.screen else {
+            panic!("expected Composer screen after `e`");
+        };
+        assert!(matches!(c.scope, ComposerScope::Change));
+        assert!(c.editing.is_some());
+        assert_eq!(c.body_text(), "split this commit");
+    }
+
+    #[test]
+    fn e_on_description_comment_row_opens_edit_composer_in_description_scope() {
+        use crate::comment::DescriptionAnchor;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let details = ChangeDetails {
+            change_id: ChangeId::parse(&"a".repeat(32)).unwrap(),
+            commit_id: CommitId::parse(&"a".repeat(40)).unwrap(),
+            description: "first line".to_owned(),
+            diff: Diff {
+                files: vec![sample_diff_file()],
+            },
+        };
+        let mut app = App::new(
+            details,
+            dir.path().to_path_buf(),
+            "@".to_owned(),
+            None,
+            TransitionMode::Never,
+            None,
+        );
+        let comment = Comment {
+            schema_version: SchemaVersion,
+            anchor: Anchor::Description {
+                change_id: app.details.change_id.clone(),
+                location: DescriptionAnchor {
+                    display_line: Some(1),
+                    target_text: "first line".to_owned(),
+                    context_before: vec![],
+                    context_after: vec![],
+                },
+            },
+            repo_root: dir.path().to_path_buf(),
+            revset: "@".to_owned(),
+            commit_id: None,
+            body: "review wording".to_owned(),
+            severity: Severity::Suggestion,
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
+            updated_at: None,
+            status: Some(Status::Pending),
+            mismatch_reason: None,
+        };
+        crate::store::save_comment(dir.path(), &comment).unwrap();
+        app.refresh_inline_comments();
+        app.file_index = 0;
+        let view = app.current_view().expect("description view");
+        let meta_idx = view
+            .lines
+            .iter()
+            .position(|l| matches!(l.kind, RenderedLineKind::InlineCommentMeta { .. }))
+            .expect("description-comment meta row should be present");
+        app.line_index = meta_idx;
+
+        open_composer_for_edit(&mut app);
+        let Screen::Composer(ref c) = app.screen else {
+            panic!("expected Composer screen after `e`");
+        };
+        assert!(matches!(c.scope, ComposerScope::Description(_)));
+        assert!(c.editing.is_some());
+        assert_eq!(c.body_text(), "review wording");
+        assert!(
+            app.status_message.is_none(),
+            "edit must not surface a 'cannot edit' status; got {:?}",
+            app.status_message
+        );
+    }
+
+    #[test]
+    fn d_on_change_comment_row_deletes_the_comment() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = make_app_with_change_comment_on_disk(dir.path());
+        assert_eq!(app.loaded_comments.len(), 1);
+
+        delete_focused_comment(&mut app);
+        assert_eq!(app.loaded_comments.len(), 0);
+        for view in &app.annotated_per_file {
+            assert!(view
+                .lines
+                .iter()
+                .all(|l| !matches!(l.kind, RenderedLineKind::InlineCommentMeta { .. })));
+        }
+    }
+
+    #[test]
+    fn c_on_change_comment_row_defaults_to_change_scope() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = make_app_with_change_comment_on_disk(dir.path());
+        open_composer(&mut app);
+        let Screen::Composer(ref c) = app.screen else {
+            panic!("expected Composer screen after `c`");
+        };
+        assert!(matches!(c.scope, ComposerScope::Change));
+        assert!(c.editing.is_none());
+    }
+
+    #[test]
+    fn multiple_change_comments_in_app_render_in_created_at_order() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let details = ChangeDetails {
+            change_id: ChangeId::parse(&"a".repeat(32)).unwrap(),
+            commit_id: CommitId::parse(&"a".repeat(40)).unwrap(),
+            description: "describe".to_owned(),
+            diff: Diff {
+                files: vec![sample_diff_file()],
+            },
+        };
+        let mut app = App::new(
+            details,
+            dir.path().to_path_buf(),
+            "@".to_owned(),
+            None,
+            TransitionMode::Never,
+            None,
+        );
+        let t0 = time::OffsetDateTime::UNIX_EPOCH;
+        for (offset, body) in [(0, "first"), (60, "second"), (120, "third")] {
+            let comment = Comment {
+                schema_version: SchemaVersion,
+                anchor: Anchor::Change {
+                    change_id: app.details.change_id.clone(),
+                },
+                repo_root: dir.path().to_path_buf(),
+                revset: "@".to_owned(),
+                commit_id: None,
+                body: body.to_owned(),
+                severity: Severity::Note,
+                created_at: t0 + time::Duration::seconds(offset),
+                updated_at: None,
+                status: Some(Status::Pending),
+                mismatch_reason: None,
+            };
+            crate::store::save_comment(dir.path(), &comment).unwrap();
+        }
+        app.refresh_inline_comments();
+
+        let desc_view = app.annotated_per_file.first().expect("description view");
+        let bodies: Vec<&str> = desc_view
+            .lines
+            .iter()
+            .filter(|l| l.kind == RenderedLineKind::InlineCommentBody)
+            .map(|l| l.text.as_str())
+            .collect();
+        assert_eq!(
+            bodies,
+            vec!["\u{2503} first", "\u{2503} second", "\u{2503} third"]
+        );
+    }
+
+    /// Save-status copy: a new Change-scope comment lands in the description
+    /// view, which is off-screen when the user is on a file view. The status
+    /// message tells them where it went so they don't think it disappeared.
+    #[test]
+    fn save_change_scope_comment_sets_status_pointing_to_description_view() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = make_app_with_single_file(sample_diff_file());
+        app.repo_root = dir.path().to_path_buf();
+        app.line_index = 2;
+        let BuildTargetResult::Ready(target) = build_line_target(&app) else {
+            panic!("expected Ready");
+        };
+        let mut composer = make_composer_with_body(&app, target, "split this commit");
+        composer.scope = ComposerScope::Change;
+        let outcome = save_composer(&mut app, &composer, time::OffsetDateTime::UNIX_EPOCH);
+        assert!(matches!(outcome, SaveOutcome::Saved));
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("change comment saved (visible in description view)"),
+        );
+    }
+
+    /// Symmetric pin for line-scope: confirmation copy must NOT mention any
+    /// other view, so a Line-scope save reads "comment saved" rather than
+    /// the change/stack-specific copy.
+    #[test]
+    fn save_line_scope_comment_sets_plain_saved_status() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = make_app_with_single_file(sample_diff_file());
+        app.repo_root = dir.path().to_path_buf();
+        app.line_index = 2;
+        let BuildTargetResult::Ready(target) = build_line_target(&app) else {
+            panic!("expected Ready");
+        };
+        let composer = make_composer_with_body(&app, target, "fix this");
+        let outcome = save_composer(&mut app, &composer, time::OffsetDateTime::UNIX_EPOCH);
+        assert!(matches!(outcome, SaveOutcome::Saved));
+        assert_eq!(app.status_message.as_deref(), Some("comment saved"));
     }
 
     /// Helper: save a comment on the diff line whose (source, target) line
