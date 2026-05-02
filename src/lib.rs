@@ -1,3 +1,4 @@
+pub(crate) mod agent_config;
 pub mod anchoring;
 pub mod change_id;
 pub mod claude;
@@ -12,6 +13,8 @@ pub mod reviewed;
 pub mod stack;
 pub mod stderr_log;
 pub mod store;
+#[cfg(test)]
+mod test_helpers;
 pub mod tui;
 pub mod util;
 pub mod working_copy_guard;

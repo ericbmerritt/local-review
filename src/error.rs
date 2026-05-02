@@ -96,19 +96,35 @@ pub enum JjrError {
     #[snafu(display("clear aborted"))]
     ClearAborted,
 
-    #[snafu(display(
-        "claude is not on PATH; install Claude CLI (https://docs.anthropic.com/en/docs/claude-code)"
-    ))]
-    ClaudeMissing { source: std::io::Error },
+    #[snafu(display("{}", agent_missing_message(tool)))]
+    AgentMissing {
+        tool: String,
+        source: std::io::Error,
+    },
 
     #[snafu(display(
-        "claude exited with {}: see stderr above for details",
+        "{tool} exited with {}: see stderr above for details",
         exit_code.map_or_else(|| "signal".to_owned(), |c| c.to_string())
     ))]
-    ClaudeFailed { exit_code: Option<i32> },
+    AgentFailed {
+        tool: String,
+        exit_code: Option<i32>,
+    },
 
     #[snafu(display(
         "review packet ({size} bytes) exceeds {limit}-byte argv limit; chunk the stack or omit context"
     ))]
     PromptTooLarge { size: usize, limit: usize },
+}
+
+/// Format an `AgentMissing` display string. Appends the Claude install URL
+/// only when the configured tool is the default (`claude`); for any other
+/// tool, jjr has no canonical install pointer to offer.
+fn agent_missing_message(tool: &str) -> String {
+    if tool == crate::agent_config::DEFAULT_TOOL {
+        "claude is not on PATH; install Claude CLI (https://docs.anthropic.com/en/docs/claude-code)"
+            .to_owned()
+    } else {
+        format!("{tool} is not on PATH")
+    }
 }

@@ -229,7 +229,7 @@ fn run_packet(revset: &str, output: Option<&std::path::Path>, include_stale: boo
 }
 
 fn run_claude(revset: &str, include_stale: bool) -> ExitCode {
-    let result = (|| -> Result<(), JjrError> {
+    let result = (|| -> Result<String, JjrError> {
         let repo_root = find_repo_root()?;
         let change_id = jj::resolve_revset(revset)?;
         let details = jj::show(&change_id)?;
@@ -255,17 +255,19 @@ fn run_claude(revset: &str, include_stale: bool) -> ExitCode {
 
         let _guard = WorkingCopyGuard::enter(&repo_root, &change_id)?;
         match claude::invoke_claude(&prompt)? {
-            ClaudeOutcome::Success => Ok(()),
-            ClaudeOutcome::Failed { exit_code } => Err(JjrError::ClaudeFailed { exit_code }),
+            ClaudeOutcome::Success { tool } => Ok(tool),
+            ClaudeOutcome::Failed { tool, exit_code } => {
+                Err(JjrError::AgentFailed { tool, exit_code })
+            }
         }
     })();
 
     match result {
-        Ok(()) => {
+        Ok(tool) => {
             let mut stderr = std::io::stderr().lock();
             let _ = writeln!(
                 stderr,
-                "claude completed; re-run `jjr` to review the result"
+                "{tool} completed; re-run `jjr` to review the result"
             );
             ExitCode::SUCCESS
         }

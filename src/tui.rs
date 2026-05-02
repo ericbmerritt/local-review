@@ -1217,7 +1217,7 @@ fn run_app(
     stack: Option<StackContext>,
     stderr_guard: Option<StderrLogGuard>,
 ) -> Result<()> {
-    let transition_mode = load_transition_mode(&repo_root);
+    let transition_mode = load_transition_mode();
     let mut app = App::new(
         details,
         repo_root,
@@ -1276,15 +1276,8 @@ fn persist_cursor_on_exit(app: &App) {
     let _ = cursor::record(&app.repo_root, ctx.revset_hash, &ctx.revset, change_id);
 }
 
-fn load_transition_mode(repo_root: &std::path::Path) -> TransitionMode {
-    let config_path = repo_root.join(".jj-review").join("config.toml");
-    if !config_path.exists() {
-        return TransitionMode::Never;
-    }
-    let Ok(raw) = std::fs::read_to_string(&config_path) else {
-        return TransitionMode::Never;
-    };
-    let Ok(table) = raw.parse::<toml::Table>() else {
+fn load_transition_mode() -> TransitionMode {
+    let Some(table) = crate::util::load_global_config_table() else {
         return TransitionMode::Never;
     };
     let value = table
@@ -2515,19 +2508,19 @@ fn invoke_claude_from_tui(app: &mut App) -> Result<()> {
     app.screen = Screen::Main;
 
     match outcome? {
-        crate::claude::ClaudeOutcome::Success => match jj::show(&change_id) {
+        crate::claude::ClaudeOutcome::Success { tool } => match jj::show(&change_id) {
             Ok(details) => apply_post_claude_reload(app, details),
             Err(e) => {
                 app.status_message = Some(format!(
-                    "claude completed; could not reload diff: {}",
+                    "{tool} completed; could not reload diff: {}",
                     sanitize_for_status(&e.to_string())
                 ));
             }
         },
-        crate::claude::ClaudeOutcome::Failed { exit_code } => {
+        crate::claude::ClaudeOutcome::Failed { tool, exit_code } => {
             let code_str = exit_code.map_or_else(|| "signal".to_owned(), |c| c.to_string());
             app.status_message = Some(format!(
-                "claude exited with {code_str}; working copy restored"
+                "{tool} exited with {code_str}; working copy restored"
             ));
         }
     }
@@ -5793,49 +5786,68 @@ mod tests {
 
     #[test]
     fn load_transition_mode_missing_file_is_never() {
+        let _lock = crate::test_helpers::env_lock();
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(load_transition_mode(dir.path()), TransitionMode::Never);
-    }
-
-    fn write_config(dir: &std::path::Path, contents: &str) {
-        let cfg_dir = dir.join(".jj-review");
-        std::fs::create_dir_all(&cfg_dir).unwrap();
-        std::fs::write(cfg_dir.join("config.toml"), contents).unwrap();
+        let missing = dir.path().join("nope.toml");
+        let _g = crate::test_helpers::EnvGuard::set_path("JJR_CONFIG_PATH", &missing);
+        assert_eq!(load_transition_mode(), TransitionMode::Never);
     }
 
     #[test]
     fn load_transition_mode_explicit_never() {
+        let _lock = crate::test_helpers::env_lock();
         let dir = tempfile::tempdir().unwrap();
-        write_config(dir.path(), "[ui]\ntransition_screen = \"never\"\n");
-        assert_eq!(load_transition_mode(dir.path()), TransitionMode::Never);
+        let path = crate::test_helpers::write_global_config_at(
+            dir.path(),
+            "[ui]\ntransition_screen = \"never\"\n",
+        );
+        let _g = crate::test_helpers::EnvGuard::set_path("JJR_CONFIG_PATH", &path);
+        assert_eq!(load_transition_mode(), TransitionMode::Never);
     }
 
     #[test]
     fn load_transition_mode_auto() {
+        let _lock = crate::test_helpers::env_lock();
         let dir = tempfile::tempdir().unwrap();
-        write_config(dir.path(), "[ui]\ntransition_screen = \"auto\"\n");
-        assert_eq!(load_transition_mode(dir.path()), TransitionMode::Auto);
+        let path = crate::test_helpers::write_global_config_at(
+            dir.path(),
+            "[ui]\ntransition_screen = \"auto\"\n",
+        );
+        let _g = crate::test_helpers::EnvGuard::set_path("JJR_CONFIG_PATH", &path);
+        assert_eq!(load_transition_mode(), TransitionMode::Auto);
     }
 
     #[test]
     fn load_transition_mode_always() {
+        let _lock = crate::test_helpers::env_lock();
         let dir = tempfile::tempdir().unwrap();
-        write_config(dir.path(), "[ui]\ntransition_screen = \"always\"\n");
-        assert_eq!(load_transition_mode(dir.path()), TransitionMode::Always);
+        let path = crate::test_helpers::write_global_config_at(
+            dir.path(),
+            "[ui]\ntransition_screen = \"always\"\n",
+        );
+        let _g = crate::test_helpers::EnvGuard::set_path("JJR_CONFIG_PATH", &path);
+        assert_eq!(load_transition_mode(), TransitionMode::Always);
     }
 
     #[test]
     fn load_transition_mode_malformed_toml_is_never() {
+        let _lock = crate::test_helpers::env_lock();
         let dir = tempfile::tempdir().unwrap();
-        write_config(dir.path(), "[ui\nbroken");
-        assert_eq!(load_transition_mode(dir.path()), TransitionMode::Never);
+        let path = crate::test_helpers::write_global_config_at(dir.path(), "[ui\nbroken");
+        let _g = crate::test_helpers::EnvGuard::set_path("JJR_CONFIG_PATH", &path);
+        assert_eq!(load_transition_mode(), TransitionMode::Never);
     }
 
     #[test]
     fn load_transition_mode_invalid_value_is_never() {
+        let _lock = crate::test_helpers::env_lock();
         let dir = tempfile::tempdir().unwrap();
-        write_config(dir.path(), "[ui]\ntransition_screen = \"bogus\"\n");
-        assert_eq!(load_transition_mode(dir.path()), TransitionMode::Never);
+        let path = crate::test_helpers::write_global_config_at(
+            dir.path(),
+            "[ui]\ntransition_screen = \"bogus\"\n",
+        );
+        let _g = crate::test_helpers::EnvGuard::set_path("JJR_CONFIG_PATH", &path);
+        assert_eq!(load_transition_mode(), TransitionMode::Never);
     }
 
     #[test]

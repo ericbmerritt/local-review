@@ -83,6 +83,54 @@ pub(crate) fn atomic_write_bytes(
     Ok(())
 }
 
+/// Resolve the path to the global `jjr` config file.
+///
+/// Resolution order:
+/// 1. `JJR_CONFIG_PATH` if set and non-empty — used verbatim. Test-only
+///    override; not advertised as a user-facing knob.
+/// 2. `XDG_CONFIG_HOME/jjr/config.toml` if `XDG_CONFIG_HOME` is set and
+///    non-empty.
+/// 3. `HOME/.config/jjr/config.toml` if `HOME` is set and non-empty.
+/// 4. `None` — caller falls back to defaults.
+///
+/// On macOS we deliberately use the XDG layout (`~/.config/jjr/`) rather than
+/// `~/Library/Application Support/`; this matches `jj` itself and other CLI
+/// tools.
+pub(crate) fn global_config_path() -> Option<std::path::PathBuf> {
+    if let Some(override_path) = std::env::var_os("JJR_CONFIG_PATH").filter(|v| !v.is_empty()) {
+        return Some(std::path::PathBuf::from(override_path));
+    }
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
+        return Some(
+            std::path::PathBuf::from(xdg)
+                .join("jjr")
+                .join("config.toml"),
+        );
+    }
+    let home = std::env::var_os("HOME").filter(|v| !v.is_empty())?;
+    Some(
+        std::path::PathBuf::from(home)
+            .join(".config")
+            .join("jjr")
+            .join("config.toml"),
+    )
+}
+
+/// Load and parse the global `jjr` config file as a TOML table.
+///
+/// Resolves the path via [`global_config_path`]. Returns `None` if the path
+/// can't be resolved (no `HOME`/`XDG_CONFIG_HOME`), the file is missing,
+/// unreadable, or malformed. Section- and field-level fallbacks are the
+/// caller's responsibility.
+pub(crate) fn load_global_config_table() -> Option<toml::Table> {
+    let path = global_config_path()?;
+    if !path.exists() {
+        return None;
+    }
+    let raw = std::fs::read_to_string(&path).ok()?;
+    raw.parse::<toml::Table>().ok()
+}
+
 /// Locate the jj repo root by walking up from the process's current directory.
 ///
 /// Returns the first ancestor that contains a `.jj/` directory. If no
@@ -345,6 +393,70 @@ mod tests {
             }
             other => panic!("expected NotInJjRepo, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn global_config_path_uses_jjr_config_path_override_first() {
+        let _lock = crate::test_helpers::env_lock();
+        let custom = std::path::PathBuf::from("/explicit/jjr-config.toml");
+        let _override = crate::test_helpers::EnvGuard::set_path("JJR_CONFIG_PATH", &custom);
+        // XDG and HOME should be ignored when JJR_CONFIG_PATH is set.
+        let _xdg = crate::test_helpers::EnvGuard::set_path(
+            "XDG_CONFIG_HOME",
+            std::path::Path::new("/some/xdg"),
+        );
+        let _home =
+            crate::test_helpers::EnvGuard::set_path("HOME", std::path::Path::new("/some/home"));
+        assert_eq!(global_config_path(), Some(custom));
+    }
+
+    #[test]
+    fn global_config_path_uses_xdg_when_set() {
+        let _lock = crate::test_helpers::env_lock();
+        let _override = crate::test_helpers::EnvGuard::unset("JJR_CONFIG_PATH");
+        let _xdg = crate::test_helpers::EnvGuard::set_path(
+            "XDG_CONFIG_HOME",
+            std::path::Path::new("/x/config"),
+        );
+        let _home =
+            crate::test_helpers::EnvGuard::set_path("HOME", std::path::Path::new("/should/ignore"));
+        assert_eq!(
+            global_config_path(),
+            Some(std::path::PathBuf::from("/x/config/jjr/config.toml"))
+        );
+    }
+
+    #[test]
+    fn global_config_path_falls_back_to_dot_config_when_xdg_unset() {
+        let _lock = crate::test_helpers::env_lock();
+        let _override = crate::test_helpers::EnvGuard::unset("JJR_CONFIG_PATH");
+        let _xdg = crate::test_helpers::EnvGuard::unset("XDG_CONFIG_HOME");
+        let _home = crate::test_helpers::EnvGuard::set_path("HOME", std::path::Path::new("/u/me"));
+        assert_eq!(
+            global_config_path(),
+            Some(std::path::PathBuf::from("/u/me/.config/jjr/config.toml"))
+        );
+    }
+
+    #[test]
+    fn global_config_path_returns_none_when_no_home_or_xdg() {
+        let _lock = crate::test_helpers::env_lock();
+        let _override = crate::test_helpers::EnvGuard::unset("JJR_CONFIG_PATH");
+        let _xdg = crate::test_helpers::EnvGuard::unset("XDG_CONFIG_HOME");
+        let _home = crate::test_helpers::EnvGuard::unset("HOME");
+        assert_eq!(global_config_path(), None);
+    }
+
+    #[test]
+    fn global_config_path_treats_empty_xdg_as_unset() {
+        let _lock = crate::test_helpers::env_lock();
+        let _override = crate::test_helpers::EnvGuard::unset("JJR_CONFIG_PATH");
+        let _xdg = crate::test_helpers::EnvGuard::set_str("XDG_CONFIG_HOME", "");
+        let _home = crate::test_helpers::EnvGuard::set_path("HOME", std::path::Path::new("/h"));
+        assert_eq!(
+            global_config_path(),
+            Some(std::path::PathBuf::from("/h/.config/jjr/config.toml"))
+        );
     }
 
     #[test]
