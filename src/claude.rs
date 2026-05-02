@@ -1,61 +1,70 @@
 use std::process::{Command, Stdio};
 
+use crate::agent_config::{load_agent_config, AgentConfig};
 use crate::error::{JjrError, Result};
 
-/// Maximum prompt size passable through argv.
+/// Maximum combined size (`prompt` + `extra_args`) passable through argv.
 ///
 /// macOS `ARG_MAX` is 1 MiB shared with the environment; Linux is typically
-/// 2 MiB. 512 KiB leaves room for `environ` plus claude's own argv across
-/// platforms. If a review packet exceeds this, the user gets a legible
-/// `PromptTooLarge` error pointing them at chunking the stack — without the
-/// guard, `spawn()` would surface a generic `E2BIG` mapped to `Io`.
+/// 2 MiB. 512 KiB leaves room for `environ` plus the agent's own argv across
+/// platforms.
 pub const PROMPT_ARG_LIMIT: usize = 512 * 1024;
 
-/// Outcome of a Claude invocation.
 pub enum ClaudeOutcome {
-    /// Claude exited zero; the working copy now reflects Claude's edits.
-    Success,
-    /// Claude exited non-zero. The user already saw stderr on their terminal.
-    Failed { exit_code: Option<i32> },
+    Success {
+        tool: String,
+    },
+    Failed {
+        tool: String,
+        exit_code: Option<i32>,
+    },
 }
 
-/// Invoke `claude` interactively with `prompt` as the initial message.
+/// Invoke the configured agent CLI interactively with `prompt` as the initial
+/// message. Loads `[agent]` from the global `jjr` config file (see
+/// [`crate::util::global_config_path`]); falls back to `claude` with no extra
+/// args when the config is missing or malformed.
 ///
-/// Claude runs interactively (no `-p`) so it can prompt the user to approve
-/// edits in real time. The caller (TUI or CLI) is responsible for handing
-/// the terminal to Claude — the subprocess inherits stdin/stdout/stderr,
-/// takes over the tty for the session, and returns control on exit.
+/// The subprocess inherits stdin/stdout/stderr; the caller is responsible for
+/// suspending any TUI before the call.
 pub fn invoke_claude(prompt: &str) -> Result<ClaudeOutcome> {
-    invoke_with_command("claude", prompt)
+    let config = load_agent_config();
+    invoke_with_config(&config, prompt)
 }
 
-/// Low-level invocation; separated so tests can substitute a known binary.
+/// Invoke `config.tool` with `config.extra_args` followed by `--` and the
+/// `prompt`. Crate-internal so the loader stays the only public surface.
+pub(crate) fn invoke_with_config(config: &AgentConfig, prompt: &str) -> Result<ClaudeOutcome> {
+    invoke_with_command(&config.tool, &config.extra_args, prompt)
+}
+
+/// Spawn `bin` with `extra_args` followed by `--` and `prompt`.
 ///
-/// The prompt is passed as a positional argument after a `--` separator —
-/// claude accepts it as the initial message and then uses the inherited
-/// terminal for subsequent interactive I/O. The `--` is required so that a
-/// prompt whose first character is `-` (e.g. a packet starting with
-/// `--Description:`) isn't parsed as a flag by claude's argv parser.
+/// `extra_args` go BEFORE the `--` separator so the agent CLI parses them as
+/// flags. The `--` is required so a prompt whose first character is `-`
+/// isn't parsed as a flag itself.
 ///
-/// SECURITY NOTE: the prompt is passed as argv, which is visible in process
-/// listings (`ps`, `/proc/<pid>/cmdline`) to same-uid processes while claude
-/// runs. Review-comment text and reviewer prose are exposed for the lifetime
-/// of the subprocess. Do not embed secrets in review comments. (Pre-existing
-/// trust boundary — the reviewer typed it on their own box — but worth being
-/// explicit.)
+/// Returns `PromptTooLarge` before spawning if the combined argv (`prompt` +
+/// `extra_args` + per-arg overhead) exceeds [`PROMPT_ARG_LIMIT`], so the user
+/// gets an actionable error instead of a generic kernel `E2BIG`.
 ///
-/// Returns `PromptTooLarge` before spawning if `prompt` exceeds
-/// [`PROMPT_ARG_LIMIT`], so the user sees an actionable message instead of
-/// a generic `E2BIG` from the kernel.
-pub fn invoke_with_command(bin: &str, prompt: &str) -> Result<ClaudeOutcome> {
-    if prompt.len() > PROMPT_ARG_LIMIT {
+/// SECURITY: argv is visible in process listings to same-uid processes;
+/// review-comment text is exposed for the lifetime of the subprocess.
+pub(crate) fn invoke_with_command(
+    bin: &str,
+    extra_args: &[String],
+    prompt: &str,
+) -> Result<ClaudeOutcome> {
+    let combined = combined_argv_size(extra_args, prompt);
+    if combined > PROMPT_ARG_LIMIT {
         return Err(JjrError::PromptTooLarge {
-            size: prompt.len(),
+            size: combined,
             limit: PROMPT_ARG_LIMIT,
         });
     }
 
     let mut child = Command::new(bin)
+        .args(extra_args)
         .arg("--")
         .arg(prompt)
         .stdin(Stdio::inherit())
@@ -64,7 +73,10 @@ pub fn invoke_with_command(bin: &str, prompt: &str) -> Result<ClaudeOutcome> {
         .spawn()
         .map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
-                JjrError::ClaudeMissing { source: e }
+                JjrError::AgentMissing {
+                    tool: bin.to_owned(),
+                    source: e,
+                }
             } else {
                 JjrError::Io { source: e }
             }
@@ -73,12 +85,22 @@ pub fn invoke_with_command(bin: &str, prompt: &str) -> Result<ClaudeOutcome> {
     let status = child.wait().map_err(|source| JjrError::Io { source })?;
 
     if status.success() {
-        Ok(ClaudeOutcome::Success)
+        Ok(ClaudeOutcome::Success {
+            tool: bin.to_owned(),
+        })
     } else {
         Ok(ClaudeOutcome::Failed {
+            tool: bin.to_owned(),
             exit_code: status.code(),
         })
     }
+}
+
+/// Conservative argv-size estimate (bytes + per-arg NUL overhead) used to
+/// gate `ARG_MAX` before spawn.
+fn combined_argv_size(extra_args: &[String], prompt: &str) -> usize {
+    let extras: usize = extra_args.iter().map(String::len).sum();
+    prompt.len() + extras + extra_args.len()
 }
 
 #[cfg(test)]
@@ -101,33 +123,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn true_binary_returns_success() {
-        let result = invoke_with_command(true_bin(), "hello").unwrap();
-        assert!(matches!(result, ClaudeOutcome::Success));
-    }
-
-    #[test]
-    fn false_binary_returns_failed_with_exit_code_1() {
-        let result = invoke_with_command(false_bin(), "hello").unwrap();
-        assert!(
-            matches!(result, ClaudeOutcome::Failed { exit_code: Some(1) }),
-            "expected Failed {{ exit_code: Some(1) }}"
-        );
-    }
-
-    #[test]
-    fn nonexistent_binary_returns_claude_missing() {
-        let result = invoke_with_command("/nonexistent/binary/jjr_test_probe_xyz", "hello");
-        assert!(
-            matches!(result, Err(JjrError::ClaudeMissing { .. })),
-            "expected ClaudeMissing error"
-        );
-    }
-
-    /// Writes a `/bin/sh` script that captures every argv entry on its own
-    /// line into `out_path`, marks it executable on Unix, and returns its
-    /// path. Used by the argv-shape regression tests.
     fn write_argv_capture_script(
         scripts_dir: &std::path::Path,
         out_path: &std::path::Path,
@@ -149,135 +144,169 @@ mod tests {
         capture_script
     }
 
-    /// The prompt must reach the subprocess as the positional argument
-    /// AFTER a `--` separator (interactive mode: claude treats the first
-    /// positional after `--` as the initial message and then uses the
-    /// inherited tty for subsequent I/O).
-    #[test]
-    fn prompt_reaches_subprocess_after_separator() {
-        let prompt = "unique-payload-jjr-claude-arg-test";
-
+    /// Run the capture script and return the captured argv. Returns `None`
+    /// when the script can't execute (some CI sandboxes); callers treat that
+    /// as skip.
+    fn run_capture(extra_args: &[String], prompt: &str) -> Option<Vec<String>> {
         let scripts_dir = tempfile::TempDir::new().unwrap();
         let capture_file = scripts_dir.path().join("argv.txt");
         let capture_script = write_argv_capture_script(scripts_dir.path(), &capture_file);
 
-        let result = invoke_with_command(capture_script.to_str().unwrap(), prompt);
-
+        let result = invoke_with_command(capture_script.to_str().unwrap(), extra_args, prompt);
         match result {
-            Ok(ClaudeOutcome::Success) => {
+            Ok(ClaudeOutcome::Success { .. }) => {
                 let captured = std::fs::read_to_string(&capture_file).unwrap_or_default();
-                let argv: Vec<&str> = captured.lines().collect();
-                assert_eq!(
-                    argv,
-                    vec!["--", prompt],
-                    "argv must be [\"--\", prompt]; got: {captured:?}"
-                );
+                Some(captured.lines().map(str::to_owned).collect())
             }
-            Ok(ClaudeOutcome::Failed { .. }) | Err(_) => {
-                // Script may not be executable in all environments; the other
-                // tests already cover the success/fail/missing paths.
-            }
+            Ok(ClaudeOutcome::Failed { .. }) | Err(_) => None,
         }
     }
 
-    /// Regression: claude must NOT be invoked with `-p` (non-interactive
-    /// print mode). With `-p`, claude can't prompt the user to approve
-    /// tool calls and bails with "permission denied" in environments whose
-    /// policy requires explicit approval per write. Interactive mode lets
-    /// the user approve edits in real time.
     #[test]
-    fn invoke_with_command_does_not_pass_p_flag() {
-        let prompt = "unique-payload-jjr-no-p-flag";
-
-        let scripts_dir = tempfile::TempDir::new().unwrap();
-        let capture_file = scripts_dir.path().join("argv.txt");
-        let capture_script = write_argv_capture_script(scripts_dir.path(), &capture_file);
-
-        let result = invoke_with_command(capture_script.to_str().unwrap(), prompt);
-
-        match result {
-            Ok(ClaudeOutcome::Success) => {
-                let captured = std::fs::read_to_string(&capture_file).unwrap_or_default();
-                assert!(
-                    !captured
-                        .lines()
-                        .any(|line| line == "-p" || line == "--print"),
-                    "argv must not contain `-p` / `--print`; got: {captured:?}"
-                );
-            }
-            Ok(ClaudeOutcome::Failed { .. }) | Err(_) => {
-                // Script may not be executable in all environments; the other
-                // tests already cover the success/fail/missing paths.
-            }
-        }
+    fn true_binary_returns_success() {
+        let result = invoke_with_command(true_bin(), &[], "hello").unwrap();
+        assert!(matches!(result, ClaudeOutcome::Success { .. }));
     }
 
-    /// T1: empty prompt must not panic and must spawn cleanly through the
-    /// guard. `/bin/true` ignores argv, so we get `Success` back; the
-    /// important guarantee is that an empty `&str` does not cause an
-    /// early return or panic. claude's behavior on empty argv is its concern.
     #[test]
-    fn invoke_with_command_handles_empty_prompt() {
-        let result = invoke_with_command(true_bin(), "").unwrap();
+    fn false_binary_returns_failed() {
+        let result = invoke_with_command(false_bin(), &[], "hello").unwrap();
+        let ClaudeOutcome::Failed { tool, exit_code } = result else {
+            panic!("expected Failed");
+        };
+        assert_eq!(tool, false_bin());
+        assert_eq!(exit_code, Some(1));
+    }
+
+    #[test]
+    fn nonexistent_binary_returns_agent_missing() {
+        let result = invoke_with_command("/nonexistent/binary/jjr_test_probe_xyz", &[], "hello");
+        assert!(matches!(result, Err(JjrError::AgentMissing { .. })));
+    }
+
+    #[test]
+    fn missing_configured_tool_reports_configured_name_not_claude() {
+        let result =
+            invoke_with_command("/nonexistent/binary/jjr_test_probe_opencode", &[], "hello");
+        let Err(JjrError::AgentMissing { tool, .. }) = result else {
+            panic!("expected AgentMissing");
+        };
+        assert_eq!(tool, "/nonexistent/binary/jjr_test_probe_opencode");
+        // Display string must mention the configured tool, not "claude".
+        let displayed = format!(
+            "{}",
+            JjrError::AgentMissing {
+                tool: "opencode".to_owned(),
+                source: std::io::Error::from(std::io::ErrorKind::NotFound),
+            }
+        );
+        assert!(displayed.contains("opencode"), "display: {displayed:?}");
         assert!(
-            matches!(result, ClaudeOutcome::Success),
-            "expected Success for empty prompt"
+            !displayed.contains("claude"),
+            "display leaked claude: {displayed:?}"
         );
     }
 
-    /// T2: a prompt that LOOKS like a flag (e.g. `--help`, `-p`) must be
-    /// passed through as the prompt text, not interpreted as a flag by
-    /// claude's argv parser. The `--` separator guarantees this.
     #[test]
-    fn invoke_with_command_passes_flag_like_prompt_after_separator() {
+    fn prompt_reaches_subprocess_after_separator() {
+        let prompt = "unique-payload-jjr-claude-arg-test";
+        let Some(argv) = run_capture(&[], prompt) else {
+            return;
+        };
+        assert_eq!(argv, vec!["--".to_owned(), prompt.to_owned()]);
+    }
+
+    /// Regression: the agent must NOT be invoked with `-p` (non-interactive
+    /// print mode). With `-p`, claude can't prompt the user to approve tool
+    /// calls and bails with "permission denied" in environments whose policy
+    /// requires explicit approval per write.
+    #[test]
+    fn invoke_with_command_does_not_pass_p_flag() {
+        let Some(argv) = run_capture(&[], "unique-payload-jjr-no-p-flag") else {
+            return;
+        };
+        assert!(!argv.iter().any(|a| a == "-p" || a == "--print"));
+    }
+
+    #[test]
+    fn handles_empty_prompt() {
+        let result = invoke_with_command(true_bin(), &[], "").unwrap();
+        assert!(matches!(result, ClaudeOutcome::Success { .. }));
+    }
+
+    #[test]
+    fn flag_like_prompt_passes_through_after_separator() {
         for prompt in ["--help", "-p", "--print", "--version"] {
-            let scripts_dir = tempfile::TempDir::new().unwrap();
-            let capture_file = scripts_dir.path().join("argv.txt");
-            let capture_script = write_argv_capture_script(scripts_dir.path(), &capture_file);
-
-            let result = invoke_with_command(capture_script.to_str().unwrap(), prompt);
-
-            match result {
-                Ok(ClaudeOutcome::Success) => {
-                    let captured = std::fs::read_to_string(&capture_file).unwrap_or_default();
-                    let argv: Vec<&str> = captured.lines().collect();
-                    assert_eq!(
-                        argv,
-                        vec!["--", prompt],
-                        "flag-like prompt {prompt:?} must arrive as positional after `--`; got: {captured:?}"
-                    );
-                }
-                Ok(ClaudeOutcome::Failed { .. }) | Err(_) => {
-                    // Script may not be executable in all environments.
-                }
-            }
+            let Some(argv) = run_capture(&[], prompt) else {
+                continue;
+            };
+            assert_eq!(argv, vec!["--".to_owned(), prompt.to_owned()]);
         }
     }
 
-    /// T3: oversize prompt returns `PromptTooLarge` before spawning so the
-    /// user gets an actionable error instead of a generic `E2BIG`. Verifies
-    /// both the variant and that `size`/`limit` carry the actual byte counts.
     #[test]
-    fn invoke_with_command_returns_prompt_too_large_for_oversize_input() {
+    fn oversize_prompt_returns_prompt_too_large() {
         let oversize = "x".repeat(PROMPT_ARG_LIMIT + 1);
-        let result = invoke_with_command(true_bin(), &oversize);
-
+        let result = invoke_with_command(true_bin(), &[], &oversize);
         let Err(JjrError::PromptTooLarge { size, limit }) = result else {
-            panic!("expected PromptTooLarge for oversize prompt");
+            panic!("expected PromptTooLarge");
         };
         assert_eq!(size, PROMPT_ARG_LIMIT + 1);
         assert_eq!(limit, PROMPT_ARG_LIMIT);
     }
 
-    /// T4: prompt at exactly the limit is accepted (boundary inclusive).
-    /// The guard rejects only `> limit`, not `>= limit`.
     #[test]
-    fn invoke_with_command_accepts_prompt_at_limit() {
+    fn prompt_at_limit_is_accepted() {
         let at_limit = "x".repeat(PROMPT_ARG_LIMIT);
-        let result = invoke_with_command(true_bin(), &at_limit);
-        assert!(
-            !matches!(result, Err(JjrError::PromptTooLarge { .. })),
-            "prompt of exactly PROMPT_ARG_LIMIT bytes must NOT trigger PromptTooLarge"
+        let result = invoke_with_command(true_bin(), &[], &at_limit);
+        assert!(!matches!(result, Err(JjrError::PromptTooLarge { .. })));
+    }
+
+    /// Long `extra_args` must count toward the argv-size guard. Without this,
+    /// a multi-megabyte `extra_args` payload would skip the guard and spawn
+    /// would surface a generic `E2BIG`.
+    #[test]
+    fn extra_args_overflow_returns_prompt_too_large() {
+        let big_arg = "x".repeat(PROMPT_ARG_LIMIT);
+        let extras = vec![big_arg];
+        let result = invoke_with_command(true_bin(), &extras, "hi");
+        let Err(JjrError::PromptTooLarge { size, limit }) = result else {
+            panic!("expected PromptTooLarge for oversize extra_args");
+        };
+        assert!(size > PROMPT_ARG_LIMIT);
+        assert_eq!(limit, PROMPT_ARG_LIMIT);
+    }
+
+    #[test]
+    fn extra_args_precede_separator() {
+        let extras = vec!["--dangerously-skip-permissions".to_owned()];
+        let Some(argv) = run_capture(&extras, "p") else {
+            return;
+        };
+        assert_eq!(
+            argv,
+            vec![
+                "--dangerously-skip-permissions".to_owned(),
+                "--".to_owned(),
+                "p".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn multiple_extra_args_pass_through_in_order() {
+        let extras = vec!["--flag-one".to_owned(), "--flag-two=value".to_owned()];
+        let Some(argv) = run_capture(&extras, "p") else {
+            return;
+        };
+        assert_eq!(
+            argv,
+            vec![
+                "--flag-one".to_owned(),
+                "--flag-two=value".to_owned(),
+                "--".to_owned(),
+                "p".to_owned(),
+            ]
         );
     }
 }

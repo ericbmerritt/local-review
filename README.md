@@ -269,6 +269,36 @@ to re-anchor, or send them to Claude anyway with `--include-stale`.
 Stack-scoped comments are never stale (no anchoring to content); they reappear
 in every cycle until cleared.
 
+## Configuration
+
+Settings live in a single global file: `$XDG_CONFIG_HOME/jjr/config.toml` if
+`XDG_CONFIG_HOME` is set, otherwise `~/.config/jjr/config.toml`. The file is
+optional; missing fields fall back to defaults.
+
+```toml
+[ui]
+transition_screen = "auto"        # "auto" | "always" | "never" (default "never")
+
+[agent]
+tool = "claude"                   # CLI binary used by `jjr claude` and the C-key send-to-claude flow
+extra_args = []                   # flags passed to the agent before the `--` separator
+```
+
+To skip Claude's per-edit approval prompts, set:
+
+```toml
+[agent]
+extra_args = ["--dangerously-skip-permissions"]
+```
+
+`tool` accepts any binary on `PATH` (e.g., `tool = "opencode"`). `jjr` spawns
+the named binary with `extra_args`, then `--`, then the prompt path.
+
+**Migration.** If you previously set config in
+`<repo_root>/.jj-review/config.toml`, move it to
+`$XDG_CONFIG_HOME/jjr/config.toml` (or `~/.config/jjr/config.toml`). Per-repo
+config files are no longer read.
+
 ## Storage
 
 Everything is local. `jjr` writes to a `.jj-review/` directory at the repo root,
