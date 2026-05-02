@@ -1,9 +1,5 @@
 [advisories]
-ignore = [
-  # paste is unmaintained but pulled in transitively by ratatui. No safe
-  # alternative drop-in until ratatui migrates.
-  "RUSTSEC-2024-0436",
-]
+ignore = []
 
 [licenses]
 allow = [
@@ -12,20 +8,20 @@ allow = [
   "MIT-0",
   "BSD-2-Clause",
   "BSD-3-Clause",
-  "ISC",
   "Unicode-3.0",
-  "Unicode-DFS-2016",
   "Unlicense",
   "Zlib",
-  "MPL-2.0",
 ]
 confidence-threshold = 0.8
+unused-allowed-license = "deny"
 
 [bans]
-multiple-versions = "warn"
+multiple-versions = "deny"
 wildcards = "deny"
 highlight = "all"
-skip = []
+skip = [
+  { crate = "wit-bindgen@0.51.0", reason = "two wit-bindgen versions reach us via tempfile's wasip2/wasip3 deps; cannot collapse without forking. Pinned so the skip fails when 0.51 drops out and we can re-evaluate." },
+]
 
 [sources]
 unknown-registry = "deny"

@@ -1236,12 +1236,15 @@ fn run_app(
 /// the next `terminal.draw()` only writes diffs against a buffer that no
 /// longer matches the freshly-blank alternate screen, leaving cells ratatui
 /// thinks "unchanged" stale on screen.
-fn maybe_clear_for_full_redraw<B: ratatui::backend::Backend>(
-    terminal: &mut Terminal<B>,
-    app: &mut App,
-) -> Result<()> {
+fn maybe_clear_for_full_redraw<B>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()>
+where
+    B: ratatui::backend::Backend,
+    B::Error: core::error::Error + Send + Sync + 'static,
+{
     if app.needs_full_redraw {
-        terminal.clear().map_err(io_err)?;
+        terminal
+            .clear()
+            .map_err(|e| io_err(std::io::Error::other(e)))?;
         app.needs_full_redraw = false;
     }
     Ok(())
