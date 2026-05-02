@@ -144,6 +144,40 @@ pub(crate) fn description_comment_to_inline(
     })
 }
 
+/// Convert an `Anchor::Change` comment to an `InlineComment` appended after
+/// the description body. Change comments have no per-line anchor, so both
+/// `source_line` and `target_line` are `None` — the caller routes them through
+/// [`DiffView::with_change_comments_appended`] rather than
+/// `with_inline_comments` (which keys on a matching line number).
+pub(crate) fn change_comment_to_inline(
+    comment: &Comment,
+    comment_index: usize,
+    target_change_id: &crate::change_id::ChangeId,
+    now: time::OffsetDateTime,
+) -> Option<InlineComment> {
+    if matches!(comment.status, Some(Status::Stale | Status::Orphaned)) {
+        return None;
+    }
+    let Anchor::Change { change_id } = &comment.anchor else {
+        return None;
+    };
+    if change_id != target_change_id {
+        return None;
+    }
+
+    let age = format_age(now, comment.created_at);
+    let body_lines = comment.body.lines().map(str::to_owned).collect();
+
+    Some(InlineComment {
+        source_line: None,
+        target_line: None,
+        severity: comment.severity,
+        age,
+        body_lines,
+        comment_index,
+    })
+}
+
 /// One row of the side-by-side diff view.
 ///
 /// `Spanning(idx)` rows reference a single `RenderedLine` that the renderer
@@ -249,6 +283,59 @@ impl DiffView {
                     inject_comment_lines(&mut output, comment);
                 }
             }
+        }
+
+        let paired_rows = pair_rows(&output);
+        Self {
+            title: self.title,
+            lines: output,
+            paired_rows,
+        }
+    }
+
+    /// Return a new `DiffView` with change-scoped comment rows appended after
+    /// the description body. Used to surface change-anchored comments inline —
+    /// they have no per-line anchor, so they sit as a fixed block after all
+    /// description content.
+    ///
+    /// When the description has its own content (i.e. `DescriptionLine` rows)
+    /// the appended block is preceded by a `Notice` separator row so the
+    /// reader can tell at a glance that the following `┃ ● ...` rows are
+    /// anchored to the change as a whole and not to the last description line.
+    /// The empty-description case already shows a `(no description)` Notice
+    /// placeholder, which is signal enough on its own — no extra separator.
+    ///
+    /// The renderer uses the same `InlineCommentMeta` / `InlineCommentBody`
+    /// kinds and severity styling as line- and description-anchored comments,
+    /// so navigation (`e`, `d`, `c`) and visual treatment fall out unchanged.
+    pub(crate) fn with_change_comments_appended(self, comments: &[InlineComment]) -> Self {
+        if comments.is_empty() {
+            return self;
+        }
+
+        let needs_separator = self
+            .lines
+            .iter()
+            .any(|l| matches!(l.kind, RenderedLineKind::DescriptionLine));
+
+        let mut output: Vec<RenderedLine> = Vec::with_capacity(
+            self.lines.len()
+                + usize::from(needs_separator)
+                + comments.len() * ROWS_PER_INLINE_COMMENT_HINT,
+        );
+        output.extend(self.lines.iter().cloned());
+        if needs_separator {
+            output.push(RenderedLine {
+                kind: RenderedLineKind::Notice,
+                text: "─ on this change ─".to_owned(),
+                source_line: None,
+                target_line: None,
+                hunk_header: None,
+                comment_severity: None,
+            });
+        }
+        for comment in comments {
+            inject_comment_lines(&mut output, comment);
         }
 
         let paired_rows = pair_rows(&output);
@@ -1510,14 +1597,142 @@ mod tests {
             source_line: None,
             target_line: Some(2),
             severity: Severity::Required,
-            age: "just now".to_owned(),
             body_lines: vec!["fix".to_owned()],
+            age: "just now".to_owned(),
             comment_index: 0,
         };
         let augmented = view.with_inline_comments(&[comment]);
         assert!(
             augmented.paired_rows.len() > before,
             "comment injection should add at least one paired row"
+        );
+    }
+
+    fn make_change_comment(
+        change_id: &crate::change_id::ChangeId,
+        severity: Severity,
+        body: &str,
+        created_at: time::OffsetDateTime,
+    ) -> Comment {
+        Comment {
+            schema_version: SchemaVersion,
+            anchor: Anchor::Change {
+                change_id: change_id.clone(),
+            },
+            repo_root: PathBuf::from("/repo"),
+            revset: "@".to_owned(),
+            commit_id: None,
+            body: body.to_owned(),
+            severity,
+            created_at,
+            updated_at: None,
+            status: Some(Status::Pending),
+            mismatch_reason: None,
+        }
+    }
+
+    #[test]
+    fn change_comment_to_inline_returns_some_for_matching_change_id() {
+        let change_id = crate::change_id::ChangeId::parse(&"a".repeat(32)).unwrap();
+        let comment = make_change_comment(
+            &change_id,
+            Severity::Required,
+            "split this commit",
+            time::OffsetDateTime::UNIX_EPOCH,
+        );
+        let now = time::OffsetDateTime::UNIX_EPOCH;
+        let inline =
+            change_comment_to_inline(&comment, 4, &change_id, now).expect("matching change_id");
+        assert_eq!(inline.source_line, None);
+        assert_eq!(inline.target_line, None);
+        assert_eq!(inline.severity, Severity::Required);
+        assert_eq!(inline.comment_index, 4);
+        assert_eq!(inline.body_lines, vec!["split this commit".to_owned()]);
+    }
+
+    #[test]
+    fn change_comments_append_to_description_view_with_separator() {
+        let change_id = crate::change_id::ChangeId::parse(&"a".repeat(32)).unwrap();
+        let now = time::OffsetDateTime::UNIX_EPOCH;
+
+        let desc_view = DiffView::from_description("first description line");
+        let desc_inline = description_comment_to_inline(
+            &make_description_comment(Some(1), Severity::Note),
+            0,
+            now,
+        )
+        .expect("description anchor yields Some");
+        let change_inline = change_comment_to_inline(
+            &make_change_comment(&change_id, Severity::Required, "split", now),
+            1,
+            &change_id,
+            now,
+        )
+        .expect("matching change_id");
+        let augmented_desc = desc_view
+            .with_inline_comments(&[desc_inline])
+            .with_change_comments_appended(&[change_inline]);
+        let kinds: Vec<RenderedLineKind> = augmented_desc.lines.iter().map(|l| l.kind).collect();
+        assert!(matches!(
+            kinds.as_slice(),
+            [
+                RenderedLineKind::DescriptionLine,
+                RenderedLineKind::InlineCommentMeta { .. },
+                RenderedLineKind::InlineCommentBody,
+                RenderedLineKind::Notice,
+                RenderedLineKind::InlineCommentMeta { .. },
+                RenderedLineKind::InlineCommentBody,
+            ]
+        ));
+    }
+
+    #[test]
+    fn change_comments_do_not_leak_into_diff_file_view() {
+        let now = time::OffsetDateTime::UNIX_EPOCH;
+        let file_view = DiffView::from_file(&sample_modified());
+        let line_inline = comment_to_inline(
+            &make_line_comment("foo.txt", Severity::Note),
+            2,
+            Some(std::path::Path::new("foo.txt")),
+            now,
+        )
+        .expect("matching file path");
+        let augmented_file = file_view.with_inline_comments(&[line_inline]);
+        let change_metas = augmented_file
+            .lines
+            .iter()
+            .filter(|l| {
+                matches!(l.kind, RenderedLineKind::InlineCommentMeta { .. })
+                    && l.source_line.is_none()
+                    && l.target_line.is_none()
+            })
+            .count();
+        assert_eq!(change_metas, 0);
+    }
+
+    // The "(no description)" placeholder is itself signal that what follows is
+    // not anchored to any description line; an additional separator would be
+    // visual noise.
+    #[test]
+    fn change_comments_skip_separator_when_description_is_empty() {
+        let change_id = crate::change_id::ChangeId::parse(&"a".repeat(32)).unwrap();
+        let now = time::OffsetDateTime::UNIX_EPOCH;
+        let inline = change_comment_to_inline(
+            &make_change_comment(&change_id, Severity::Note, "body", now),
+            0,
+            &change_id,
+            now,
+        )
+        .expect("matching change_id");
+        let view = DiffView::from_description("").with_change_comments_appended(&[inline]);
+        let notice_count = view
+            .lines
+            .iter()
+            .filter(|l| l.kind == RenderedLineKind::Notice)
+            .count();
+        assert_eq!(
+            notice_count, 1,
+            "only the (no description) notice — no separator added"
         );
     }
 }
