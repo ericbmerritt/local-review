@@ -2385,7 +2385,10 @@ fn handle_send_to_claude_key(app: &mut App, key: KeyEvent) -> Result<()> {
                 let SendToClaudeState::Confirm(data) = *boxed else {
                     unreachable!("matched Confirm above");
                 };
-                let prompt = crate::packet::render_prompt(&data.packet);
+                let prompt = crate::packet::render_prompt_with_mode(
+                    &data.packet,
+                    crate::packet::PromptMode::JsonlPaths,
+                );
                 app.screen = Screen::SendToClaude(Box::new(SendToClaudeState::PromptView {
                     confirm: data,
                     prompt,
@@ -2457,7 +2460,8 @@ fn invoke_claude_from_tui(app: &mut App) -> Result<()> {
     };
 
     let change_id = data.change_id.clone();
-    let prompt = crate::packet::render_prompt(&data.packet);
+    let prompt =
+        crate::packet::render_prompt_with_mode(&data.packet, crate::packet::PromptMode::JsonlPaths);
     let repo_root = app.repo_root.clone();
 
     // Restore real stderr BEFORE leaving the alt screen so claude (spawned
