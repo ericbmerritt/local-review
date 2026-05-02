@@ -36,6 +36,7 @@ mod help_screen;
 mod overview_screen;
 mod send_to_claude;
 mod stale_screen;
+mod textarea;
 
 use composer::{
     default_severity, Composer, ComposerAction, ComposerInit, ComposerScope, DescriptionContext,
@@ -4997,16 +4998,17 @@ mod tests {
         );
     }
 
-    // -- T3: Ctrl+K reaches the textarea (was previously intercepted as a
-    //   scope chord, killing the dialog instead of killing-to-EOL inside
-    //   the body). Pin the user-reported bug fix: the keypress flows
-    //   through to tui-textarea, which performs its kill-to-EOL.
+    // -- T3: Ctrl+K is no longer a scope chord, so it must NOT close the
+    //   composer or switch scopes. The minimal in-tree textarea also does
+    //   not bind Ctrl+K (the previous tui-textarea kill-to-EOL behavior is
+    //   intentionally not reimplemented), so the body is left unmodified.
+    //   Pin the user-reported regression: pressing Ctrl+K inside the body
+    //   does not damage state.
     #[test]
-    fn ctrl_k_inside_composer_body_forwards_to_textarea_and_kills_to_eol() {
+    fn ctrl_k_inside_composer_body_is_noop_and_does_not_switch_scope() {
         let mut app = make_app_with_single_file(sample_diff_file());
         app.line_index = 2;
         open_composer(&mut app);
-        // Type "hello world" then a newline then "second line".
         for ch in "hello world".chars() {
             handle_composer_event(
                 &mut app,
@@ -5020,13 +5022,6 @@ mod tests {
                 KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
             );
         }
-        // Move cursor to row 0, after "hello " (col 6).
-        handle_composer_event(&mut app, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
-        handle_composer_event(&mut app, KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
-        for _ in 0..6 {
-            handle_composer_event(&mut app, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
-        }
-        // Ctrl+K — tui-textarea kills from cursor to end of line.
         handle_composer_event(
             &mut app,
             KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
@@ -5036,10 +5031,9 @@ mod tests {
         };
         assert_eq!(
             composer.body_text(),
-            "hello \nsecond line",
-            "Ctrl+K must reach the textarea and kill the rest of row 0"
+            "hello world\nsecond line",
+            "Ctrl+K must be a no-op; body unchanged"
         );
-        // Scope is unchanged (Ctrl+K is no longer a chord).
         assert!(matches!(composer.scope, ComposerScope::Line(_)));
     }
 
@@ -6436,7 +6430,7 @@ mod tests {
             panic!("expected composer");
         };
         // Edit the body and bump severity.
-        composer.body = tui_textarea::TextArea::default();
+        composer.body = textarea::TextArea::default();
         for ch in "edited body text".chars() {
             composer
                 .body
@@ -6485,7 +6479,7 @@ mod tests {
         let Screen::Composer(ref mut composer) = app.screen else {
             panic!("expected composer");
         };
-        composer.body = tui_textarea::TextArea::default();
+        composer.body = textarea::TextArea::default();
         for ch in "B-edited".chars() {
             composer
                 .body

@@ -85,7 +85,6 @@ snafu = "0.9"
 tempfile = "3"
 time = { version = "0.3", features = ["serde", "formatting", "parsing", "macros"] }
 toml = "1.1"
-tui-textarea = { version = "0.7.0", features = ["crossterm"] }
 unidiff = "0.4"
 
 [dev-dependencies]

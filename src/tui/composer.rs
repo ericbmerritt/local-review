@@ -2,11 +2,11 @@ use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use time::OffsetDateTime;
-use tui_textarea::TextArea;
 
 use crate::change_id::ChangeId;
 use crate::comment::{Anchor, Comment, Severity};
 use crate::stack::RevsetHash;
+use crate::tui::textarea::TextArea;
 
 const SECS_PER_MIN: i64 = 60;
 const SECS_PER_HOUR: i64 = 60 * SECS_PER_MIN;
@@ -148,7 +148,7 @@ pub(crate) struct EditingContext {
 pub(crate) struct Composer {
     pub(crate) scope: ComposerScope,
     pub(crate) severity: Severity,
-    pub(crate) body: TextArea<'static>,
+    pub(crate) body: TextArea,
     /// `Some` when the composer is in edit mode; `None` for new comments.
     /// The folded payload keeps the edit-mode fields impossible to drift
     /// out of sync.
@@ -282,13 +282,13 @@ pub(crate) enum ComposerAction {
 ///
 /// Scope chords (`Alt+L`, `Alt+C`, `Alt+K`, `Alt+D`) and severity chords
 /// (`Alt+R`, `Alt+S`, `Alt+N`) are Alt-chorded; save/delete (`^X`, `^D`)
-/// remain Ctrl-chorded. The scope chords moved off Ctrl because `^K` is
-/// intercepted by tui-textarea ("delete to end of line"), `^C` is
-/// inconsistently delivered as SIGINT vs. as a Char key across terminals,
-/// and `^L` collides with redraw bindings in some hosts; under raw mode the
-/// Alt prefix avoids those collisions entirely. All intercepted keys are
-/// consumed before being passed to tui-textarea; everything else flows
-/// through.
+/// remain Ctrl-chorded. The scope chords moved off Ctrl because `^K` was
+/// historically intercepted by the body editor's "delete to end of line"
+/// (tui-textarea's binding), `^C` is inconsistently delivered as SIGINT vs.
+/// as a Char key across terminals, and `^L` collides with redraw bindings
+/// in some hosts; under raw mode the Alt prefix avoids those collisions
+/// entirely. All intercepted keys are consumed before being forwarded to
+/// the body editor; everything else flows through.
 ///
 /// Scope chords whose availability snapshot is absent (`Alt+L` without
 /// `line_available`, `Alt+K` without `stack_available`, `Alt+D` without
@@ -561,9 +561,10 @@ mod tests {
     }
 
     // Pin the regression: under CONTROL, L/C/K must NOT trigger a scope
-    // switch (Ctrl+K collides with tui-textarea's "delete to end of line",
-    // and Ctrl+C is delivered inconsistently across terminals). The keys are
-    // forwarded to the textarea; the action is `Continue`.
+    // switch (Ctrl+K historically collided with the body editor's
+    // "delete to end of line", and Ctrl+C is delivered inconsistently
+    // across terminals). The keys are forwarded to the body editor; the
+    // action is `Continue`.
     #[test]
     fn handle_composer_key_ctrl_k_does_not_switch_scope() {
         let mut c = make_composer(Severity::Suggestion);
