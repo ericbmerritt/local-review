@@ -6,88 +6,78 @@ Before agent-generated commits leave your workstation as PRs, you have to review
 them. They have your name on them. The agent wrote the code; you're the one
 who's accountable for it.
 
-`jjr` is the tool for that pass.
+`jjr` is the tool for that pass. It walks you through a stack of jj changes,
+captures line / change / description / stack-scoped comments, and hands the
+comments to Claude (or another agent CLI) for remediation. The agent edits the
+changes in place. You re-review. Repeat until you push.
 
-## What is jjr?
+This is **self-review**, not collaboration. Comments stay on disk, ignored by
+git and jj. Nothing is committed. Nothing is shared.
 
-You sent an agent off to implement a spec. It came back with a stack of fifteen
-`jj` commits. They compile, the tests pass, and now you have to read them —
-commit by commit, oldest to newest — and decide whether what you're about to
-publish actually represents your judgment.
+## Why jujutsu
 
-`jjr` is a terminal UI that walks the stack with you. You read each diff, leave
-line / change / stack-scoped comments where something needs to change, then hand
-the comments to Claude in one shot. Claude addresses the comments by editing
-each change in place; you re-review the modified stack. Repeat until you're
-satisfied, then push.
+Agent-driven coding generates many small commits that need rewriting before they
+ship: split this one, squash these two, drop that experiment, fix the
+description. The git workflow for that is interactive rebase — slow,
+error-prone, and easy to bail on. The friction tax is paid every cycle.
 
-This is **self-review**, not collaboration. There's nobody on the other end.
-It's you, looking at code an agent wrote, deciding whether it's good enough to
-ship under your name.
+`jj` removes that tax in three places that matter for the review loop:
 
-## The review cycle
+- **History rewriting is first-class.** `jj split`, `jj squash`, `jj rebase`,
+  `jj absorb` are everyday commands, not ceremony. The agent re-shapes its own
+  stack when told to, and `jj` records conflicts as first-class objects in
+  commits rather than halting the rebase — descendants re-parent automatically
+  and you handle conflicts where they actually live instead of in a 30-minute
+  interactive rebase.
+- **Working copy is a commit.** The agent's edits are tracked the moment they
+  hit disk. There's no "did I `git add`?" failure mode and no staging area to
+  desynchronize from intent.
+- **A stack is the review unit.** `trunk()..@` gives `jjr` a stable, exact
+  definition of "the work I'm reviewing." One change is one commit is one review
+  pass. The boundary doesn't drift while you're looking at it.
 
-The workflow `jjr` encodes is a cycle:
+`jjr` exists because `jj`'s data model removes the friction the agent loop
+generates. The reviewer points at content; the tool re-anchors comments across
+the agent's rewrites; the cycle stays cheap enough to run as many times as the
+work needs. None of that is impossible on git, but on git it costs enough that
+you stop running the loop. That's why this is `jujutsu-review`, not
+`git-review`.
 
-1. Walk the stack from oldest to newest.
-2. For each commit, read the diff.
-3. Where something needs to change, leave a comment — on a line, on the whole
-   commit, or on the stack.
-4. When done with a commit, advance to the next.
-5. When done with the stack, hand the comments to the agent. The agent edits the
-   changes in place.
-6. Re-review the modified stack. New cycle.
+## Synopsis
 
-You repeat the cycle as many times as the work demands. When you're satisfied,
-you push. The tool doesn't tell you when to stop — that judgment is yours.
+```
+jjr [revset]
+jjr <subcommand> [args]
+```
 
-That's it. No PR system. No web UI. No automated reviewer. Just the missing
-primitive between _agent finishes generating_ and _you push to GitHub_.
+Two modes:
 
-## Why this exists
+- **Stack mode** (default; bare `jjr`, `jjr --stack`, or `jjr <revset>` where
+  the revset returns multiple changes): walk a sequence of changes
+  oldest-to-newest with `n` / `p`.
+- **Single-change mode** (`jjr <change-id>`, or any revset that returns one
+  change): review a single change. Stack-mode keys (`s`, `n`, `p`) are inert.
 
-The current local review primitive is `jj show | less`. That works for reading.
-It doesn't work for the actual review loop, which requires capturing
-line-specific intent without losing your place in the stack.
+The default revset is `trunk()..@`.
 
-Without a tool, the loop falls apart into scratchpad notes, copy/paste, and ad
-hoc Claude prompts written from memory of what you saw three commits ago. The
-result is either thin review (you skim, you trust, you ship) or no review (you
-stop reading at commit four of fifteen).
+## Status
 
-Neither is acceptable when the code has your name on it.
+MVP complete and stable. The whole [milestone ladder](specs/jjr-mvp.ladder.md)
+has landed: read-only diff view, line / change / description / stack-scoped
+comments with severity, stack walking with cursor resume, side-by-side diff at
+wide widths, line re-anchoring with stale view, packet generation, single-change
+Claude handoff via the CLI (`jjr claude`) and stack-wide handoff via the in-TUI
+`C` key in stack mode (both with working-copy guard), per-file reviewed
+tracking, file picker, severity filters, refresh, JSONL/markdown export,
+configurable agent CLI.
 
-`jjr` makes the sequential walk fast enough that you actually do it.
+Not yet implemented (deferred): inter-cycle diff feature, full `jjr orphans`
+view (the `--orphaned` flag on `jjr clear` covers cleanup), syntax highlighting,
+GitHub integration, multiple-reviewer support.
 
-GitHub PR review and Gerrit are designed for the _other_ side of publication —
-once code is up for someone else to look at. `jjr` is the surface _before_
-publication, when the diff is fresh in your head and your judgment is sharpest.
-By the time it's a PR, you're context-switched away.
-
-## What it isn't
-
-- **Not a PR review tool.** It runs against your local jj working copy, before
-  anything is pushed.
-- **Not an AI reviewer.** Claude doesn't review the code. You review the code.
-  Claude addresses the comments you leave by editing the codebase — that's the
-  only response. No prose, no summary, no decline-with-reasoning. The diff is
-  the reply.
-- **Not a GitHub client.** Doesn't talk to GitHub. Doesn't create PRs. Doesn't
-  post comments anywhere.
-- **Not collaborative.** Comments are local, never committed, never shared.
-- **Not a code editor.** It's a viewer with comment affordances.
-- **Not a gate.** The tool doesn't model "done." There's no approved state, no
-  required-comments-outstanding warning, no quit-time summary. It surfaces
-  what's there; you decide when you're satisfied. Pushing happens outside the
-  tool.
-
-## What it assumes
-
-You're using [jujutsu](https://github.com/jj-vcs/jj). When the agent addresses
-your comments, it edits each change in place — that's how jj works. If you bring
-git instincts (commits are sacred, fixes go in new commits), the loop will
-surprise you. Trust jj's mutability model; that's the substrate the tool is
-built on.
+See the [engineering design document](specs/local-stack-review-edd.md) for the
+full spec and the [TUI design document](specs/jjr-tui-design.md) for screen
+layouts.
 
 ## Install
 
@@ -102,85 +92,67 @@ nix develop                    # or `direnv allow` if you use direnv
 cargo install --path .         # builds and installs `jjr` to ~/.cargo/bin
 ```
 
-You'll need `jj` (jujutsu) on PATH at runtime. The Nix dev shell provides it;
+`jj` (jujutsu) must be on `PATH` at runtime. The Nix dev shell provides it;
 outside the dev shell, install jj separately. The `claude` CLI is optional —
-only needed for `jjr claude` to hand comments off for remediation.
+only needed for `jjr claude` and the `C` keybind.
 
-## Quick start
+## Quickstart
 
 From inside any jj-tracked repository:
 
 ```bash
-$ jjr
-```
-
-That's it. With no arguments, `jjr` resolves the default stack (`trunk()..@`)
-and drops you into the TUI. On a fresh stack with no reviewed-state, you land at
-the oldest change so the natural `n` flow walks the stack bottom-up. On a
-half-reviewed stack, you land at the most-recent change you haven't finished —
-the front of the new work. The `n` / `p` keys walk oldest-to-newest. Use
-`jjr --stack --restart` to clear the saved cursor and start over.
-
-A typical session:
-
-```bash
-# 1. (your agent of choice generates a stack of changes)
-
-# 2. you review the stack
-$ jjr
-  # fresh stack: opens at the oldest change; resumed stack: opens at the most-recent unreviewed change
-  # ↑ ↓ to scan a diff, n / p to move between commits (oldest-to-newest), Tab to cycle files
+$ jjr                          # opens the stack
+  # ↑ ↓ to scan a diff, n / p to move between changes (oldest-to-newest)
+  # Tab cycles files; f opens the file picker
   # Enter on a line to comment; Ctrl-X saves
   # press C to send comments to Claude
 
-# 3. Claude addresses your comments (alternative to pressing C above)
-$ jjr claude @
+$ jjr claude @                 # alternative: send from CLI without entering the TUI
 
-# 4. re-review the modified stack
-$ jjr
+$ jjr                          # re-review the modified stack
   # resumes where you stopped; stale comments surface separately under S
 
-# 5. ship it
-$ jj git push
+$ jj git push                  # ship it
 ```
 
 ## Commands
 
-| Command                                             | What it does                                                                                                                                                          |
-| --------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `jjr`                                               | Walk the stack (`trunk()..@`); fresh stack opens at the oldest change, resumed stack opens at the most-recent unreviewed change, then `n` / `p` move oldest-to-newest |
-| `jjr --stack`                                       | Same as bare `jjr`; explicit form                                                                                                                                     |
-| `jjr --stack --restart`                             | Clear the saved cursor and start at the oldest change                                                                                                                 |
-| `jjr <change-id>`                                   | Review a single specific change                                                                                                                                       |
-| `jjr <revset>`                                      | Review changes returned by an arbitrary jj revset                                                                                                                     |
-| `jjr packet [revset] [--include-stale] [-o <path>]` | Print the review packet that would be sent to Claude (or write to a file)                                                                                             |
-| `jjr claude [revset] [--include-stale]`             | Send comments to Claude CLI for remediation                                                                                                                           |
-| `jjr export [revset] [--format markdown\|jsonl]`    | Export comments as JSONL (default) or markdown                                                                                                                        |
-| `jjr clear <revset> [--stale\|--orphaned] [--yes]`  | Clear comments for a revset                                                                                                                                           |
+| Command                                             | Description                                                                                                                                |
+| --------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| `jjr`                                               | Walk the stack (`trunk()..@`); fresh stack opens at oldest, resumed stack opens at the most-recent unreviewed change; `n` / `p` to advance |
+| `jjr --stack`                                       | Same as bare `jjr`; explicit form                                                                                                          |
+| `jjr --stack --restart`                             | Clear the saved cursor and start at the oldest change                                                                                      |
+| `jjr <change-id>`                                   | Review a single specific change                                                                                                            |
+| `jjr <revset>`                                      | Review changes returned by an arbitrary jj revset                                                                                          |
+| `jjr packet [revset] [--include-stale] [-o <path>]` | Print the rendered Claude prompt to stdout, or write it to a file                                                                          |
+| `jjr claude [revset] [--include-stale]`             | Send comments to the configured agent CLI for remediation                                                                                  |
+| `jjr export [revset] [--format markdown\|jsonl]`    | Export comments as JSONL (default) or markdown                                                                                             |
+| `jjr clear <revset> [--stale\|--orphaned] [--yes]`  | Clear comments for a revset                                                                                                                |
 
-## Key bindings
+## Keybindings
 
 ### Main view
 
-| Key                    | Action                                                        |
-| ---------------------- | ------------------------------------------------------------- |
-| `↑` `↓` / `j` `k`      | Move line cursor                                              |
-| `PgUp` `PgDn`          | Page up / down                                                |
-| `Home` `End` / `g` `G` | Top / bottom of diff                                          |
-| `Tab` / `Shift-Tab`    | Next / previous file                                          |
-| `n` / `p`              | Next / previous change in stack                               |
-| `Enter` / `c`          | New comment on current line                                   |
-| `e`                    | Edit comment (cursor on a comment)                            |
-| `d`                    | Delete comment (cursor on a comment)                          |
-| `1` / `2` / `3`        | Filter to required / suggestion / note (press again to clear) |
-| `f`                    | File picker — jump to a file or the change description        |
-| `r`                    | Refresh — re-run `jj show` and reload comments                |
-| `s`                    | Stack overview                                                |
-| `S`                    | Stale comments view                                           |
-| `U`                    | Toggle reviewed status on the current file                    |
-| `C`                    | Send current change to Claude                                 |
-| `?`                    | Help                                                          |
-| `q`                    | Quit                                                          |
+| Key                    | Action                                                                    |
+| ---------------------- | ------------------------------------------------------------------------- |
+| `↑` `↓` / `j` `k`      | Move line cursor                                                          |
+| `PgUp` `PgDn`          | Page up / down                                                            |
+| `Home` `End` / `g` `G` | Top / bottom of diff                                                      |
+| `Tab` / `Shift-Tab`    | Next / previous file                                                      |
+| `n` / `p`              | Next / previous change in stack                                           |
+| `Enter` / `c`          | New comment on current line                                               |
+| `e`                    | Edit comment (cursor on a comment)                                        |
+| `d`                    | Delete comment (cursor on a comment)                                      |
+| `1` / `2` / `3`        | Filter to required / suggestion / note (press again to clear)             |
+| `f`                    | File picker — jump to a file or the change description                    |
+| `r`                    | Refresh — re-run `jj show` and reload comments                            |
+| `s`                    | Stack overview                                                            |
+| `S`                    | Stale comments view                                                       |
+| `U`                    | Toggle reviewed status on the current file                                |
+| <code>&#124;</code>    | Cycle diff layout: auto / unified / side-by-side                          |
+| `C`                    | Send to Claude (current change in single mode; whole stack in stack mode) |
+| `?`                    | Help                                                                      |
+| `q`                    | Quit                                                                      |
 
 ### Composer (when writing a comment)
 
@@ -224,19 +196,23 @@ flow control.
 
 ## Comments
 
-Comments come in three scopes:
+Comments come in four scopes:
 
 - **line** — anchored to a specific line in a specific file in a specific
-  change. The default. For "this `.unwrap()` will panic" or "rename this
+  change. Renders inline directly below the target line, indented with a `┃`
+  column marker. The default. For "this `.unwrap()` will panic" or "rename this
   variable."
-- **change** — anchored to a whole change. For "this commit does too much, split
-  it" or "the description doesn't match the code."
-- **stack** — anchored to the whole stack you're reviewing. For "rename
-  `retry_wrapper` to `retry_policy` throughout" or "don't introduce new public
-  APIs in this stack."
-
-There's also a fourth scope, **description**, available when the cursor is on a
-change's commit message — for comments on the commit description itself.
+- **change** — anchored to a whole change. Renders in that change's description
+  view (file index 0), appended after the description body with a
+  `─ on this change ─` separator. For "this commit does too much, split it" or
+  "the description doesn't match the code."
+- **description** — anchored to a specific line in a change's commit message.
+  Renders inline below the anchor line in the description view. For "this bullet
+  doesn't reflect what the code actually does."
+- **stack** — anchored to the whole stack you're reviewing. Renders in the stack
+  overview (`s`), at the top above the change rows. For "rename `retry_wrapper`
+  to `retry_policy` throughout" or "don't introduce new public APIs in this
+  stack."
 
 Each comment carries a severity:
 
@@ -248,7 +224,7 @@ Each comment carries a severity:
   The diff (or its absence) is the response.
 - **note** — Informational. Claude doesn't act on it.
 
-There is no decline-with-reasoning channel. Claude responds by editing the code,
+There's no decline-with-reasoning channel. Claude responds by editing the code,
 full stop. If it doesn't change something you flagged, that's the conversation —
 you read the next diff and adjudicate.
 
@@ -264,10 +240,12 @@ shift on every edit.
   changed, anchor not found, or file removed.
 
 Stale comments aren't auto-deleted. You decide whether to clear them, edit them
-to re-anchor, or send them to Claude anyway with `--include-stale`.
+to re-anchor, or send them anyway with `--include-stale`.
 
 Stack-scoped comments are never stale (no anchoring to content); they reappear
-in every cycle until cleared.
+in every cycle until cleared. Description-scoped comments re-anchor against the
+commit message; if the message changes enough they go stale alongside
+line-scoped comments.
 
 ## Configuration
 
@@ -280,7 +258,7 @@ optional; missing fields fall back to defaults.
 transition_screen = "auto"        # "auto" | "always" | "never" (default "never")
 
 [agent]
-tool = "claude"                   # CLI binary used by `jjr claude` and the C-key send-to-claude flow
+tool = "claude"                   # CLI binary used by `jjr claude` and the C keybind
 extra_args = []                   # flags passed to the agent before the `--` separator
 ```
 
@@ -299,7 +277,7 @@ the named binary with `extra_args`, then `--`, then the prompt path.
 `$XDG_CONFIG_HOME/jjr/config.toml` (or `~/.config/jjr/config.toml`). Per-repo
 config files are no longer read.
 
-## Storage
+## Files
 
 Everything is local. `jjr` writes to a `.jj-review/` directory at the repo root,
 ignored by both `git` and `jj`:
@@ -307,34 +285,15 @@ ignored by both `git` and `jj`:
 ```
 .jj-review/
 ├── comments/
-│   ├── <change-id>.jsonl    # one file per change, one JSONL row per comment
+│   ├── <change-id>.jsonl    # line, change, and description comments per change
 │   └── _stack.jsonl         # stack-scoped comments; records carry revset hash
 ├── cursor.json              # last-viewed change per resolved revset, for resume
-└── reviewed.json            # per-change file-reviewed status (the ✓ indicator)
+├── reviewed.json            # per-change file-reviewed status (the ✓ indicator)
+└── config.toml              # optional [ui] / [agent] config
 ```
 
 Comments are never committed and never shared. `.jj-review/` is added to
 `.gitignore` and `.jjignore` on first run.
-
-## Status
-
-MVP complete. All milestones in the [ladder](specs/jjr-mvp.ladder.md) are
-landed: read-only diff view, line / change / stack / description-scoped comments
-with severity, stack walking with cursor resume, line re-anchoring with stale
-view, packet generation, Claude invocation with working-copy guard, and polish
-(export, file picker, refresh, severity filters, reviewed tracking).
-
-Stable: single-change review, stack walking, comment storage, anchoring, packet
-generation, Claude single-change handoff, JSONL/markdown export.
-
-Not yet implemented (deferred): stack-wide Claude handoff, inter-cycle diff
-feature, full `jjr orphans` view, syntax highlighting, GitHub integration,
-multi-reviewer support.
-
-See the [engineering design document](specs/local-stack-review-edd.md) for full
-spec, the [TUI design document](specs/jjr-tui-design.md) for screen layouts, and
-the [milestone ladder](specs/jjr-mvp.ladder.md) for what's landed and what's
-planned.
 
 ## Development
 
@@ -350,8 +309,8 @@ cargo-deny, statix), and the test suite under `cargo-llvm-cov` with a 90%
 line-coverage floor on the functional core. The same command runs in CI on every
 push and pull request.
 
-Other targets: `just format`, `just lint`, `just test`, `just build`. `just`
-with no arguments lists everything.
+Other targets: `just format`, `just lint`, `just test`, `just build`. Bare
+`just` lists everything.
 
 ## License
 
