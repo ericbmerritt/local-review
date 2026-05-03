@@ -1,0 +1,49 @@
+name: Publish to crates.io
+
+# Triggered by pushing a tag like `v0.1.0`. Uses the Nix dev shell so the
+# Rust toolchain matches what the rest of CI builds with.
+#
+# Required secret: CARGO_REGISTRY_TOKEN
+#   Generate at https://crates.io/settings/tokens with `publish-new` +
+#   `publish-update` scope, then add as a repository secret.
+#
+# Manual run: `gh workflow run release-crates.yml --ref v0.1.0`
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-crates-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: cachix/install-nix-action@ab739621df7a23f52766f9ccc97f38da6b7af14f # v31.10.5
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Verify tag matches Cargo.toml version
+        run: |
+          tag="${GITHUB_REF#refs/tags/v}"
+          cargo_version=$(grep -E '^version = ' Cargo.toml | head -1 | sed -E 's/version = "(.+)"/\1/')
+          if [ "$tag" != "$cargo_version" ]; then
+            echo "::error::Tag v${tag} does not match Cargo.toml version ${cargo_version}" >&2
+            exit 1
+          fi
+          echo "Tag v${tag} matches Cargo.toml"
+
+      - name: Publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: nix develop --command cargo publish
