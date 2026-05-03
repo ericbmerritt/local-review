@@ -11,6 +11,7 @@
   };
 
   outputs = {
+    self,
     nixpkgs,
     fenix,
     flake-utils,
@@ -27,7 +28,35 @@
         "rust-src"
         "llvm-tools-preview"
       ];
+
+      rustPlatform = pkgs.makeRustPlatform {
+        cargo = toolchain;
+        rustc = toolchain;
+      };
+
+      cargoToml = builtins.fromTOML (builtins.readFile (self + "/Cargo.toml"));
     in {
+      packages.default = rustPlatform.buildRustPackage {
+        pname = cargoToml.package.name;
+        inherit (cargoToml.package) version;
+
+        src = self;
+        cargoLock.lockFile = self + "/Cargo.lock";
+
+        # Tests use /bin/true and /bin/false as agent-spawn fixtures; the Nix
+        # build sandbox strips /bin to /bin/sh on Linux, so they fail there.
+        # The full suite runs outside the sandbox via `just validate`.
+        doCheck = false;
+
+        meta = with pkgs.lib; {
+          inherit (cargoToml.package) description;
+          homepage = "https://github.com/ericbmerritt/jujutsu-review";
+          license = with licenses; [mit asl20];
+          mainProgram = "jjr";
+          platforms = platforms.unix;
+        };
+      };
+
       devShells.default = pkgs.mkShell {
         name = "jjr";
 
