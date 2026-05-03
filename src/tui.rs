@@ -2508,15 +2508,14 @@ fn invoke_claude_from_tui(app: &mut App) -> Result<()> {
     app.screen = Screen::Main;
 
     match outcome? {
-        crate::claude::ClaudeOutcome::Success { tool } => match jj::show(&change_id) {
-            Ok(details) => apply_post_claude_reload(app, details),
-            Err(e) => {
+        crate::claude::ClaudeOutcome::Success { tool } => {
+            if let Err(e) = reload_after_agent_success(app, &change_id) {
                 app.status_message = Some(format!(
                     "{tool} completed; could not reload diff: {}",
                     sanitize_for_status(&e.to_string())
                 ));
             }
-        },
+        }
         crate::claude::ClaudeOutcome::Failed { tool, exit_code } => {
             let code_str = exit_code.map_or_else(|| "signal".to_owned(), |c| c.to_string());
             app.status_message = Some(format!(
@@ -2527,12 +2526,76 @@ fn invoke_claude_from_tui(app: &mut App) -> Result<()> {
     Ok(())
 }
 
-/// Pure in-memory side of `invoke_claude_from_tui`'s post-Claude success
-/// path. Claude may have rewritten anything in the change, so reset the
-/// cursor to the description before rebuilding so the reviewer doesn't
-/// land mid-file in code that no longer corresponds to where they were.
-/// Extracted so the auto-mark wiring is unit-testable without spawning
-/// claude or `jj show`.
+/// In stack mode, the agent may have split, squashed, abandoned, or reordered
+/// changes — so the in-memory `entries` list itself can be stale, not just the
+/// current change's diff. Re-resolve the revset and pick a sensible new index
+/// before reloading the diff. In single-change mode, just reload the one
+/// change.
+fn reload_after_agent_success(app: &mut App, prev_change_id: &ChangeId) -> Result<()> {
+    if let Some(ctx) = app.stack.as_ref() {
+        let revset = ctx.revset.clone();
+        let prev_index = ctx.current_index;
+        let resolved = jj::resolve_stack(&revset)?;
+        let new_index =
+            new_current_index_after_reload(prev_change_id, prev_index, &resolved.entries);
+        let new_change_id = resolved.entries[new_index].change_id.clone();
+        let details = jj::show(&new_change_id)?;
+        apply_post_claude_stack_reload(app, resolved, new_index, details);
+    } else {
+        let details = jj::show(prev_change_id)?;
+        apply_post_claude_reload(app, details);
+    }
+    Ok(())
+}
+
+/// Pick the new `current_index` after a stack re-resolution. Prefer the
+/// previously-current `change_id` if it still exists; otherwise clamp the old
+/// index into the new range so the cursor lands somewhere reasonable when the
+/// agent abandoned or squashed away the old entry.
+///
+/// Caller must guarantee `new_entries` is non-empty (an empty stack triggers
+/// `RevsetNoMatch` upstream in `resolve_stack`).
+fn new_current_index_after_reload(
+    prev_change_id: &ChangeId,
+    prev_index: usize,
+    new_entries: &[StackEntry],
+) -> usize {
+    if let Some(idx) = new_entries
+        .iter()
+        .position(|e| &e.change_id == prev_change_id)
+    {
+        return idx;
+    }
+    prev_index.min(new_entries.len() - 1)
+}
+
+/// Pure in-memory side of the stack-mode reload. Replaces `app.stack` entries
+/// with the freshly-resolved set, advances `current_index` to the chosen
+/// position, resets the cursor, and rebuilds views from the new details.
+fn apply_post_claude_stack_reload(
+    app: &mut App,
+    resolved: ResolvedStack,
+    new_index: usize,
+    details: ChangeDetails,
+) {
+    if let Some(ctx) = app.stack.as_mut() {
+        ctx.entries = resolved.entries;
+        ctx.revset = resolved.revset;
+        ctx.revset_hash = resolved.revset_hash;
+        ctx.current_index = new_index;
+    }
+    app.file_index = 0;
+    app.line_index = 0;
+    app.scroll = 0;
+    rebuild_views_and_mark(app, details);
+}
+
+/// Pure in-memory side of `invoke_claude_from_tui`'s post-agent success path
+/// in single-change mode. The agent may have rewritten anything in the change,
+/// so reset the cursor to the description before rebuilding so the reviewer
+/// doesn't land mid-file in code that no longer corresponds to where they
+/// were. Extracted so the auto-mark wiring is unit-testable without spawning
+/// the agent or `jj show`.
 fn apply_post_claude_reload(app: &mut App, details: ChangeDetails) {
     app.file_index = 0;
     app.line_index = 0;
@@ -9100,6 +9163,135 @@ mod tests {
             .get(&app.details.change_id)
             .expect("post-reload must mark the description");
         assert!(entry.description_reviewed);
+    }
+
+    fn make_stack_entry(change_label: char) -> StackEntry {
+        StackEntry {
+            change_id: ChangeId::parse(&change_label.to_string().repeat(32)).unwrap(),
+            commit_id: CommitId::parse(&change_label.to_string().repeat(40)).unwrap(),
+            description: format!("change {change_label}"),
+        }
+    }
+
+    /// Happy path: prev `change_id` still in the new stack — index follows
+    /// it, even when the position shifted (e.g. agent inserted a change
+    /// before it).
+    #[test]
+    fn new_current_index_after_reload_returns_position_of_matching_change_id() {
+        let entry_a = make_stack_entry('a');
+        let entry_b = make_stack_entry('b');
+        let entry_c = make_stack_entry('c');
+        let prev_id = entry_b.change_id.clone();
+
+        // Agent inserted a new change at index 0; prev change_id is now at index 2.
+        let new_entries = vec![entry_c, entry_a, entry_b];
+        assert_eq!(new_current_index_after_reload(&prev_id, 1, &new_entries), 2);
+    }
+
+    /// Agent abandoned the prev change and the old index is still in the new
+    /// range — keep the old index so the cursor lands at the same position.
+    #[test]
+    fn new_current_index_after_reload_keeps_old_index_when_change_abandoned_and_in_range() {
+        let entry_a = make_stack_entry('a');
+        let entry_b = make_stack_entry('b');
+        let abandoned_id = make_stack_entry('d').change_id;
+
+        let new_entries = vec![entry_a, entry_b];
+        assert_eq!(
+            new_current_index_after_reload(&abandoned_id, 1, &new_entries),
+            1
+        );
+    }
+
+    /// Agent abandoned the prev change AND the old index is past the new end
+    /// (e.g. agent squashed the last two changes, `prev_index` = 2, len = 1)
+    /// — clamp to the last valid index.
+    #[test]
+    fn new_current_index_after_reload_clamps_when_old_index_past_new_end() {
+        let entry_a = make_stack_entry('a');
+        let abandoned_id = make_stack_entry('d').change_id;
+
+        let new_entries = vec![entry_a];
+        assert_eq!(
+            new_current_index_after_reload(&abandoned_id, 5, &new_entries),
+            0
+        );
+    }
+
+    /// Stack-mode reload replaces entries, advances the index, resets the
+    /// cursor, and rebuilds views from the new details. Pins the full
+    /// post-agent contract for stack mode.
+    #[test]
+    fn apply_post_claude_stack_reload_replaces_entries_and_resets_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, id_a, _id_b) = make_stack_app_with_two_changes(dir.path());
+        app.file_index = 1;
+        app.line_index = 5;
+        app.scroll = 3;
+
+        // Agent inserted a new change before the existing two; same revset.
+        let entry_new = make_stack_entry('c');
+        let entry_a = make_stack_entry('a');
+        let entry_b = make_stack_entry('b');
+        let resolved = ResolvedStack {
+            revset: "trunk()..@".to_owned(),
+            revset_hash: RevsetHash::from_revset("trunk()..@"),
+            entries: vec![entry_new.clone(), entry_a.clone(), entry_b.clone()],
+        };
+        let details = ChangeDetails {
+            change_id: id_a.clone(),
+            commit_id: entry_a.commit_id.clone(),
+            description: "first".to_owned(),
+            diff: Diff {
+                files: vec![sample_diff_file()],
+            },
+        };
+
+        apply_post_claude_stack_reload(&mut app, resolved, 1, details);
+
+        let ctx = app.stack.as_ref().expect("stack context preserved");
+        assert_eq!(
+            ctx.entries.len(),
+            3,
+            "entries replaced with the resolved stack"
+        );
+        assert_eq!(ctx.current_index, 1, "current_index advanced to new slot");
+        assert_eq!(ctx.entries[1].change_id, id_a, "index points at id_a");
+        assert_eq!(app.file_index, 0, "cursor reset to description");
+        assert_eq!(app.line_index, 0);
+        assert_eq!(app.scroll, 0);
+    }
+
+    /// Pin the revset-update side: if the agent caused a fallback (e.g. the
+    /// original revset became unresolvable), `apply_post_claude_stack_reload`
+    /// must replace `revset` and `revset_hash` to match what was resolved, so
+    /// downstream cursor-resume keys hash consistently.
+    #[test]
+    fn apply_post_claude_stack_reload_updates_revset_and_hash_when_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, id_a, _id_b) = make_stack_app_with_two_changes(dir.path());
+
+        let entry_a = make_stack_entry('a');
+        let fallback_revset = "@".to_owned();
+        let resolved = ResolvedStack {
+            revset: fallback_revset.clone(),
+            revset_hash: RevsetHash::from_revset(&fallback_revset),
+            entries: vec![entry_a.clone()],
+        };
+        let details = ChangeDetails {
+            change_id: id_a,
+            commit_id: entry_a.commit_id.clone(),
+            description: "first".to_owned(),
+            diff: Diff {
+                files: vec![sample_diff_file()],
+            },
+        };
+
+        apply_post_claude_stack_reload(&mut app, resolved, 0, details);
+
+        let ctx = app.stack.as_ref().expect("stack context preserved");
+        assert_eq!(ctx.revset, fallback_revset);
+        assert_eq!(ctx.revset_hash, RevsetHash::from_revset(&fallback_revset));
     }
 
     /// Pin the default: a freshly-built `App` does not request a full
