@@ -81,18 +81,30 @@ layouts.
 
 ## Install
 
-`jjr` is built and run from the Nix dev shell. The flake pins the Rust toolchain
-and pulls in `jj`, `just`, `cargo-nextest`, `cargo-llvm-cov`, `cargo-deny`,
-`alejandra`, `statix`, and `prettier`.
+The flake exposes a package, so the one-liner is:
 
 ```bash
-git clone https://github.com/emerritt/jujutsu-review
+nix profile install github:ericbmerritt/jujutsu-review
+```
+
+To run without installing:
+
+```bash
+nix run github:ericbmerritt/jujutsu-review -- --help
+```
+
+To build from a clone (Rust toolchain and review tooling come from the dev
+shell):
+
+```bash
+git clone https://github.com/ericbmerritt/jujutsu-review
 cd jujutsu-review
 nix develop                    # or `direnv allow` if you use direnv
 cargo install --path .         # builds and installs `jjr` to ~/.cargo/bin
 ```
 
-`jj` (jujutsu) must be on `PATH` at runtime. The Nix dev shell provides it;
+`jj` (jujutsu) must be on `PATH` at runtime — `jjr` does not bundle it, so it
+uses whatever `jj` your environment provides. The Nix dev shell installs one;
 outside the dev shell, install jj separately. The `claude` CLI is optional —
 only needed for `jjr claude` and the `C` keybind.
 
