@@ -1,0 +1,43 @@
+name: Bump Homebrew formula
+
+# Triggered by pushing a tag like `v0.1.0`. Opens a PR against the
+# `ericbmerritt/homebrew-jjr` tap that updates the `url` + `sha256` in
+# `Formula/jjr.rb` to point at the new tag's source tarball.
+#
+# Prerequisites (one-time):
+#   1. The tap repo `ericbmerritt/homebrew-jjr` exists with an initial
+#      `Formula/jjr.rb` (build-from-source recipe).
+#   2. Repository secret `HOMEBREW_TAP_TOKEN` holds a Personal Access Token
+#      with `repo` scope on the tap repo (the default `GITHUB_TOKEN` cannot
+#      push to a different repository).
+#
+# Until both are in place this workflow runs but the bump step fails — that's
+# fine, it doesn't block the crates.io publish (separate workflow).
+#
+# Manual run: `gh workflow run release-brew.yml --ref v0.1.0`
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-brew-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Bump tap formula
+        uses: dawidd6/action-homebrew-bump-formula@v4
+        with:
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          tap: ericbmerritt/homebrew-jjr
+          formula: jjr
+          tag: ${{ github.ref_name }}
+          revision: ${{ github.sha }}
