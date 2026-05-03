@@ -305,7 +305,7 @@ ignored by both `git` and `jj`:
 ```
 
 Comments are never committed and never shared. `.jj-review/` is added to
-`.gitignore` and `.jjignore` on first run.
+`.gitignore` on first run (`jj` reads `.gitignore` natively).
 
 ## Development
 

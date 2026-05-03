@@ -40,14 +40,12 @@ pub(crate) fn ensure_review_dir(repo_root: &Path) -> Result<()> {
     std::fs::create_dir_all(comments_dir(repo_root)).map_err(|source| JjrError::Io { source })
 }
 
-/// Idempotently append `/.jj-review` to `.gitignore` and `.jjignore`.
+/// Idempotently append `/.jj-review` to `.gitignore`.
 ///
-/// Each ignore file is created if absent. The entry is not duplicated if it
-/// already exists.
+/// `jj` reads `.gitignore` natively, so a separate `.jjignore` is unnecessary.
+/// The file is created if absent; the entry is not duplicated.
 pub(crate) fn ensure_ignored(repo_root: &Path) -> Result<()> {
-    ensure_entry_in_file(repo_root, ".gitignore", "/.jj-review")?;
-    ensure_entry_in_file(repo_root, ".jjignore", "/.jj-review")?;
-    Ok(())
+    ensure_entry_in_file(repo_root, ".gitignore", "/.jj-review")
 }
 
 fn ensure_entry_in_file(repo_root: &Path, filename: &str, entry: &str) -> Result<()> {
@@ -906,12 +904,11 @@ mod tests {
     }
 
     #[test]
-    fn ensure_ignored_adds_entry_to_jjignore() {
+    fn ensure_ignored_does_not_create_jjignore() {
         let dir = tmp();
         ensure_ignored(dir.path()).unwrap();
 
-        let content = std::fs::read_to_string(dir.path().join(".jjignore")).unwrap();
-        assert!(content.contains("/.jj-review"));
+        assert!(!dir.path().join(".jjignore").exists());
     }
 
     #[test]
@@ -922,10 +919,6 @@ mod tests {
 
         let gitignore = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
         let count = gitignore.lines().filter(|l| *l == "/.jj-review").count();
-        assert_eq!(count, 1);
-
-        let jjignore = std::fs::read_to_string(dir.path().join(".jjignore")).unwrap();
-        let count = jjignore.lines().filter(|l| *l == "/.jj-review").count();
         assert_eq!(count, 1);
     }
 
