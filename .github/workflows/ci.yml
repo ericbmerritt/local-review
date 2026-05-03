@@ -17,7 +17,7 @@ jobs:
     name: just validate
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: cachix/install-nix-action@ab739621df7a23f52766f9ccc97f38da6b7af14f  # v31.10.5
         with:
@@ -42,7 +42,7 @@ jobs:
     name: nix build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: cachix/install-nix-action@ab739621df7a23f52766f9ccc97f38da6b7af14f  # v31.10.5
         with:
