@@ -100,16 +100,20 @@ pub fn parse(input: &str) -> Result<Diff> {
 
         if pf_list.is_empty() {
             // unidiff produces no PatchedFile for sections that have no hunk
-            // content (e.g. a pure rename with similarity 100%). Detect and
-            // emit those manually; everything else is a parse failure we
-            // surface rather than silently drop.
-            if let Some(rename) = detect_pure_rename(&section) {
-                files.push(rename);
+            // content: pure renames with similarity 100%, and empty file
+            // creates/deletes (no `---`/`+++` headers because there is no
+            // textual content to diff). Detect and emit those manually;
+            // everything else is a parse failure we surface rather than
+            // silently drop.
+            if let Some(file) = detect_metadata_only_section(&section) {
+                files.push(file);
                 continue;
             }
             return Err(JjrError::DiffParse {
                 file: section_file_hint(&section),
-                message: "section produced no patched files and is not a pure rename".to_owned(),
+                message: "section produced no patched files and has no recognised metadata-only \
+                          shape (rename, empty add, empty delete)"
+                    .to_owned(),
             });
         }
 
@@ -167,30 +171,61 @@ fn detect_binary(section: &str) -> Option<PathBuf> {
     None
 }
 
-/// Detect a pure rename section (no hunk content, only metadata headers).
+/// Detect a section with no hunk content but a recognisable metadata-only
+/// shape: pure rename, empty file create, or empty file delete.
 ///
-/// Returns a `DiffFile::Renamed` with empty hunks when both `rename from` and
-/// `rename to` headers are present.
-fn detect_pure_rename(section: &str) -> Option<DiffFile> {
-    let mut from: Option<PathBuf> = None;
-    let mut to: Option<PathBuf> = None;
+/// `unidiff` returns no `PatchedFile` for these because there are no
+/// `---`/`+++` headers (no textual content to diff). We synthesise a
+/// `DiffFile` with empty hunks from the header lines instead. Rename takes
+/// priority over add/delete because a pure rename can carry both `similarity
+/// index 100%` and a file mode header.
+fn detect_metadata_only_section(section: &str) -> Option<DiffFile> {
+    let mut rename_from: Option<PathBuf> = None;
+    let mut rename_to: Option<PathBuf> = None;
+    let mut new_file = false;
+    let mut deleted_file = false;
+    let mut diff_target: Option<PathBuf> = None;
 
     for line in section.lines() {
-        if let Some(path) = line.strip_prefix("rename from ") {
-            from = Some(PathBuf::from(path));
+        if let Some(rest) = line.strip_prefix("diff --git ") {
+            if let Some((_, b)) = parse_diff_git_line(rest) {
+                diff_target = Some(PathBuf::from(strip_b_prefix(b)));
+            }
+        } else if let Some(path) = line.strip_prefix("rename from ") {
+            rename_from = Some(PathBuf::from(path));
         } else if let Some(path) = line.strip_prefix("rename to ") {
-            to = Some(PathBuf::from(path));
+            rename_to = Some(PathBuf::from(path));
+        } else if line.starts_with("new file mode ") {
+            new_file = true;
+        } else if line.starts_with("deleted file mode ") {
+            deleted_file = true;
         }
     }
 
-    match (from, to) {
-        (Some(from), Some(to)) => Some(DiffFile::Renamed {
+    if let (Some(from), Some(to)) = (rename_from, rename_to) {
+        return Some(DiffFile::Renamed {
             from,
             to,
             hunks: vec![],
-        }),
-        _ => None,
+        });
     }
+
+    let path = diff_target?;
+
+    if new_file {
+        return Some(DiffFile::Added {
+            path,
+            hunks: vec![],
+        });
+    }
+    if deleted_file {
+        return Some(DiffFile::Removed {
+            path,
+            hunks: vec![],
+        });
+    }
+
+    None
 }
 
 /// Parse the path pair from a `diff --git a/X b/Y` header.
@@ -507,6 +542,38 @@ old mode 100644\n\
 new mode 100755\n";
         let result = parse(input);
         assert!(matches!(result, Err(JjrError::DiffParse { .. })));
+    }
+
+    #[test]
+    fn parses_empty_new_file_as_added_with_no_hunks() {
+        // jj/git emits no `---`/`+++` headers for a brand-new zero-byte file,
+        // so unidiff returns no PatchedFile. We must still surface it as
+        // `Added` so the TUI can list it (with the "No textual changes"
+        // notice) instead of erroring.
+        let input = "diff --git a/empty.rs b/empty.rs\n\
+new file mode 100644\n\
+index 0000000000..e69de29bb2\n";
+        let diff = parse(input).unwrap();
+        assert_eq!(diff.files.len(), 1);
+        let DiffFile::Added { path, hunks } = &diff.files[0] else {
+            panic!("expected Added, got {:?}", diff.files[0]);
+        };
+        assert_eq!(path, &PathBuf::from("empty.rs"));
+        assert!(hunks.is_empty());
+    }
+
+    #[test]
+    fn parses_empty_deleted_file_as_removed_with_no_hunks() {
+        let input = "diff --git a/empty.rs b/empty.rs\n\
+deleted file mode 100644\n\
+index e69de29bb2..0000000000\n";
+        let diff = parse(input).unwrap();
+        assert_eq!(diff.files.len(), 1);
+        let DiffFile::Removed { path, hunks } = &diff.files[0] else {
+            panic!("expected Removed, got {:?}", diff.files[0]);
+        };
+        assert_eq!(path, &PathBuf::from("empty.rs"));
+        assert!(hunks.is_empty());
     }
 
     #[test]
