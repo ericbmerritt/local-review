@@ -33,17 +33,18 @@ jobs:
           extra_nix_config: |
             experimental-features = nix-command flakes
 
-      - name: Verify tag matches Cargo.toml version
+      - name: Verify tag matches jjr Cargo.toml version
         run: |
+          manifest=crates/jjr/Cargo.toml
           tag="${GITHUB_REF#refs/tags/v}"
-          cargo_version=$(grep -E '^version = ' Cargo.toml | head -1 | sed -E 's/version = "(.+)"/\1/')
+          cargo_version=$(grep -E '^version = ' "$manifest" | head -1 | sed -E 's/version = "(.+)"/\1/')
           if [ "$tag" != "$cargo_version" ]; then
-            echo "::error::Tag v${tag} does not match Cargo.toml version ${cargo_version}" >&2
+            echo "::error::Tag v${tag} does not match $manifest version ${cargo_version}" >&2
             exit 1
           fi
-          echo "Tag v${tag} matches Cargo.toml"
+          echo "Tag v${tag} matches $manifest"
 
-      - name: Publish
+      - name: Publish jjr
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: nix develop --command cargo publish
+        run: nix develop --command cargo publish -p jjr

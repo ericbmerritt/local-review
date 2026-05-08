@@ -1,0 +1,14 @@
+[package]
+name = "local-review-core"
+version = "0.0.0"
+description = "Shared core for local-first batched code review (diff parsing, anchoring, comment storage, TUI render)"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]

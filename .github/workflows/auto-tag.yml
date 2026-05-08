@@ -1,9 +1,10 @@
 name: Auto-tag from Cargo.toml version
 
-# Triggered when `Cargo.toml` changes on `main`. Reads the package version,
-# checks whether `v$version` already exists as a tag, and if not, creates and
-# pushes the tag. The tag push then triggers `release-crates.yml` and
-# `release-brew.yml`.
+# Triggered when `crates/jjr/Cargo.toml` changes on `main`. Reads the jjr
+# package version, checks whether `v$version` already exists as a tag, and
+# if not, creates and pushes the tag. The tag push then triggers
+# `release-crates.yml` and `release-brew.yml`. Tags are jjr-specific —
+# ggr is not yet published.
 #
 # Required secret: RELEASE_TAG_TOKEN
 #   A fine-grained PAT scoped to this repo only, with `Repository permissions
@@ -18,7 +19,7 @@ on:
   push:
     branches: [main]
     paths:
-      - "Cargo.toml"
+      - "crates/jjr/Cargo.toml"
   workflow_dispatch:
 
 permissions:
@@ -37,16 +38,17 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.RELEASE_TAG_TOKEN }}
 
-      - name: Read Cargo.toml version
+      - name: Read jjr Cargo.toml version
         id: version
         run: |
-          version=$(grep -E '^version = ' Cargo.toml | head -1 | sed -E 's/version = "(.+)"/\1/')
+          manifest=crates/jjr/Cargo.toml
+          version=$(grep -E '^version = ' "$manifest" | head -1 | sed -E 's/version = "(.+)"/\1/')
           if [ -z "$version" ]; then
-            echo "::error::Could not parse version from Cargo.toml" >&2
+            echo "::error::Could not parse version from $manifest" >&2
             exit 1
           fi
           echo "value=$version" >> "$GITHUB_OUTPUT"
-          echo "Cargo.toml version: $version"
+          echo "$manifest version: $version"
 
       - name: Check if tag already exists
         id: check
