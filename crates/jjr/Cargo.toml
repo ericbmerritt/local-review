@@ -24,6 +24,7 @@ include = [
 workspace = true
 
 [dependencies]
+local-review-core.workspace = true
 blake3.workspace = true
 clap.workspace = true
 crossterm.workspace = true
@@ -35,7 +36,6 @@ snafu.workspace = true
 tempfile.workspace = true
 time.workspace = true
 toml.workspace = true
-unidiff.workspace = true
 
 [dev-dependencies]
 assert_cmd.workspace = true

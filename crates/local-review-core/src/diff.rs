@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use unidiff::{PatchSet, PatchedFile};
 
-use crate::error::{JjrError, Result};
+use crate::error::{Error, Result};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Diff {
@@ -91,7 +91,7 @@ pub fn parse(input: &str) -> Result<Diff> {
         }
 
         let mut patch = PatchSet::new();
-        patch.parse(&section).map_err(|e| JjrError::DiffParse {
+        patch.parse(&section).map_err(|e| Error::DiffParse {
             file: section_file_hint(&section),
             message: format!("unidiff: {e}"),
         })?;
@@ -109,7 +109,7 @@ pub fn parse(input: &str) -> Result<Diff> {
                 files.push(file);
                 continue;
             }
-            return Err(JjrError::DiffParse {
+            return Err(Error::DiffParse {
                 file: section_file_hint(&section),
                 message: "section produced no patched files and has no recognised metadata-only \
                           shape (rename, empty add, empty delete)"
@@ -323,19 +323,19 @@ fn convert_hunk(h: &unidiff::Hunk, file: &Path) -> Result<Hunk> {
         Some(h.section_header.clone())
     };
 
-    let source_start = u32::try_from(h.source_start).map_err(|_| JjrError::DiffParse {
+    let source_start = u32::try_from(h.source_start).map_err(|_| Error::DiffParse {
         file: file.to_owned(),
         message: format!("source_start {} exceeds u32::MAX", h.source_start),
     })?;
-    let source_length = u32::try_from(h.source_length).map_err(|_| JjrError::DiffParse {
+    let source_length = u32::try_from(h.source_length).map_err(|_| Error::DiffParse {
         file: file.to_owned(),
         message: format!("source_length {} exceeds u32::MAX", h.source_length),
     })?;
-    let target_start = u32::try_from(h.target_start).map_err(|_| JjrError::DiffParse {
+    let target_start = u32::try_from(h.target_start).map_err(|_| Error::DiffParse {
         file: file.to_owned(),
         message: format!("target_start {} exceeds u32::MAX", h.target_start),
     })?;
-    let target_length = u32::try_from(h.target_length).map_err(|_| JjrError::DiffParse {
+    let target_length = u32::try_from(h.target_length).map_err(|_| Error::DiffParse {
         file: file.to_owned(),
         message: format!("target_length {} exceeds u32::MAX", h.target_length),
     })?;
@@ -396,7 +396,7 @@ fn convert_line(l: &unidiff::Line, file: &Path) -> Result<Line> {
     } else if l.is_context() {
         LineKind::Context
     } else {
-        return Err(JjrError::DiffParse {
+        return Err(Error::DiffParse {
             file: file.to_owned(),
             message: format!("unrecognized line type: {:?}", l.line_type),
         });
@@ -406,7 +406,7 @@ fn convert_line(l: &unidiff::Line, file: &Path) -> Result<Line> {
         .source_line_no
         .map(u32::try_from)
         .transpose()
-        .map_err(|_| JjrError::DiffParse {
+        .map_err(|_| Error::DiffParse {
             file: file.to_owned(),
             message: "source_line_no exceeds u32::MAX".to_owned(),
         })?;
@@ -414,7 +414,7 @@ fn convert_line(l: &unidiff::Line, file: &Path) -> Result<Line> {
         .target_line_no
         .map(u32::try_from)
         .transpose()
-        .map_err(|_| JjrError::DiffParse {
+        .map_err(|_| Error::DiffParse {
             file: file.to_owned(),
             message: "target_line_no exceeds u32::MAX".to_owned(),
         })?;
@@ -541,7 +541,7 @@ rename to new.rs\n";
 old mode 100644\n\
 new mode 100755\n";
         let result = parse(input);
-        assert!(matches!(result, Err(JjrError::DiffParse { .. })));
+        assert!(matches!(result, Err(Error::DiffParse { .. })));
     }
 
     #[test]

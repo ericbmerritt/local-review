@@ -1,10 +1,15 @@
 //! Shared core for local-first batched code review.
 //!
-//! This crate is the eventual home of the diff parser, fuzzy-anchoring
-//! machinery, comment storage, and TUI render layer that are currently
-//! still inside `jjr`. The two consumers — `jjr` (jj stacks) and `ggr`
-//! (GitHub PRs) — will plug a thin source-of-truth shell into the same
-//! pure core.
+//! Owns the pure data layers — diff parsing, fuzzy-anchoring, comment
+//! storage, TUI render — that both `jjr` (jj stacks) and `ggr` (GitHub
+//! PRs) plug a thin source-of-truth shell into. No IO, no clock, no
+//! subprocess.
 //!
-//! Code migration is intentionally deferred so the workspace conversion
-//! lands as a reviewable structural change before any logic moves.
+//! Code migration from `jjr` happens in stages; today this crate owns
+//! diff parsing only.
+
+pub mod diff;
+pub mod error;
+
+pub use diff::{Diff, DiffFile, Hunk, Line, LineKind};
+pub use error::{Error, Result};

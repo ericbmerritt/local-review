@@ -12,3 +12,5 @@ publish = false
 workspace = true
 
 [dependencies]
+snafu.workspace = true
+unidiff.workspace = true

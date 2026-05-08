@@ -117,6 +117,16 @@ pub enum JjrError {
     PromptTooLarge { size: usize, limit: usize },
 }
 
+impl From<local_review_core::Error> for JjrError {
+    fn from(error: local_review_core::Error) -> Self {
+        match error {
+            local_review_core::Error::DiffParse { file, message } => {
+                Self::DiffParse { file, message }
+            }
+        }
+    }
+}
+
 /// Format an `AgentMissing` display string. Appends the Claude install URL
 /// only when the configured tool is the default (`claude`); for any other
 /// tool, jjr has no canonical install pointer to offer.
