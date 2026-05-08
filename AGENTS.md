@@ -1,9 +1,19 @@
 # Agent Instructions
 
-This is a Rust CLI tool wrapping a TUI for self-review of jj stacks before they
-become PRs. No database, no network I/O, no async.
+This is a Cargo workspace housing two local-first batched code-review tools that
+share a common core:
 
-## Mental model
+- `crates/jjr/` — review surface for local jj stacks, pre-PR. Functional and
+  shipping. No database, no network I/O, no async.
+- `crates/ggr/` — review surface for GitHub pull requests, walked
+  commit-by-commit. Scaffold only; not yet implemented. Will introduce network
+  I/O at the gh-CLI shell boundary.
+- `crates/local-review-core/` — shared library. Stub today; logic migrates from
+  `jjr` over follow-up commits.
+
+Default to working in `crates/jjr/` unless the task specifies otherwise.
+
+## Mental model (jjr)
 
 The mental model lives in `specs/local-stack-review-edd.md`. Read the
 **Principles** section first; it constrains every implementation decision.
@@ -21,9 +31,9 @@ Notably:
 ## Code layout
 
 Functional core in the middle, imperative shell at the edges. Pure modules take
-data and return data — no IO, no subprocess, no clock. Each `.rs` file in `src/`
-carries a module-level doc comment summarising its role; read those rather than
-relying on a list here.
+data and return data — no IO, no subprocess, no clock. Each `.rs` file in
+`crates/jjr/src/` carries a module-level doc comment summarising its role; read
+those rather than relying on a list here.
 
 See `specs/jjr-mvp.ladder.md` for current scope and what is still planned.
 
@@ -32,7 +42,9 @@ same-named subdirectory (`tui/`) because the TUI is genuinely multi-file.
 
 ## Quality posture
 
-Strict clippy + rustc lints in `Cargo.toml [lints.*]`. Notable denies:
+Strict clippy + rustc lints in the workspace root
+`Cargo.toml [workspace.lints.*]`, inherited by every crate via
+`lints.workspace = true`. Notable denies:
 
 - `unwrap_used`, `expect_used` — no Result shortcuts. Errors flow through
   `Result<T, JjrError>` everywhere via `snafu`.

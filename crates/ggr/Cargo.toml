@@ -1,0 +1,16 @@
+[package]
+name = "ggr"
+version = "0.0.0"
+description = "Local terminal review surface for GitHub pull requests (scaffold; not functional)"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+local-review-core.workspace = true
