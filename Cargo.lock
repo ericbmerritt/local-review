@@ -754,6 +754,7 @@ dependencies = [
  "clap",
  "crossterm",
  "libc",
+ "local-review-core",
  "predicates",
  "ratatui",
  "serde",
@@ -762,7 +763,6 @@ dependencies = [
  "tempfile",
  "time",
  "toml",
- "unidiff",
 ]
 
 [[package]]
@@ -836,6 +836,10 @@ checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
 [[package]]
 name = "local-review-core"
 version = "0.0.0"
+dependencies = [
+ "snafu",
+ "unidiff",
+]
 
 [[package]]
 name = "lock_api"

@@ -4,7 +4,6 @@ pub mod change_id;
 pub mod claude;
 pub mod comment;
 pub mod cursor;
-pub mod diff;
 pub mod error;
 pub mod export;
 pub mod jj;
@@ -18,6 +17,8 @@ mod test_helpers;
 pub mod tui;
 pub mod util;
 pub mod working_copy_guard;
+
+pub use local_review_core::diff;
 
 pub use change_id::{ChangeId, CommitId};
 pub use comment::{

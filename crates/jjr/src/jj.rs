@@ -169,7 +169,7 @@ fn log_metadata_from_records(
 
 fn show_diff(change_id: &ChangeId) -> Result<Diff> {
     let output = run_jj(&["show", change_id.as_str(), "--git", "--color=never"])?;
-    diff::parse(&output)
+    Ok(diff::parse(&output)?)
 }
 
 /// Default revset used when stack mode runs without an explicit revset.
