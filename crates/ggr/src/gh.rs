@@ -1,10 +1,11 @@
-//! Subprocess wrappers for `gh` and `git`.
+//! Subprocess wrappers for the `gh` CLI.
 //!
-//! `fetch_pr_details` calls `gh pr view --json ...` to get the PR commit list.
-//! `fetch_commit_diff` calls `git show <sha>` to get a per-commit diff and
-//! parses it with `local_review_core::diff::parse`.
+//! `fetch_pr_details` calls `gh pr view --json ...` for PR metadata (including
+//! `headRepository.nameWithOwner` to learn the repo slug without requiring a
+//! local git clone). `fetch_commit_diff` calls `gh api` with an
+//! `Accept: application/vnd.github.diff` header to get per-commit diffs from
+//! the GitHub API — no local `git clone` required.
 
-use std::path::Path;
 use std::process::Command;
 
 use serde::Deserialize;
@@ -13,9 +14,7 @@ use local_review_core::diff::Diff;
 
 use snafu::IntoError as _;
 
-use crate::error::{
-    GgrError, GhFailedSnafu, GhMissingSnafu, GitFailedSnafu, GitMissingSnafu, Result,
-};
+use crate::error::{GgrError, GhFailedSnafu, GhMissingSnafu, Result};
 use crate::pr::{CommitEntry, PrDetails};
 
 // ── gh JSON shapes ────────────────────────────────────────────────────────────
@@ -29,6 +28,14 @@ struct PrJson {
     #[serde(rename = "baseRefName")]
     base_ref_name: String,
     commits: Vec<CommitJson>,
+    #[serde(rename = "headRepository")]
+    head_repository: HeadRepositoryJson,
+}
+
+#[derive(Deserialize)]
+struct HeadRepositoryJson {
+    #[serde(rename = "nameWithOwner")]
+    name_with_owner: String,
 }
 
 #[derive(Deserialize)]
@@ -42,25 +49,32 @@ struct CommitJson {
 
 /// Fetch PR metadata and the ordered commit list from the GitHub API via `gh`.
 ///
-/// Runs `gh pr view <pr> --json number,title,headRefName,baseRefName,commits`.
-/// `gh` auto-detects the repo from the git remote in the current directory.
-pub(crate) fn fetch_pr_details(pr: u64) -> Result<PrDetails> {
+/// Runs `gh pr view <pr> --json ...`. When `repo` is `Some("owner/repo")` the
+/// `--repo` flag is passed, allowing use outside a git working tree. When
+/// `repo` is `None`, `gh` auto-detects the repo from the current directory's
+/// git remote or from `gh repo set-default`.
+///
+/// The response includes `headRepository.nameWithOwner`, which is stored in
+/// `PrDetails.repo_name` and used by `fetch_commit_diff` — so the caller does
+/// not need to track the repo slug separately.
+pub(crate) fn fetch_pr_details(pr: u64, repo: Option<&str>) -> Result<PrDetails> {
     let pr_str = pr.to_string();
+    let mut args = vec!["pr", "view", &pr_str, "--json"];
+    let fields = "number,title,headRefName,baseRefName,commits,headRepository";
+    args.push(fields);
+    if let Some(r) = repo {
+        args.push("--repo");
+        args.push(r);
+    }
+
     let output = Command::new("gh")
-        .args([
-            "pr",
-            "view",
-            &pr_str,
-            "--json",
-            "number,title,headRefName,baseRefName,commits",
-        ])
+        .args(&args)
         .output()
         .map_err(|source| GhMissingSnafu.into_error(source))?;
 
     if !output.status.success() {
         let message = String::from_utf8_lossy(&output.stderr).into_owned();
         let exit_code = output.status.code();
-        // A PR-not-found error from gh typically contains "not found" in the message.
         if message.to_lowercase().contains("not found")
             || message.to_lowercase().contains("no pull requests found")
         {
@@ -93,31 +107,47 @@ pub(crate) fn fetch_pr_details(pr: u64) -> Result<PrDetails> {
         title: parsed.title,
         head_ref: parsed.head_ref_name,
         base_ref: parsed.base_ref_name,
+        repo_name: parsed.head_repository.name_with_owner,
+        hostname: None,
         commits,
     })
 }
 
-/// Fetch the diff for a single commit via `git show`.
+/// Fetch the diff for a single commit via the GitHub API.
 ///
-/// Uses `git show <sha> --format="" --no-color` so the commit message header
-/// is suppressed, leaving only the unified diff output. The leading blank line
-/// produced by `--format=""` is handled by the diff parser (which skips
-/// non-diff lines).
-pub(crate) fn fetch_commit_diff(repo_root: &Path, sha: &str) -> Result<Diff> {
-    let output = Command::new("git")
-        .args(["show", sha, "--format=", "--no-color"])
-        .current_dir(repo_root)
+/// Uses `gh api repos/{repo_name}/commits/{sha}` with
+/// `Accept: application/vnd.github.diff`, which returns a standard unified
+/// diff. No local git clone is required; `repo_name` is `owner/repo`.
+/// Pass `hostname` for GitHub Enterprise Server endpoints.
+pub(crate) fn fetch_commit_diff(
+    repo_name: &str,
+    sha: &str,
+    hostname: Option<&str>,
+) -> Result<Diff> {
+    let endpoint = format!("repos/{repo_name}/commits/{sha}");
+    let mut args = vec![
+        "api",
+        &endpoint,
+        "--header",
+        "Accept: application/vnd.github.diff",
+    ];
+    if let Some(host) = hostname {
+        args.push("--hostname");
+        args.push(host);
+    }
+    let output = Command::new("gh")
+        .args(&args)
         .output()
-        .map_err(|source| GitMissingSnafu.into_error(source))?;
+        .map_err(|source| GhMissingSnafu.into_error(source))?;
 
     if !output.status.success() {
         let message = String::from_utf8_lossy(&output.stderr).into_owned();
         let exit_code = output.status.code();
-        return GitFailedSnafu { message, exit_code }.fail();
+        return GhFailedSnafu { message, exit_code }.fail();
     }
 
-    let raw = String::from_utf8(output.stdout)
-        .map_err(|source| GgrError::GitOutputEncoding { source })?;
+    let raw =
+        String::from_utf8(output.stdout).map_err(|source| GgrError::GhOutputEncoding { source })?;
 
     local_review_core::diff::parse(&raw).map_err(GgrError::from)
 }

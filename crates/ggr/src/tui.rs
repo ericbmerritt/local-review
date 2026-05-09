@@ -1,6 +1,5 @@
 //! Terminal UI for `ggr` Phase 1: read-only PR diff viewer.
 use std::io::{stdout, Stdout};
-use std::path::PathBuf;
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
@@ -45,7 +44,6 @@ enum Screen {
 
 struct App {
     pr: PrDetails,
-    repo_root: PathBuf,
     /// Current commit index within `pr.commits`.
     commit_idx: usize,
     /// Diff for the currently loaded commit.
@@ -67,11 +65,10 @@ struct App {
 }
 
 impl App {
-    fn new(pr: PrDetails, initial_diff: Diff, repo_root: PathBuf) -> Self {
+    fn new(pr: PrDetails, initial_diff: Diff) -> Self {
         let views = build_views(&initial_diff);
         Self {
             pr,
-            repo_root,
             commit_idx: 0,
             diff: initial_diff,
             views,
@@ -94,7 +91,7 @@ impl App {
 
     fn load_commit(&mut self, idx: usize) -> Result<()> {
         let sha = self.pr.commits[idx].sha.clone();
-        let diff = gh::fetch_commit_diff(&self.repo_root, &sha)?;
+        let diff = gh::fetch_commit_diff(&self.pr.repo_name, &sha, self.pr.hostname.as_deref())?;
         self.diff = diff;
         self.views = build_views(&self.diff);
         self.commit_idx = idx;
@@ -212,7 +209,7 @@ fn enter_tui() -> Result<(Terminal<CrosstermBackend<Stdout>>, TuiGuard)> {
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 /// Open the TUI for `pr`.
-pub(crate) fn run(pr: PrDetails, initial_diff: Diff, repo_root: PathBuf) -> Result<()> {
+pub(crate) fn run(pr: PrDetails, initial_diff: Diff) -> Result<()> {
     let size = crossterm::terminal::size().map_err(|source| GgrError::Io { source })?;
     if size.0 < MIN_COLS {
         return Err(GgrError::TerminalTooNarrow { cols: size.0 });
@@ -222,7 +219,7 @@ pub(crate) fn run(pr: PrDetails, initial_diff: Diff, repo_root: PathBuf) -> Resu
     }
 
     let (mut terminal, _guard) = enter_tui()?;
-    let mut app = App::new(pr, initial_diff, repo_root);
+    let mut app = App::new(pr, initial_diff);
 
     loop {
         terminal
