@@ -20,6 +20,12 @@ pub(crate) enum GgrError {
     #[snafu(display("PR #{pr} not found — check the number and that you are in the right repo"))]
     PrNotFound { pr: u64 },
 
+    #[snafu(display(
+        "repository '{repo}' not found on github.com — if this is a GitHub Enterprise repo, \
+         use: ggr --url <host> {repo}#<pr>"
+    ))]
+    RepoNotFound { repo: String },
+
     #[snafu(display("gh output is not valid UTF-8: {source}"))]
     GhOutputEncoding { source: std::string::FromUtf8Error },
 

@@ -3,9 +3,9 @@
 //! | Form                                          | Example                                                          |
 //! |-----------------------------------------------|------------------------------------------------------------------|
 //! | Bare number                                   | `42`                                                             |
-//! | `owner/repo#number`                           | `whitepages-meta/monorepo#2429`                                  |
-//! | `--url <host>` + `owner/repo#number`          | `--url https://github.dev.pages whitepages-meta/monorepo#2429`   |
-//! | Full GitHub pull URL                          | `https://github.dev.pages/whitepages-meta/monorepo/pull/2429`    |
+//! | `owner/repo#number`                           | `acme/myrepo#2429`                                  |
+//! | `--url <host>` + `owner/repo#number`          | `--url https://github.example.com acme/myrepo#2429`   |
+//! | Full GitHub pull URL                          | `https://github.example.com/acme/myrepo/pull/2429`    |
 //!
 //! `ParsedPrRef` carries enough information to build any `gh` invocation.
 
@@ -28,7 +28,7 @@ pub(crate) struct ParsedPrRef {
 /// Accepted forms:
 /// - `"42"` or `"#42"` — bare PR number
 /// - `"owner/repo#42"` — explicit repo + number (any directory)
-/// - `"owner/repo#42"` with `url = Some("https://github.dev.pages")` — GHE host + short form
+/// - `"owner/repo#42"` with `url = Some("https://github.example.com")` — GHE host + short form
 /// - `"https://host/owner/repo/pull/42"` — full pull URL (paste from browser)
 pub(crate) fn parse(input: &str, url_flag: Option<&str>) -> Result<ParsedPrRef> {
     // ── Form 4: full URL ──────────────────────────────────────────────────────
@@ -134,8 +134,8 @@ fn parse_url(url: &str) -> Result<ParsedPrRef> {
     })
 }
 
-/// Extract the bare hostname from a base URL string (e.g. `https://github.dev.pages`
-/// → `github.dev.pages`). The raw PR ref string is included in error messages.
+/// Extract the bare hostname from a base URL string (e.g. `https://github.example.com`
+/// → `github.example.com`). The raw PR ref string is included in error messages.
 fn extract_host(url: &str, pr_raw: &str) -> Result<String> {
     let host = url
         .trim_start_matches("https://")
@@ -169,25 +169,21 @@ mod tests {
 
     #[test]
     fn repo_and_number() {
-        let r = parse("whitepages-meta/monorepo#2429", None).unwrap();
+        let r = parse("acme/myrepo#2429", None).unwrap();
         assert_eq!(r.number, 2429);
-        assert_eq!(r.repo_flag.as_deref(), Some("whitepages-meta/monorepo"));
+        assert_eq!(r.repo_flag.as_deref(), Some("acme/myrepo"));
         assert!(r.hostname.is_none());
     }
 
     #[test]
     fn repo_and_number_with_url_flag() {
-        let r = parse(
-            "whitepages-meta/monorepo#2429",
-            Some("https://github.dev.pages"),
-        )
-        .unwrap();
+        let r = parse("acme/myrepo#2429", Some("https://github.example.com")).unwrap();
         assert_eq!(r.number, 2429);
         assert_eq!(
             r.repo_flag.as_deref(),
-            Some("github.dev.pages/whitepages-meta/monorepo")
+            Some("github.example.com/acme/myrepo")
         );
-        assert_eq!(r.hostname.as_deref(), Some("github.dev.pages"));
+        assert_eq!(r.hostname.as_deref(), Some("github.example.com"));
     }
 
     #[test]
@@ -200,22 +196,18 @@ mod tests {
 
     #[test]
     fn full_ghe_url() {
-        let r = parse(
-            "https://github.dev.pages/whitepages-meta/monorepo/pull/2429",
-            None,
-        )
-        .unwrap();
+        let r = parse("https://github.example.com/acme/myrepo/pull/2429", None).unwrap();
         assert_eq!(r.number, 2429);
         assert_eq!(
             r.repo_flag.as_deref(),
-            Some("github.dev.pages/whitepages-meta/monorepo")
+            Some("github.example.com/acme/myrepo")
         );
-        assert_eq!(r.hostname.as_deref(), Some("github.dev.pages"));
+        assert_eq!(r.hostname.as_deref(), Some("github.example.com"));
     }
 
     #[test]
     fn bare_number_with_url_flag_is_error() {
-        assert!(parse("42", Some("https://github.dev.pages")).is_err());
+        assert!(parse("42", Some("https://github.example.com")).is_err());
     }
 
     #[test]
