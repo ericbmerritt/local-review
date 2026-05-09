@@ -1,8 +1,26 @@
 //! Shared core for local-first batched code review.
 //!
-//! Owns the pure data layers — diff parsing, fuzzy-anchoring, anchor types —
-//! that both `jjr` (jj stacks) and `ggr` (GitHub PRs) build their own
-//! comment models on top of. No IO, no clock, no subprocess.
+//! # Layers
+//!
+//! ## Pure data layer
+//!
+//! The following modules are **pure**: no IO, no clock, no subprocess.
+//! They take data and return data; callers (and tests) can drive them without
+//! any side-effects or runtime setup.
+//!
+//! - [`anchoring`] — fuzzy comment re-anchoring after diffs change
+//! - [`diff`] — unified-diff parser
+//! - [`revset_hash`] — stable hash of a jj revset expression
+//! - [`severity`] — comment severity enum
+//! - [`comment`], [`change_id`], [`error`] — shared data types
+//!
+//! ## Terminal rendering layer
+//!
+//! The [`tui`] module adds terminal-rendering and clock dependencies
+//! (`ratatui`, `crossterm`, `time`).  This is intentional: the shared TUI
+//! infrastructure lives here so that both `jjr` and `ggr` can use it without
+//! duplicating code.  The module is parameterised by the [`tui::ReviewSurface`]
+//! trait so each binary supplies its own surface implementation.
 
 pub mod anchoring;
 pub mod change_id;
@@ -10,6 +28,8 @@ pub mod comment;
 pub mod diff;
 pub mod error;
 pub mod revset_hash;
+pub mod severity;
+pub mod tui;
 
 pub use anchoring::{match_anchor, match_description_anchor, AnchorOutcome};
 pub use change_id::{ChangeId, CommitId};
@@ -20,3 +40,4 @@ pub use comment::{
 pub use diff::{Diff, DiffFile, Hunk, Line, LineKind};
 pub use error::{Error, Result};
 pub use revset_hash::RevsetHash;
+pub use severity::Severity;

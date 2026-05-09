@@ -21,6 +21,7 @@ pub use local_review_core::comment::{
     DescriptionAnchor, LineAnchor, MismatchReason, Side, CONTEXT_MAX, TARGET_TEXT_MAX,
     TRUNCATION_SUFFIX,
 };
+pub use local_review_core::severity::Severity;
 
 pub(crate) const SCHEMA_VERSION_VALUE: &str = "diff-comment/v2";
 pub(crate) const BODY_MAX: usize = 64 * 1024;
@@ -50,44 +51,6 @@ impl<'de> Deserialize<'de> for SchemaVersion {
             Err(serde::de::Error::custom(format!(
                 "schema version mismatch: expected \"{SCHEMA_VERSION_VALUE}\", got \"{s}\""
             )))
-        }
-    }
-}
-
-/// Reviewer-assigned weight: how much attention the comment demands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Severity {
-    Note,
-    Suggestion,
-    Required,
-}
-
-impl Serialize for Severity {
-    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        match self {
-            Self::Note => serializer.serialize_str("note"),
-            Self::Suggestion => serializer.serialize_str("suggestion"),
-            Self::Required => serializer.serialize_str("required"),
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for Severity {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        match s.as_str() {
-            "note" => Ok(Self::Note),
-            "suggestion" => Ok(Self::Suggestion),
-            "required" => Ok(Self::Required),
-            other => Err(serde::de::Error::custom(format!(
-                "unknown severity \"{other}\", expected note/suggestion/required"
-            ))),
         }
     }
 }

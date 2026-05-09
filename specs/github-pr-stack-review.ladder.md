@@ -1,8 +1,8 @@
 ## Phase 1: Shared review TUI; ggr shows existing GitHub state
 
-| Status         | Started    | Completed  |
-| -------------- | ---------- | ---------- |
-| 🟡 in-progress  | 2026-05-09 |            |
+| Status         | Started    | Completed |
+| -------------- | ---------- | --------- |
+| 🟡 in-progress | 2026-05-09 |           |
 
 Move the review TUI from `crates/jjr/src/tui*` into
 `crates/local-review-core/src/tui/`, parameterized by a `ReviewSurface` trait.
@@ -81,9 +81,9 @@ Workspace lints (per `CLAUDE.md`): strict — `unwrap_used`, `expect_used`,
 
 ## Phase 2: Local drafts at three scopes
 
-| Status         | Started    | Completed  |
-| -------------- | ---------- | ---------- |
-| ⬜ not-started  |            |            |
+| Status         | Started | Completed |
+| -------------- | ------- | --------- |
+| ⬜ not-started |         |           |
 
 Build the comment data model in `local-review-core`, parameterized over the
 identifier type (jjr's `ChangeId` vs ggr's `CommitId`) and over the scope shape
@@ -160,9 +160,9 @@ seam that lets ggr have its own storage layout without changing jjr's behavior.
 
 ## Phase 3: Reply composer and batched submit to GitHub
 
-| Status         | Started    | Completed  |
-| -------------- | ---------- | ---------- |
-| ⬜ not-started  |            |            |
+| Status         | Started | Completed |
+| -------------- | ------- | --------- |
+| ⬜ not-started |         |           |
 
 Ship the reply composer and the GitHub submit endpoint in one phase. They're
 combined because reply drafts that can't be submitted have no reviewer-visible
@@ -270,9 +270,9 @@ endpoint is ggr-only code.
 
 ## Phase 4: Re-review across cycles with stale handling
 
-| Status         | Started    | Completed  |
-| -------------- | ---------- | ---------- |
-| ⬜ not-started  |            |            |
+| Status         | Started | Completed |
+| -------------- | ------- | --------- |
+| ⬜ not-started |         |           |
 
 Final phase. Closes the cycle loop per the spec at
 `specs/github-pr-stack-review.md` (_Re-Review Semantics_).

@@ -1,0 +1,441 @@
+//! Shared terminal UI infrastructure for local-first batched code review.
+//!
+//! This module owns all rendering logic that is the same regardless of whether
+//! the reviewer is walking a local jj stack (`jjr`) or a GitHub pull request
+//! (`ggr`). Per-tool behaviour is plugged in through the [`ReviewSurface`]
+//! trait.
+//!
+//! ## Layout rule
+//! The `tui.rs` + `tui/` layout (no `mod.rs`) is required by the workspace's
+//! `mod_module_files = "deny"` / `self_named_module_files = "allow"` policy.
+
+pub mod composer;
+pub mod composer_overlay;
+pub mod diff_view;
+pub mod file_picker;
+pub mod help_screen;
+pub mod textarea;
+
+pub use diff_view::{DiffView, InlineComment, PairedRow, RenderedLine, RenderedLineKind};
+pub use file_picker::{FilePickerEntry, FilePickerState};
+
+use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::style::{Color, Style};
+use ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState};
+use ratatui::Frame;
+
+use crate::severity::Severity;
+
+// ---------------------------------------------------------------------------
+// Scrollbar utilities — shared by file_picker, diff panes, and extra screens.
+// ---------------------------------------------------------------------------
+
+/// Width (cells) of the vertical scrollbar strip on the right edge of a
+/// paginated body. One column is reserved when content overflows the viewport.
+pub const SCROLLBAR_WIDTH: u16 = 1;
+
+/// Compute the overflow parameters needed to build a `ScrollbarState` for a
+/// paginated body of `total_lines` rows with topmost-visible row `scroll` in
+/// a viewport `viewport_rows` rows tall.
+///
+/// Returns `None` when the content fits in the viewport (or the viewport is
+/// zero-height); the caller should skip the scrollbar in that case.
+///
+/// Returns `Some((content_length, position))` where `content_length` is the
+/// number of scrollable positions and `position` is the clamped scroll index.
+pub fn scrollbar_overflow_for_view(
+    total_lines: usize,
+    scroll: u16,
+    viewport_rows: u16,
+) -> Option<(usize, usize)> {
+    if viewport_rows == 0 {
+        return None;
+    }
+    let viewport_usize = usize::from(viewport_rows);
+    if total_lines <= viewport_usize {
+        return None;
+    }
+    let max_scroll = total_lines - viewport_usize;
+    let position = usize::from(scroll).min(max_scroll);
+    let content_length = max_scroll + 1;
+    Some((content_length, position))
+}
+
+/// Build the [`ScrollbarState`] for a paginated body.
+///
+/// Thin shell over [`scrollbar_overflow_for_view`] that lifts the tuple
+/// into ratatui's `ScrollbarState`. Returns `None` when no scrollbar is
+/// needed.
+pub fn scrollbar_state_for_view(
+    total_lines: usize,
+    scroll: u16,
+    viewport_rows: u16,
+) -> Option<ScrollbarState> {
+    let (content_length, position) =
+        scrollbar_overflow_for_view(total_lines, scroll, viewport_rows)?;
+    Some(ScrollbarState::new(content_length).position(position))
+}
+
+/// Split `area` into a body region and an optional [`SCROLLBAR_WIDTH`]-col
+/// scrollbar strip on the right edge.
+///
+/// Returns `(body_area, scrollbar_slot)`. The slot is `None` when no scrollbar
+/// was requested (`with_scrollbar = false`) **or** when the area is too narrow
+/// to host both the body and a scrollbar column. In both cases the body keeps
+/// the full original area.
+pub fn split_body_for_scrollbar(area: Rect, with_scrollbar: bool) -> (Rect, Option<Rect>) {
+    if !with_scrollbar || area.width <= SCROLLBAR_WIDTH {
+        return (area, None);
+    }
+    let split =
+        Layout::horizontal([Constraint::Min(0), Constraint::Length(SCROLLBAR_WIDTH)]).split(area);
+    (split[0], Some(split[1]))
+}
+
+/// Build the right-edge scrollbar widget shared by every paginated view.
+/// Centralises the orientation and per-element style choices so all screens
+/// render the same glyphs and colors.
+pub fn view_scrollbar() -> Scrollbar<'static> {
+    Scrollbar::default()
+        .orientation(ScrollbarOrientation::VerticalRight)
+        .track_style(Style::default().fg(Color::DarkGray))
+        .thumb_style(Style::default().fg(Color::Gray))
+        .begin_style(Style::default().fg(Color::DarkGray))
+        .end_style(Style::default().fg(Color::DarkGray))
+}
+
+/// One-shot layout helper for paginated views that want a scrollbar.
+///
+/// Combines [`scrollbar_state_for_view`] and [`split_body_for_scrollbar`] into
+/// a single call so both pieces of scroll state are computed together.
+///
+/// Returns `(body, sb_area, sb_state)`:
+/// - `body` — area into which the view's content is rendered; shrinks by
+///   [`SCROLLBAR_WIDTH`] when a scrollbar will be drawn.
+/// - `sb_area` and `sb_state` — both `Some` together (overflow + room) or
+///   both `None` (fits or area too narrow).
+pub fn scrollbar_layout_for_view(
+    area: Rect,
+    total_lines: usize,
+    scroll: u16,
+) -> (Rect, Option<Rect>, Option<ScrollbarState>) {
+    let sb_state = scrollbar_state_for_view(total_lines, scroll, area.height);
+    let (body, sb_area) = split_body_for_scrollbar(area, sb_state.is_some());
+    (body, sb_area, sb_state)
+}
+
+/// Render the right-edge scrollbar into `sb_area` if both the area and the
+/// state were produced by [`scrollbar_layout_for_view`]. Either both are
+/// `Some` together or both are `None`; in the latter case this is a no-op.
+pub fn render_view_scrollbar(
+    frame: &mut Frame<'_>,
+    sb_state: Option<&mut ScrollbarState>,
+    sb_area: Option<Rect>,
+) {
+    if let (Some(state), Some(area)) = (sb_state, sb_area) {
+        frame.render_stateful_widget(view_scrollbar(), area, state);
+    }
+}
+
+/// Maps a [`Severity`] variant to the terminal [`Color`] used across all
+/// review surfaces (composer overlay, stale screen, overview, send-to-claude).
+pub fn severity_color(severity: Severity) -> Color {
+    match severity {
+        Severity::Required => Color::Red,
+        Severity::Suggestion => Color::Yellow,
+        Severity::Note => Color::DarkGray,
+    }
+}
+
+#[cfg(test)]
+mod scrollbar_tests {
+    use super::scrollbar_overflow_for_view;
+
+    #[test]
+    fn viewport_rows_zero_returns_none() {
+        assert_eq!(scrollbar_overflow_for_view(100, 0, 0), None);
+    }
+
+    #[test]
+    fn content_fits_exactly_returns_none() {
+        assert_eq!(scrollbar_overflow_for_view(10, 0, 10), None);
+    }
+
+    #[test]
+    fn content_shorter_than_viewport_returns_none() {
+        assert_eq!(scrollbar_overflow_for_view(5, 0, 10), None);
+    }
+
+    #[test]
+    fn one_line_overflow_returns_some() {
+        let result = scrollbar_overflow_for_view(11, 0, 10);
+        assert!(result.is_some(), "one overflow line must produce Some");
+        let (content_length, position) = result.unwrap();
+        assert_eq!(content_length, 2, "max_scroll=1, so content_length=2");
+        assert_eq!(position, 0);
+    }
+
+    #[test]
+    fn scroll_beyond_max_is_clamped() {
+        // total=20, viewport=10 => max_scroll=10; passing scroll=99 should clamp to 10.
+        let (content_length, position) = scrollbar_overflow_for_view(20, 99, 10).unwrap();
+        assert_eq!(position, 10, "scroll must be clamped to max_scroll");
+        assert_eq!(content_length, 11);
+    }
+
+    #[test]
+    fn scrollbar_overflow_for_view_zero_lines_returns_none() {
+        assert_eq!(scrollbar_overflow_for_view(0, 0, 10), None);
+    }
+}
+
+#[cfg(test)]
+pub mod scrollbar_test_helpers {
+    /// Whether `col` of `buf` contains any glyph drawn by ratatui's
+    /// `Scrollbar` widget (the begin/end arrows, the thumb, or the track).
+    pub fn col_contains_scrollbar_glyph(buf: &ratatui::buffer::Buffer, col: u16) -> bool {
+        (0..buf.area.height).any(|row| {
+            matches!(
+                buf[(col, row)].symbol(),
+                "\u{25b2}" | "\u{25bc}" | "\u{2588}" | "\u{2551}"
+            )
+        })
+    }
+
+    /// Find the row of the topmost thumb (`█`) glyph in `col` of `buf`.
+    pub fn scrollbar_thumb_row(buf: &ratatui::buffer::Buffer, col: u16) -> Option<u16> {
+        (0..buf.area.height).find(|&row| buf[(col, row)].symbol() == "\u{2588}")
+    }
+}
+
+/// The behavioural seams that distinguish review tools inside the shared TUI.
+/// Each tool implements this trait once; the core `App<S>` is parameterised
+/// over it. Only add methods here when the behaviour must differ across tools.
+pub trait ReviewSurface: Sized {
+    /// Error type returned by fallible surface operations.
+    type Error: core::error::Error + Send + Sync + 'static;
+
+    // ------------------------------------------------------------------
+    // Stack / entry enumeration
+    // ------------------------------------------------------------------
+
+    /// Total number of entries in this review session (PR commits or jj
+    /// changes). Must be ≥ 1; the core asserts this at construction time.
+    fn entry_count(&self) -> usize;
+
+    /// 0-based index of the currently loaded entry.
+    fn current_entry_index(&self) -> usize;
+
+    /// Short display identifier for entry `idx` — used in the stack bar.
+    /// Returns an empty string for out-of-range indices.
+    fn entry_id_display(&self, idx: usize) -> String;
+
+    /// One-line description (commit message first line, PR commit subject) for
+    /// entry `idx`. Returns an empty string for out-of-range indices.
+    fn entry_description(&self, idx: usize) -> String;
+
+    // ------------------------------------------------------------------
+    // Diff retrieval
+    // ------------------------------------------------------------------
+
+    /// Build the rendered diff views for the entry at the given index.
+    ///
+    /// View 0 is always the synthetic description/cover view. Views 1..N map
+    /// to the per-file diff views in their natural order.
+    ///
+    /// Returning an error causes the caller to surface a status message and
+    /// leave the current views in place rather than replacing them.
+    fn fetch_views(&mut self, idx: usize) -> Result<Vec<DiffView>, Self::Error>;
+
+    // ------------------------------------------------------------------
+    // Existing-state context (inline threads, GitHub review comments)
+    // ------------------------------------------------------------------
+
+    /// Return the inline comments to inject into view `view_idx` of the entry
+    /// currently loaded in the core `App`. The core calls this after loading a
+    /// new entry and after every save/delete operation.
+    ///
+    /// The severity filter, if any, must be applied by the surface so the core
+    /// does not need to know the comment type.
+    fn inline_comments_for_view(
+        &self,
+        view_idx: usize,
+        severity_filter: Option<Severity>,
+    ) -> Vec<InlineComment>;
+
+    // ------------------------------------------------------------------
+    // Comment persistence (composer hooks)
+    // ------------------------------------------------------------------
+
+    /// Invoked when the user presses `^X` in the composer to save a new
+    /// comment. The surface persists the comment and updates its internal
+    /// state. The core will call [`inline_comments_for_view`] on the next
+    /// redraw to re-inject the new comment.
+    ///
+    /// [`inline_comments_for_view`]: ReviewSurface::inline_comments_for_view
+    fn save_comment(&mut self, req: SaveRequest<'_>) -> Result<SaveOutcome, Self::Error>;
+
+    /// Invoked when the user presses `^X` in edit mode. The surface updates
+    /// the existing record.
+    fn update_comment(&mut self, req: UpdateRequest<'_>) -> Result<SaveOutcome, Self::Error>;
+
+    /// Invoked when the user presses `^D` in edit mode. The surface deletes
+    /// the record keyed by `identity`.
+    fn delete_comment(&mut self, req: DeleteRequest) -> Result<(), Self::Error>;
+
+    // ------------------------------------------------------------------
+    // Reviewed-bit tracking
+    // ------------------------------------------------------------------
+
+    /// Return `true` when view `view_idx` of the currently loaded entry has
+    /// been marked reviewed.
+    fn is_view_reviewed(&self, view_idx: usize) -> bool;
+
+    /// Persist the reviewed bit for view `view_idx`. Called automatically
+    /// when the user lands on a new view; also called manually via `U`.
+    ///
+    /// Returns the outcome so the caller can surface a status message when
+    /// the entry was reset due to a commit amendment.
+    fn mark_view_reviewed(&mut self, view_idx: usize) -> MarkReviewedOutcome;
+
+    /// Toggle the reviewed bit for view `view_idx`. Used by the `U` keybind.
+    ///
+    /// Returns the new state so the caller can surface the appropriate toast.
+    fn toggle_view_reviewed(&mut self, view_idx: usize) -> bool;
+
+    // ------------------------------------------------------------------
+    // Severity histogram (used by transition modal and stack overview)
+    // ------------------------------------------------------------------
+
+    /// Count active (non-stale, non-orphaned) comments for the currently
+    /// loaded entry, grouped by severity. Used by the between-change
+    /// transition modal and the stack overview's right-edge dot column.
+    fn severity_histogram(&self) -> SeverityHistogram;
+
+    // ------------------------------------------------------------------
+    // Extra-screen hooks
+    // ------------------------------------------------------------------
+
+    /// Handle a key not consumed by the core event loop from `Screen::Main`.
+    ///
+    /// Returning `ExtraKeyAction::OpenScreen` pushes an opaque extra screen
+    /// managed by the surface. The core does not know the screen's type; it
+    /// just stores `Box<dyn ExtraScreen>` and dispatches to the surface's
+    /// `render_extra_screen` / `handle_extra_screen_key` methods.
+    fn handle_extra_key(
+        &mut self,
+        key: crossterm::event::KeyEvent,
+    ) -> Result<ExtraKeyAction, Self::Error>;
+
+    /// Render the extra screen. Called when `app.screen` is `Screen::Extra`.
+    fn render_extra_screen(&self, frame: &mut Frame<'_>, state: &dyn ExtraScreen);
+
+    /// Handle a key while the extra screen is open. Return `true` to signal
+    /// that the extra screen should be closed and `Screen::Main` restored.
+    fn handle_extra_screen_key(
+        &mut self,
+        state: &mut dyn ExtraScreen,
+        key: crossterm::event::KeyEvent,
+    ) -> Result<bool, Self::Error>;
+}
+
+/// Opaque extra-screen state owned by the core `App` but whose type is only
+/// known to the surface implementation.
+pub trait ExtraScreen: Send + 'static {}
+
+/// Action returned by [`ReviewSurface::handle_extra_key`].
+pub enum ExtraKeyAction {
+    /// Key was not consumed or had no effect.
+    Ignored,
+    /// Open an extra screen with the given state.
+    OpenScreen(Box<dyn ExtraScreen>),
+    /// Surface a status message on the main screen.
+    StatusMessage(String),
+    /// Quit the application.
+    Quit,
+}
+
+/// Request bundle passed to [`ReviewSurface::save_comment`].
+pub struct SaveRequest<'a> {
+    /// Scope of the comment (line, change, stack, description).
+    pub scope: &'a composer::ComposerScope,
+    /// Severity chosen by the reviewer.
+    pub severity: Severity,
+    /// Body text (already trimmed of leading/trailing whitespace by the core).
+    pub body: &'a str,
+    /// Current entry index (0-based) at save time.
+    pub entry_idx: usize,
+}
+
+/// Request bundle passed to [`ReviewSurface::update_comment`].
+pub struct UpdateRequest<'a> {
+    /// Opaque timestamp key identifying the comment record to update.
+    pub identity: time::OffsetDateTime,
+    /// New body text.
+    pub body: &'a str,
+    /// New severity.
+    pub severity: Severity,
+    /// Whether the body exceeded the size cap (so the surface can warn).
+    pub oversized: bool,
+}
+
+/// Request bundle passed to [`ReviewSurface::delete_comment`].
+pub struct DeleteRequest {
+    /// Opaque timestamp key identifying the comment record to delete.
+    pub identity: time::OffsetDateTime,
+    /// The `comment_index` carried by the focused `RenderedLineKind::InlineCommentMeta`
+    /// row, so the surface can look the record up in its loaded list. `None`
+    /// when the composer was opened outside the main-view inline list (e.g.
+    /// the stack overview), where there is no `InlineCommentMeta` row to carry
+    /// the index.
+    pub comment_index: Option<usize>,
+}
+
+impl DeleteRequest {
+    #[must_use]
+    pub fn new(identity: time::OffsetDateTime, comment_index: Option<usize>) -> Self {
+        Self {
+            identity,
+            comment_index,
+        }
+    }
+}
+
+/// Outcome reported after a save or update operation.
+#[derive(Debug)]
+pub enum SaveOutcome {
+    /// Comment was persisted successfully.
+    Saved { status_message: String },
+    /// Save was refused (e.g. empty body). Composer stays open.
+    Refused { reason: String },
+    /// Persistence failed. Composer stays open so the reviewer can retry.
+    Errored { message: String },
+}
+
+/// Result of marking a view reviewed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkReviewedOutcome {
+    /// Normal mark — no prior reviewed entry or the commit matches.
+    NoReset,
+    /// The stored commit id no longer matched (change was amended/rebased).
+    /// The previous reviewed bits were cleared.
+    ResetDueToCommitMismatch,
+}
+
+/// Comment counts by severity for the currently loaded entry.
+///
+/// Stale and orphaned comments are excluded — they live in the stale view, not
+/// the active-comment counts.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SeverityHistogram {
+    pub required: usize,
+    pub suggestion: usize,
+    pub note: usize,
+}
+
+impl SeverityHistogram {
+    #[must_use]
+    pub fn total(self) -> usize {
+        self.required + self.suggestion + self.note
+    }
+}
