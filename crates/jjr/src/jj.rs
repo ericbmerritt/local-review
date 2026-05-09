@@ -46,7 +46,7 @@ pub fn current_change(repo_root: &std::path::Path) -> Result<ChangeId> {
     ])?;
     let non_empty: Vec<&str> = output.lines().filter(|l| !l.trim().is_empty()).collect();
     match non_empty.as_slice() {
-        [single] => ChangeId::parse(single.trim()),
+        [single] => Ok(ChangeId::parse(single.trim())?),
         [] => Err(JjrError::RevsetNoMatch {
             revset: "@".to_owned(),
         }),
@@ -75,7 +75,7 @@ pub fn resolve_revset(revset: &str) -> Result<ChangeId> {
     ])?;
     let non_empty: Vec<&str> = output.lines().filter(|l| !l.trim().is_empty()).collect();
     match non_empty.as_slice() {
-        [single] => ChangeId::parse(single.trim()),
+        [single] => Ok(ChangeId::parse(single.trim())?),
         [] => Err(JjrError::RevsetNoMatch {
             revset: revset.to_owned(),
         }),

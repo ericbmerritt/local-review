@@ -14,3 +14,8 @@ workspace = true
 [dependencies]
 snafu.workspace = true
 unidiff.workspace = true
+blake3.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

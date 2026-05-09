@@ -15,4 +15,10 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub enum Error {
     #[snafu(display("failed to parse diff for {}: {message}", file.display()))]
     DiffParse { file: PathBuf, message: String },
+
+    #[snafu(display("invalid change id: {raw}"))]
+    InvalidChangeId { raw: String },
+
+    #[snafu(display("invalid commit id: {raw}"))]
+    InvalidCommitId { raw: String },
 }
