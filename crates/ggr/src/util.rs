@@ -1,4 +1,51 @@
 //! Shared layout and navigation helpers.
+use std::process::Command;
+
+/// Try to infer the GitHub host from the local git remote.
+///
+/// Runs `git remote get-url origin`, parses SSH (`git@HOST:OWNER/REPO.git`) or
+/// HTTPS (`https://HOST/OWNER/REPO`) format, and returns the host when:
+/// - `expected_slug` is `Some("owner/repo")` and the remote slug matches, or
+/// - `expected_slug` is `None` (bare PR number — use whatever host the remote is on).
+///
+/// Returns `None` if git is absent, the remote can't be parsed, the slug doesn't
+/// match, or the host is `github.com` (no special handling needed there).
+pub(crate) fn detect_remote_host(expected_slug: Option<&str>) -> Option<String> {
+    let out = Command::new("git")
+        .args(["remote", "get-url", "origin"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let url = std::str::from_utf8(&out.stdout).ok()?.trim();
+    let (host, slug) = parse_remote_url(url)?;
+    if let Some(expected) = expected_slug {
+        if !slug.eq_ignore_ascii_case(expected) {
+            return None;
+        }
+    }
+    if host == "github.com" {
+        None
+    } else {
+        Some(host.to_owned())
+    }
+}
+
+/// Parse `(host, owner/repo)` from an SSH or HTTPS git remote URL.
+fn parse_remote_url(url: &str) -> Option<(&str, &str)> {
+    // SSH: git@HOST:OWNER/REPO.git
+    if let Some(rest) = url.strip_prefix("git@") {
+        let (host, path) = rest.split_once(':')?;
+        return Some((host, path.trim_end_matches(".git")));
+    }
+    // HTTPS: https://HOST/OWNER/REPO[.git]
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    let (host, path) = rest.split_once('/')?;
+    Some((host, path.trim_end_matches(".git")))
+}
 
 /// Clamp `value + delta` to `[0, max]`, saturating at each bound.
 pub(crate) fn clamp_with_delta(value: usize, delta: isize, max: usize) -> usize {
@@ -73,5 +120,31 @@ mod tests {
     #[test]
     fn truncate_max_zero_empty() {
         assert_eq!(truncate("hi", 0), "");
+    }
+
+    #[test]
+    fn parse_remote_ssh() {
+        let (host, slug) = parse_remote_url("git@github.example.com:acme/myrepo.git").unwrap();
+        assert_eq!(host, "github.example.com");
+        assert_eq!(slug, "acme/myrepo");
+    }
+
+    #[test]
+    fn parse_remote_https() {
+        let (host, slug) = parse_remote_url("https://github.com/owner/repo.git").unwrap();
+        assert_eq!(host, "github.com");
+        assert_eq!(slug, "owner/repo");
+    }
+
+    #[test]
+    fn parse_remote_https_no_dot_git() {
+        let (host, slug) = parse_remote_url("https://github.example.com/owner/repo").unwrap();
+        assert_eq!(host, "github.example.com");
+        assert_eq!(slug, "owner/repo");
+    }
+
+    #[test]
+    fn parse_remote_invalid_returns_none() {
+        assert!(parse_remote_url("not-a-url").is_none());
     }
 }

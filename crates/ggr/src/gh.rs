@@ -75,9 +75,12 @@ pub(crate) fn fetch_pr_details(pr: u64, repo: Option<&str>) -> Result<PrDetails>
     if !output.status.success() {
         let message = String::from_utf8_lossy(&output.stderr).into_owned();
         let exit_code = output.status.code();
-        if message.to_lowercase().contains("not found")
-            || message.to_lowercase().contains("no pull requests found")
-        {
+        let msg_lower = message.to_lowercase();
+        if msg_lower.contains("could not resolve to a repository") {
+            let repo = repo.unwrap_or("unknown").to_owned();
+            return Err(GgrError::RepoNotFound { repo });
+        }
+        if msg_lower.contains("not found") || msg_lower.contains("no pull requests found") {
             return Err(GgrError::PrNotFound { pr });
         }
         return GhFailedSnafu { message, exit_code }.fail();
