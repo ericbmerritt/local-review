@@ -52,7 +52,7 @@
 
         meta = with pkgs.lib; {
           inherit (cargoToml.package) description;
-          homepage = "https://github.com/ericbmerritt/jujutsu-review";
+          homepage = "https://github.com/ericbmerritt/local-review";
           license = with licenses; [mit asl20];
           mainProgram = "jjr";
           platforms = platforms.unix;

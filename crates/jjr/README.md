@@ -40,8 +40,8 @@ error-prone, and easy to bail on. The friction tax is paid every cycle.
 generates. The reviewer points at content; the tool re-anchors comments across
 the agent's rewrites; the cycle stays cheap enough to run as many times as the
 work needs. None of that is impossible on git, but on git it costs enough that
-you stop running the loop. That's why this is `jujutsu-review`, not
-`git-review`.
+you stop running the loop. That's why `jjr` is a jj-only tool, not a git-review
+tool.
 
 ## Synopsis
 
@@ -84,23 +84,23 @@ layouts.
 The flake exposes a package, so the one-liner is:
 
 ```bash
-nix profile install github:ericbmerritt/jujutsu-review
+nix profile install github:ericbmerritt/local-review
 ```
 
 To run without installing:
 
 ```bash
-nix run github:ericbmerritt/jujutsu-review -- --help
+nix run github:ericbmerritt/local-review -- --help
 ```
 
 To build from a clone (Rust toolchain and review tooling come from the dev
 shell):
 
 ```bash
-git clone https://github.com/ericbmerritt/jujutsu-review
-cd jujutsu-review
+git clone https://github.com/ericbmerritt/local-review
+cd local-review
 nix develop                    # or `direnv allow` if you use direnv
-cargo install --path .         # builds and installs `jjr` to ~/.cargo/bin
+cargo install --path crates/jjr  # builds and installs `jjr` to ~/.cargo/bin
 ```
 
 `jj` (jujutsu) must be on `PATH` at runtime — `jjr` does not bundle it, so it
