@@ -1,0 +1,70 @@
+name: Auto-tag from ggr Cargo.toml version
+
+# Triggered when `crates/ggr/Cargo.toml` changes on `main`. Reads the ggr
+# package version, checks whether `ggr-v$version` already exists as a tag,
+# and if not, creates and pushes it. The tag push then triggers
+# `release-crates-ggr.yml` and `release-brew-ggr.yml`.
+#
+# Tags are prefixed `ggr-v` so jjr and ggr release independently.
+#
+# Required secret: RELEASE_TAG_TOKEN
+#   Same PAT used by auto-tag.yml — fine-grained, Contents: Read and write.
+#
+# Manual run: `gh workflow run auto-tag-ggr.yml --ref main`
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/ggr/Cargo.toml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: auto-tag-ggr
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_TAG_TOKEN }}
+
+      - name: Read ggr Cargo.toml version
+        id: version
+        run: |
+          manifest=crates/ggr/Cargo.toml
+          version=$(grep -E '^version = ' "$manifest" | head -1 | sed -E 's/version = "(.+)"/\1/')
+          if [ -z "$version" ]; then
+            echo "::error::Could not parse version from $manifest" >&2
+            exit 1
+          fi
+          echo "value=$version" >> "$GITHUB_OUTPUT"
+          echo "$manifest version: $version"
+
+      - name: Check if tag already exists
+        id: check
+        run: |
+          tag="ggr-v${{ steps.version.outputs.value }}"
+          if git rev-parse --verify --quiet "refs/tags/$tag" >/dev/null; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Tag $tag already exists; nothing to do."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "Tag $tag does not exist; will create."
+          fi
+
+      - name: Create and push tag
+        if: steps.check.outputs.exists == 'false'
+        run: |
+          tag="ggr-v${{ steps.version.outputs.value }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "$tag" -m "Release $tag"
+          git push origin "$tag"
+          echo "Pushed $tag"
