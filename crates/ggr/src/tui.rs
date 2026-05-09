@@ -729,8 +729,12 @@ fn render_rendered_line(line: &RenderedLine, focused: bool, width: u16) -> TuiLi
 fn render_description(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let scroll = u16::try_from(app.scroll_offset).unwrap_or(u16::MAX);
     let total = app.description_lines.len();
-    let (body_area, sb_area, mut sb_state) = scrollbar_layout(area, total, scroll);
 
+    let block = Block::default().borders(Borders::ALL).title("Description");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let (body_area, sb_area, mut sb_state) = scrollbar_layout(inner, total, scroll);
     let lines: Vec<TuiLine<'_>> = app.description_lines.iter().map(render_desc_line).collect();
     frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), body_area);
     render_scrollbar(frame, sb_state.as_mut(), sb_area);
