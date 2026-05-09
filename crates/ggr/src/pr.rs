@@ -19,8 +19,6 @@ pub(crate) struct CommitEntry {
 pub(crate) struct PrDetails {
     pub(crate) number: u64,
     pub(crate) title: String,
-    pub(crate) head_ref: String,
-    pub(crate) base_ref: String,
     /// `owner/repo` slug from `headRepository.nameWithOwner`, used for diff API calls.
     pub(crate) repo_name: String,
     /// GHE hostname for `gh api --hostname`. `None` → github.com.
