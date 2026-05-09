@@ -9,8 +9,8 @@ resolver = "2"
 [workspace.package]
 edition = "2021"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/ericbmerritt/jujutsu-review"
-homepage = "https://github.com/ericbmerritt/jujutsu-review"
+repository = "https://github.com/ericbmerritt/local-review"
+homepage = "https://github.com/ericbmerritt/local-review"
 authors = ["Eric Merritt <eric@merritt.tech>"]
 
 [workspace.lints.clippy]
