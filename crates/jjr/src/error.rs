@@ -123,6 +123,8 @@ impl From<local_review_core::Error> for JjrError {
             local_review_core::Error::DiffParse { file, message } => {
                 Self::DiffParse { file, message }
             }
+            local_review_core::Error::InvalidChangeId { raw } => Self::InvalidChangeId { raw },
+            local_review_core::Error::InvalidCommitId { raw } => Self::InvalidCommitId { raw },
         }
     }
 }

@@ -1,15 +1,22 @@
 //! Shared core for local-first batched code review.
 //!
-//! Owns the pure data layers — diff parsing, fuzzy-anchoring, comment
-//! storage, TUI render — that both `jjr` (jj stacks) and `ggr` (GitHub
-//! PRs) plug a thin source-of-truth shell into. No IO, no clock, no
-//! subprocess.
-//!
-//! Code migration from `jjr` happens in stages; today this crate owns
-//! diff parsing only.
+//! Owns the pure data layers — diff parsing, fuzzy-anchoring, anchor types —
+//! that both `jjr` (jj stacks) and `ggr` (GitHub PRs) build their own
+//! comment models on top of. No IO, no clock, no subprocess.
 
+pub mod anchoring;
+pub mod change_id;
+pub mod comment;
 pub mod diff;
 pub mod error;
+pub mod revset_hash;
 
+pub use anchoring::{AnchorOutcome, match_anchor, match_description_anchor};
+pub use change_id::{ChangeId, CommitId};
+pub use comment::{
+    DescriptionAnchor, LineAnchor, MismatchReason, Side, CONTEXT_MAX, TARGET_TEXT_MAX,
+    TRUNCATION_SUFFIX,
+};
 pub use diff::{Diff, DiffFile, Hunk, Line, LineKind};
 pub use error::{Error, Result};
+pub use revset_hash::RevsetHash;
