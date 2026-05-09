@@ -15,7 +15,7 @@ use local_review_core::diff::Diff;
 use snafu::IntoError as _;
 
 use crate::error::{GgrError, GhFailedSnafu, GhMissingSnafu, Result};
-use crate::pr::{CommitEntry, PrDetails};
+use crate::pr::{CommitEntry, PrComment, PrDetails};
 
 // ── gh JSON shapes ────────────────────────────────────────────────────────────
 
@@ -23,6 +23,8 @@ use crate::pr::{CommitEntry, PrDetails};
 struct PrJson {
     number: u64,
     title: String,
+    body: String,
+    comments: Vec<CommentJson>,
     commits: Vec<CommitJson>,
     #[serde(rename = "headRepository")]
     head_repository: HeadRepositoryJson,
@@ -41,6 +43,17 @@ struct CommitJson {
     message_headline: String,
 }
 
+#[derive(Deserialize)]
+struct CommentJson {
+    author: CommentAuthorJson,
+    body: String,
+}
+
+#[derive(Deserialize)]
+struct CommentAuthorJson {
+    login: String,
+}
+
 // ── public API ────────────────────────────────────────────────────────────────
 
 /// Fetch PR metadata and the ordered commit list from the GitHub API via `gh`.
@@ -56,7 +69,7 @@ struct CommitJson {
 pub(crate) fn fetch_pr_details(pr: u64, repo: Option<&str>) -> Result<PrDetails> {
     let pr_str = pr.to_string();
     let mut args = vec!["pr", "view", &pr_str, "--json"];
-    let fields = "number,title,commits,headRepository";
+    let fields = "number,title,body,comments,commits,headRepository";
     args.push(fields);
     if let Some(r) = repo {
         args.push("--repo");
@@ -101,9 +114,20 @@ pub(crate) fn fetch_pr_details(pr: u64, repo: Option<&str>) -> Result<PrDetails>
         })
         .collect();
 
+    let comments = parsed
+        .comments
+        .into_iter()
+        .map(|c| PrComment {
+            author: c.author.login,
+            body: c.body,
+        })
+        .collect();
+
     Ok(PrDetails {
         number: parsed.number,
         title: parsed.title,
+        body: parsed.body,
+        comments,
         repo_name: parsed.head_repository.name_with_owner,
         hostname: None,
         commits,
