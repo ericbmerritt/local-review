@@ -1,0 +1,44 @@
+name: Bump Homebrew formula for ggr
+
+# Triggered by pushing a tag like `ggr-v0.1.0`. Opens a PR against the
+# `ericbmerritt/homebrew-jjr` tap that updates `Formula/ggr.rb`.
+#
+# Prerequisites (one-time):
+#   1. Add `Formula/ggr.rb` to the `ericbmerritt/homebrew-jjr` tap repo
+#      (build-from-source recipe targeting this repo + the ggr-v* tag format).
+#   2. Repository secret `HOMEBREW_TAP_TOKEN` holds a PAT with `repo` scope
+#      on the tap repo (same token used by release-brew.yml).
+#
+# Manual run: `gh workflow run release-brew-ggr.yml --ref ggr-v0.1.0`
+
+on:
+  push:
+    tags:
+      - "ggr-v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-brew-ggr-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Extract version from tag
+        id: version
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          echo "value=${tag#ggr-v}" >> "$GITHUB_OUTPUT"
+
+      - name: Bump tap formula
+        uses: dawidd6/action-homebrew-bump-formula@v4
+        with:
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          tap: ericbmerritt/homebrew-jjr
+          formula: ggr
+          tag: ${{ github.ref_name }}
+          revision: ${{ github.sha }}

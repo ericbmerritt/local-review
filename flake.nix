@@ -34,29 +34,48 @@
         rustc = toolchain;
       };
 
-      cargoToml = builtins.fromTOML (builtins.readFile (self + "/crates/jjr/Cargo.toml"));
-    in {
-      packages.default = rustPlatform.buildRustPackage {
-        pname = cargoToml.package.name;
-        inherit (cargoToml.package) version;
+      jjrToml = builtins.fromTOML (builtins.readFile (self + "/crates/jjr/Cargo.toml"));
+      ggrToml = builtins.fromTOML (builtins.readFile (self + "/crates/ggr/Cargo.toml"));
 
-        src = self;
-        cargoLock.lockFile = self + "/Cargo.lock";
+      mkTool = {
+        toml,
+        mainProgram,
+      }:
+        rustPlatform.buildRustPackage {
+          pname = toml.package.name;
+          inherit (toml.package) version;
 
-        cargoBuildFlags = ["--package" "jjr"];
+          src = self;
+          cargoLock.lockFile = self + "/Cargo.lock";
 
-        # Tests use /bin/true and /bin/false as agent-spawn fixtures; the Nix
-        # build sandbox strips /bin to /bin/sh on Linux, so they fail there.
-        # The full suite runs outside the sandbox via `just validate`.
-        doCheck = false;
+          cargoBuildFlags = ["--package" toml.package.name];
 
-        meta = with pkgs.lib; {
-          inherit (cargoToml.package) description;
-          homepage = "https://github.com/ericbmerritt/local-review";
-          license = with licenses; [mit asl20];
-          mainProgram = "jjr";
-          platforms = platforms.unix;
+          # Tests use /bin/true and /bin/false as agent-spawn fixtures; the Nix
+          # build sandbox strips /bin to /bin/sh on Linux, so they fail there.
+          # The full suite runs outside the sandbox via `just validate`.
+          doCheck = false;
+
+          meta = with pkgs.lib; {
+            inherit (toml.package) description;
+            homepage = "https://github.com/ericbmerritt/local-review";
+            license = with licenses; [mit asl20];
+            inherit mainProgram;
+            platforms = platforms.unix;
+          };
         };
+      jjrPkg = mkTool {
+        toml = jjrToml;
+        mainProgram = "jjr";
+      };
+      ggrPkg = mkTool {
+        toml = ggrToml;
+        mainProgram = "ggr";
+      };
+    in {
+      packages = {
+        jjr = jjrPkg;
+        ggr = ggrPkg;
+        default = jjrPkg;
       };
 
       devShells.default = pkgs.mkShell {
