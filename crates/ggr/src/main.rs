@@ -71,8 +71,5 @@ fn run() -> error::Result<()> {
         return Err(GgrError::PrNotFound { pr: parsed.number });
     }
 
-    let initial_diff =
-        gh::fetch_commit_diff(&pr.repo_name, &pr.commits[0].sha, pr.hostname.as_deref())?;
-
-    tui::run(pr, initial_diff)
+    tui::run(pr)
 }

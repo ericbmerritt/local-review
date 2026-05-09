@@ -14,11 +14,22 @@ pub(crate) struct CommitEntry {
     pub(crate) title: String,
 }
 
+/// A general (non-inline) PR comment.
+#[derive(Debug, Clone)]
+pub(crate) struct PrComment {
+    pub(crate) author: String,
+    pub(crate) body: String,
+}
+
 /// A resolved pull request with its ordered commit list (oldest-first).
 #[derive(Debug, Clone)]
 pub(crate) struct PrDetails {
     pub(crate) number: u64,
     pub(crate) title: String,
+    /// PR description body (may be empty).
+    pub(crate) body: String,
+    /// General (non-inline) PR comments, oldest-first.
+    pub(crate) comments: Vec<PrComment>,
     /// `owner/repo` slug from `headRepository.nameWithOwner`, used for diff API calls.
     pub(crate) repo_name: String,
     /// GHE hostname for `gh api --hostname`. `None` → github.com.

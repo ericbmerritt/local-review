@@ -47,6 +47,20 @@ const MIN_USEFUL_SIDE_CELL_WIDTH: u16 = 4;
 const MIN_USEFUL_SIDE_BY_SIDE_WIDTH: u16 =
     SIDE_BY_SIDE_GUTTER_WIDTH + 2 * MIN_USEFUL_SIDE_CELL_WIDTH;
 
+// ── description view types ────────────────────────────────────────────────────
+
+struct DescLine {
+    kind: DescLineKind,
+    text: String,
+}
+
+#[derive(Clone, Copy)]
+enum DescLineKind {
+    Body,
+    Separator,
+    Author,
+}
+
 // ── diff mode ─────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,6 +105,9 @@ enum Screen {
 
 struct App {
     pr: PrDetails,
+    /// `true` while the description page is the active view.
+    showing_description: bool,
+    description_lines: Vec<DescLine>,
     commit_idx: usize,
     diff: Diff,
     views: Vec<DiffView>,
@@ -107,13 +124,15 @@ struct App {
 }
 
 impl App {
-    fn new(pr: PrDetails, initial_diff: Diff) -> Self {
-        let views = build_views(&initial_diff);
+    fn new(pr: PrDetails) -> Self {
+        let description_lines = build_description_lines(&pr);
         Self {
+            showing_description: true,
+            description_lines,
             pr,
             commit_idx: 0,
-            diff: initial_diff,
-            views,
+            diff: Diff { files: vec![] },
+            views: vec![],
             file_idx: 0,
             cursor: 0,
             scroll_offset: 0,
@@ -130,6 +149,9 @@ impl App {
     }
 
     fn active_line_count(&self) -> usize {
+        if self.showing_description {
+            return self.description_lines.len();
+        }
         let Some(view) = self.active_view() else {
             return 0;
         };
@@ -144,6 +166,9 @@ impl App {
     }
 
     fn cycle_diff_mode(&mut self) {
+        if self.showing_description {
+            return;
+        }
         self.diff_mode = match self.diff_mode {
             DiffMode::Auto => DiffMode::ForceUnified,
             DiffMode::ForceUnified => DiffMode::ForceSideBySide,
@@ -174,7 +199,10 @@ impl App {
     }
 
     fn go_next_commit(&mut self) -> Result<()> {
-        if self.commit_idx + 1 < self.pr.commits.len() {
+        if self.showing_description {
+            self.load_commit(0)?;
+            self.showing_description = false;
+        } else if self.commit_idx + 1 < self.pr.commits.len() {
             self.load_commit(self.commit_idx + 1)?;
         } else {
             self.status = Some("already at the last commit".to_owned());
@@ -183,16 +211,20 @@ impl App {
     }
 
     fn go_prev_commit(&mut self) -> Result<()> {
-        if self.commit_idx > 0 {
-            self.load_commit(self.commit_idx - 1)?;
+        if self.showing_description {
+            self.status = Some("already at the PR description".to_owned());
+        } else if self.commit_idx == 0 {
+            self.showing_description = true;
+            self.cursor = 0;
+            self.scroll_offset = 0;
         } else {
-            self.status = Some("already at the first commit".to_owned());
+            self.load_commit(self.commit_idx - 1)?;
         }
         Ok(())
     }
 
     fn go_next_file(&mut self) {
-        if self.views.is_empty() {
+        if self.showing_description || self.views.is_empty() {
             return;
         }
         let max = self.views.len() - 1;
@@ -206,6 +238,9 @@ impl App {
     }
 
     fn go_prev_file(&mut self) {
+        if self.showing_description {
+            return;
+        }
         if self.file_idx == 0 {
             self.status = Some("already at the first file".to_owned());
         } else {
@@ -280,7 +315,7 @@ fn enter_tui() -> Result<(Terminal<CrosstermBackend<Stdout>>, TuiGuard)> {
 
 // ── entry point ───────────────────────────────────────────────────────────────
 
-pub(crate) fn run(pr: PrDetails, initial_diff: Diff) -> Result<()> {
+pub(crate) fn run(pr: PrDetails) -> Result<()> {
     let size = crossterm::terminal::size().map_err(|source| GgrError::Io { source })?;
     if size.0 < MIN_COLS {
         return Err(GgrError::TerminalTooNarrow { cols: size.0 });
@@ -290,7 +325,7 @@ pub(crate) fn run(pr: PrDetails, initial_diff: Diff) -> Result<()> {
     }
 
     let (mut terminal, _guard) = enter_tui()?;
-    let mut app = App::new(pr, initial_diff);
+    let mut app = App::new(pr);
 
     loop {
         terminal
@@ -393,10 +428,14 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
     render_stack_bar(frame, app, layout[0]);
     render_file_header(frame, app, layout[1]);
 
-    let diff_area = layout[2];
-    app.viewport_rows = diff_area.height;
+    let body_area = layout[2];
+    app.viewport_rows = body_area.height;
     app.adjust_scroll();
-    render_diff(frame, app, diff_area);
+    if app.showing_description {
+        render_description(frame, app, body_area);
+    } else {
+        render_diff(frame, app, body_area);
+    }
 
     render_footer(frame, app, layout[3]);
 }
@@ -404,6 +443,24 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
 // ── stack bar ─────────────────────────────────────────────────────────────────
 
 fn render_stack_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let max_title_chars = usize::from(area.width).saturating_sub(10);
+    let pr_block_title = format!(
+        "PR #{} — {}",
+        app.pr.number,
+        truncate(&app.pr.title, max_title_chars)
+    );
+    let block = Block::default().borders(Borders::ALL).title(pr_block_title);
+
+    if app.showing_description {
+        let total = app.pr.commits.len();
+        let label = format!(
+            "description  ({total} commit{})",
+            if total == 1 { "" } else { "s" }
+        );
+        frame.render_widget(Paragraph::new(label).block(block), area);
+        return;
+    }
+
     let total = app.pr.commits.len();
     let current = app.commit_idx + 1;
     let short_sha = &app.pr.commits[app.commit_idx].short_sha;
@@ -424,13 +481,6 @@ fn render_stack_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
         truncate(commit_title, title_budget)
     );
 
-    let max_title_chars = usize::from(area.width).saturating_sub(10);
-    let pr_block_title = format!(
-        "PR #{} — {}",
-        app.pr.number,
-        truncate(&app.pr.title, max_title_chars)
-    );
-    let block = Block::default().borders(Borders::ALL).title(pr_block_title);
     frame.render_widget(Paragraph::new(label).block(block), area);
 }
 
@@ -457,6 +507,18 @@ fn progress_bar_string(position: usize, total: usize, width: u16) -> String {
 // ── file header ───────────────────────────────────────────────────────────────
 
 fn render_file_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    if app.showing_description {
+        let n = app.pr.comments.len();
+        let label = if n == 0 {
+            "no comments".to_owned()
+        } else {
+            format!("{n} comment{}", if n == 1 { "" } else { "s" })
+        };
+        let block = Block::default().borders(Borders::ALL).title("Description");
+        frame.render_widget(Paragraph::new(label).block(block), area);
+        return;
+    }
+
     let total = app.views.len();
     let position = app.file_idx.saturating_add(1);
     let path_label = app
@@ -656,6 +718,80 @@ fn render_rendered_line(line: &RenderedLine, focused: bool, width: u16) -> TuiLi
             Span::styled(line.text.as_str(), focus_style(attrs.fg_color, false)),
         ])
     }
+}
+
+// ── description body ──────────────────────────────────────────────────────────
+
+fn render_description(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
+    let scroll = u16::try_from(app.scroll_offset).unwrap_or(u16::MAX);
+    let total = app.description_lines.len();
+    let (body_area, sb_area, mut sb_state) = scrollbar_layout(area, total, scroll);
+
+    let lines: Vec<TuiLine<'_>> = app.description_lines.iter().map(render_desc_line).collect();
+    frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), body_area);
+    render_scrollbar(frame, sb_state.as_mut(), sb_area);
+}
+
+fn render_desc_line(dl: &DescLine) -> TuiLine<'_> {
+    match dl.kind {
+        DescLineKind::Separator => TuiLine::from(Span::styled(
+            dl.text.as_str(),
+            Style::default().fg(Color::DarkGray),
+        )),
+        DescLineKind::Author => TuiLine::from(Span::styled(
+            dl.text.as_str(),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        DescLineKind::Body => TuiLine::raw(dl.text.as_str()),
+    }
+}
+
+fn build_description_lines(pr: &PrDetails) -> Vec<DescLine> {
+    let mut lines = Vec::new();
+
+    if pr.body.is_empty() {
+        lines.push(DescLine {
+            kind: DescLineKind::Body,
+            text: "(no description)".to_owned(),
+        });
+    } else {
+        for line in pr.body.lines() {
+            lines.push(DescLine {
+                kind: DescLineKind::Body,
+                text: line.to_owned(),
+            });
+        }
+    }
+
+    if !pr.comments.is_empty() {
+        let n = pr.comments.len();
+        lines.push(DescLine {
+            kind: DescLineKind::Body,
+            text: String::new(),
+        });
+        lines.push(DescLine {
+            kind: DescLineKind::Separator,
+            text: format!("── {} comment{} ──", n, if n == 1 { "" } else { "s" }),
+        });
+        for comment in &pr.comments {
+            lines.push(DescLine {
+                kind: DescLineKind::Body,
+                text: String::new(),
+            });
+            lines.push(DescLine {
+                kind: DescLineKind::Author,
+                text: format!("@{}:", comment.author),
+            });
+            for line in comment.body.lines() {
+                lines.push(DescLine {
+                    kind: DescLineKind::Body,
+                    text: line.to_owned(),
+                });
+            }
+        }
+    }
+
+    lines
 }
 
 // ── scrollbar helpers ─────────────────────────────────────────────────────────
