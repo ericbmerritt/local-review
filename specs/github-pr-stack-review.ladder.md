@@ -1,8 +1,8 @@
 ## Phase 1: Shared review TUI; ggr shows existing GitHub state
 
-| Status         | Started | Completed |
-| -------------- | ------- | --------- |
-| ⬜ not-started |         |           |
+| Status         | Started    | Completed  |
+| -------------- | ---------- | ---------- |
+| 🟡 in-progress  | 2026-05-09 |            |
 
 Move the review TUI from `crates/jjr/src/tui*` into
 `crates/local-review-core/src/tui/`, parameterized by a `ReviewSurface` trait.
@@ -55,37 +55,24 @@ Workspace lints (per `CLAUDE.md`): strict — `unwrap_used`, `expect_used`,
 #### Delivers
 
 - `local-review-core::tui` module exposing the review TUI parameterized by a
-  `ReviewSurface` trait (stack source, diff fetcher, existing-state renderer,
-  composer-entry hooks)
 - jjr migrated to consume the core TUI; jjr behavior unchanged
 - ggr migrated to consume the core TUI
 - ggr fetches existing GitHub state via `gh api`: PR description, issue-thread
-  comments, inline review threads (with replies), prior reviews
 - Issue-thread comments render as a chronological section beneath the PR
-  description on the description page
 - Inline review threads render as collapsible blocks beneath their anchor lines
-  (author + timestamp + body; replies indented under parent)
 - Outdated threads (GitHub `position: null` or `original_commit_id` not in
-  current commit list) render with a faded color and "outdated" label, kept
-  visible
 - `T` keybinding toggles thread expand/collapse globally
 - Cursor persistence at
-  `~/.local/share/ggr/<host>/<owner>/<repo>/<pr>/cursor.json` shape
-  `{commit_sha, file, line, side}`
 
 #### Done When
 
 - `cargo build -p jjr -p ggr` succeeds
 - `just validate` passes
 - Manual: jjr non-regression — opening jjr on a stack walks the diff, composer
-  works, `jjr packet` generates, `jjr claude @` invokes claude
 - Manual: `ggr <pr-ref>` on a real PR shows description body and issue-thread
-  comments on the description page
 - Manual: walking commits shows existing inline review threads beneath their
-  anchor lines, expanded by default
 - Manual: `T` toggles all threads to collapsed, `T` again toggles back
 - Manual: a thread anchored to a force-pushed-away commit renders with a faded
-  "outdated" label
 - Manual: quit and reopen ggr; resumes at the last viewed commit + file + line
 
 #### Depends On
@@ -94,9 +81,9 @@ Workspace lints (per `CLAUDE.md`): strict — `unwrap_used`, `expect_used`,
 
 ## Phase 2: Local drafts at three scopes
 
-| Status         | Started | Completed |
-| -------------- | ------- | --------- |
-| ⬜ not-started |         |           |
+| Status         | Started    | Completed  |
+| -------------- | ---------- | ---------- |
+| ⬜ not-started  |            |            |
 
 Build the comment data model in `local-review-core`, parameterized over the
 identifier type (jjr's `ChangeId` vs ggr's `CommitId`) and over the scope shape
@@ -148,39 +135,24 @@ seam that lets ggr have its own storage layout without changing jjr's behavior.
 #### Delivers
 
 - Comment data model in `local-review-core` parameterized over identifier
-  (`ChangeId` for jjr, `CommitId` for ggr) and over scope shape (jjr:
-  line/change/stack with description anchor; ggr: line/commit/pr with no
-  description anchor)
 - ggr composer modal entry: `Enter`/`c` for line scope, dedicated key for commit
-  scope, `P` for PR scope
 - Severity selector (note/suggestion/required), defaulting to note
 - Validity rules per spec — line scope requires commit_sha + file + side +
-  matching old_line/new_line + hunk_header + target_text + context_before (≤3) +
-  context_after (≤3); commit scope requires only commit_sha; pr scope has no
-  anchor fields
 - Edit and delete via the same composer (atomic read-modify-write-then-rename of
-  JSONL)
 - Persistence at
-  `~/.local/share/ggr/<host>/<owner>/<repo>/<pr>/drafts/<commit-sha>.jsonl` for
-  line/commit drafts and `_pr.jsonl` for PR drafts
 - `ggr drafts <pr-ref>` lists local drafts in human-readable form
 - `ggr clear <pr-ref>` truncates all draft files (preserves directory);
-  `--stale` flag accepted but no-op until P4
 
 #### Done When
 
 - `cargo build -p ggr` succeeds
 - `just validate` passes
 - Manual: reviewer adds a line draft on commit X, file Y, line Z; quits ggr;
-  reopens; the draft is visible in place
 - Manual: edit changes the body; delete removes the draft from disk
 - Manual: drafts at all three scopes work; severity selector defaults to note
 - Manual: invalid drafts (e.g., line scope with missing commit_sha) are rejected
-  at composer save time
 - Manual: `ggr drafts <pr-ref>` shows correct output; `ggr clear <pr-ref>`
-  clears them
 - Manual: jjr non-regression — jjr's draft model unchanged, still uses
-  `.jj-review/comments/<change-id>.jsonl`
 
 #### Depends On
 
@@ -188,9 +160,9 @@ seam that lets ggr have its own storage layout without changing jjr's behavior.
 
 ## Phase 3: Reply composer and batched submit to GitHub
 
-| Status         | Started | Completed |
-| -------------- | ------- | --------- |
-| ⬜ not-started |         |           |
+| Status         | Started    | Completed  |
+| -------------- | ---------- | ---------- |
+| ⬜ not-started  |            |            |
 
 Ship the reply composer and the GitHub submit endpoint in one phase. They're
 combined because reply drafts that can't be submitted have no reviewer-visible
@@ -269,45 +241,27 @@ endpoint is ggr-only code.
 #### Delivers
 
 - `r` keybinding (when cursor is on an existing thread block) opens the composer
-  in reply mode
 - Reply drafts stored in
-  `~/.local/share/ggr/<host>/<owner>/<repo>/<pr>/drafts/_replies.jsonl` with
-  `kind: "reply"` and `parent_comment_id` (GitHub's review-comment ID, not
-  thread ID)
 - Reply drafts render indented under the parent thread, visually distinct from
-  new top-level drafts
 - `S` keybinding triggers submit modal with verdict choice (APPROVE /
-  REQUEST_CHANGES / COMMENT, default COMMENT)
 - Empty-submit handling: APPROVE/REQUEST_CHANGES with zero drafts is allowed;
-  COMMENT with zero drafts errors with clear message
 - Submit posts one `gh api repos/<owner>/<repo>/pulls/<n>/reviews -X POST`
-  (body, line comments, verdict) followed by per-reply
-  `gh api repos/<owner>/<repo>/pulls/<n>/comments -X POST -f in_reply_to=<id>`
 - Severity markers `[REQUIRED]`, `[SUGGESTION]`, `[NOTE]` rendered as the first
-  line of submitted comment bodies (matches jjr's packet format)
 - Commit-scoped drafts folded into the review body with
-  `> Commit <sha-short> — "<subject>"` quoted attribution
 - Line-scoped drafts posted with `commit_id` set to the draft's commit_sha
-  (per-commit anchoring; outdated-on-force-push is the accepted cost)
 - On full success, all drafts cleared via the atomic-rewrite path from P2
 - On partial failure, drafts that did not reach GitHub remain on disk; ggr
-  reports per-call status (review status + per-reply status + which drafts to
-  retry)
 
 #### Done When
 
 - `cargo build -p ggr` succeeds
 - `just validate` passes
 - Manual: reviewer drafts at all three scopes plus a reply, submits with verdict
-  APPROVE — the review appears on the actual PR with comments at expected places
 - Manual: severity markers visible as first line of submitted comment bodies
 - Manual: commit-scoped drafts appear in review body with commit pointer;
-  line-scoped drafts appear as inline comments anchored to specific commits
 - Manual: replies land in their target threads
 - Manual: empty submit with verdict COMMENT errors with clear message; empty
-  submit with verdict APPROVE succeeds with no comments
 - Manual: simulated partial failure (e.g., bad parent_comment_id) leaves correct
-  drafts on disk; ggr reports per-call status
 - Manual: jjr's claude-packet path still works (non-regression)
 
 #### Depends On
@@ -316,9 +270,9 @@ endpoint is ggr-only code.
 
 ## Phase 4: Re-review across cycles with stale handling
 
-| Status         | Started | Completed |
-| -------------- | ------- | --------- |
-| ⬜ not-started |         |           |
+| Status         | Started    | Completed  |
+| -------------- | ---------- | ---------- |
+| ⬜ not-started  |            |            |
 
 Final phase. Closes the cycle loop per the spec at
 `specs/github-pr-stack-review.md` (_Re-Review Semantics_).
@@ -381,24 +335,13 @@ power both tools.
 #### Delivers
 
 - On reopen, fetch current PR state and re-anchor local drafts (re-uses the P1
-  fetch logic)
 - Line/commit-scoped drafts: if `commit_sha` is still in the PR's commit list,
-  run line-anchoring algorithm against the current diff for `(commit_sha, file)`
-  (`local-review-core::anchoring::match_anchor`)
 - If `commit_sha` is no longer in the commit list, attempt commit-subject
-  successor heuristic: find a commit in the new list whose subject equals the
-  original commit's subject; on unique match, re-anchor and re-run
-  line-anchoring on the new SHA
 - On no successor or non-unique match, mark stale with
-  `mismatch_reason = "commit not in PR"`
 - Reply drafts: if `parent_comment_id` no longer present in fetched comments,
-  mark stale with `mismatch_reason = "parent comment deleted"`; outdated parents
-  (parent exists but its anchor is now outdated) are NOT stale
 - PR-scoped drafts never go stale
 - Stale panel surfacing stale drafts with their `mismatch_reason`; reviewer can
-  clear, edit, or ignore
 - Stale drafts excluded from submission unless the reviewer explicitly
-  re-anchors or upgrades them
 - `ggr clear <pr-ref> --stale` filter implemented (the flag was wired in P2)
 - `R` keybinding for mid-session refresh: re-fetch state and re-run re-anchoring
 - Submit failures due to stale anchors prompt the reviewer to refresh
@@ -408,15 +351,9 @@ power both tools.
 - `cargo build -p ggr` succeeds
 - `just validate` passes
 - Manual: reviewer creates a line draft on commit X; PR is force-pushed (a new
-  commit with the same subject replaces X); reviewer reopens; draft is
-  re-anchored to the new SHA via subject match, line-anchoring runs against the
-  new diff, status pending
 - Manual: reviewer creates a line draft on commit Y; PR is force-pushed dropping
-  Y entirely; reviewer reopens; draft is marked stale with
-  `mismatch_reason = "commit not in PR"`
 - Manual: stale panel shows stale drafts with reasons
 - Manual: `ggr clear --stale` clears only the stale drafts, leaves pending
-  drafts in place
 - Manual: `R` mid-session re-fetches state and updates the stale panel
 - Manual: jjr's re-anchoring for jj changes still works (non-regression)
 
