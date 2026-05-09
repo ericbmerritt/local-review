@@ -416,28 +416,44 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
     }
 
     let area = frame.area();
-    // [stack bar (3), file header (3), diff body (fill), footer (1)]
-    let layout = Layout::vertical([
-        Constraint::Length(3),
-        Constraint::Length(3),
-        Constraint::Min(1),
-        Constraint::Length(1),
-    ])
-    .split(area);
 
-    render_stack_bar(frame, app, layout[0]);
-    render_file_header(frame, app, layout[1]);
-
-    let body_area = layout[2];
-    app.viewport_rows = body_area.height;
-    app.adjust_scroll();
     if app.showing_description {
-        render_description(frame, app, body_area);
-    } else {
-        render_diff(frame, app, body_area);
-    }
+        // Description page: [stack bar (3), body (fill), footer (1)] — no file header.
+        let layout = Layout::vertical([
+            Constraint::Length(3),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(area);
 
-    render_footer(frame, app, layout[3]);
+        render_stack_bar(frame, app, layout[0]);
+
+        let body_area = layout[1];
+        app.viewport_rows = body_area.height;
+        app.adjust_scroll();
+        render_description(frame, app, body_area);
+
+        render_footer(frame, app, layout[2]);
+    } else {
+        // Commit diff page: [stack bar (3), file header (3), diff body (fill), footer (1)].
+        let layout = Layout::vertical([
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(area);
+
+        render_stack_bar(frame, app, layout[0]);
+        render_file_header(frame, app, layout[1]);
+
+        let diff_area = layout[2];
+        app.viewport_rows = diff_area.height;
+        app.adjust_scroll();
+        render_diff(frame, app, diff_area);
+
+        render_footer(frame, app, layout[3]);
+    }
 }
 
 // ── stack bar ─────────────────────────────────────────────────────────────────
@@ -507,18 +523,6 @@ fn progress_bar_string(position: usize, total: usize, width: u16) -> String {
 // ── file header ───────────────────────────────────────────────────────────────
 
 fn render_file_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    if app.showing_description {
-        let n = app.pr.comments.len();
-        let label = if n == 0 {
-            "no comments".to_owned()
-        } else {
-            format!("{n} comment{}", if n == 1 { "" } else { "s" })
-        };
-        let block = Block::default().borders(Borders::ALL).title("Description");
-        frame.render_widget(Paragraph::new(label).block(block), area);
-        return;
-    }
-
     let total = app.views.len();
     let position = app.file_idx.saturating_add(1);
     let path_label = app
