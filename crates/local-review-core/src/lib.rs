@@ -11,7 +11,7 @@ pub mod diff;
 pub mod error;
 pub mod revset_hash;
 
-pub use anchoring::{AnchorOutcome, match_anchor, match_description_anchor};
+pub use anchoring::{match_anchor, match_description_anchor, AnchorOutcome};
 pub use change_id::{ChangeId, CommitId};
 pub use comment::{
     DescriptionAnchor, LineAnchor, MismatchReason, Side, CONTEXT_MAX, TARGET_TEXT_MAX,

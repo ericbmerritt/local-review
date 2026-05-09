@@ -1,7 +1,7 @@
 [package]
 name = "ggr"
 version = "0.0.0"
-description = "Local terminal review surface for GitHub pull requests (scaffold; not functional)"
+description = "Local terminal review surface for GitHub pull requests"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -14,3 +14,12 @@ workspace = true
 
 [dependencies]
 local-review-core.workspace = true
+clap.workspace = true
+crossterm.workspace = true
+ratatui.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+snafu.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

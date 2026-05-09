@@ -1,4 +1,4 @@
-pub use local_review_core::anchoring::{AnchorOutcome, match_anchor, match_description_anchor};
+pub use local_review_core::anchoring::{match_anchor, match_description_anchor, AnchorOutcome};
 
 use crate::comment::{Anchor, Comment, DescriptionAnchor, LineAnchor, MismatchReason, Status};
 use crate::diff::Diff;
