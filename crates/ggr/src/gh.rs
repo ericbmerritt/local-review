@@ -23,10 +23,6 @@ use crate::pr::{CommitEntry, PrDetails};
 struct PrJson {
     number: u64,
     title: String,
-    #[serde(rename = "headRefName")]
-    head_ref_name: String,
-    #[serde(rename = "baseRefName")]
-    base_ref_name: String,
     commits: Vec<CommitJson>,
     #[serde(rename = "headRepository")]
     head_repository: HeadRepositoryJson,
@@ -60,7 +56,7 @@ struct CommitJson {
 pub(crate) fn fetch_pr_details(pr: u64, repo: Option<&str>) -> Result<PrDetails> {
     let pr_str = pr.to_string();
     let mut args = vec!["pr", "view", &pr_str, "--json"];
-    let fields = "number,title,headRefName,baseRefName,commits,headRepository";
+    let fields = "number,title,commits,headRepository";
     args.push(fields);
     if let Some(r) = repo {
         args.push("--repo");
@@ -108,8 +104,6 @@ pub(crate) fn fetch_pr_details(pr: u64, repo: Option<&str>) -> Result<PrDetails>
     Ok(PrDetails {
         number: parsed.number,
         title: parsed.title,
-        head_ref: parsed.head_ref_name,
-        base_ref: parsed.base_ref_name,
         repo_name: parsed.head_repository.name_with_owner,
         hostname: None,
         commits,

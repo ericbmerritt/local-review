@@ -1,4 +1,4 @@
-//! Terminal UI for `ggr` Phase 1: read-only PR diff viewer.
+//! Terminal UI for ggr: read-only PR diff viewer.
 use std::io::{stdout, Stdout};
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -10,7 +10,9 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line as TuiLine, Span};
-use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
+use ratatui::widgets::{
+    Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+};
 use ratatui::{Frame, Terminal};
 
 use local_review_core::diff::Diff;
@@ -23,16 +25,61 @@ use crate::util::{clamp_with_delta, page_size, truncate};
 mod diff_view;
 mod help_screen;
 
-use diff_view::{DiffView, RenderedLine, RenderedLineKind};
+use diff_view::{DiffView, PairedRow, RenderedLine, RenderedLineKind};
+
+// ── constants ─────────────────────────────────────────────────────────────────
 
 const MIN_COLS: u16 = 60;
 const MIN_ROWS: u16 = 10;
 const SCROLLBAR_WIDTH: u16 = 1;
+const BLOCK_BORDER_COLS: u16 = 2;
 const FALLBACK_VIEWPORT_ROWS: u16 = 20;
 const STACK_BAR_MIN_COLS_FOR_FILL: u16 = 80;
 const STACK_PROGRESS_BAR_WIDTH: u16 = 20;
 
-// ── Screen variants ───────────────────────────────────────────────────────────
+/// Body width at which `DiffMode::Auto` switches to side-by-side.
+const SIDE_BY_SIDE_MIN_WIDTH: u16 = 120;
+/// Width of the ` │ ` gutter between the two columns.
+const SIDE_BY_SIDE_GUTTER_WIDTH: u16 = 3;
+/// Minimum useful cells per side (prefix + 2 chars of content).
+const MIN_USEFUL_SIDE_CELL_WIDTH: u16 = 4;
+/// Below this body width, side-by-side falls back to unified.
+const MIN_USEFUL_SIDE_BY_SIDE_WIDTH: u16 =
+    SIDE_BY_SIDE_GUTTER_WIDTH + 2 * MIN_USEFUL_SIDE_CELL_WIDTH;
+
+// ── diff mode ─────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiffMode {
+    Auto,
+    ForceUnified,
+    ForceSideBySide,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EffectiveDiffMode {
+    Unified,
+    SideBySide,
+}
+
+fn resolve_diff_mode(pref: DiffMode, body_width: u16) -> EffectiveDiffMode {
+    if body_width < MIN_USEFUL_SIDE_BY_SIDE_WIDTH {
+        return EffectiveDiffMode::Unified;
+    }
+    match pref {
+        DiffMode::Auto => {
+            if body_width >= SIDE_BY_SIDE_MIN_WIDTH {
+                EffectiveDiffMode::SideBySide
+            } else {
+                EffectiveDiffMode::Unified
+            }
+        }
+        DiffMode::ForceUnified => EffectiveDiffMode::Unified,
+        DiffMode::ForceSideBySide => EffectiveDiffMode::SideBySide,
+    }
+}
+
+// ── screen variants ───────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Screen {
@@ -40,27 +87,22 @@ enum Screen {
     Help,
 }
 
-// ── App state ─────────────────────────────────────────────────────────────────
+// ── app state ─────────────────────────────────────────────────────────────────
 
 struct App {
     pr: PrDetails,
-    /// Current commit index within `pr.commits`.
     commit_idx: usize,
-    /// Diff for the currently loaded commit.
     diff: Diff,
-    /// Views built from `diff.files`; `file_idx` selects the active view.
     views: Vec<DiffView>,
-    /// Index into `views`. 0 is always the first file (no separate description
-    /// view in ggr Phase 1 — commits have a title in the stack bar only).
     file_idx: usize,
-    /// Cursor row within the active view (0-based index into `views[file_idx].lines`).
     cursor: usize,
-    /// Scroll offset: first visible line of the diff body.
     scroll_offset: usize,
-    /// Measured diff-body height in rows; updated every render.
     viewport_rows: u16,
+    /// Cached body width from the last render; used by navigation to resolve
+    /// the effective layout. Set to 0 until the first draw.
+    diff_body_width: u16,
+    diff_mode: DiffMode,
     screen: Screen,
-    /// Transient one-frame status hint shown in the footer.
     status: Option<String>,
 }
 
@@ -76,6 +118,8 @@ impl App {
             cursor: 0,
             scroll_offset: 0,
             viewport_rows: FALLBACK_VIEWPORT_ROWS,
+            diff_body_width: 0,
+            diff_mode: DiffMode::Auto,
             screen: Screen::Main,
             status: None,
         }
@@ -86,7 +130,35 @@ impl App {
     }
 
     fn active_line_count(&self) -> usize {
-        self.active_view().map_or(0, |v| v.lines.len())
+        let Some(view) = self.active_view() else {
+            return 0;
+        };
+        match self.effective_mode() {
+            EffectiveDiffMode::Unified => view.lines.len(),
+            EffectiveDiffMode::SideBySide => view.paired_rows.len(),
+        }
+    }
+
+    fn effective_mode(&self) -> EffectiveDiffMode {
+        resolve_diff_mode(self.diff_mode, self.diff_body_width)
+    }
+
+    fn cycle_diff_mode(&mut self) {
+        self.diff_mode = match self.diff_mode {
+            DiffMode::Auto => DiffMode::ForceUnified,
+            DiffMode::ForceUnified => DiffMode::ForceSideBySide,
+            DiffMode::ForceSideBySide => DiffMode::Auto,
+        };
+        self.cursor = 0;
+        self.scroll_offset = 0;
+        self.status = Some(
+            match self.diff_mode {
+                DiffMode::Auto => "diff layout: auto",
+                DiffMode::ForceUnified => "diff layout: unified",
+                DiffMode::ForceSideBySide => "diff layout: side-by-side",
+            }
+            .to_owned(),
+        );
     }
 
     fn load_commit(&mut self, idx: usize) -> Result<()> {
@@ -184,7 +256,7 @@ fn build_views(diff: &Diff) -> Vec<DiffView> {
     diff.files.iter().map(DiffView::from_file).collect()
 }
 
-// ── Terminal setup / teardown ─────────────────────────────────────────────────
+// ── terminal setup / teardown ─────────────────────────────────────────────────
 
 struct TuiGuard;
 
@@ -206,9 +278,8 @@ fn enter_tui() -> Result<(Terminal<CrosstermBackend<Stdout>>, TuiGuard)> {
     Ok((terminal, TuiGuard))
 }
 
-// ── Entry point ───────────────────────────────────────────────────────────────
+// ── entry point ───────────────────────────────────────────────────────────────
 
-/// Open the TUI for `pr`.
 pub(crate) fn run(pr: PrDetails, initial_diff: Diff) -> Result<()> {
     let size = crossterm::terminal::size().map_err(|source| GgrError::Io { source })?;
     if size.0 < MIN_COLS {
@@ -228,7 +299,6 @@ pub(crate) fn run(pr: PrDetails, initial_diff: Diff) -> Result<()> {
                 source: std::io::Error::other(e),
             })?;
 
-        // Clear one-frame status after render.
         app.status = None;
 
         if !event::poll(std::time::Duration::from_millis(200))
@@ -262,7 +332,8 @@ pub(crate) fn run(pr: PrDetails, initial_diff: Diff) -> Result<()> {
     Ok(())
 }
 
-/// Returns `true` when the app should quit.
+// ── key handling ──────────────────────────────────────────────────────────────
+
 #[expect(
     clippy::wildcard_enum_match_arm,
     reason = "unhandled KeyCode variants are intentionally ignored"
@@ -271,9 +342,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
     match app.screen {
         Screen::Help => {
             match key.code {
-                KeyCode::Char('q' | '?') | KeyCode::Esc => {
-                    app.screen = Screen::Main;
-                }
+                KeyCode::Char('q' | '?') | KeyCode::Esc => app.screen = Screen::Main,
                 _ => {}
             }
             return Ok(false);
@@ -283,9 +352,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
 
     match key.code {
         KeyCode::Char('q') => return Ok(true),
-        KeyCode::Char('?') => {
-            app.screen = Screen::Help;
-        }
+        KeyCode::Char('?') => app.screen = Screen::Help,
         KeyCode::Down | KeyCode::Char('j') => app.move_cursor(1),
         KeyCode::Up | KeyCode::Char('k') => app.move_cursor(-1),
         KeyCode::PageDown => app.page_down(),
@@ -298,13 +365,14 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<bool> {
         KeyCode::BackTab => app.go_prev_file(),
         KeyCode::Char('n') => app.go_next_commit()?,
         KeyCode::Char('p') => app.go_prev_commit()?,
+        KeyCode::Char('|') => app.cycle_diff_mode(),
         _ => {}
     }
 
     Ok(false)
 }
 
-// ── Rendering ─────────────────────────────────────────────────────────────────
+// ── rendering ─────────────────────────────────────────────────────────────────
 
 fn render(frame: &mut Frame<'_>, app: &mut App) {
     if app.screen == Screen::Help {
@@ -313,17 +381,27 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
     }
 
     let area = frame.area();
+    // [stack bar (3), file header (3), diff body (fill), footer (1)]
     let layout = Layout::vertical([
-        Constraint::Length(1),
+        Constraint::Length(3),
+        Constraint::Length(3),
         Constraint::Min(1),
         Constraint::Length(1),
     ])
     .split(area);
 
     render_stack_bar(frame, app, layout[0]);
-    render_diff_body(frame, app, layout[1]);
-    render_footer(frame, app, layout[2]);
+    render_file_header(frame, app, layout[1]);
+
+    let diff_area = layout[2];
+    app.viewport_rows = diff_area.height;
+    app.adjust_scroll();
+    render_diff(frame, app, diff_area);
+
+    render_footer(frame, app, layout[3]);
 }
+
+// ── stack bar ─────────────────────────────────────────────────────────────────
 
 fn render_stack_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let total = app.pr.commits.len();
@@ -331,255 +409,320 @@ fn render_stack_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let short_sha = &app.pr.commits[app.commit_idx].short_sha;
     let commit_title = &app.pr.commits[app.commit_idx].title;
 
-    let cols = usize::from(area.width);
-
-    // "#42 PR Title (base←head)  [====    ]  1/3  sha  commit title"
-    // Narrow (<80): drop the progress bar fill and PR title
-    let pr_title_budget = if cols >= 120 {
-        40_usize
-    } else if cols >= 80 {
-        20_usize
+    let interior_cols = area.width.saturating_sub(BLOCK_BORDER_COLS);
+    let bar_segment = if area.width >= STACK_BAR_MIN_COLS_FOR_FILL && total > 0 {
+        progress_bar_string(current, total, STACK_PROGRESS_BAR_WIDTH)
     } else {
-        0_usize
+        String::new()
     };
-    let pr_tag = if pr_title_budget > 0 {
-        format!(
-            "#{} {}  ({}←{})",
-            app.pr.number,
-            truncate(&app.pr.title, pr_title_budget),
-            app.pr.base_ref,
-            app.pr.head_ref,
-        )
-    } else {
-        format!(
-            "#{} ({}←{})",
-            app.pr.number, app.pr.base_ref, app.pr.head_ref
-        )
-    };
-    let pos = format!("{current}/{total}");
 
-    let mut spans: Vec<Span<'_>> = Vec::new();
+    let text_segment = format!("{current}/{total}  {short_sha}  ");
+    let used = bar_segment.chars().count() + text_segment.chars().count();
+    let title_budget = usize::from(interior_cols).saturating_sub(used);
+    let label = format!(
+        "{bar_segment}{text_segment}{}",
+        truncate(commit_title, title_budget)
+    );
 
-    spans.push(Span::styled(
-        pr_tag,
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    ));
-
-    if cols >= usize::from(STACK_BAR_MIN_COLS_FOR_FILL) {
-        let filled = if total > 1 {
-            usize::from(STACK_PROGRESS_BAR_WIDTH) * (current - 1) / (total - 1)
-        } else {
-            usize::from(STACK_PROGRESS_BAR_WIDTH)
-        };
-        let empty = usize::from(STACK_PROGRESS_BAR_WIDTH) - filled;
-        let bar = format!("  [{}{}]", "=".repeat(filled), " ".repeat(empty));
-        spans.push(Span::styled(bar, Style::default().fg(Color::DarkGray)));
-    }
-
-    spans.push(Span::raw(format!("  {pos}  ")));
-    spans.push(Span::styled(
-        short_sha.clone(),
-        Style::default().fg(Color::Yellow),
-    ));
-    spans.push(Span::raw("  "));
-
-    let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-    let budget = cols.saturating_sub(used);
-    let commit_title_truncated = truncate(commit_title, budget);
-    spans.push(Span::raw(commit_title_truncated));
-
-    frame.render_widget(TuiLine::from(spans), area);
+    let max_title_chars = usize::from(area.width).saturating_sub(10);
+    let pr_block_title = format!(
+        "PR #{} — {}",
+        app.pr.number,
+        truncate(&app.pr.title, max_title_chars)
+    );
+    let block = Block::default().borders(Borders::ALL).title(pr_block_title);
+    frame.render_widget(Paragraph::new(label).block(block), area);
 }
 
-fn render_diff_body(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
-    let body_width = area.width.saturating_sub(SCROLLBAR_WIDTH);
+/// `████░░░░  ` style progress fill of fixed `width` cells, followed by two spaces.
+fn progress_bar_string(position: usize, total: usize, width: u16) -> String {
+    let width_usize = usize::from(width);
+    if total == 0 || width_usize == 0 {
+        return String::new();
+    }
+    let position = position.min(total);
+    let filled = (position * width_usize) / total;
+    let empty = width_usize.saturating_sub(filled);
+    let mut s = String::with_capacity(width_usize * 4 + 2);
+    for _ in 0..filled {
+        s.push('█');
+    }
+    for _ in 0..empty {
+        s.push('░');
+    }
+    s.push_str("  ");
+    s
+}
 
-    // File header
-    let header_height: u16 = 1;
-    let body_area = Rect {
-        y: area.y + header_height,
-        height: area.height.saturating_sub(header_height),
-        ..area
+// ── file header ───────────────────────────────────────────────────────────────
+
+fn render_file_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let total = app.views.len();
+    let position = app.file_idx.saturating_add(1);
+    let path_label = app
+        .active_view()
+        .map_or_else(|| "(no files)".to_owned(), |v| v.title.clone());
+    let label = format!("{path_label}  ·  {position} of {total}");
+    let block = Block::default().borders(Borders::ALL).title("File");
+    frame.render_widget(Paragraph::new(label).block(block), area);
+}
+
+// ── diff body ─────────────────────────────────────────────────────────────────
+
+fn render_diff(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
+    let scroll = u16::try_from(app.scroll_offset).unwrap_or(u16::MAX);
+
+    let Some(view) = app.active_view() else {
+        frame.render_widget(Paragraph::new("No files in this commit."), area);
+        app.diff_body_width = area.width;
+        return;
     };
 
-    // Render file header
-    let file_title = app.active_view().map_or("<no files>", |v| v.title.as_str());
-    let file_count = app.views.len();
-    let file_pos = if file_count > 0 {
-        format!(" {}/{file_count}  {file_title}", app.file_idx + 1)
-    } else {
-        " (no files)".to_owned()
+    let probe_total = view.lines.len();
+    let probe_mode = resolve_diff_mode(app.diff_mode, area.width.saturating_sub(SCROLLBAR_WIDTH));
+    let row_total = match probe_mode {
+        EffectiveDiffMode::Unified => probe_total,
+        EffectiveDiffMode::SideBySide => view.paired_rows.len(),
     };
-    let header_widget = Paragraph::new(file_pos).style(
-        Style::default()
-            .fg(Color::White)
-            .add_modifier(Modifier::BOLD),
-    );
-    let header_area = Rect {
-        height: header_height,
-        ..area
-    };
-    frame.render_widget(header_widget, header_area);
 
-    // Measure viewport (after removing the file header row)
-    app.viewport_rows = body_area.height;
-    let viewport = usize::from(body_area.height);
+    let (body_area, sb_area, mut sb_state) = scrollbar_layout(area, row_total, scroll);
+    let body_width = body_area.width;
+    let mode = resolve_diff_mode(app.diff_mode, body_width);
 
-    if app.active_line_count() == 0 {
-        let notice = Paragraph::new("(no diff — empty commit)");
-        frame.render_widget(notice, body_area);
+    match mode {
+        EffectiveDiffMode::Unified => {
+            let cursor = app.cursor;
+            let lines: Vec<TuiLine<'_>> = view
+                .lines
+                .iter()
+                .enumerate()
+                .map(|(idx, line)| render_rendered_line(line, idx == cursor, body_width))
+                .collect();
+            frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), body_area);
+        }
+        EffectiveDiffMode::SideBySide => {
+            render_diff_side_by_side(frame, body_area, view, app.cursor, scroll);
+        }
+    }
+
+    render_scrollbar(frame, sb_state.as_mut(), sb_area);
+    app.diff_body_width = body_width;
+}
+
+fn render_diff_side_by_side(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    view: &DiffView,
+    cursor_row: usize,
+    scroll: u16,
+) {
+    let total_width = area.width;
+    if total_width < MIN_USEFUL_SIDE_BY_SIDE_WIDTH {
+        let cursor = cursor_row;
+        let lines: Vec<TuiLine<'_>> = view
+            .lines
+            .iter()
+            .enumerate()
+            .map(|(idx, line)| render_rendered_line(line, idx == cursor, total_width))
+            .collect();
+        frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), area);
         return;
     }
 
-    // Ensure cursor is in view (may have changed due to resize)
-    app.adjust_scroll();
+    let side_width = (total_width - SIDE_BY_SIDE_GUTTER_WIDTH) / 2;
 
-    let Some(view) = app.active_view() else {
-        return;
-    };
-
-    let visible: Vec<TuiLine<'_>> = view
-        .lines
+    let lines: Vec<TuiLine<'_>> = view
+        .paired_rows
         .iter()
-        .skip(app.scroll_offset)
-        .take(viewport)
         .enumerate()
-        .map(|(row_in_viewport, line)| {
-            let abs_idx = app.scroll_offset + row_in_viewport;
-            let is_cursor = abs_idx == app.cursor;
-            render_diff_line(line, body_width, is_cursor)
+        .map(|(row_idx, row)| {
+            render_paired_row(view, *row, row_idx == cursor_row, side_width, total_width)
         })
         .collect();
 
-    let paragraph = Paragraph::new(visible);
-    let content_area = Rect {
-        width: body_width,
-        ..body_area
-    };
-    frame.render_widget(paragraph, content_area);
+    frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), area);
+}
 
-    // Scrollbar
-    let total_lines = view.lines.len();
-    if total_lines > viewport {
-        let mut scrollbar_state = ScrollbarState::new(total_lines).position(app.scroll_offset);
-        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
-        let scrollbar_area = Rect {
-            x: body_area.x + body_width,
-            width: SCROLLBAR_WIDTH,
-            ..body_area
-        };
-        frame.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
+fn render_paired_row(
+    view: &DiffView,
+    row: PairedRow,
+    focused: bool,
+    side_width: u16,
+    full_width: u16,
+) -> TuiLine<'_> {
+    match row {
+        PairedRow::Spanning(idx) => {
+            let Some(line) = view.lines.get(idx) else {
+                return TuiLine::raw("");
+            };
+            render_full_width_row(line, focused, full_width)
+        }
+        PairedRow::Pair { left, right } => {
+            let left_spans = match left.and_then(|i| view.lines.get(i)) {
+                Some(line) => side_cell_spans(line, side_width, focused),
+                None => blank_cell_spans(side_width, focused),
+            };
+            let right_spans = match right.and_then(|i| view.lines.get(i)) {
+                Some(line) => side_cell_spans(line, side_width, focused),
+                None => blank_cell_spans(side_width, focused),
+            };
+            TuiLine::from([left_spans, side_by_side_gutter_spans(), right_spans].concat())
+        }
     }
 }
 
-fn render_diff_line(line: &RenderedLine, body_width: u16, is_cursor: bool) -> TuiLine<'_> {
-    let (prefix, fg, bg) = match line.kind {
-        RenderedLineKind::Added => (
-            "+",
-            Color::Green,
-            if is_cursor {
-                Color::DarkGray
-            } else {
-                Color::Reset
-            },
-        ),
-        RenderedLineKind::Removed => (
-            "-",
-            Color::Red,
-            if is_cursor {
-                Color::DarkGray
-            } else {
-                Color::Reset
-            },
-        ),
-        RenderedLineKind::Context => (
-            " ",
-            Color::Reset,
-            if is_cursor {
-                Color::DarkGray
-            } else {
-                Color::Reset
-            },
-        ),
-        RenderedLineKind::HunkHeader => (
-            "",
-            Color::Cyan,
-            if is_cursor {
-                Color::DarkGray
-            } else {
-                Color::Reset
-            },
-        ),
-        RenderedLineKind::HunkSeparator | RenderedLineKind::Notice => {
-            ("", Color::DarkGray, Color::Reset)
-        }
-    };
-
-    // Line number gutter (6 chars: 3 old + space + 3 new)
-    let gutter_width: u16 = 7; // "123 456 "
-    let gutter = match line.kind {
-        RenderedLineKind::HunkHeader
-        | RenderedLineKind::HunkSeparator
-        | RenderedLineKind::Notice => " ".repeat(usize::from(gutter_width)),
-        RenderedLineKind::Context | RenderedLineKind::Added | RenderedLineKind::Removed => {
-            let old = line
-                .source_line
-                .map_or_else(|| "   ".to_owned(), |n| format!("{n:>3}"));
-            let new = line
-                .target_line
-                .map_or_else(|| "   ".to_owned(), |n| format!("{n:>3}"));
-            format!("{old} {new} ")
-        }
-    };
-
-    let max_text = usize::from(body_width)
-        .saturating_sub(gutter_width.into())
-        .saturating_sub(1); // prefix char
-
-    let text = truncate(&line.text, max_text);
-
-    let style = Style::default().fg(fg).bg(bg);
-    let cursor_style = if is_cursor {
-        style.add_modifier(Modifier::REVERSED)
-    } else {
-        style
-    };
-
-    TuiLine::from(vec![
-        Span::styled(gutter, Style::default().fg(Color::DarkGray).bg(bg)),
-        Span::styled(format!("{prefix}{text}"), cursor_style),
-    ])
+fn render_full_width_row(line: &RenderedLine, focused: bool, width: u16) -> TuiLine<'_> {
+    let (body, fg) = prefix_truncate_pad(line, width);
+    TuiLine::from(vec![Span::styled(body, focus_style(fg, focused))])
 }
 
+fn side_cell_spans(line: &RenderedLine, side_width: u16, focused: bool) -> Vec<Span<'_>> {
+    let (body, fg) = prefix_truncate_pad(line, side_width);
+    vec![Span::styled(body, focus_style(fg, focused))]
+}
+
+fn blank_cell_spans<'a>(side_width: u16, focused: bool) -> Vec<Span<'a>> {
+    let body = " ".repeat(usize::from(side_width));
+    vec![Span::styled(body, focus_style(Color::Reset, focused))]
+}
+
+fn side_by_side_gutter_spans<'a>() -> Vec<Span<'a>> {
+    vec![Span::styled(
+        " \u{2502} ",
+        Style::default().fg(Color::DarkGray),
+    )]
+}
+
+/// Assemble `prefix + truncated text + space-padding` to exactly `width` cells.
+/// Returns `(body, fg_color)`; callers apply focus via [`focus_style`].
+fn prefix_truncate_pad(line: &RenderedLine, width: u16) -> (String, Color) {
+    let attrs = line_visual_attrs(line);
+    let prefix_chars = attrs.prefix.chars().count();
+    let max_text = usize::from(width).saturating_sub(prefix_chars);
+    let text = truncate(&line.text, max_text);
+    let used = prefix_chars + text.chars().count();
+    let pad = usize::from(width).saturating_sub(used);
+    (
+        format!("{}{}{}", attrs.prefix, text, " ".repeat(pad)),
+        attrs.fg_color,
+    )
+}
+
+struct LineVisual {
+    prefix: &'static str,
+    fg_color: Color,
+}
+
+fn line_visual_attrs(line: &RenderedLine) -> LineVisual {
+    match line.kind {
+        RenderedLineKind::Added => LineVisual {
+            prefix: "+ ",
+            fg_color: Color::Green,
+        },
+        RenderedLineKind::Removed => LineVisual {
+            prefix: "- ",
+            fg_color: Color::Red,
+        },
+        RenderedLineKind::HunkHeader
+        | RenderedLineKind::HunkSeparator
+        | RenderedLineKind::Context
+        | RenderedLineKind::Notice => LineVisual {
+            prefix: "  ",
+            fg_color: Color::Reset,
+        },
+    }
+}
+
+fn focus_style(fg_color: Color, focused: bool) -> Style {
+    if focused {
+        Style::default().add_modifier(Modifier::REVERSED)
+    } else if matches!(fg_color, Color::Reset) {
+        Style::default()
+    } else {
+        Style::default().fg(fg_color)
+    }
+}
+
+/// Render one unified-mode diff line. Focused rows are padded to `width` and
+/// reversed; unfocused rows use the natural prefix + text length.
+fn render_rendered_line(line: &RenderedLine, focused: bool, width: u16) -> TuiLine<'_> {
+    if focused {
+        let (body, fg) = prefix_truncate_pad(line, width);
+        TuiLine::from(vec![Span::styled(body, focus_style(fg, true))])
+    } else {
+        let attrs = line_visual_attrs(line);
+        TuiLine::from(vec![
+            Span::raw(attrs.prefix),
+            Span::styled(line.text.as_str(), focus_style(attrs.fg_color, false)),
+        ])
+    }
+}
+
+// ── scrollbar helpers ─────────────────────────────────────────────────────────
+
+fn scrollbar_layout(
+    area: Rect,
+    total_lines: usize,
+    scroll: u16,
+) -> (Rect, Option<Rect>, Option<ScrollbarState>) {
+    let viewport = usize::from(area.height);
+    let sb_state = if viewport > 0 && total_lines > viewport {
+        let max_scroll = total_lines - viewport;
+        let pos = usize::from(scroll).min(max_scroll);
+        Some(ScrollbarState::new(max_scroll + 1).position(pos))
+    } else {
+        None
+    };
+    let (body, sb_area) = if sb_state.is_some() && area.width > SCROLLBAR_WIDTH {
+        let split = Layout::horizontal([Constraint::Min(0), Constraint::Length(SCROLLBAR_WIDTH)])
+            .split(area);
+        (split[0], Some(split[1]))
+    } else {
+        (area, None)
+    };
+    (body, sb_area, sb_state)
+}
+
+fn render_scrollbar(
+    frame: &mut Frame<'_>,
+    sb_state: Option<&mut ScrollbarState>,
+    sb_area: Option<Rect>,
+) {
+    if let (Some(state), Some(area)) = (sb_state, sb_area) {
+        let scrollbar = Scrollbar::default()
+            .orientation(ScrollbarOrientation::VerticalRight)
+            .track_style(Style::default().fg(Color::DarkGray))
+            .thumb_style(Style::default().fg(Color::Gray))
+            .begin_style(Style::default().fg(Color::DarkGray))
+            .end_style(Style::default().fg(Color::DarkGray));
+        frame.render_stateful_widget(scrollbar, area, state);
+    }
+}
+
+// ── footer ────────────────────────────────────────────────────────────────────
+
+const FOOTER_IRREDUCIBLE: &str = " \u{2191}\u{2193} line  Tab file  n/p commit";
+
 fn render_footer(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let cols = usize::from(area.width);
-
-    let status = app.status.as_deref().unwrap_or("");
-
-    // Build footer segments right-to-left (drop segments if they don't fit).
-    // Minimum: arrow/jk + Tab + q
-    let min_keys = "↑↓/jk line   Tab file   q quit";
-    let with_nav = "n/p commit   ↑↓/jk line   Tab file   q quit";
-    let full = "n/p commit   ↑↓/jk line   Tab file   ?   q quit";
-
-    let keys = if cols >= full.len() + status.len() + 2 {
-        full
-    } else if cols >= with_nav.len() + status.len() + 2 {
-        with_nav
+    let (text, style) = if let Some(msg) = app.status.as_deref() {
+        (msg.to_owned(), Style::default().fg(Color::Yellow))
     } else {
-        min_keys
+        (footer_text(area.width), Style::default())
     };
+    frame.render_widget(Paragraph::new(text).style(style), area);
+}
 
-    let text = if status.is_empty() {
-        keys.to_owned()
-    } else {
-        let budget = cols.saturating_sub(keys.len() + 2);
-        let s = truncate(status, budget);
-        format!("{s}  {keys}")
-    };
-
-    let widget = Paragraph::new(text).style(Style::default().fg(Color::DarkGray));
-    frame.render_widget(widget, area);
+fn footer_text(width: u16) -> String {
+    let width = usize::from(width);
+    let optional: &[&str] = &["  |", "  ?", "  q quit"];
+    let mut text = FOOTER_IRREDUCIBLE.to_owned();
+    let mut used = text.chars().count();
+    for seg in optional {
+        let seg_len = seg.chars().count();
+        if used + seg_len <= width {
+            text.push_str(seg);
+            used += seg_len;
+        }
+    }
+    text
 }
