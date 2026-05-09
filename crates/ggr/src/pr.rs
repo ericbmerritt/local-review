@@ -21,6 +21,10 @@ pub(crate) struct PrDetails {
     pub(crate) title: String,
     pub(crate) head_ref: String,
     pub(crate) base_ref: String,
+    /// `owner/repo` slug from `headRepository.nameWithOwner`, used for diff API calls.
+    pub(crate) repo_name: String,
+    /// GHE hostname for `gh api --hostname`. `None` → github.com.
+    pub(crate) hostname: Option<String>,
     /// Ordered commits, oldest-first (as returned by `gh pr view --json commits`).
     pub(crate) commits: Vec<CommitEntry>,
 }

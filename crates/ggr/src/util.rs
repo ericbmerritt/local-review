@@ -1,28 +1,4 @@
 //! Shared layout and navigation helpers.
-use crate::error::{GgrError, Result};
-
-/// Locate the git repo root by walking up from the process's current directory.
-pub(crate) fn find_git_root() -> Result<std::path::PathBuf> {
-    let cwd = std::env::current_dir().map_err(|source| GgrError::Io { source })?;
-    find_git_root_from(&cwd)
-}
-
-fn find_git_root_from(start: &std::path::Path) -> Result<std::path::PathBuf> {
-    let mut current = start;
-    loop {
-        if current.join(".git").is_dir() {
-            return Ok(current.to_owned());
-        }
-        match current.parent() {
-            Some(parent) if parent != current => current = parent,
-            _ => {
-                return Err(GgrError::NotInGitRepo {
-                    cwd: start.to_owned(),
-                })
-            }
-        }
-    }
-}
 
 /// Clamp `value + delta` to `[0, max]`, saturating at each bound.
 pub(crate) fn clamp_with_delta(value: usize, delta: isize, max: usize) -> usize {
@@ -97,36 +73,5 @@ mod tests {
     #[test]
     fn truncate_max_zero_empty() {
         assert_eq!(truncate("hi", 0), "");
-    }
-
-    #[test]
-    fn find_git_root_finds_dot_git() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
-        let root = find_git_root_from(dir.path()).unwrap();
-        assert_eq!(
-            std::fs::canonicalize(root).unwrap(),
-            std::fs::canonicalize(dir.path()).unwrap()
-        );
-    }
-
-    #[test]
-    fn find_git_root_walks_up() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
-        let sub = dir.path().join("a").join("b");
-        std::fs::create_dir_all(&sub).unwrap();
-        let root = find_git_root_from(&sub).unwrap();
-        assert_eq!(
-            std::fs::canonicalize(root).unwrap(),
-            std::fs::canonicalize(dir.path()).unwrap()
-        );
-    }
-
-    #[test]
-    fn find_git_root_fails_without_dot_git() {
-        let dir = tempfile::tempdir().unwrap();
-        let result = find_git_root_from(dir.path());
-        assert!(matches!(result, Err(GgrError::NotInGitRepo { .. })));
     }
 }

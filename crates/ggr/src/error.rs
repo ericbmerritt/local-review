@@ -17,23 +17,11 @@ pub(crate) enum GgrError {
         exit_code: Option<i32>,
     },
 
-    #[snafu(display("git is not on PATH"))]
-    GitMissing { source: std::io::Error },
-
-    #[snafu(display("git failed: {message}"))]
-    GitFailed {
-        message: String,
-        exit_code: Option<i32>,
-    },
-
     #[snafu(display("PR #{pr} not found — check the number and that you are in the right repo"))]
     PrNotFound { pr: u64 },
 
     #[snafu(display("gh output is not valid UTF-8: {source}"))]
     GhOutputEncoding { source: std::string::FromUtf8Error },
-
-    #[snafu(display("git output is not valid UTF-8: {source}"))]
-    GitOutputEncoding { source: std::string::FromUtf8Error },
 
     #[snafu(display("failed to parse PR metadata: {source}"))]
     GhJsonParse { source: serde_json::Error },
@@ -41,11 +29,8 @@ pub(crate) enum GgrError {
     #[snafu(display("failed to parse diff for {}: {message}", file.display()))]
     DiffParse { file: PathBuf, message: String },
 
-    #[snafu(display(
-        "not inside a git repo: searched up from {} and found no .git directory",
-        cwd.display()
-    ))]
-    NotInGitRepo { cwd: PathBuf },
+    #[snafu(display("invalid PR reference: {raw}"))]
+    InvalidPrRef { raw: String },
 
     #[snafu(display("io error: {source}"))]
     Io { source: std::io::Error },

@@ -644,7 +644,6 @@ dependencies = [
  "serde",
  "serde_json",
  "snafu",
- "tempfile",
 ]
 
 [[package]]
