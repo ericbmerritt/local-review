@@ -35,7 +35,7 @@ jobs:
           echo "value=${tag#ggr-v}" >> "$GITHUB_OUTPUT"
 
       - name: Bump tap formula
-        uses: dawidd6/action-homebrew-bump-formula@v4
+        uses: dawidd6/action-homebrew-bump-formula@v7
         with:
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           tap: ericbmerritt/homebrew-jjr
