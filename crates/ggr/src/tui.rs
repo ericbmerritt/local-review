@@ -417,43 +417,32 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
 
     let area = frame.area();
 
+    // Same 4-pane layout for description and commit pages: the description is
+    // its own place in the stack with one file (the description body itself),
+    // so Tab/Shift-Tab semantics stay honest (cycle files within the current
+    // position; on description there is one file, so they're no-ops).
+    let layout = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Length(3),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .split(area);
+
+    render_stack_bar(frame, app, layout[0]);
+    render_file_header(frame, app, layout[1]);
+
+    let body_area = layout[2];
+    app.viewport_rows = body_area.height;
+    app.adjust_scroll();
+
     if app.showing_description {
-        // Description page: [stack bar (3), body (fill), footer (1)] — no file header.
-        let layout = Layout::vertical([
-            Constraint::Length(3),
-            Constraint::Min(1),
-            Constraint::Length(1),
-        ])
-        .split(area);
-
-        render_stack_bar(frame, app, layout[0]);
-
-        let body_area = layout[1];
-        app.viewport_rows = body_area.height;
-        app.adjust_scroll();
         render_description(frame, app, body_area);
-
-        render_footer(frame, app, layout[2]);
     } else {
-        // Commit diff page: [stack bar (3), file header (3), diff body (fill), footer (1)].
-        let layout = Layout::vertical([
-            Constraint::Length(3),
-            Constraint::Length(3),
-            Constraint::Min(1),
-            Constraint::Length(1),
-        ])
-        .split(area);
-
-        render_stack_bar(frame, app, layout[0]);
-        render_file_header(frame, app, layout[1]);
-
-        let diff_area = layout[2];
-        app.viewport_rows = diff_area.height;
-        app.adjust_scroll();
-        render_diff(frame, app, diff_area);
-
-        render_footer(frame, app, layout[3]);
+        render_diff(frame, app, body_area);
     }
+
+    render_footer(frame, app, layout[3]);
 }
 
 // ── stack bar ─────────────────────────────────────────────────────────────────
@@ -523,12 +512,16 @@ fn progress_bar_string(position: usize, total: usize, width: u16) -> String {
 // ── file header ───────────────────────────────────────────────────────────────
 
 fn render_file_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let total = app.views.len();
-    let position = app.file_idx.saturating_add(1);
-    let path_label = app
-        .active_view()
-        .map_or_else(|| "(no files)".to_owned(), |v| v.title.clone());
-    let label = format!("{path_label}  ·  {position} of {total}");
+    let label = if app.showing_description {
+        "PR description  ·  1 of 1".to_owned()
+    } else {
+        let total = app.views.len();
+        let position = app.file_idx.saturating_add(1);
+        let path_label = app
+            .active_view()
+            .map_or_else(|| "(no files)".to_owned(), |v| v.title.clone());
+        format!("{path_label}  ·  {position} of {total}")
+    };
     let block = Block::default().borders(Borders::ALL).title("File");
     frame.render_widget(Paragraph::new(label).block(block), area);
 }
@@ -729,12 +722,7 @@ fn render_rendered_line(line: &RenderedLine, focused: bool, width: u16) -> TuiLi
 fn render_description(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let scroll = u16::try_from(app.scroll_offset).unwrap_or(u16::MAX);
     let total = app.description_lines.len();
-
-    let block = Block::default().borders(Borders::ALL).title("Description");
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    let (body_area, sb_area, mut sb_state) = scrollbar_layout(inner, total, scroll);
+    let (body_area, sb_area, mut sb_state) = scrollbar_layout(area, total, scroll);
     let lines: Vec<TuiLine<'_>> = app.description_lines.iter().map(render_desc_line).collect();
     frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), body_area);
     render_scrollbar(frame, sb_state.as_mut(), sb_area);
