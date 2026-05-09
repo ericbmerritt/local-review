@@ -844,9 +844,12 @@ name = "local-review-core"
 version = "0.0.0"
 dependencies = [
  "blake3",
+ "crossterm",
+ "ratatui",
  "serde",
  "serde_json",
  "snafu",
+ "time",
  "unidiff",
 ]
 

@@ -10,9 +10,9 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line as TuiLine, Span};
-use ratatui::widgets::{
-    Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
-};
+use ratatui::widgets::{Block, Borders, Paragraph};
+#[cfg(test)]
+use ratatui::widgets::{Scrollbar, ScrollbarOrientation};
 use ratatui::{Frame, Terminal};
 
 use crate::change_id::ChangeId;
@@ -47,6 +47,10 @@ use diff_view::{
     InlineComment, PairedRow, RenderedLine, RenderedLineKind,
 };
 use file_picker::{build_entries as build_file_picker_entries, FilePickerState};
+#[cfg(test)]
+use local_review_core::tui::composer::{
+    STATUS_DESCRIPTION_UNAVAILABLE, STATUS_LINE_UNAVAILABLE, STATUS_STACK_UNAVAILABLE,
+};
 use overview_screen::{OverviewCommentSet, OverviewScreenState};
 use send_to_claude::{ConfirmData, SendToClaudeState};
 use stale_screen::StaleScreenState;
@@ -60,12 +64,6 @@ const BLOCK_BORDER_COLS: u16 = 2;
 /// Initial value for `App::viewport_rows` before the first render measures the
 /// real diff area height. Overwritten by `render_main` on every frame.
 const FALLBACK_VIEWPORT_ROWS: u16 = 20;
-
-/// Width (cells) of a length-indicator (vertical scrollbar). The scrollbar
-/// widget renders into a single column on the right edge of a paginated body
-/// (diff pane, file picker, stale list, stack overview) when content overflows
-/// the viewport.
-pub(super) const SCROLLBAR_WIDTH: u16 = 1;
 
 /// Stack depth at which `transition_screen = "auto"` starts firing. Per spec,
 /// deep stacks get the beat between changes; short ones don't need the pause.
@@ -155,23 +153,8 @@ pub(super) fn resolve_diff_mode(
     }
 }
 
-/// Severity -> terminal color.
-pub(super) fn severity_color(severity: Severity) -> Color {
-    match severity {
-        Severity::Required => Color::Red,
-        Severity::Suggestion => Color::Yellow,
-        Severity::Note => Color::DarkGray,
-    }
-}
-
-/// Severity -> display label.
-pub(super) fn severity_label(severity: Severity) -> &'static str {
-    match severity {
-        Severity::Required => "required",
-        Severity::Suggestion => "suggestion",
-        Severity::Note => "note",
-    }
-}
+pub(super) use local_review_core::tui::diff_view::severity_label;
+pub(super) use local_review_core::tui::severity_color;
 
 pub fn run(change_id: &ChangeId, repo_root: &std::path::Path) -> Result<()> {
     let details = jj::show(change_id)?;
@@ -1321,7 +1304,7 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
     render_main(frame, app);
     match &app.screen {
         Screen::Main => {}
-        Screen::Help => help_screen::render(frame),
+        Screen::Help => help_screen::render(frame, "jjr · keybindings"),
         Screen::Composer(composer) => {
             composer_overlay::render_composer_overlay(frame, composer, app.current_view());
         }
@@ -1592,6 +1575,7 @@ fn inline_comment_column(
             Some(PairedRow::Pair {
                 left: Some(_),
                 right: None,
+                ..
             }) => return InlineCommentColumn::Left,
             Some(_) | None => return InlineCommentColumn::Right,
         }
@@ -1646,7 +1630,7 @@ fn render_paired_row<'a>(
                 render_full_width_row(line, focused, geom.full_width)
             }
         }
-        PairedRow::Pair { left, right } => {
+        PairedRow::Pair { left, right, .. } => {
             let left_spans = match left.and_then(|i| view.lines.get(i)) {
                 Some(line) => side_cell_spans(line, geom.side_width, focused),
                 None => blank_cell_spans(geom.side_width, focused),
@@ -1727,122 +1711,12 @@ fn side_by_side_gutter_spans<'a>() -> Vec<Span<'a>> {
     )]
 }
 
-/// Pure numeric core for a paginated-view scrollbar: returns
-/// `Some((content_length, position))` when the content overflows the viewport,
-/// `None` otherwise.
-///
-/// `total_lines` is the count of distinct rows the body can scroll across —
-/// for the diff pane that is rendered diff lines, for an entry list that is
-/// the entry count (or summed per-entry rows when entries vary in height).
-/// The math is identical regardless of what each row represents.
-///
-/// `content_length` is the number of distinct *scroll positions* (top-row
-/// indices the user can land at), which is `max_scroll + 1` where
-/// `max_scroll = total_lines - viewport_rows`. `position` is `scroll` clamped
-/// to `[0, max_scroll]`.
-///
-/// The clamp is defensive against future ratatui changes — current ratatui
-/// also clamps internally — and gives us a tuple shape the tests can pin
-/// numerically without rendering.
-pub(super) fn scrollbar_overflow_for_view(
-    total_lines: usize,
-    scroll: u16,
-    viewport_rows: u16,
-) -> Option<(usize, usize)> {
-    if viewport_rows == 0 {
-        return None;
-    }
-    let viewport_usize = usize::from(viewport_rows);
-    if total_lines <= viewport_usize {
-        return None;
-    }
-    let max_scroll = total_lines - viewport_usize;
-    let position = usize::from(scroll).min(max_scroll);
-    let content_length = max_scroll + 1;
-    Some((content_length, position))
-}
+pub(super) use local_review_core::tui::{render_view_scrollbar, scrollbar_layout_for_view};
 
-/// Build the [`ScrollbarState`] for a paginated body of `total_lines` rows
-/// with topmost-visible row `scroll` in a viewport `viewport_rows` rows tall.
-///
-/// Returns `None` when the content fits in the viewport (or the viewport is
-/// degenerate); the caller should skip the scrollbar in that case so it does
-/// not waste a column on noise.
-///
-/// Thin shell over [`scrollbar_overflow_for_view`]: pinning the numeric
-/// behavior happens against the pure helper; this function just lifts the
-/// tuple into ratatui's `ScrollbarState`.
-pub(super) fn scrollbar_state_for_view(
-    total_lines: usize,
-    scroll: u16,
-    viewport_rows: u16,
-) -> Option<ScrollbarState> {
-    let (content_length, position) =
-        scrollbar_overflow_for_view(total_lines, scroll, viewport_rows)?;
-    Some(ScrollbarState::new(content_length).position(position))
-}
-
-/// Split `area` into a body region and an optional [`SCROLLBAR_WIDTH`]-col
-/// scrollbar strip on the right edge.
-///
-/// Returns `(body_area, scrollbar_slot)`. The slot is `None` when no
-/// scrollbar was requested (`with_scrollbar = false`) **or** when the area is
-/// too narrow to host both the body and a scrollbar column. In both cases the
-/// body keeps the full original area.
-pub(super) fn split_body_for_scrollbar(area: Rect, with_scrollbar: bool) -> (Rect, Option<Rect>) {
-    if !with_scrollbar || area.width <= SCROLLBAR_WIDTH {
-        return (area, None);
-    }
-    let split =
-        Layout::horizontal([Constraint::Min(0), Constraint::Length(SCROLLBAR_WIDTH)]).split(area);
-    (split[0], Some(split[1]))
-}
-
-/// Build the right-edge scrollbar widget shared by every paginated view.
-/// Centralizes the orientation and per-element style choices so all screens
-/// render the same glyphs and colors.
-pub(super) fn view_scrollbar() -> Scrollbar<'static> {
-    Scrollbar::default()
-        .orientation(ScrollbarOrientation::VerticalRight)
-        .track_style(Style::default().fg(Color::DarkGray))
-        .thumb_style(Style::default().fg(Color::Gray))
-        .begin_style(Style::default().fg(Color::DarkGray))
-        .end_style(Style::default().fg(Color::DarkGray))
-}
-
-/// One-shot layout helper for paginated views that want a scrollbar.
-///
-/// Combines [`scrollbar_state_for_view`] and [`split_body_for_scrollbar`] so
-/// each call site collapses to "compute layout, render body into `body`,
-/// hand `(state, sb_area)` to [`render_view_scrollbar`]." The helper returns
-/// `(body, sb_area, sb_state)`:
-///
-/// - `body` is always the area into which the view's content is rendered. It
-///   shrinks by [`SCROLLBAR_WIDTH`] when a scrollbar will be drawn.
-/// - `sb_area` and `sb_state` are both `Some` together (overflow + room for
-///   the strip) or both `None` (no overflow, or area too narrow).
-pub(super) fn scrollbar_layout_for_view(
-    area: Rect,
-    total_lines: usize,
-    scroll: u16,
-) -> (Rect, Option<Rect>, Option<ScrollbarState>) {
-    let sb_state = scrollbar_state_for_view(total_lines, scroll, area.height);
-    let (body, sb_area) = split_body_for_scrollbar(area, sb_state.is_some());
-    (body, sb_area, sb_state)
-}
-
-/// Render the right-edge scrollbar into `sb_area` if both the area and the
-/// state were produced by [`scrollbar_layout_for_view`]. Either both are
-/// `Some` together or both are `None`; in the latter case this is a no-op.
-pub(super) fn render_view_scrollbar(
-    frame: &mut Frame<'_>,
-    sb_state: Option<&mut ScrollbarState>,
-    sb_area: Option<Rect>,
-) {
-    if let (Some(state), Some(area)) = (sb_state, sb_area) {
-        frame.render_stateful_widget(view_scrollbar(), area, state);
-    }
-}
+#[cfg(test)]
+pub(super) use local_review_core::tui::{
+    scrollbar_overflow_for_view, scrollbar_state_for_view, split_body_for_scrollbar,
+};
 
 /// Visual attributes that the unified and side-by-side renderers share for a
 /// `RenderedLine`. The `prefix` is the two-cell `+ ` / `- ` / `  ` glyph
@@ -3209,15 +3083,15 @@ fn handle_composer_event(app: &mut App, key: KeyEvent) {
 #[test]
 fn refused_scope_chord_status_strings_are_byte_stable() {
     assert_eq!(
-        composer::STATUS_STACK_UNAVAILABLE,
+        STATUS_STACK_UNAVAILABLE,
         "stack scope unavailable in single-change mode"
     );
     assert_eq!(
-        composer::STATUS_DESCRIPTION_UNAVAILABLE,
+        STATUS_DESCRIPTION_UNAVAILABLE,
         "description scope unavailable: open from a description line"
     );
     assert_eq!(
-        composer::STATUS_LINE_UNAVAILABLE,
+        STATUS_LINE_UNAVAILABLE,
         "line scope unavailable: cursor is not on a commentable line"
     );
 }
@@ -4494,7 +4368,7 @@ mod tests {
         );
         assert_eq!(
             app.status_message.as_deref(),
-            Some(composer::STATUS_STACK_UNAVAILABLE),
+            Some(STATUS_STACK_UNAVAILABLE),
             "status message must surface the stack-unavailable hint",
         );
     }
@@ -5100,7 +4974,7 @@ mod tests {
             );
             assert_eq!(
                 c.refusal_status,
-                Some(composer::STATUS_STACK_UNAVAILABLE),
+                Some(STATUS_STACK_UNAVAILABLE),
                 "refusal_status must surface the stack-unavailable hint"
             );
         } else {
@@ -5108,7 +4982,7 @@ mod tests {
         }
         assert_eq!(
             app.status_message.as_deref(),
-            Some(composer::STATUS_STACK_UNAVAILABLE)
+            Some(STATUS_STACK_UNAVAILABLE)
         );
     }
 
