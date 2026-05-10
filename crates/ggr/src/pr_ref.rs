@@ -10,6 +10,7 @@
 //! `ParsedPrRef` carries enough information to build any `gh` invocation.
 
 use crate::error::{GgrError, Result};
+use crate::pr::RepoName;
 
 /// Resolved PR reference, ready to drive `gh pr view` and `gh api`.
 #[derive(Debug, Clone)]
@@ -38,7 +39,7 @@ pub(crate) fn parse(input: &str, url_flag: Option<&str>) -> Result<ParsedPrRef> 
 
     // ── Form 2 / 3: owner/repo#number ────────────────────────────────────────
     if let Some((repo, num_str)) = input.split_once('#') {
-        if !repo.is_empty() && repo.contains('/') {
+        if RepoName::try_from(repo).is_ok() {
             let number = num_str.parse::<u64>().map_err(|_| GgrError::InvalidPrRef {
                 raw: input.to_owned(),
             })?;
