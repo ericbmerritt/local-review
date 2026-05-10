@@ -52,7 +52,13 @@ pub(crate) fn parse(input: &str, url_flag: Option<&str>) -> Result<ParsedPrRef> 
             let (repo_flag, hostname) = match url_flag {
                 Some(url) => {
                     let host = extract_host(url, input)?;
-                    (Some(format!("{host}/{}", repo_name.as_str())), Some(host))
+                    let hostname = crate::util::hostname_from_host(&host);
+                    let repo_flag = if hostname.is_some() {
+                        Some(format!("{host}/{}", repo_name.as_str()))
+                    } else {
+                        Some(repo_name.as_str().to_owned())
+                    };
+                    (repo_flag, hostname)
                 }
                 None => (Some(repo_name.as_str().to_owned()), None),
             };
@@ -155,11 +161,7 @@ fn parse_url(url: &str) -> Result<ParsedPrRef> {
     })?;
 
     // Standard github.com — no hostname needed.
-    let hostname = if host == "github.com" {
-        None
-    } else {
-        Some(host.to_owned())
-    };
+    let hostname = crate::util::hostname_from_host(host);
 
     let repo_flag = match &hostname {
         Some(h) => Some(format!("{h}/{}", repo_name.as_str())),
@@ -416,5 +418,59 @@ mod tests {
                 "control characters must be stripped from error raw: {raw:?}"
             );
         }
+    }
+
+    #[test]
+    fn url_flag_github_com_normalizes_hostname() {
+        let r = parse("owner/repo#42", Some("https://github.com")).unwrap();
+        assert_eq!(r.number, 42);
+        assert_eq!(r.repo_flag.as_deref(), Some("owner/repo"));
+        assert!(r.hostname.is_none());
+    }
+
+    #[test]
+    fn url_flag_github_com_bare_normalizes_hostname() {
+        let r = parse("owner/repo#42", Some("github.com")).unwrap();
+        assert_eq!(r.number, 42);
+        assert_eq!(r.repo_flag.as_deref(), Some("owner/repo"));
+        assert!(r.hostname.is_none());
+    }
+
+    #[test]
+    fn url_flag_github_com_http_normalizes_hostname() {
+        let r = parse("owner/repo#42", Some("http://github.com")).unwrap();
+        assert_eq!(r.number, 42);
+        assert_eq!(r.repo_flag.as_deref(), Some("owner/repo"));
+        assert!(r.hostname.is_none());
+    }
+
+    #[test]
+    fn valid_segment_rejects_leading_dot_owner() {
+        assert!(parse(".owner/repo#42", None).is_err());
+    }
+
+    #[test]
+    fn valid_segment_rejects_trailing_dot_owner() {
+        assert!(parse("owner./repo#42", None).is_err());
+    }
+
+    #[test]
+    fn url_with_leading_dot_owner_is_error() {
+        assert!(parse("https://github.com/.owner/repo/pull/42", None).is_err());
+    }
+
+    #[test]
+    fn url_flag_with_leading_dot_hostname_is_error() {
+        assert!(parse("owner/repo#42", Some("https://.github.com")).is_err());
+    }
+
+    #[test]
+    fn url_with_trailing_dot_hostname_is_error() {
+        assert!(parse("https://github.com./owner/repo/pull/42", None).is_err());
+    }
+
+    #[test]
+    fn url_with_leading_dot_hostname_is_error() {
+        assert!(parse("https://.github.com/owner/repo/pull/42", None).is_err());
     }
 }
