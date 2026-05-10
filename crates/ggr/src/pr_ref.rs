@@ -10,7 +10,7 @@
 //! `ParsedPrRef` carries enough information to build any `gh` invocation.
 
 use crate::error::{GgrError, Result};
-use crate::pr::RepoName;
+use crate::pr::{strip_controls, RepoName};
 
 /// Resolved PR reference, ready to drive `gh pr view` and `gh api`.
 #[derive(Debug, Clone)]
@@ -39,17 +39,22 @@ pub(crate) fn parse(input: &str, url_flag: Option<&str>) -> Result<ParsedPrRef> 
 
     // ── Form 2 / 3: owner/repo#number ────────────────────────────────────────
     if let Some((repo, num_str)) = input.split_once('#') {
-        if RepoName::try_from(repo).is_ok() {
+        if let Ok(repo_name) = RepoName::try_from(repo) {
             let number = num_str.parse::<u64>().map_err(|_| GgrError::InvalidPrRef {
-                raw: input.to_owned(),
+                raw: strip_controls(input),
             })?;
+            if number == 0 {
+                return Err(GgrError::InvalidPrRef {
+                    raw: strip_controls(input),
+                });
+            }
 
             let (repo_flag, hostname) = match url_flag {
                 Some(url) => {
                     let host = extract_host(url, input)?;
-                    (Some(format!("{host}/{repo}")), Some(host))
+                    (Some(format!("{host}/{}", repo_name.as_str())), Some(host))
                 }
-                None => (Some(repo.to_owned()), None),
+                None => (Some(repo_name.as_str().to_owned()), None),
             };
 
             return Ok(ParsedPrRef {
@@ -63,6 +68,11 @@ pub(crate) fn parse(input: &str, url_flag: Option<&str>) -> Result<ParsedPrRef> 
     // ── Form 1: bare number (optional leading #) ──────────────────────────────
     let digits = input.trim_start_matches('#');
     if let Ok(number) = digits.parse::<u64>() {
+        if number == 0 {
+            return Err(GgrError::InvalidPrRef {
+                raw: strip_controls(input),
+            });
+        }
         if url_flag.is_some() {
             // --url without an explicit repo makes no sense: gh can't know
             // which repo to query on a remote host without being told.
@@ -80,7 +90,7 @@ pub(crate) fn parse(input: &str, url_flag: Option<&str>) -> Result<ParsedPrRef> 
     }
 
     Err(GgrError::InvalidPrRef {
-        raw: input.to_owned(),
+        raw: strip_controls(input),
     })
 }
 
@@ -88,41 +98,60 @@ pub(crate) fn parse(input: &str, url_flag: Option<&str>) -> Result<ParsedPrRef> 
 fn parse_url(url: &str) -> Result<ParsedPrRef> {
     // Strip scheme: "https://host/owner/repo/pull/42"
     let without_scheme = url
-        .trim_start_matches("https://")
-        .trim_start_matches("http://");
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .ok_or_else(|| GgrError::InvalidPrRef {
+            raw: strip_controls(url),
+        })?;
 
     // Split off host from the rest.
     let (host, path) = without_scheme
         .split_once('/')
         .ok_or_else(|| GgrError::InvalidPrRef {
-            raw: url.to_owned(),
+            raw: strip_controls(url),
         })?;
 
-    if !valid_hostname(host) {
+    // Hostname character rules match repo-segment rules.
+    if !crate::pr::valid_segment(host) {
         return Err(GgrError::InvalidPrRef {
-            raw: url.to_owned(),
+            raw: strip_controls(url),
         });
     }
 
-    // Expect path = "owner/repo/pull/number"
-    let parts: Vec<&str> = path.splitn(4, '/').collect();
+    // Expect path = "owner/repo/pull/number" — exactly 4 segments, no trailing
+    // path or fragment.  Split into at most 5 parts; a 5th part means there is
+    // a trailing segment (e.g. "/files") or fragment ("#...") after the number,
+    // both of which are invalid.
+    let parts: Vec<&str> = path.splitn(5, '/').collect();
     if parts.len() != 4 || parts[2] != "pull" {
         return Err(GgrError::InvalidPrRef {
-            raw: url.to_owned(),
+            raw: strip_controls(url),
         });
     }
 
     let owner = parts[0];
     let repo = parts[1];
-    let number = parts[3]
+    // Reject fragments embedded in the number segment (e.g. "42#issuecomment-123").
+    let number_str = parts[3];
+    if number_str.contains('#') {
+        return Err(GgrError::InvalidPrRef {
+            raw: strip_controls(url),
+        });
+    }
+    let number = number_str
         .parse::<u64>()
         .map_err(|_| GgrError::InvalidPrRef {
-            raw: url.to_owned(),
+            raw: strip_controls(url),
         })?;
+    if number == 0 {
+        return Err(GgrError::InvalidPrRef {
+            raw: strip_controls(url),
+        });
+    }
 
     let repo_str = format!("{owner}/{repo}");
     let repo_name = RepoName::try_from(repo_str.as_str()).map_err(|_| GgrError::InvalidPrRef {
-        raw: url.to_owned(),
+        raw: strip_controls(url),
     })?;
 
     // Standard github.com — no hostname needed.
@@ -144,23 +173,22 @@ fn parse_url(url: &str) -> Result<ParsedPrRef> {
     })
 }
 
-fn valid_hostname(s: &str) -> bool {
-    !s.is_empty()
-        && !s.contains("..")
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-'))
-}
-
 /// Extract the bare hostname from a base URL string (e.g. `https://github.example.com`
-/// → `github.example.com`). The raw PR ref string is included in error messages.
+/// → `github.example.com`). Bare hostnames without a scheme (e.g.
+/// `github.example.com`) are also accepted — `unwrap_or(url)` passes them
+/// through directly, so `--url github.example.com` works as well as
+/// `--url https://github.example.com`. The raw PR ref string is included in
+/// error messages.
 fn extract_host(url: &str, pr_raw: &str) -> Result<String> {
     let host = url
-        .trim_start_matches("https://")
-        .trim_start_matches("http://")
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url)
         .trim_end_matches('/');
-    if host.is_empty() || !valid_hostname(host) {
+    // Hostname character rules match repo-segment rules.
+    if host.is_empty() || !crate::pr::valid_segment(host) {
         return Err(GgrError::InvalidPrRef {
-            raw: pr_raw.to_owned(),
+            raw: strip_controls(pr_raw),
         });
     }
     Ok(host.to_owned())
@@ -245,5 +273,148 @@ mod tests {
     #[test]
     fn url_flag_with_dotdot_host_is_error() {
         assert!(parse("owner/repo#42", Some("https://../etc/passwd")).is_err());
+    }
+
+    #[test]
+    fn url_with_underscore_hostname_is_accepted() {
+        let r = parse("https://github_internal.corp.com/owner/repo/pull/42", None).unwrap();
+        assert_eq!(r.number, 42);
+        assert_eq!(
+            r.repo_flag.as_deref(),
+            Some("github_internal.corp.com/owner/repo")
+        );
+        assert_eq!(r.hostname.as_deref(), Some("github_internal.corp.com"));
+    }
+
+    #[test]
+    fn url_flag_with_underscore_hostname_is_accepted() {
+        let r = parse("owner/repo#42", Some("https://github_corp.internal")).unwrap();
+        assert_eq!(r.number, 42);
+        assert_eq!(
+            r.repo_flag.as_deref(),
+            Some("github_corp.internal/owner/repo")
+        );
+        assert_eq!(r.hostname.as_deref(), Some("github_corp.internal"));
+    }
+
+    #[test]
+    fn short_form_with_dotdot_owner_is_error() {
+        assert!(parse("../repo#42", None).is_err());
+    }
+
+    #[test]
+    fn url_with_all_underscore_hostname_is_error() {
+        assert!(parse("owner/repo#42", Some("https://_")).is_err());
+    }
+
+    #[test]
+    fn url_flag_bare_hostname_is_accepted() {
+        let r = parse("owner/repo#42", Some("github.example.com")).unwrap();
+        assert_eq!(r.number, 42);
+        assert_eq!(r.hostname.as_deref(), Some("github.example.com"));
+    }
+
+    #[test]
+    fn url_with_trailing_path_segment_is_error() {
+        assert!(parse("https://github.com/owner/repo/pull/42/files", None).is_err());
+    }
+
+    #[test]
+    fn url_with_fragment_is_error() {
+        assert!(parse(
+            "https://github.com/owner/repo/pull/42#issuecomment-123",
+            None
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn bare_number_zero_is_error() {
+        assert!(parse("0", None).is_err());
+    }
+
+    #[test]
+    fn repo_and_number_zero_is_error() {
+        assert!(parse("owner/repo#0", None).is_err());
+    }
+
+    #[test]
+    fn url_with_zero_pr_is_error() {
+        assert!(parse("https://github.com/owner/repo/pull/0", None).is_err());
+    }
+
+    #[test]
+    fn url_flag_with_path_suffix_is_error() {
+        assert!(parse(
+            "owner/repo#42",
+            Some("https://github.example.com/extra/path")
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn full_http_url_is_accepted() {
+        let r = parse("http://github.com/owner/repo/pull/42", None).unwrap();
+        assert_eq!(r.number, 42);
+        assert_eq!(r.repo_flag.as_deref(), Some("owner/repo"));
+        // github.com → no hostname override
+        assert!(r.hostname.is_none());
+    }
+
+    #[test]
+    fn url_flag_http_is_accepted() {
+        let r = parse("owner/repo#42", Some("http://github.example.com")).unwrap();
+        assert_eq!(r.number, 42);
+        assert_eq!(
+            r.repo_flag.as_deref(),
+            Some("github.example.com/owner/repo")
+        );
+        assert_eq!(r.hostname.as_deref(), Some("github.example.com"));
+    }
+
+    #[test]
+    fn ansi_escape_in_invalid_ref_is_stripped_from_error_raw() {
+        // A crafted input containing ANSI escapes must not survive into the error
+        // raw field; control characters are stripped before the value is stored,
+        // mirroring the CommitSha::try_from pattern.
+        let crafted = "\x1b[31mevil/repo#0\x1b[0m";
+        let result = parse(crafted, None);
+        assert!(result.is_err());
+        if let Err(GgrError::InvalidPrRef { raw }) = result {
+            assert!(
+                !raw.chars().any(char::is_control),
+                "control characters must be stripped from error raw: {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn url_flag_trailing_slash_is_accepted() {
+        let r = parse("owner/repo#42", Some("https://github.example.com/")).unwrap();
+        assert_eq!(r.number, 42);
+        assert_eq!(r.hostname.as_deref(), Some("github.example.com"));
+    }
+
+    #[test]
+    fn url_flag_bare_hostname_trailing_slash_is_accepted() {
+        let r = parse("owner/repo#42", Some("github.example.com/")).unwrap();
+        assert_eq!(r.number, 42);
+        assert_eq!(r.hostname.as_deref(), Some("github.example.com"));
+    }
+
+    #[test]
+    fn ansi_escape_in_url_repo_name_is_stripped_from_error_raw() {
+        // ANSI escapes in the owner segment of a full pull URL must not survive
+        // into the InvalidPrRef raw field; strip_controls is applied in the
+        // RepoName validation failure path of parse_url.
+        let crafted = "https://github.com/\x1b[31mevil\x1b[0m/repo/pull/1";
+        let result = parse(crafted, None);
+        assert!(result.is_err());
+        if let Err(GgrError::InvalidPrRef { raw }) = result {
+            assert!(
+                !raw.chars().any(char::is_control),
+                "control characters must be stripped from error raw: {raw:?}"
+            );
+        }
     }
 }

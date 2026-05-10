@@ -9,6 +9,29 @@ use crate::error::GgrError;
 
 // ── RepoName ──────────────────────────────────────────────────────────────────
 
+/// Strip ASCII/Unicode control characters from a string.
+///
+/// Used when embedding untrusted input in error values to prevent
+/// control-character injection into error messages.
+pub(crate) fn strip_controls(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).collect()
+}
+
+/// Validate a single path/hostname segment: non-empty, no `..`, only
+/// alphanumeric and separator chars (`-`, `_`, `.`), at least one alphanumeric.
+///
+/// Used by both [`RepoName::try_from`] for owner/repo segments and by
+/// `pr_ref::extract_host` for hostname validation (hostname character rules
+/// match repo-segment rules).
+pub(crate) fn valid_segment(seg: &str) -> bool {
+    !seg.is_empty()
+        && !seg.contains("..")
+        && seg
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        && seg.chars().any(|c| c.is_ascii_alphanumeric())
+}
+
 /// A validated `owner/repo` slug.
 ///
 /// Constructed via [`TryFrom<&str>`], which enforces the `owner/repo` format
@@ -21,15 +44,8 @@ impl TryFrom<&str> for RepoName {
     type Error = GgrError;
 
     fn try_from(s: &str) -> Result<Self, Self::Error> {
-        fn valid_segment(seg: &str) -> bool {
-            !seg.is_empty()
-                && !seg.contains("..")
-                && seg
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-        }
         let err = || GgrError::InvalidRepoName {
-            repo_name: s.to_owned(),
+            repo_name: strip_controls(s),
         };
         let (owner, repo) = s.split_once('/').ok_or_else(err)?;
         if !valid_segment(owner) || !valid_segment(repo) {
@@ -64,7 +80,9 @@ impl TryFrom<&str> for CommitSha {
         if valid {
             Ok(Self(s.to_owned()))
         } else {
-            Err(GgrError::InvalidCommitSha { sha: s.to_owned() })
+            Err(GgrError::InvalidCommitSha {
+                sha: strip_controls(s),
+            })
         }
     }
 }
@@ -77,54 +95,58 @@ impl CommitSha {
 }
 
 /// One commit in a PR, as resolved by `gh pr view --json commits`.
+///
+/// # Security
+/// All string fields originate from GitHub users and are untrusted.
+/// Strip terminal control characters before passing to any renderer to
+/// prevent ANSI escape injection.
 #[derive(Debug, Clone)]
 pub(crate) struct CommitEntry {
     /// Full 40-char validated SHA.
     pub(crate) sha: CommitSha,
     /// First 8 characters of the SHA, for display.
     pub(crate) short_sha: String,
-    /// First line of the commit message.
+    /// First line of the commit message (the `messageHeadline` field from GitHub).
     pub(crate) title: String,
 }
 
 /// A general (non-inline) PR comment.
+///
+/// # Security
+/// All string fields originate from GitHub users and are untrusted.
+/// Strip terminal control characters before passing to any renderer to
+/// prevent ANSI escape injection.
 #[derive(Debug, Clone)]
 pub(crate) struct PrComment {
+    /// Comment author login as returned by the GitHub API.
     pub(crate) author: String,
+    /// Comment body as returned by the GitHub API.
     pub(crate) body: String,
 }
 
 /// One comment within an inline review thread.
 ///
 /// `id` is GitHub's review comment ID; it is needed to post replies.
+///
+/// # Security
+/// All string fields originate from GitHub users and are untrusted.
+/// Strip terminal control characters before passing to any renderer to
+/// prevent ANSI escape injection.
 #[derive(Debug, Clone)]
 pub(crate) struct ThreadComment {
     /// GitHub's numeric review comment ID.
     #[expect(dead_code, reason = "consumed by thread rendering TUI (not yet built)")]
     pub(crate) id: u64,
     /// Comment author login as returned by the GitHub API.
-    ///
-    /// # Security
-    /// Content originates from GitHub users and is untrusted.
-    /// Strip terminal control characters before passing to any renderer to
-    /// prevent ANSI escape injection.
     #[expect(dead_code, reason = "consumed by thread rendering TUI (not yet built)")]
     pub(crate) author: String,
     /// ISO 8601 creation timestamp (e.g. `"2024-01-15T10:30:00Z"`).
-    ///
-    /// From the GitHub API; strip control characters before rendering.
-    ///
-    /// # Security
-    /// Content originates from the GitHub API and is untrusted.
-    /// Strip terminal control characters before passing to any renderer.
-    #[expect(dead_code, reason = "consumed by thread rendering TUI (not yet built)")]
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "consumed by thread rendering TUI (not yet built)")
+    )]
     pub(crate) created_at: String,
     /// Comment body as returned by the GitHub API.
-    ///
-    /// # Security
-    /// Content originates from GitHub users and is untrusted.
-    /// Strip terminal control characters before passing to any renderer to
-    /// prevent ANSI escape injection.
     #[cfg_attr(
         not(test),
         expect(dead_code, reason = "consumed by thread rendering TUI (not yet built)")
@@ -155,14 +177,12 @@ pub(crate) struct ReviewThread {
     pub(crate) path: String,
     /// 1-based diff-offset position in the PR diff.
     pub(crate) position: Option<u32>,
-    /// Commit SHA at which the root comment was first made.
-    ///
-    /// From the GitHub API; strip control characters before rendering.
+    /// Validated 40-char lowercase-hex SHA.
     #[cfg_attr(
         not(test),
         expect(dead_code, reason = "consumed by thread rendering TUI (not yet built)")
     )]
-    pub(crate) original_commit_id: String,
+    pub(crate) original_commit_id: CommitSha,
     /// Root (first) comment for the thread.
     #[cfg_attr(
         not(test),
@@ -226,6 +246,11 @@ mod tests {
     }
 
     #[test]
+    fn valid_commit_sha_rejects_empty() {
+        assert!(CommitSha::try_from("").is_err());
+    }
+
+    #[test]
     fn valid_commit_sha_rejects_non_hex_char() {
         assert!(CommitSha::try_from("g3b4c5d6e7f8a3b4c5d6e7f8a3b4c5d6e7f8a3b4").is_err());
     }
@@ -236,8 +261,20 @@ mod tests {
     }
 
     #[test]
-    fn valid_commit_sha_rejects_empty() {
-        assert!(CommitSha::try_from("").is_err());
+    fn root_with_invalid_sha_returns_err() {
+        // A crafted SHA containing ANSI escape sequences must not be echoed
+        // verbatim into the error display; control characters are stripped
+        // before the error is constructed, so the returned Err still carries
+        // a sanitised (non-40-hex) string and is not Ok.
+        let crafted = "\x1b[31mevil\x1b[0m";
+        let result = CommitSha::try_from(crafted);
+        assert!(result.is_err());
+        if let Err(crate::error::GgrError::InvalidCommitSha { sha }) = result {
+            assert!(
+                !sha.chars().any(char::is_control),
+                "control characters must be stripped from error sha: {sha:?}"
+            );
+        }
     }
 
     #[test]
@@ -293,5 +330,46 @@ mod tests {
     #[test]
     fn validate_repo_name_rejects_dotdot_repo() {
         assert!(RepoName::try_from("owner/..").is_err());
+    }
+
+    #[test]
+    fn validate_repo_name_rejects_all_underscore_owner() {
+        assert!(RepoName::try_from("_/repo").is_err());
+    }
+
+    #[test]
+    fn validate_repo_name_rejects_all_underscore_repo() {
+        assert!(RepoName::try_from("owner/_").is_err());
+    }
+
+    #[test]
+    fn validate_repo_name_rejects_single_dot_owner() {
+        assert!(RepoName::try_from("./repo").is_err());
+    }
+
+    #[test]
+    fn validate_repo_name_accepts_leading_hyphen() {
+        // valid_segment does not restrict hyphen position; GitHub API enforces naming rules.
+        assert!(RepoName::try_from("-owner/repo").is_ok());
+    }
+
+    #[test]
+    fn validate_repo_name_accepts_trailing_hyphen() {
+        assert!(RepoName::try_from("owner/repo-").is_ok());
+    }
+
+    #[test]
+    fn validate_repo_name_ansi_escape_is_stripped_from_error() {
+        // ANSI escape sequences in the repo slug must not survive into the
+        // error's repo_name field; strip_controls is applied before embedding.
+        let crafted = "\x1b[31mevil\x1b[0m/repo";
+        let result = RepoName::try_from(crafted);
+        assert!(result.is_err());
+        if let Err(crate::error::GgrError::InvalidRepoName { repo_name }) = result {
+            assert!(
+                !repo_name.chars().any(char::is_control),
+                "control characters must be stripped from error repo_name: {repo_name:?}"
+            );
+        }
     }
 }
