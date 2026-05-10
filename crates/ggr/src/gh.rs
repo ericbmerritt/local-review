@@ -13,6 +13,7 @@ use serde::Deserialize;
 
 use local_review_core::comment::Side;
 use local_review_core::diff::Diff;
+use local_review_core::Severity;
 
 use snafu::IntoError as _;
 
@@ -288,7 +289,7 @@ fn group_review_comments(raw: Vec<RawReviewComment>) -> Result<Vec<ReviewThread>
                     Some(RawSide::Unknown) | None => None,
                 };
                 let thread = ReviewThread {
-                    path: comment.path,
+                    path: strip_controls(&comment.path),
                     position: comment.position,
                     original_commit_id,
                     root,
@@ -296,6 +297,7 @@ fn group_review_comments(raw: Vec<RawReviewComment>) -> Result<Vec<ReviewThread>
                     line: comment.line,
                     original_line: comment.original_line,
                     diff_side,
+                    severity: Severity::Note,
                 };
                 root_index.insert(comment.id, threads.len());
                 threads.push(thread);
@@ -644,5 +646,20 @@ mod tests {
         assert_eq!(threads[0].line, Some(42));
         assert_eq!(threads[0].original_line, Some(5));
         assert_eq!(threads[0].diff_side, Some(Side::New));
+    }
+
+    #[test]
+    fn group_review_comments_strips_control_chars_from_path() {
+        let crafted_path = "\x1b[31mevil\x1b[0m/src/lib.rs";
+        let raw = vec![RawReviewComment {
+            path: crafted_path.to_owned(),
+            ..make_root(1, "ignored", Some(1))
+        }];
+        let threads = group_review_comments(raw).unwrap();
+        assert!(
+            !threads[0].path.chars().any(char::is_control),
+            "thread.path must have control chars stripped; got: {:?}",
+            threads[0].path
+        );
     }
 }

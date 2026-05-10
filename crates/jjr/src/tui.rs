@@ -736,10 +736,11 @@ impl ReviewSurface for JjrSurface {
 
     fn inline_comments_for_view(
         &self,
+        now: std::time::SystemTime,
         view_idx: usize,
         severity_filter: Option<Severity>,
     ) -> Vec<InlineComment> {
-        let now = time::OffsetDateTime::now_utc();
+        let now = time::OffsetDateTime::from(now);
         if view_idx == 0 {
             self.loaded_comments
                 .iter()

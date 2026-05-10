@@ -15,10 +15,7 @@ use crate::change_id::ChangeId;
 use crate::revset_hash::RevsetHash;
 use crate::severity::Severity;
 use crate::tui::textarea::TextArea;
-
-const SECS_PER_MIN: i64 = 60;
-const SECS_PER_HOUR: i64 = 60 * SECS_PER_MIN;
-const SECS_PER_DAY: i64 = 24 * SECS_PER_HOUR;
+use crate::util::format_age_secs;
 
 /// Where the comment is being anchored. Each variant carries the data needed
 /// to build its anchor at save time, so a variant cannot exist without its
@@ -467,37 +464,9 @@ pub fn default_severity(last: Option<Severity>) -> Severity {
 /// Negative durations are clamped to zero.
 #[must_use]
 pub fn format_age(now: OffsetDateTime, created_at: OffsetDateTime) -> String {
-    let secs = (now - created_at).whole_seconds();
-    format_age_secs(secs)
-}
-
-#[must_use]
-fn format_age_secs(secs: i64) -> String {
-    let secs = secs.max(0);
-    match secs {
-        0..=29 => "just now".to_owned(),
-        30..=89 => "1 min ago".to_owned(),
-        90..=3599 => {
-            let mins = (secs + SECS_PER_MIN / 2) / SECS_PER_MIN;
-            format!("{mins} min ago")
-        }
-        3600..=86399 => {
-            let hours = (secs + SECS_PER_HOUR / 2) / SECS_PER_HOUR;
-            if hours == 1 {
-                "1 hour ago".to_owned()
-            } else {
-                format!("{hours} hours ago")
-            }
-        }
-        _ => {
-            let days = secs / SECS_PER_DAY;
-            if days == 1 {
-                "yesterday".to_owned()
-            } else {
-                format!("{days} days ago")
-            }
-        }
-    }
+    let elapsed_i64 = (now - created_at).whole_seconds();
+    let elapsed_secs = u64::try_from(elapsed_i64.max(0)).unwrap_or(0);
+    format_age_secs(elapsed_secs)
 }
 
 #[cfg(test)]
@@ -558,39 +527,35 @@ mod tests {
     fn format_age_secs_just_now() {
         assert_eq!(format_age_secs(0), "just now");
         assert_eq!(format_age_secs(15), "just now");
-        assert_eq!(format_age_secs(29), "just now");
-    }
-
-    #[test]
-    fn format_age_secs_one_min_boundary() {
-        assert_eq!(format_age_secs(30), "1 min ago");
-        assert_eq!(format_age_secs(89), "1 min ago");
+        assert_eq!(format_age_secs(30), "just now");
+        assert_eq!(format_age_secs(59), "just now");
     }
 
     #[test]
     fn format_age_secs_minutes() {
-        assert_eq!(format_age_secs(90), "2 min ago");
+        assert_eq!(format_age_secs(60), "1 min ago");
+        assert_eq!(format_age_secs(90), "1 min ago");
         assert_eq!(format_age_secs(120), "2 min ago");
-        assert_eq!(format_age_secs(150), "3 min ago");
         assert_eq!(format_age_secs(600), "10 min ago");
+        assert_eq!(format_age_secs(3_599), "59 min ago");
     }
 
     #[test]
     fn format_age_secs_one_hour_boundary() {
-        assert_eq!(format_age_secs(3600), "1 hour ago");
-        assert_eq!(format_age_secs(5399), "1 hour ago");
+        assert_eq!(format_age_secs(3_600), "1 hour ago");
+        assert_eq!(format_age_secs(7_199), "1 hour ago");
     }
 
     #[test]
     fn format_age_secs_hours() {
-        assert_eq!(format_age_secs(7200), "2 hours ago");
-        assert_eq!(format_age_secs(10800), "3 hours ago");
+        assert_eq!(format_age_secs(7_200), "2 hours ago");
+        assert_eq!(format_age_secs(10_800), "3 hours ago");
     }
 
     #[test]
-    fn format_age_secs_yesterday() {
-        assert_eq!(format_age_secs(86_400), "yesterday");
-        assert_eq!(format_age_secs(172_799), "yesterday");
+    fn format_age_secs_one_day() {
+        assert_eq!(format_age_secs(86_400), "1 day ago");
+        assert_eq!(format_age_secs(172_799), "1 day ago");
     }
 
     #[test]
@@ -888,12 +853,11 @@ mod tests {
         );
     }
 
-    /// `format_age_secs` guards against negative input via `.max(0)`; negative
-    /// values are treated as "just now" rather than reaching the wildcard arm.
     #[test]
-    fn format_age_secs_negative_input_treated_as_just_now() {
-        assert_eq!(format_age_secs(-1), "just now");
-        assert_eq!(format_age_secs(-3600), "just now");
+    fn format_age_future_timestamp_treated_as_just_now() {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let future = OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(3600);
+        assert_eq!(format_age(now, future), "just now");
     }
 
     /// `Box<Composer>` satisfies `ComposerOps` via the blanket impl; exercise

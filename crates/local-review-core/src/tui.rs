@@ -265,6 +265,7 @@ pub trait ReviewSurface: Sized {
     /// does not need to know the comment type.
     fn inline_comments_for_view(
         &self,
+        now: std::time::SystemTime,
         view_idx: usize,
         severity_filter: Option<Severity>,
     ) -> Vec<InlineComment>;

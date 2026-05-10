@@ -479,14 +479,15 @@ impl<S: ReviewSurfaceExt> App<S> {
 
     /// Rebuild annotated views by re-injecting inline comments from the surface.
     pub fn refresh_inline_comments(&mut self) {
+        let now = std::time::SystemTime::now();
         self.annotated_per_file = BaseViews(
             self.rendered_per_file
                 .iter()
                 .enumerate()
                 .map(|(view_idx, base_view)| {
-                    let inline = self
-                        .surface
-                        .inline_comments_for_view(view_idx, self.severity_filter);
+                    let inline =
+                        self.surface
+                            .inline_comments_for_view(now, view_idx, self.severity_filter);
                     let appended = self
                         .surface
                         .appended_comments_for_view(view_idx, self.severity_filter);
@@ -1676,6 +1677,7 @@ mod app_tests {
         }
         fn inline_comments_for_view(
             &self,
+            _: std::time::SystemTime,
             _: usize,
             _: Option<Severity>,
         ) -> Vec<crate::tui::InlineComment> {

@@ -5,3 +5,4 @@
 /result
 /.jj-review
 .team-execution/
+*.rlib
