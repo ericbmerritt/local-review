@@ -11,6 +11,7 @@ use std::process::Command;
 
 use serde::Deserialize;
 
+use local_review_core::comment::Side;
 use local_review_core::diff::Diff;
 
 use snafu::IntoError as _;
@@ -206,6 +207,22 @@ pub(crate) fn fetch_commit_diff(
 
 // ── review comments JSON shapes ───────────────────────────────────────────────
 
+/// GitHub API value for the `side` field on a review comment.
+///
+/// `#[serde(other)]` on `Unknown` captures any unrecognized string (e.g.
+/// `"BOTH"`) as a named variant rather than silently discarding it via `_ =>
+/// None`, keeping the exhaustive match in `group_review_comments` compiler-
+/// enforced.
+#[derive(Deserialize, Debug)]
+enum RawSide {
+    #[serde(rename = "LEFT")]
+    Left,
+    #[serde(rename = "RIGHT")]
+    Right,
+    #[serde(other)]
+    Unknown,
+}
+
 /// Raw shape for one element of `GET /pulls/{pr}/comments`.
 ///
 /// GitHub returns a flat JSON array; replies are distinguished by the presence
@@ -223,6 +240,15 @@ struct RawReviewComment {
     user: CommentAuthorJson,
     created_at: String,
     body: String,
+    /// `null` for hunk-context and outdated threads.
+    #[serde(default)]
+    line: Option<u32>,
+    /// `null` for right-side, hunk-context, and outdated threads.
+    #[serde(default)]
+    original_line: Option<u32>,
+    /// `null` for hunk-context and outdated threads.
+    #[serde(default)]
+    side: Option<RawSide>,
 }
 
 // ── grouping logic (pure) ─────────────────────────────────────────────────────
@@ -256,12 +282,20 @@ fn group_review_comments(raw: Vec<RawReviewComment>) -> Result<Vec<ReviewThread>
                     created_at: comment.created_at,
                     body: comment.body,
                 };
+                let diff_side = match comment.side {
+                    Some(RawSide::Right) => Some(Side::New),
+                    Some(RawSide::Left) => Some(Side::Old),
+                    Some(RawSide::Unknown) | None => None,
+                };
                 let thread = ReviewThread {
                     path: comment.path,
                     position: comment.position,
                     original_commit_id,
                     root,
                     replies: vec![],
+                    line: comment.line,
+                    original_line: comment.original_line,
+                    diff_side,
                 };
                 root_index.insert(comment.id, threads.len());
                 threads.push(thread);
@@ -327,7 +361,7 @@ pub(crate) fn fetch_review_threads(
 
 #[cfg(test)]
 mod tests {
-    use super::{group_review_comments, CommentAuthorJson, RawReviewComment};
+    use super::{group_review_comments, CommentAuthorJson, RawReviewComment, RawSide, Side};
 
     fn make_root(id: u64, path: &str, position: Option<u32>) -> RawReviewComment {
         RawReviewComment {
@@ -341,6 +375,9 @@ mod tests {
             },
             created_at: format!("2024-01-{id:02}T00:00:00Z"),
             body: format!("root comment {id}"),
+            line: None,
+            original_line: None,
+            side: None,
         }
     }
 
@@ -360,6 +397,9 @@ mod tests {
             },
             created_at: format!("2024-01-{id:02}T01:00:00Z"),
             body: format!("reply {id} to {parent_id}"),
+            line: None,
+            original_line: None,
+            side: None,
         }
     }
 
@@ -460,6 +500,9 @@ mod tests {
             },
             created_at: "2024-01-01T00:00:00Z".to_owned(),
             body: "comment".to_owned(),
+            line: None,
+            original_line: None,
+            side: None,
         }];
         assert!(group_review_comments(raw).is_err());
     }
@@ -479,6 +522,9 @@ mod tests {
                 },
                 created_at: "2024-01-02T00:00:00Z".to_owned(),
                 body: "second root".to_owned(),
+                line: None,
+                original_line: None,
+                side: None,
             },
         ];
         assert!(group_review_comments(raw).is_err());
@@ -537,5 +583,66 @@ mod tests {
         ];
         let threads = group_review_comments(raw).unwrap();
         assert_eq!(threads[0].replies.len(), 1);
+    }
+
+    #[test]
+    fn root_with_line_and_right_side_propagated_to_thread() {
+        let raw = vec![RawReviewComment {
+            line: Some(42),
+            side: Some(RawSide::Right),
+            ..make_root(1, "src/lib.rs", Some(5))
+        }];
+        let threads = group_review_comments(raw).unwrap();
+        assert_eq!(threads[0].line, Some(42));
+        assert_eq!(threads[0].diff_side, Some(Side::New));
+        assert_eq!(threads[0].original_line, None);
+    }
+
+    #[test]
+    fn root_with_original_line_and_left_side_propagated_to_thread() {
+        let raw = vec![RawReviewComment {
+            original_line: Some(7),
+            side: Some(RawSide::Left),
+            line: None,
+            ..make_root(1, "src/lib.rs", Some(5))
+        }];
+        let threads = group_review_comments(raw).unwrap();
+        assert_eq!(threads[0].original_line, Some(7));
+        assert_eq!(threads[0].diff_side, Some(Side::Old));
+        assert_eq!(threads[0].line, None);
+    }
+
+    #[test]
+    fn root_with_none_line_produces_thread_with_none_line() {
+        let raw = vec![make_root(1, "src/main.rs", Some(3))];
+        let threads = group_review_comments(raw).unwrap();
+        assert_eq!(threads[0].line, None);
+        assert_eq!(threads[0].diff_side, None);
+        assert_eq!(threads[0].original_line, None);
+    }
+
+    #[test]
+    fn root_with_unrecognized_side_string_produces_none_diff_side() {
+        let raw = vec![RawReviewComment {
+            side: Some(RawSide::Unknown),
+            line: Some(10),
+            ..make_root(1, "src/lib.rs", Some(5))
+        }];
+        let threads = group_review_comments(raw).unwrap();
+        assert_eq!(threads[0].diff_side, None);
+    }
+
+    #[test]
+    fn right_side_thread_with_both_line_and_original_line_stores_both() {
+        let raw = vec![RawReviewComment {
+            side: Some(RawSide::Right),
+            line: Some(42),
+            original_line: Some(5),
+            ..make_root(1, "src/lib.rs", Some(5))
+        }];
+        let threads = group_review_comments(raw).unwrap();
+        assert_eq!(threads[0].line, Some(42));
+        assert_eq!(threads[0].original_line, Some(5));
+        assert_eq!(threads[0].diff_side, Some(Side::New));
     }
 }
