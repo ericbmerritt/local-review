@@ -6,6 +6,7 @@
 //!   `ggr --url https://github.example.com owner/repo#2429` — GHE host + short form
 //!   `ggr https://github.example.com/owner/repo/pull/2429`  — full pull URL
 
+mod cursor;
 mod error;
 mod gh;
 mod pr;

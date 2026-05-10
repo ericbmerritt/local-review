@@ -648,6 +648,13 @@ pub trait ReviewSurfaceExt: ReviewSurface {
     fn take_pending_status_message(&mut self) -> Option<String> {
         None
     }
+
+    /// Initial `(file_index, line_index)` to navigate to at startup, for
+    /// surfaces that restore a saved cursor position. Called once after
+    /// `reload_current_entry` succeeds, before the event loop starts.
+    fn initial_view_position(&mut self) -> (usize, usize) {
+        (0, 0)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -746,6 +753,17 @@ where
     }
     app.refresh_inline_comments();
     app.mark_current_file_reviewed();
+
+    {
+        let (fi, li) = app.surface.initial_view_position();
+        app.file_index = fi;
+        let max_li = app
+            .rendered_per_file
+            .get(fi)
+            .map(|v| v.lines.len().saturating_sub(1))
+            .unwrap_or(0);
+        app.line_index = li.min(max_li);
+    }
 
     while !app.should_quit {
         if app.needs_full_redraw {

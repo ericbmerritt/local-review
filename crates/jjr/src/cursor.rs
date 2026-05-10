@@ -50,12 +50,11 @@ pub fn load(repo_root: &Path) -> Result<Cursor> {
 
 /// Save the cursor to `repo_root/.jj-review/cursor.json` atomically.
 pub fn save(repo_root: &Path, cursor: &Cursor) -> Result<()> {
-    let dir = repo_root.join(".jj-review");
     let path = cursor_path(repo_root);
     let json = serde_json::to_string_pretty(cursor).map_err(|e| JjrError::Io {
         source: std::io::Error::other(e),
     })?;
-    atomic_write_bytes(&dir, &path, json.as_bytes())
+    atomic_write_bytes(&path, json.as_bytes())
 }
 
 /// Update the cursor for a single revset entry and persist.

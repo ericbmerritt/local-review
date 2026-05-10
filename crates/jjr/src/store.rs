@@ -308,9 +308,6 @@ fn delete_by_timestamp(existing: Vec<Comment>, key: &str, path: &Path) -> Result
 
 /// Serialize `comments` to JSONL bytes and write to `path` atomically.
 fn write_file(path: &Path, comments: &[Comment]) -> Result<()> {
-    let dir = path.parent().ok_or_else(|| JjrError::Io {
-        source: io::Error::other(format!("path has no parent directory: {}", path.display())),
-    })?;
     let mut buf: Vec<u8> = Vec::new();
     for comment in comments {
         let line = serde_json::to_string(comment).map_err(|e| JjrError::Io {
@@ -319,7 +316,7 @@ fn write_file(path: &Path, comments: &[Comment]) -> Result<()> {
         buf.extend_from_slice(line.as_bytes());
         buf.push(b'\n');
     }
-    crate::util::atomic_write_bytes(dir, path, &buf)
+    crate::util::atomic_write_bytes(path, &buf)
 }
 
 /// Walk `.jj-review/comments/` and return the `ChangeId` for every

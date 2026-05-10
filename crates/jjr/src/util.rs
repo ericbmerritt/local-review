@@ -23,35 +23,11 @@ pub(crate) fn log_warning(msg: &str) {
     let _ = writeln!(handle, "warning: {msg}");
 }
 
-/// Atomically write `bytes` to `path`, creating `dir` if needed.
-///
-/// Three call sites (cursor, comment store, reviewed-state) used to inline
-/// the same `create_dir_all + tempfile + write_all + flush + persist`
-/// sequence; centralizing the idiom here keeps the crash-safety contract in
-/// one named place. `dir` must be the parent directory of `path` (passed
-/// explicitly so the caller can hold an owned `PathBuf` for both without an
-/// extra `parent()` round-trip).
-///
-/// Crash safety: writes go to a randomized sibling temp file, which `persist`
-/// renames into place; same-directory placement keeps the rename on a single
-/// filesystem so the OS can guarantee atomicity.
-pub(crate) fn atomic_write_bytes(
-    dir: &std::path::Path,
-    path: &std::path::Path,
-    bytes: &[u8],
-) -> crate::error::Result<()> {
-    use std::io::Write as _;
-    std::fs::create_dir_all(dir).map_err(|source| crate::error::JjrError::Io { source })?;
-    let mut tmp = tempfile::NamedTempFile::new_in(dir)
-        .map_err(|source| crate::error::JjrError::Io { source })?;
-    tmp.write_all(bytes)
-        .map_err(|source| crate::error::JjrError::Io { source })?;
-    tmp.flush()
-        .map_err(|source| crate::error::JjrError::Io { source })?;
-    tmp.persist(path).map_err(|e| crate::error::JjrError::Io {
-        source: std::io::Error::other(e),
-    })?;
-    Ok(())
+/// Thin wrapper around [`local_review_core::util::atomic_write_bytes`], which owns
+/// the crash-safety contract (same-filesystem rename via [`tempfile::NamedTempFile`]).
+pub(crate) fn atomic_write_bytes(path: &std::path::Path, bytes: &[u8]) -> crate::error::Result<()> {
+    local_review_core::util::atomic_write_bytes(path, bytes)
+        .map_err(|source| crate::error::JjrError::Io { source })
 }
 
 /// Resolve the path to the global `jjr` config file.
@@ -264,7 +240,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let nested = dir.path().join("subdir");
         let target = nested.join("out.txt");
-        atomic_write_bytes(&nested, &target, b"hello").unwrap();
+        atomic_write_bytes(&target, b"hello").unwrap();
         let read = std::fs::read(&target).unwrap();
         assert_eq!(read, b"hello");
     }
@@ -274,7 +250,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("out.txt");
         std::fs::write(&target, b"old").unwrap();
-        atomic_write_bytes(dir.path(), &target, b"new").unwrap();
+        atomic_write_bytes(&target, b"new").unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), b"new");
     }
 
@@ -282,7 +258,7 @@ mod tests {
     fn atomic_write_bytes_leaves_no_temp_files_behind() {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("out.txt");
-        atomic_write_bytes(dir.path(), &target, b"x").unwrap();
+        atomic_write_bytes(&target, b"x").unwrap();
         let extras: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .map(|e| e.unwrap().file_name())

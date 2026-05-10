@@ -1,7 +1,7 @@
 //! Terminal UI entry point for ggr: wires `PrDetails` into the shared
 //! `App<GgrSurface>` review loop from `local-review-core`.
 
-use std::io::{stdout, Stdout};
+use std::io::{stdout, Stdout, Write as _};
 
 use crossterm::event::{KeyCode, KeyEvent};
 use crossterm::execute;
@@ -21,6 +21,7 @@ use local_review_core::tui::{
 use local_review_core::util::{strip_controls, strip_controls_preserve_newlines};
 use local_review_core::Severity;
 
+use crate::cursor;
 use crate::error::{GgrError, Result};
 use crate::gh;
 use crate::pr::PrDetails;
@@ -57,15 +58,62 @@ pub(crate) struct GgrSurface {
     pr: PrDetails,
     state: State,
     threads_expanded: bool,
+    /// Consumed on the first `fetch_views` call; after that, `state` is the
+    /// authoritative index source and this stays `None` to prevent
+    /// `current_entry_index` returning a stale value.
+    pending_initial_index: Option<usize>,
+    /// Consumed once by `initial_view_position` so the initial scroll position
+    /// is applied exactly once on first render; subsequent calls return `(0, 0)`.
+    pending_cursor: Option<(String, usize)>,
 }
 
 impl GgrSurface {
-    pub(crate) fn new(pr: PrDetails) -> Self {
+    pub(crate) fn new(pr: PrDetails, initial_cursor: Option<&cursor::CursorState>) -> Self {
+        let pending_initial_index = initial_cursor.and_then(|c| {
+            pr.commits
+                .iter()
+                .position(|commit| commit.sha.as_str() == c.commit_sha)
+                .map(|pos| pos + 1)
+        });
+        let pending_cursor = pending_initial_index
+            .and(initial_cursor)
+            .map(|c| (c.file.clone(), c.line));
         Self {
             pr,
             state: State::Description,
             threads_expanded: true,
+            pending_initial_index,
+            pending_cursor,
         }
+    }
+
+    /// Returns `None` when `State::Description` is active.
+    /// `file_index == 0` (commit description sub-view) stores `file: ""`.
+    pub(crate) fn current_cursor_state(
+        &self,
+        file_index: usize,
+        line_index: usize,
+    ) -> Option<cursor::CursorState> {
+        let State::CommitDiff { index, ref diff } = self.state else {
+            return None;
+        };
+        let commit_sha = match self.pr.commits.get(index.wrapping_sub(1)) {
+            Some(c) => c.sha.as_str().to_owned(),
+            None => return None,
+        };
+        let file = if file_index == 0 {
+            String::new()
+        } else {
+            diff.files
+                .get(file_index - 1)
+                .map(|f| strip_controls(&f.display_path().to_string_lossy()))
+                .unwrap_or_default()
+        };
+        Some(cursor::CursorState {
+            commit_sha,
+            file,
+            line: line_index,
+        })
     }
 
     fn pr_description_text(&self) -> String {
@@ -95,6 +143,9 @@ impl ReviewSurface for GgrSurface {
     }
 
     fn current_entry_index(&self) -> usize {
+        if let Some(idx) = self.pending_initial_index {
+            return idx;
+        }
         match self.state {
             State::Description => 0,
             State::CommitDiff { index, .. } => index,
@@ -124,6 +175,7 @@ impl ReviewSurface for GgrSurface {
     }
 
     fn fetch_views(&mut self, idx: usize) -> std::result::Result<Vec<DiffView>, GgrError> {
+        self.pending_initial_index.take();
         if idx == 0 {
             self.state = State::Description;
             let desc = self.pr_description_text();
@@ -298,6 +350,22 @@ impl ReviewSurfaceExt for GgrSurface {
     fn severity_histogram_for_transition(&self) -> (Option<usize>, SeverityHistogram) {
         (Some(0), SeverityHistogram::default())
     }
+
+    fn initial_view_position(&mut self) -> (usize, usize) {
+        let Some((file_path, line)) = self.pending_cursor.take() else {
+            return (0, 0);
+        };
+        let State::CommitDiff { ref diff, .. } = self.state else {
+            return (0, 0);
+        };
+        let file_idx = diff
+            .files
+            .iter()
+            .position(|f| strip_controls(&f.display_path().to_string_lossy()) == file_path)
+            .map(|pos| pos + 1)
+            .unwrap_or(0);
+        (file_idx, line)
+    }
 }
 
 // ── terminal setup / teardown ─────────────────────────────────────────────────
@@ -332,10 +400,25 @@ pub(crate) fn run(pr: PrDetails) -> Result<()> {
     if size.1 < MIN_ROWS {
         return Err(GgrError::TerminalTooShort { rows: size.1 });
     }
-    let surface = GgrSurface::new(pr);
+    let cursor_path = cursor::cursor_path(&pr);
+    let initial_cursor = cursor_path.as_deref().and_then(cursor::load);
+    let surface = GgrSurface::new(pr, initial_cursor.as_ref());
     let mut app = App::new(surface, vec![], TransitionMode::Auto);
     let (mut terminal, _guard) = enter_tui()?;
-    core_run_app(&mut terminal, &mut app, |_| {}).map_err(|e| match e {
+    core_run_app(&mut terminal, &mut app, |app| {
+        if let Some(ref path) = cursor_path {
+            if let Some(state) = app
+                .surface
+                .current_cursor_state(app.file_index(), app.line_index())
+            {
+                if let Err(e) = cursor::save(path, &state) {
+                    let mut stderr = std::io::stderr().lock();
+                    let _ = writeln!(stderr, "ggr: warning: failed to save cursor: {e}");
+                }
+            }
+        }
+    })
+    .map_err(|e| match e {
         AppError::Io(source) => GgrError::Io { source },
         AppError::Surface(e) => e,
     })
@@ -383,7 +466,7 @@ mod tests {
 
     #[test]
     fn entry_count_includes_description_entry() {
-        let surface = GgrSurface::new(make_pr());
+        let surface = GgrSurface::new(make_pr(), None);
         assert_eq!(surface.entry_count(), 3, "2 commits + 1 description entry");
     }
 
@@ -391,38 +474,38 @@ mod tests {
     fn entry_count_single_commit() {
         let mut pr = make_pr();
         pr.commits.truncate(1);
-        let surface = GgrSurface::new(pr);
+        let surface = GgrSurface::new(pr, None);
         assert_eq!(surface.entry_count(), 2);
     }
 
     #[test]
     fn entry_id_display_returns_pr_number_for_index_0() {
-        let surface = GgrSurface::new(make_pr());
+        let surface = GgrSurface::new(make_pr(), None);
         assert_eq!(surface.entry_id_display(0), "#42");
     }
 
     #[test]
     fn entry_id_display_returns_short_sha_for_commits() {
-        let surface = GgrSurface::new(make_pr());
+        let surface = GgrSurface::new(make_pr(), None);
         assert_eq!(surface.entry_id_display(1), "a3b4c5d6");
         assert_eq!(surface.entry_id_display(2), "b3b4c5d6");
     }
 
     #[test]
     fn entry_id_display_out_of_range_returns_empty() {
-        let surface = GgrSurface::new(make_pr());
+        let surface = GgrSurface::new(make_pr(), None);
         assert_eq!(surface.entry_id_display(99), "");
     }
 
     #[test]
     fn entry_description_returns_pr_title_for_index_0() {
-        let surface = GgrSurface::new(make_pr());
+        let surface = GgrSurface::new(make_pr(), None);
         assert_eq!(surface.entry_description(0), "PR title");
     }
 
     #[test]
     fn entry_description_returns_commit_title() {
-        let surface = GgrSurface::new(make_pr());
+        let surface = GgrSurface::new(make_pr(), None);
         assert_eq!(surface.entry_description(1), "First commit");
     }
 
@@ -430,7 +513,7 @@ mod tests {
     fn entry_description_strips_control_chars_from_pr_title() {
         let mut pr = make_pr();
         pr.title = "\x1b[31mevil\x1b[0m".to_owned();
-        let surface = GgrSurface::new(pr);
+        let surface = GgrSurface::new(pr, None);
         let desc = surface.entry_description(0);
         assert!(
             !desc.chars().any(char::is_control),
@@ -440,7 +523,7 @@ mod tests {
 
     #[test]
     fn entry_description_out_of_range_returns_empty() {
-        let surface = GgrSurface::new(make_pr());
+        let surface = GgrSurface::new(make_pr(), None);
         assert_eq!(surface.entry_description(99), "");
     }
 
@@ -477,7 +560,7 @@ mod tests {
     fn make_surface_with_thread(thread: ReviewThread) -> GgrSurface {
         let mut pr = make_pr();
         pr.review_threads.push(thread);
-        let mut surface = GgrSurface::new(pr);
+        let mut surface = GgrSurface::new(pr, None);
         surface.state = State::CommitDiff {
             index: 1,
             diff: Diff {
@@ -492,7 +575,7 @@ mod tests {
 
     #[test]
     fn inline_comments_for_view_returns_empty() {
-        let surface = GgrSurface::new(make_pr());
+        let surface = GgrSurface::new(make_pr(), None);
         assert!(surface
             .inline_comments_for_view(std::time::SystemTime::UNIX_EPOCH, 0, None)
             .is_empty());
@@ -503,7 +586,7 @@ mod tests {
 
     #[test]
     fn threads_expanded_defaults_to_true() {
-        let surface = GgrSurface::new(make_pr());
+        let surface = GgrSurface::new(make_pr(), None);
         assert!(
             surface.threads_expanded,
             "threads_expanded must be true after new()"
@@ -512,7 +595,7 @@ mod tests {
 
     #[test]
     fn handle_extra_key_t_expands_then_collapses() {
-        let mut surface = GgrSurface::new(make_pr());
+        let mut surface = GgrSurface::new(make_pr(), None);
         assert!(surface.threads_expanded);
 
         let result = surface
@@ -536,7 +619,7 @@ mod tests {
 
     #[test]
     fn handle_extra_key_unknown_returns_ignored() {
-        let mut surface = GgrSurface::new(make_pr());
+        let mut surface = GgrSurface::new(make_pr(), None);
         let result = surface
             .handle_extra_key(make_key(KeyCode::Char('x')))
             .unwrap();
@@ -567,7 +650,7 @@ mod tests {
 
     #[test]
     fn inline_comments_for_view_returns_empty_in_description_state() {
-        let surface = GgrSurface::new(make_pr());
+        let surface = GgrSurface::new(make_pr(), None);
         assert!(surface
             .inline_comments_for_view(std::time::SystemTime::UNIX_EPOCH, 0, None)
             .is_empty());
@@ -656,7 +739,7 @@ mod tests {
         let mut pr = make_pr();
         pr.review_threads.push(thread_other);
         pr.review_threads.push(thread_match);
-        let mut surface = GgrSurface::new(pr);
+        let mut surface = GgrSurface::new(pr, None);
         surface.state = State::CommitDiff {
             index: 1,
             diff: Diff {
@@ -847,7 +930,7 @@ mod tests {
 
     #[test]
     fn inline_comments_for_view_empty_review_threads_returns_empty() {
-        let mut surface = GgrSurface::new(make_pr());
+        let mut surface = GgrSurface::new(make_pr(), None);
         surface.state = State::CommitDiff {
             index: 1,
             diff: Diff {
@@ -867,7 +950,7 @@ mod tests {
 
     #[test]
     fn save_comment_returns_refused() {
-        let mut surface = GgrSurface::new(make_pr());
+        let mut surface = GgrSurface::new(make_pr(), None);
         let scope = ComposerScope::Change;
         let req = SaveRequest {
             scope: &scope,
@@ -884,7 +967,7 @@ mod tests {
 
     #[test]
     fn update_comment_returns_refused() {
-        let mut surface = GgrSurface::new(make_pr());
+        let mut surface = GgrSurface::new(make_pr(), None);
         let identity = CommentId::new(time::OffsetDateTime::UNIX_EPOCH);
         let req = UpdateRequest {
             identity,
@@ -901,20 +984,20 @@ mod tests {
 
     #[test]
     fn is_view_reviewed_returns_false() {
-        let surface = GgrSurface::new(make_pr());
+        let surface = GgrSurface::new(make_pr(), None);
         assert!(!surface.is_view_reviewed(0));
         assert!(!surface.is_view_reviewed(1));
     }
 
     #[test]
     fn severity_histogram_returns_default() {
-        let surface = GgrSurface::new(make_pr());
+        let surface = GgrSurface::new(make_pr(), None);
         assert_eq!(surface.severity_histogram(), SeverityHistogram::default());
     }
 
     #[test]
     fn help_screen_title_is_ggr() {
-        let surface = GgrSurface::new(make_pr());
+        let surface = GgrSurface::new(make_pr(), None);
         assert_eq!(surface.help_screen_title(), "ggr");
     }
 
@@ -925,7 +1008,7 @@ mod tests {
             author: "alice".to_owned(),
             body: "great PR!".to_owned(),
         });
-        let surface = GgrSurface::new(pr);
+        let surface = GgrSurface::new(pr, None);
         let text = surface.pr_description_text();
         assert!(text.contains("PR title"), "must contain title");
         assert!(text.contains("PR body"), "must contain body");
@@ -940,7 +1023,7 @@ mod tests {
             author: "alice".to_owned(),
             body: "\x1b[31mmalicious\x1b[0m content".to_owned(),
         });
-        let surface = GgrSurface::new(pr);
+        let surface = GgrSurface::new(pr, None);
         let text = surface.pr_description_text();
         let has_non_newline_control = text
             .chars()
@@ -959,7 +1042,7 @@ mod tests {
             author: "alice".to_owned(),
             body: "first line\nsecond line".to_owned(),
         });
-        let surface = GgrSurface::new(pr);
+        let surface = GgrSurface::new(pr, None);
         let text = surface.pr_description_text();
         assert!(text.contains("line one"), "body line one must be present");
         assert!(text.contains("line two"), "body line two must be present");
@@ -973,7 +1056,7 @@ mod tests {
 
     #[test]
     fn file_picker_entries_for_description_page_returns_one_entry() {
-        let surface = GgrSurface::new(make_pr());
+        let surface = GgrSurface::new(make_pr(), None);
         let entries = surface.file_picker_entries();
         assert_eq!(
             entries.len(),
@@ -985,7 +1068,7 @@ mod tests {
 
     #[test]
     fn fetch_views_index_zero_returns_description_view() {
-        let mut surface = GgrSurface::new(make_pr());
+        let mut surface = GgrSurface::new(make_pr(), None);
         let views = surface.fetch_views(0).expect("fetch_views(0) must succeed");
         assert_eq!(
             views.len(),
@@ -1001,7 +1084,7 @@ mod tests {
 
     #[test]
     fn fetch_views_out_of_range_returns_err() {
-        let mut surface = GgrSurface::new(make_pr());
+        let mut surface = GgrSurface::new(make_pr(), None);
         let count = surface.entry_count();
         let result = surface.fetch_views(count);
         assert!(result.is_err(), "out-of-range fetch_views must return Err");
@@ -1011,7 +1094,7 @@ mod tests {
     fn pr_description_text_with_empty_body_has_no_extra_newlines() {
         let mut pr = make_pr();
         pr.body = String::new();
-        let surface = GgrSurface::new(pr);
+        let surface = GgrSurface::new(pr, None);
         let text = surface.pr_description_text();
         assert_eq!(
             text, "PR title",
@@ -1021,7 +1104,7 @@ mod tests {
 
     #[test]
     fn delete_comment_returns_refused() {
-        let mut surface = GgrSurface::new(make_pr());
+        let mut surface = GgrSurface::new(make_pr(), None);
         let identity = CommentId::new(time::OffsetDateTime::UNIX_EPOCH);
         let req = DeleteRequest::new(identity, None);
         let result = surface
@@ -1043,7 +1126,7 @@ mod tests {
     fn entry_count_zero_commits_returns_one() {
         let mut pr = make_pr();
         pr.commits.clear();
-        let surface = GgrSurface::new(pr);
+        let surface = GgrSurface::new(pr, None);
         assert_eq!(
             surface.entry_count(),
             1,
@@ -1053,7 +1136,7 @@ mod tests {
 
     #[test]
     fn fetch_views_zero_resets_to_description_page() {
-        let mut surface = GgrSurface::new(make_pr());
+        let mut surface = GgrSurface::new(make_pr(), None);
         // Start in CommitDiff state to prove that fetch_views(0) actually resets it.
         surface.state = State::CommitDiff {
             index: 1,
@@ -1075,7 +1158,7 @@ mod tests {
 
     #[test]
     fn fetch_views_on_zero_commit_pr_returns_err() {
-        let mut surface = GgrSurface::new(make_pr_zero_commits());
+        let mut surface = GgrSurface::new(make_pr_zero_commits(), None);
         let count = surface.entry_count();
         assert_eq!(count, 1, "zero-commit PR has one entry (description only)");
         let result = surface.fetch_views(1);
@@ -1087,7 +1170,7 @@ mod tests {
 
     #[test]
     fn fetch_views_out_of_range_leaves_state_intact() {
-        let mut surface = GgrSurface::new(make_pr());
+        let mut surface = GgrSurface::new(make_pr(), None);
         // Pre-load a CommitDiff state to prove it is not clobbered on Err.
         surface.state = State::CommitDiff {
             index: 1,
@@ -1104,7 +1187,7 @@ mod tests {
 
     #[test]
     fn toggle_view_reviewed_returns_not_tracked() {
-        let mut surface = GgrSurface::new(make_pr());
+        let mut surface = GgrSurface::new(make_pr(), None);
         assert_eq!(
             surface.toggle_view_reviewed(0),
             ReviewedOutcome::NotTracked,
@@ -1114,7 +1197,7 @@ mod tests {
 
     #[test]
     fn file_picker_entries_for_commit_diff_state_returns_description_plus_files() {
-        let mut surface = GgrSurface::new(make_pr());
+        let mut surface = GgrSurface::new(make_pr(), None);
         let diff = Diff {
             files: vec![
                 DiffFile::Modified {
@@ -1149,11 +1232,282 @@ mod tests {
     fn entry_description_strips_control_chars_from_commit_title() {
         let mut pr = make_pr();
         pr.commits[0].title = "\x1b[31mevil\x1b[0m".to_owned();
-        let surface = GgrSurface::new(pr);
+        let surface = GgrSurface::new(pr, None);
         let desc = surface.entry_description(1);
         assert!(
             !desc.chars().any(char::is_control),
             "entry_description must strip control chars from commit title; got: {desc:?}"
         );
+    }
+
+    // ── current_cursor_state tests (pier-p2) ──────────────────────────────────
+
+    #[test]
+    fn current_cursor_state_returns_none_in_description_state() {
+        let surface = GgrSurface::new(make_pr(), None);
+        // Default state is Description; must return None regardless of file/line.
+        assert!(surface.current_cursor_state(0, 0).is_none());
+        assert!(surface.current_cursor_state(1, 5).is_none());
+    }
+
+    #[test]
+    fn current_cursor_state_at_file_index_zero_saves_empty_file() {
+        let mut surface = GgrSurface::new(make_pr(), None);
+        surface.state = State::CommitDiff {
+            index: 1,
+            diff: Diff {
+                files: vec![DiffFile::Modified {
+                    path: std::path::PathBuf::from("src/foo.rs"),
+                    hunks: vec![],
+                }],
+            },
+        };
+        // file_index=0 is the commit description sub-view; file must be "".
+        let state = surface.current_cursor_state(0, 3).unwrap();
+        assert_eq!(
+            state.file, "",
+            "file_index=0 is description sub-view; file must be empty string"
+        );
+    }
+
+    #[test]
+    fn current_cursor_state_oob_file_index_aliases_to_description_sentinel() {
+        // App-layer clamping prevents this in production; the test documents the aliasing.
+        let mut surface = GgrSurface::new(make_pr(), None);
+        surface.state = State::CommitDiff {
+            index: 1,
+            diff: Diff {
+                files: vec![DiffFile::Modified {
+                    path: std::path::PathBuf::from("src/foo.rs"),
+                    hunks: vec![],
+                }],
+            },
+        };
+        let state = surface.current_cursor_state(99, 0).unwrap();
+        assert_eq!(
+            state.file, "",
+            "OOB file_index must alias to description sentinel (file==\"\")"
+        );
+    }
+
+    #[test]
+    fn current_cursor_state_commit_diff_saves_correct_sha_and_file() {
+        let pr = make_pr();
+        let expected_sha = pr.commits[0].sha.as_str().to_owned();
+        let mut surface = GgrSurface::new(pr, None);
+        surface.state = State::CommitDiff {
+            index: 1,
+            diff: Diff {
+                files: vec![DiffFile::Modified {
+                    path: std::path::PathBuf::from("src/foo.rs"),
+                    hunks: vec![],
+                }],
+            },
+        };
+        // file_index=1 corresponds to diff.files[0] ("src/foo.rs").
+        let state = surface.current_cursor_state(1, 7).unwrap();
+        assert_eq!(state.commit_sha, expected_sha, "SHA must match commits[0]");
+        assert_eq!(
+            state.file, "src/foo.rs",
+            "file must match diff.files[0] path"
+        );
+        assert_eq!(state.line, 7);
+    }
+
+    // ── GgrSurface::new with cursor tests (priya-p3) ──────────────────────────
+
+    fn make_cursor_state(sha: &str, file: &str, line: usize) -> cursor::CursorState {
+        cursor::CursorState {
+            commit_sha: sha.to_owned(),
+            file: file.to_owned(),
+            line,
+        }
+    }
+
+    #[test]
+    fn cursor_resume_drives_current_entry_index() {
+        let pr = make_pr();
+        let sha = pr.commits[0].sha.as_str().to_owned();
+        let cursor = make_cursor_state(&sha, "src/lib.rs", 5);
+        let surface = GgrSurface::new(pr, Some(&cursor));
+        assert_eq!(
+            surface.current_entry_index(),
+            1,
+            "pending_initial_index must drive current_entry_index before first fetch_views"
+        );
+    }
+
+    #[test]
+    fn new_with_cursor_matching_sha_sets_pending_cursor() {
+        let pr = make_pr();
+        let sha = pr.commits[0].sha.as_str().to_owned();
+        let cursor = make_cursor_state(&sha, "src/lib.rs", 10);
+        let surface = GgrSurface::new(pr, Some(&cursor));
+        assert_eq!(
+            surface.pending_cursor,
+            Some(("src/lib.rs".to_owned(), 10)),
+            "matching SHA must populate pending_cursor"
+        );
+        assert_eq!(
+            surface.pending_initial_index,
+            Some(1),
+            "matching SHA at commits[0] must yield pending_initial_index=1"
+        );
+    }
+
+    #[test]
+    fn new_with_cursor_unmatched_sha_sets_pending_to_none_index() {
+        let pr = make_pr();
+        let cursor = make_cursor_state(&"0".repeat(40), "src/lib.rs", 3);
+        let surface = GgrSurface::new(pr, Some(&cursor));
+        assert_eq!(
+            surface.pending_initial_index, None,
+            "unknown SHA must leave pending_initial_index as None"
+        );
+        assert_eq!(
+            surface.pending_cursor, None,
+            "unmatched SHA must clear pending_cursor"
+        );
+    }
+
+    // ── initial_view_position tests (priya-p4) ────────────────────────────────
+
+    #[test]
+    fn initial_view_position_returns_zero_zero_when_no_cursor() {
+        let mut surface = GgrSurface::new(make_pr(), None);
+        assert_eq!(surface.initial_view_position(), (0, 0));
+    }
+
+    #[test]
+    fn initial_view_position_returns_zero_zero_in_description_state() {
+        // cursor was loaded, but state is still Description (entry not yet fetched)
+        let pr = make_pr();
+        let sha = pr.commits[0].sha.as_str().to_owned();
+        let cursor = make_cursor_state(&sha, "src/foo.rs", 5);
+        let mut surface = GgrSurface::new(pr, Some(&cursor));
+        // state remains Description; initial_view_position must fall back to (0,0)
+        assert_eq!(surface.initial_view_position(), (0, 0));
+    }
+
+    #[test]
+    fn initial_view_position_returns_file_idx_and_line() {
+        let pr = make_pr();
+        let sha = pr.commits[0].sha.as_str().to_owned();
+        let cursor = make_cursor_state(&sha, "src/foo.rs", 9);
+        let mut surface = GgrSurface::new(pr, Some(&cursor));
+        surface.state = State::CommitDiff {
+            index: 1,
+            diff: Diff {
+                files: vec![DiffFile::Modified {
+                    path: std::path::PathBuf::from("src/foo.rs"),
+                    hunks: vec![],
+                }],
+            },
+        };
+        // src/foo.rs is diff.files[0], so view index is 1 (description is 0).
+        let pos = surface.initial_view_position();
+        assert_eq!(pos, (1, 9), "must return (file_view_idx=1, line=9)");
+    }
+
+    #[test]
+    fn initial_view_position_empty_file_falls_back_to_description_subview_preserving_line() {
+        // Two cases where the saved cursor file is not found in diff.files:
+        //   1. file="" (commit description sub-view sentinel)
+        //   2. file="src/removed.rs" (stale: file was deleted from the diff)
+        // In both cases file_idx falls back to 0; line is preserved.
+        let make_surface_with_file = |file: &str, line: usize| {
+            let pr = make_pr();
+            let sha = pr.commits[0].sha.as_str().to_owned();
+            let cursor = make_cursor_state(&sha, file, line);
+            let mut surface = GgrSurface::new(pr, Some(&cursor));
+            surface.state = State::CommitDiff {
+                index: 1,
+                diff: Diff {
+                    files: vec![DiffFile::Modified {
+                        path: std::path::PathBuf::from("src/foo.rs"),
+                        hunks: vec![],
+                    }],
+                },
+            };
+            surface
+        };
+
+        // Case 1: empty file sentinel
+        let pos = make_surface_with_file("", 5).initial_view_position();
+        assert_eq!(
+            pos.0, 0,
+            "empty file must fall back to commit-description sub-view (file_idx=0)"
+        );
+        assert_eq!(pos.1, 5, "line must be preserved from cursor (empty file)");
+
+        // Case 2: stale file no longer present in diff
+        let pos = make_surface_with_file("src/removed.rs", 11).initial_view_position();
+        assert_eq!(
+            pos.0, 0,
+            "stale file not in diff must fall back to file_idx=0"
+        );
+        assert_eq!(pos.1, 11, "line must be preserved from cursor (stale file)");
+    }
+
+    #[test]
+    fn initial_view_position_consumed_after_first_call() {
+        let pr = make_pr();
+        let sha = pr.commits[0].sha.as_str().to_owned();
+        let cursor = make_cursor_state(&sha, "src/foo.rs", 4);
+        let mut surface = GgrSurface::new(pr, Some(&cursor));
+        surface.state = State::CommitDiff {
+            index: 1,
+            diff: Diff {
+                files: vec![DiffFile::Modified {
+                    path: std::path::PathBuf::from("src/foo.rs"),
+                    hunks: vec![],
+                }],
+            },
+        };
+        let first = surface.initial_view_position();
+        assert_eq!(first, (1, 4), "first call must return cursor position");
+        let second = surface.initial_view_position();
+        assert_eq!(
+            second,
+            (0, 0),
+            "second call must return (0,0) — cursor consumed"
+        );
+    }
+
+    #[test]
+    fn initial_view_position_strip_controls_applied_consistently() {
+        // current_cursor_state stores strip_controls(display_path) in CursorState.file.
+        // initial_view_position must also strip_controls on the lookup side so the
+        // comparison is stripped-vs-stripped; without it a path containing control
+        // characters would fail to match and silently fall back to file_idx=0.
+        //
+        // We simulate a file whose display path contains ANSI control chars. The
+        // saved cursor holds the already-stripped name; the lookup path is the raw
+        // DiffFile path (which, after strip_controls, matches the saved name).
+        let pr = make_pr();
+        let sha = pr.commits[0].sha.as_str().to_owned();
+        // Stripped form — as current_cursor_state would have stored it.
+        let stripped_name = "src/file.rs";
+        let cursor = make_cursor_state(&sha, stripped_name, 3);
+        let mut surface = GgrSurface::new(pr, Some(&cursor));
+        // DiffFile path contains a control character that strip_controls removes,
+        // producing the same string as the saved cursor file.
+        surface.state = State::CommitDiff {
+            index: 1,
+            diff: Diff {
+                files: vec![DiffFile::Modified {
+                    path: std::path::PathBuf::from("src/\x1bfile.rs"),
+                    hunks: vec![],
+                }],
+            },
+        };
+        // strip_controls("src/\x1bfile.rs") == "src/file.rs" == saved cursor file.
+        // The lookup must find the file at index 1, not fall back to 0.
+        let pos = surface.initial_view_position();
+        assert_eq!(
+            pos.0, 1,
+            "lookup must strip_controls on the diff path to match the saved (stripped) cursor file"
+        );
+        assert_eq!(pos.1, 3, "line must be preserved");
     }
 }
