@@ -2,7 +2,9 @@ use std::fmt::{self, Display, Write as _};
 use std::io;
 use std::path::Path;
 
-use crate::comment::{Anchor, Comment};
+use local_review_core::util::strip_controls;
+
+use crate::comment::{Anchor, Comment, LineAnchor};
 use crate::error::{JjrError, Result};
 use crate::packet::severity_label;
 use crate::stack::{ResolvedStack, StackEntry};
@@ -114,7 +116,7 @@ fn write_jsonl_line(out: &mut String, comment: &Comment) -> Result<()> {
 pub fn render_export_markdown(data: &ExportData) -> String {
     let mut out = String::new();
 
-    let _ = writeln!(out, "# Review export — {}", data.revset);
+    let _ = writeln!(out, "# Review export — {}", strip_controls(&data.revset));
 
     let mut stack = data.stack_comments.clone();
     stack.sort_by_key(|c| c.created_at);
@@ -126,9 +128,7 @@ pub fn render_export_markdown(data: &ExportData) -> String {
             out.push('\n');
             let _ = writeln!(out, "### [{}]", severity_label(comment.severity));
             out.push('\n');
-            for line in comment.body.lines() {
-                let _ = writeln!(out, "> {line}");
-            }
+            write_body_lines(&mut out, &comment.body);
         }
     }
 
@@ -144,16 +144,24 @@ pub fn render_export_markdown(data: &ExportData) -> String {
             out,
             "## {} — {}",
             change.entry.change_id.as_str(),
-            change.entry.description
+            strip_controls(&change.entry.description)
         );
 
         let change_scoped: Vec<&Comment> = comments
             .iter()
             .filter(|c| matches!(c.anchor, Anchor::Change { .. }))
             .collect();
-        let line_scoped: Vec<&Comment> = comments
+        // Description-anchored records are intentionally excluded: markdown
+        // export renders diff-line context only.
+        let line_scoped: Vec<(&Comment, &LineAnchor)> = comments
             .iter()
-            .filter(|c| matches!(c.anchor, Anchor::Line { .. }))
+            .filter_map(|c| {
+                if let Anchor::Line { location, .. } = &c.anchor {
+                    Some((c, location))
+                } else {
+                    None
+                }
+            })
             .collect();
 
         if !change_scoped.is_empty() {
@@ -163,42 +171,45 @@ pub fn render_export_markdown(data: &ExportData) -> String {
                 out.push('\n');
                 let _ = writeln!(out, "#### [{}]", severity_label(comment.severity));
                 out.push('\n');
-                for line in comment.body.lines() {
-                    let _ = writeln!(out, "> {line}");
-                }
+                write_body_lines(&mut out, &comment.body);
             }
         }
 
         if !line_scoped.is_empty() {
-            out.push('\n');
-            out.push_str("### Line-level comments\n");
-            for comment in line_scoped {
-                let Anchor::Line { location, .. } = &comment.anchor else {
-                    continue;
-                };
-                out.push('\n');
-                let line_num = location
-                    .new_line
-                    .or(location.old_line)
-                    .map_or_else(String::new, |n| n.to_string());
-                let _ = writeln!(
-                    out,
-                    "#### [{}] {}:{}",
-                    severity_label(comment.severity),
-                    location.file.display(),
-                    line_num,
-                );
-                let _ = writeln!(out, "Hunk: {}", location.hunk_header);
-                let _ = writeln!(out, "Target: {}", location.target_text);
-                out.push('\n');
-                for line in comment.body.lines() {
-                    let _ = writeln!(out, "> {line}");
-                }
-            }
+            write_line_comments(&mut out, &line_scoped);
         }
     }
 
     out
+}
+
+fn write_body_lines(out: &mut String, body: &str) {
+    for line in body.lines() {
+        let _ = writeln!(out, "> {}", strip_controls(line));
+    }
+}
+
+fn write_line_comments(out: &mut String, comments: &[(&Comment, &LineAnchor)]) {
+    out.push('\n');
+    out.push_str("### Line-level comments\n");
+    for (comment, location) in comments {
+        out.push('\n');
+        let line_num = location
+            .new_line
+            .or(location.old_line)
+            .map_or_else(String::new, |n| n.to_string());
+        let _ = writeln!(
+            out,
+            "#### [{}] {}:{}",
+            severity_label(comment.severity),
+            strip_controls(&location.file.display().to_string()),
+            line_num,
+        );
+        let _ = writeln!(out, "Hunk: {}", strip_controls(&location.hunk_header));
+        let _ = writeln!(out, "Target: {}", strip_controls(&location.target_text));
+        out.push('\n');
+        write_body_lines(out, &comment.body);
+    }
 }
 
 /// Returns `true` when `data` has no comments at all.
@@ -499,6 +510,106 @@ mod tests {
     }
 
     #[test]
+    fn render_markdown_strips_controls_from_hunk_and_target() {
+        let id = cid("abc12345");
+        let mut comment = make_line_comment(&id, "fix this");
+        let Anchor::Line {
+            ref mut location, ..
+        } = comment.anchor
+        else {
+            panic!("expected Line anchor");
+        };
+        // Embed an ANSI escape sequence in hunk_header, target_text, and file path.
+        location.hunk_header = "\x1b[31m@@ -8,3 +8,5 @@\x1b[0m".to_owned();
+        location.target_text = "\x1b[32mlet x = 1;\x1b[0m".to_owned();
+        location.file = PathBuf::from("src/\x1b[33mlib\x1b[0m.rs");
+
+        let data = ExportData {
+            revset: "@".to_owned(),
+            stack_comments: vec![],
+            per_change: vec![ChangeExport {
+                entry: make_entry("abc12345", "first"),
+                comments: vec![comment],
+            }],
+        };
+        let out = render_export_markdown(&data);
+        assert!(
+            !out.contains('\x1b'),
+            "markdown output must not contain ESC characters; got: {out:?}"
+        );
+        assert!(
+            out.contains("Hunk: [31m@@ -8,3 +8,5 @@[0m\n"),
+            "hunk header content preserved after stripping ESC; got: {out:?}"
+        );
+        assert!(
+            out.contains("Target: [32mlet x = 1;[0m\n"),
+            "target text content preserved after stripping ESC; got: {out:?}"
+        );
+        assert!(
+            out.contains("src/[33mlib[0m.rs:10\n"),
+            "file path content preserved after stripping ESC; got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn render_markdown_strips_controls_from_comment_body() {
+        let data = ExportData {
+            revset: "@".to_owned(),
+            stack_comments: vec![make_stack_comment("\x1b[31mcross-cutting\x1b[0m")],
+            per_change: vec![],
+        };
+        let out = render_export_markdown(&data);
+        assert!(
+            !out.contains('\x1b'),
+            "markdown output must not contain ESC in comment body; got: {out:?}"
+        );
+        assert!(
+            out.contains("[31mcross-cutting[0m"),
+            "body content preserved after stripping ESC; got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn render_markdown_strips_controls_from_revset() {
+        let data = ExportData {
+            revset: "\x1b[31mtrunk()..@\x1b[0m".to_owned(),
+            stack_comments: vec![],
+            per_change: vec![],
+        };
+        let out = render_export_markdown(&data);
+        assert!(
+            !out.contains('\x1b'),
+            "markdown output must not contain ESC in revset; got: {out:?}"
+        );
+        assert!(
+            out.starts_with("# Review export — [31mtrunk()..@[0m\n"),
+            "revset content preserved after stripping ESC; got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn render_markdown_strips_controls_from_description() {
+        let id = cid("abc12345");
+        let data = ExportData {
+            revset: "@".to_owned(),
+            stack_comments: vec![],
+            per_change: vec![ChangeExport {
+                entry: make_entry("abc12345", "\x1b[31mAdd feature\x1b[0m"),
+                comments: vec![make_change_comment(&id, "note")],
+            }],
+        };
+        let out = render_export_markdown(&data);
+        assert!(
+            !out.contains('\x1b'),
+            "markdown output must not contain ESC in description; got: {out:?}"
+        );
+        assert!(
+            out.contains("## abc12345 — [31mAdd feature[0m\n"),
+            "description content preserved after stripping ESC; got: {out:?}"
+        );
+    }
+
+    #[test]
     fn render_markdown_skips_change_with_no_comments() {
         let id = cid("abc12345");
         let data = ExportData {
@@ -575,6 +686,44 @@ mod tests {
             "> fix the retry logic\n",
         );
         assert_eq!(out, expected, "markdown snapshot mismatch");
+    }
+
+    #[test]
+    fn render_markdown_description_comment_excluded_from_output() {
+        let id = cid("abc12345");
+        let description_comment = Comment {
+            schema_version: SchemaVersion,
+            anchor: Anchor::Description {
+                change_id: id,
+                location: local_review_core::comment::DescriptionAnchor {
+                    display_line: Some(1),
+                    target_text: "Fix the bug".to_owned(),
+                    context_before: vec![],
+                    context_after: vec![],
+                },
+            },
+            repo_root: PathBuf::from("/repo"),
+            revset: "@".to_owned(),
+            commit_id: None,
+            body: "should not appear".to_owned(),
+            severity: Severity::Note,
+            created_at: datetime!(2026-04-29 10:00:00 UTC),
+            updated_at: None,
+            status: None,
+            mismatch_reason: None,
+        };
+        let data = ExportData {
+            revset: "@".to_owned(),
+            stack_comments: vec![],
+            per_change: vec![ChangeExport {
+                entry: make_entry("abc12345", "some desc"),
+                comments: vec![description_comment],
+            }],
+        };
+        let out = render_export_markdown(&data);
+        assert!(out.contains("## abc12345 — some desc\n"), "got: {out:?}");
+        assert!(!out.contains("### Line-level comments"), "got: {out:?}");
+        assert!(!out.contains("#### ["), "got: {out:?}");
     }
 
     #[test]
