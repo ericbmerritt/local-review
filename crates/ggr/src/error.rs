@@ -44,6 +44,9 @@ pub(crate) enum GgrError {
     #[snafu(display("invalid repository name '{repo_name}': expected 'owner/repo' format"))]
     InvalidRepoName { repo_name: String },
 
+    #[snafu(display("invalid commit SHA '{sha}': expected 40 lowercase hex characters"))]
+    InvalidCommitSha { sha: String },
+
     #[snafu(display("io error: {source}"))]
     Io { source: std::io::Error },
 
