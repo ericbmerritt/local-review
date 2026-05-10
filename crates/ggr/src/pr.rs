@@ -5,6 +5,48 @@
 //! the flat list of inline review comments returned by the GitHub pull request
 //! comments API into per-root-comment threads.
 
+use crate::error::GgrError;
+
+// ── RepoName ──────────────────────────────────────────────────────────────────
+
+/// A validated `owner/repo` slug.
+///
+/// Constructed via [`TryFrom<&str>`], which enforces the `owner/repo` format
+/// before accepting the value.  Use [`RepoName::as_str`] to recover the
+/// underlying string for API endpoint construction.
+#[derive(Debug, Clone)]
+pub(crate) struct RepoName(String);
+
+impl TryFrom<&str> for RepoName {
+    type Error = GgrError;
+
+    fn try_from(s: &str) -> Result<Self, Self::Error> {
+        fn valid_segment(seg: &str) -> bool {
+            !seg.is_empty()
+                && seg
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        }
+        let err = || GgrError::InvalidRepoName {
+            repo_name: s.to_owned(),
+        };
+        let (owner, repo) = s.split_once('/').ok_or_else(err)?;
+        if !valid_segment(owner) || !valid_segment(repo) {
+            return Err(err());
+        }
+        Ok(Self(s.to_owned()))
+    }
+}
+
+impl RepoName {
+    /// Returns the underlying `owner/repo` string.
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+// ── domain types ─────────────────────────────────────────────────────────────
+
 /// One commit in a PR, as resolved by `gh pr view --json commits`.
 #[derive(Debug, Clone)]
 pub(crate) struct CommitEntry {
@@ -25,15 +67,20 @@ pub(crate) struct PrComment {
 
 /// One comment within an inline review thread.
 ///
-/// `id` is GitHub's review comment ID; it is needed to post replies (P3).
+/// `id` is GitHub's review comment ID; it is needed to post replies.
 #[derive(Debug, Clone)]
 pub(crate) struct ThreadComment {
     /// GitHub's numeric review comment ID.
     #[expect(dead_code, reason = "consumed by thread rendering TUI (not yet built)")]
     pub(crate) id: u64,
+    /// Comment author login as returned by the GitHub API.
+    ///
+    /// From the GitHub API; strip control characters before rendering.
     #[expect(dead_code, reason = "consumed by thread rendering TUI (not yet built)")]
     pub(crate) author: String,
     /// ISO 8601 timestamp as returned by GitHub (e.g. `"2024-01-15T10:30:00Z"`).
+    ///
+    /// From the GitHub API; strip control characters before rendering.
     #[expect(dead_code, reason = "consumed by thread rendering TUI (not yet built)")]
     pub(crate) created_at: String,
     /// Comment body as returned by the GitHub API.
@@ -111,13 +158,64 @@ pub(crate) struct PrDetails {
     /// General (non-inline) PR comments, oldest-first.
     pub(crate) comments: Vec<PrComment>,
     /// Validated `owner/repo` slug from `headRepository.nameWithOwner`, used for diff API calls.
-    pub(crate) repo_name: crate::gh::RepoName,
+    pub(crate) repo_name: RepoName,
     /// GHE hostname for `gh api --hostname`. `None` → github.com.
     pub(crate) hostname: Option<String>,
     /// Ordered commits, oldest-first (as returned by `gh pr view --json commits`).
     pub(crate) commits: Vec<CommitEntry>,
     /// Inline review threads, grouped by root comment, oldest-first within each thread.
-    ///
-    /// `None` until populated by [`crate::gh::fetch_review_threads`].
-    pub(crate) review_threads: Option<Vec<ReviewThread>>,
+    #[expect(dead_code, reason = "consumed by thread rendering TUI (not yet built)")]
+    pub(crate) review_threads: Vec<ReviewThread>,
+}
+
+// ── tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::RepoName;
+
+    #[test]
+    fn validate_repo_name_accepts_valid_slug() {
+        assert!(RepoName::try_from("owner/repo").is_ok());
+    }
+
+    #[test]
+    fn validate_repo_name_rejects_missing_slash() {
+        assert!(RepoName::try_from("ownerrepo").is_err());
+    }
+
+    #[test]
+    fn validate_repo_name_rejects_extra_slash() {
+        assert!(RepoName::try_from("owner/repo/extra").is_err());
+    }
+
+    #[test]
+    fn validate_repo_name_rejects_empty_owner() {
+        assert!(RepoName::try_from("/repo").is_err());
+    }
+
+    #[test]
+    fn validate_repo_name_rejects_empty_repo() {
+        assert!(RepoName::try_from("owner/").is_err());
+    }
+
+    #[test]
+    fn validate_repo_name_rejects_bare_slash() {
+        assert!(RepoName::try_from("/").is_err());
+    }
+
+    #[test]
+    fn validate_repo_name_rejects_whitespace_owner() {
+        assert!(RepoName::try_from(" /repo").is_err());
+    }
+
+    #[test]
+    fn validate_repo_name_rejects_whitespace_repo() {
+        assert!(RepoName::try_from("owner/ ").is_err());
+    }
+
+    #[test]
+    fn validate_repo_name_accepts_dots_hyphens_underscores() {
+        assert!(RepoName::try_from("my-org/my.repo_v1").is_ok());
+    }
 }

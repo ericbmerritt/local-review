@@ -16,37 +16,7 @@ use local_review_core::diff::Diff;
 use snafu::IntoError as _;
 
 use crate::error::{GgrError, GhFailedSnafu, GhMissingSnafu, Result};
-use crate::pr::{CommitEntry, PrComment, PrDetails, ReviewThread, ThreadComment};
-
-// ── RepoName ──────────────────────────────────────────────────────────────────
-
-/// A validated `owner/repo` slug.
-///
-/// Constructed via [`RepoName::try_from_str`], which enforces the
-/// `owner/repo` format before accepting the value.  Use [`RepoName::as_str`]
-/// to recover the underlying string for API endpoint construction.
-#[derive(Debug, Clone)]
-pub(crate) struct RepoName(String);
-
-impl RepoName {
-    /// Parse and validate an `owner/repo` slug.
-    ///
-    /// Returns [`GgrError::InvalidRepoName`] when the input does not have
-    /// exactly one `/` with non-empty segments on both sides.
-    pub(crate) fn try_from_str(s: &str) -> Result<Self> {
-        let parts: Vec<&str> = s.splitn(3, '/').collect();
-        if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
-            return Err(GgrError::InvalidRepoName {
-                repo_name: s.to_owned(),
-            });
-        }
-        Ok(Self(s.to_owned()))
-    }
-
-    pub(crate) fn as_str(&self) -> &str {
-        &self.0
-    }
-}
+use crate::pr::{CommitEntry, PrComment, PrDetails, RepoName, ReviewThread, ThreadComment};
 
 // ── gh JSON shapes ────────────────────────────────────────────────────────────
 
@@ -87,7 +57,7 @@ struct CommentAuthorJson {
 
 // ── public API ────────────────────────────────────────────────────────────────
 
-/// Fetch PR metadata and the ordered commit list from the GitHub API via `gh`.
+/// Fetch PR metadata, the ordered commit list, and inline review threads from the GitHub API via `gh`.
 ///
 /// Runs `gh pr view <pr> --json ...`. When `repo` is `Some("owner/repo")` the
 /// `--repo` flag is passed, allowing use outside a git working tree. When
@@ -96,8 +66,13 @@ struct CommentAuthorJson {
 ///
 /// The response includes `headRepository.nameWithOwner`, which is stored in
 /// `PrDetails.repo_name` and used by `fetch_commit_diff` — so the caller does
-/// not need to track the repo slug separately.
-pub(crate) fn fetch_pr_details(pr: u64, repo: Option<&str>) -> Result<PrDetails> {
+/// not need to track the repo slug separately.  Review threads are fetched and
+/// populated before returning.
+pub(crate) fn fetch_pr_details(
+    pr: u64,
+    repo: Option<&str>,
+    hostname: Option<&str>,
+) -> Result<PrDetails> {
     let pr_str = pr.to_string();
     let mut args = vec!["pr", "view", &pr_str, "--json"];
     let fields = "number,title,body,comments,commits,headRepository";
@@ -154,7 +129,9 @@ pub(crate) fn fetch_pr_details(pr: u64, repo: Option<&str>) -> Result<PrDetails>
         })
         .collect();
 
-    let repo_name = RepoName::try_from_str(&parsed.head_repository.name_with_owner)?;
+    let repo_name = RepoName::try_from(parsed.head_repository.name_with_owner.as_str())?;
+
+    let review_threads = fetch_review_threads(pr, &repo_name, hostname)?;
 
     Ok(PrDetails {
         number: parsed.number,
@@ -162,9 +139,9 @@ pub(crate) fn fetch_pr_details(pr: u64, repo: Option<&str>) -> Result<PrDetails>
         body: parsed.body,
         comments,
         repo_name,
-        hostname: None,
+        hostname: hostname.map(str::to_owned),
         commits,
-        review_threads: None,
+        review_threads,
     })
 }
 
@@ -240,9 +217,7 @@ struct RawReviewComment {
 /// comment in the array — are silently skipped.  This is a defensive choice:
 /// the GitHub API should never produce orphan replies in practice, but if it
 /// does, attaching them to an arbitrary thread would corrupt the display.
-/// Skipping keeps all other threads correct.  Replies that arrive before their
-/// root comment (including pagination edge cases) are treated identically —
-/// silently dropped.
+/// Skipping keeps all other threads correct.
 ///
 /// The returned `Vec` preserves the order of root comments as they appeared in
 /// the input array.  Replies within each thread are appended in input order
@@ -307,7 +282,7 @@ pub(crate) fn fetch_review_threads(
     hostname: Option<&str>,
 ) -> Result<Vec<ReviewThread>> {
     let endpoint = format!("repos/{}/pulls/{pr}/comments", repo_name.as_str());
-    let mut args = vec!["api", &endpoint, "--paginate", "--jq", ".[]"];
+    let mut args = vec!["api", &endpoint, "--paginate"];
     if let Some(host) = hostname {
         args.push("--hostname");
         args.push(host);
@@ -327,12 +302,16 @@ pub(crate) fn fetch_review_threads(
     let raw =
         String::from_utf8(output.stdout).map_err(|source| GgrError::GhOutputEncoding { source })?;
 
-    let comments: Vec<RawReviewComment> = raw
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .map(serde_json::from_str::<RawReviewComment>)
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|source| GgrError::ReviewCommentParse { source })?;
+    let comments: Vec<RawReviewComment> = {
+        let mut all: Vec<RawReviewComment> = Vec::new();
+        let mut stream =
+            serde_json::Deserializer::from_str(&raw).into_iter::<Vec<RawReviewComment>>();
+        for page in &mut stream {
+            let page = page.map_err(|source| GgrError::ReviewCommentParse { source })?;
+            all.extend(page);
+        }
+        all
+    };
 
     Ok(group_review_comments(comments))
 }
@@ -341,7 +320,7 @@ pub(crate) fn fetch_review_threads(
 
 #[cfg(test)]
 mod tests {
-    use super::{group_review_comments, CommentAuthorJson, RawReviewComment, RepoName};
+    use super::{group_review_comments, CommentAuthorJson, RawReviewComment};
 
     fn make_root(id: u64, path: &str, position: Option<u32>) -> RawReviewComment {
         RawReviewComment {
@@ -463,30 +442,7 @@ mod tests {
             threads[0].replies.is_empty(),
             "reply-before-root is dropped"
         );
-    }
-
-    #[test]
-    fn validate_repo_name_accepts_valid_slug() {
-        assert!(RepoName::try_from_str("owner/repo").is_ok());
-    }
-
-    #[test]
-    fn validate_repo_name_rejects_missing_slash() {
-        assert!(RepoName::try_from_str("ownerrepo").is_err());
-    }
-
-    #[test]
-    fn validate_repo_name_rejects_extra_slash() {
-        assert!(RepoName::try_from_str("owner/repo/extra").is_err());
-    }
-
-    #[test]
-    fn validate_repo_name_rejects_empty_owner() {
-        assert!(RepoName::try_from_str("/repo").is_err());
-    }
-
-    #[test]
-    fn validate_repo_name_rejects_empty_repo() {
-        assert!(RepoName::try_from_str("owner/").is_err());
+        assert_eq!(threads[0].root.body, "root comment 1");
+        assert_eq!(threads[0].path, "src/lib.rs");
     }
 }

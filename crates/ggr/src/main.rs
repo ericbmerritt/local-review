@@ -64,18 +64,15 @@ fn run() -> error::Result<()> {
         }
     }
 
-    let mut pr = gh::fetch_pr_details(parsed.number, parsed.repo_flag.as_deref())?;
-    pr.hostname = parsed.hostname;
+    let pr = gh::fetch_pr_details(
+        parsed.number,
+        parsed.repo_flag.as_deref(),
+        parsed.hostname.as_deref(),
+    )?;
 
     if pr.commits.is_empty() {
         return Err(GgrError::PrNotFound { pr: parsed.number });
     }
-
-    pr.review_threads = Some(gh::fetch_review_threads(
-        pr.number,
-        &pr.repo_name,
-        pr.hostname.as_deref(),
-    )?);
 
     tui::run(pr)
 }
