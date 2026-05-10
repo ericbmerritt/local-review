@@ -3,7 +3,7 @@
 
 use std::io::{stdout, Stdout};
 
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyCode, KeyEvent};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -24,6 +24,11 @@ use local_review_core::Severity;
 use crate::error::{GgrError, Result};
 use crate::gh;
 use crate::pr::PrDetails;
+
+// ── constants ─────────────────────────────────────────────────────────────────
+
+const THREADS_EXPANDED_MSG: &str = "threads expanded";
+const THREADS_COLLAPSED_MSG: &str = "threads collapsed";
 
 // ── GgrSurface ────────────────────────────────────────────────────────────────
 
@@ -51,6 +56,7 @@ enum State {
 pub(crate) struct GgrSurface {
     pr: PrDetails,
     state: State,
+    threads_expanded: bool,
 }
 
 impl GgrSurface {
@@ -58,6 +64,7 @@ impl GgrSurface {
         Self {
             pr,
             state: State::Description,
+            threads_expanded: true,
         }
     }
 
@@ -145,10 +152,52 @@ impl ReviewSurface for GgrSurface {
 
     fn inline_comments_for_view(
         &self,
-        _view_idx: usize,
-        _severity_filter: Option<Severity>,
+        now: std::time::SystemTime,
+        view_idx: usize,
+        severity_filter: Option<Severity>,
     ) -> Vec<InlineComment> {
-        Vec::new()
+        if !self.threads_expanded {
+            return Vec::new();
+        }
+        let diff = match &self.state {
+            State::Description => return Vec::new(),
+            State::CommitDiff { diff, .. } => diff,
+        };
+        if view_idx == 0 {
+            return Vec::new();
+        }
+        let file_idx = view_idx - 1;
+        let Some(file) = diff.files.get(file_idx) else {
+            return Vec::new();
+        };
+        let file_path_str = file.display_path().to_string_lossy();
+        self.pr
+            .review_threads
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.path == file_path_str.as_ref() && !t.is_outdated())
+            .filter_map(|(comment_index, thread)| {
+                if let Some(f) = severity_filter {
+                    if thread.severity != f {
+                        return None;
+                    }
+                }
+                Some(InlineComment {
+                    source_line: thread.original_line,
+                    target_line: thread.line,
+                    severity: thread.severity,
+                    age: local_review_core::util::format_age_from_iso_str(
+                        now,
+                        &thread.root.created_at,
+                    ),
+                    body_lines: strip_controls_preserve_newlines(&thread.root.body)
+                        .lines()
+                        .map(str::to_owned)
+                        .collect(),
+                    comment_index,
+                })
+            })
+            .collect()
     }
 
     fn save_comment(
@@ -194,11 +243,23 @@ impl ReviewSurface for GgrSurface {
         SeverityHistogram::default()
     }
 
-    fn handle_extra_key(
-        &mut self,
-        _key: KeyEvent,
-    ) -> std::result::Result<ExtraKeyAction, GgrError> {
-        Ok(ExtraKeyAction::Ignored)
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "unhandled KeyCode variants are intentionally passed through as Ignored"
+    )]
+    fn handle_extra_key(&mut self, key: KeyEvent) -> std::result::Result<ExtraKeyAction, GgrError> {
+        match key.code {
+            KeyCode::Char('T') => {
+                self.threads_expanded = !self.threads_expanded;
+                let msg = if self.threads_expanded {
+                    THREADS_EXPANDED_MSG
+                } else {
+                    THREADS_COLLAPSED_MSG
+                };
+                Ok(ExtraKeyAction::StatusMessage(msg.to_owned()))
+            }
+            _ => Ok(ExtraKeyAction::Ignored),
+        }
     }
 
     fn render_extra_screen(&self, _frame: &mut Frame<'_>, _state: &mut dyn ExtraScreen) {}
@@ -285,7 +346,9 @@ pub(crate) fn run(pr: PrDetails) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pr::{CommitEntry, CommitSha, PrComment, RepoName};
+    use crate::pr::{CommitEntry, CommitSha, PrComment, RepoName, ReviewThread, ThreadComment};
+    use crossterm::event::{KeyCode, KeyModifiers};
+    use local_review_core::diff::{Diff, DiffFile};
     use local_review_core::tui::{composer::ComposerScope, CommentId};
 
     fn make_pr_zero_commits() -> PrDetails {
@@ -381,11 +444,425 @@ mod tests {
         assert_eq!(surface.entry_description(99), "");
     }
 
+    fn make_key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn make_thread(
+        path: &str,
+        line: Option<u32>,
+        position: Option<u32>,
+        body: &str,
+        created_at: &str,
+    ) -> ReviewThread {
+        ReviewThread {
+            path: path.to_owned(),
+            position,
+            original_commit_id: CommitSha::try_from("a3b4c5d6e7f8a3b4c5d6e7f8a3b4c5d6e7f8a3b4")
+                .unwrap(),
+            root: ThreadComment {
+                id: 1,
+                author: "reviewer".to_owned(),
+                created_at: created_at.to_owned(),
+                body: body.to_owned(),
+            },
+            replies: vec![],
+            line,
+            original_line: None,
+            diff_side: None,
+            severity: Severity::Note,
+        }
+    }
+
+    fn make_surface_with_thread(thread: ReviewThread) -> GgrSurface {
+        let mut pr = make_pr();
+        pr.review_threads.push(thread);
+        let mut surface = GgrSurface::new(pr);
+        surface.state = State::CommitDiff {
+            index: 1,
+            diff: Diff {
+                files: vec![DiffFile::Modified {
+                    path: std::path::PathBuf::from("src/foo.rs"),
+                    hunks: vec![],
+                }],
+            },
+        };
+        surface
+    }
+
     #[test]
     fn inline_comments_for_view_returns_empty() {
         let surface = GgrSurface::new(make_pr());
-        assert!(surface.inline_comments_for_view(0, None).is_empty());
-        assert!(surface.inline_comments_for_view(1, None).is_empty());
+        assert!(surface
+            .inline_comments_for_view(std::time::SystemTime::UNIX_EPOCH, 0, None)
+            .is_empty());
+        assert!(surface
+            .inline_comments_for_view(std::time::SystemTime::UNIX_EPOCH, 1, None)
+            .is_empty());
+    }
+
+    #[test]
+    fn threads_expanded_defaults_to_true() {
+        let surface = GgrSurface::new(make_pr());
+        assert!(
+            surface.threads_expanded,
+            "threads_expanded must be true after new()"
+        );
+    }
+
+    #[test]
+    fn handle_extra_key_t_expands_then_collapses() {
+        let mut surface = GgrSurface::new(make_pr());
+        assert!(surface.threads_expanded);
+
+        let result = surface
+            .handle_extra_key(make_key(KeyCode::Char('T')))
+            .unwrap();
+        assert!(!surface.threads_expanded, "T must collapse when expanded");
+        assert!(
+            matches!(result, ExtraKeyAction::StatusMessage(_)),
+            "T must return StatusMessage"
+        );
+
+        let result = surface
+            .handle_extra_key(make_key(KeyCode::Char('T')))
+            .unwrap();
+        assert!(surface.threads_expanded, "T must expand when collapsed");
+        assert!(
+            matches!(result, ExtraKeyAction::StatusMessage(_)),
+            "T must return StatusMessage"
+        );
+    }
+
+    #[test]
+    fn handle_extra_key_unknown_returns_ignored() {
+        let mut surface = GgrSurface::new(make_pr());
+        let result = surface
+            .handle_extra_key(make_key(KeyCode::Char('x')))
+            .unwrap();
+        assert!(
+            matches!(result, ExtraKeyAction::Ignored),
+            "unhandled key must return Ignored"
+        );
+    }
+
+    #[test]
+    fn inline_comments_for_view_returns_empty_when_collapsed() {
+        let thread = make_thread(
+            "src/foo.rs",
+            Some(10),
+            Some(1),
+            "body",
+            "2024-01-15T10:30:00Z",
+        );
+        let mut surface = make_surface_with_thread(thread);
+        surface.threads_expanded = false;
+        assert!(
+            surface
+                .inline_comments_for_view(std::time::SystemTime::UNIX_EPOCH, 1, None)
+                .is_empty(),
+            "collapsed threads must yield no inline comments"
+        );
+    }
+
+    #[test]
+    fn inline_comments_for_view_returns_empty_in_description_state() {
+        let surface = GgrSurface::new(make_pr());
+        assert!(surface
+            .inline_comments_for_view(std::time::SystemTime::UNIX_EPOCH, 0, None)
+            .is_empty());
+        assert!(surface
+            .inline_comments_for_view(std::time::SystemTime::UNIX_EPOCH, 1, None)
+            .is_empty());
+    }
+
+    #[test]
+    fn inline_comments_for_view_returns_empty_for_view_idx_zero_in_commit_diff() {
+        let thread = make_thread(
+            "src/foo.rs",
+            Some(10),
+            Some(1),
+            "body",
+            "2024-01-15T10:30:00Z",
+        );
+        let surface = make_surface_with_thread(thread);
+        assert!(
+            surface
+                .inline_comments_for_view(std::time::SystemTime::UNIX_EPOCH, 0, None)
+                .is_empty(),
+            "view_idx 0 is the commit description page; no inline threads anchor there"
+        );
+    }
+
+    #[test]
+    fn inline_comments_for_view_returns_empty_for_out_of_range_view_idx() {
+        let thread = make_thread(
+            "src/foo.rs",
+            Some(10),
+            Some(1),
+            "body",
+            "2024-01-15T10:30:00Z",
+        );
+        let surface = make_surface_with_thread(thread);
+        assert!(
+            surface
+                .inline_comments_for_view(std::time::SystemTime::UNIX_EPOCH, 2, None)
+                .is_empty(),
+            "out-of-range view_idx must return empty"
+        );
+    }
+
+    #[test]
+    fn inline_comments_for_view_maps_thread_to_inline_comment() {
+        let thread = make_thread(
+            "src/foo.rs",
+            Some(10),
+            Some(1),
+            "good stuff",
+            "2024-01-15T10:30:00Z",
+        );
+        let surface = make_surface_with_thread(thread);
+        // 2024-01-15T10:30:00Z = 1_705_314_600 secs; 3 days later = 1_705_573_800.
+        let ts_plus_3d: u64 = 1_705_573_800;
+        let now = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(ts_plus_3d);
+        let comments = surface.inline_comments_for_view(now, 1, None);
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].target_line, Some(10));
+        assert_eq!(comments[0].source_line, None);
+        assert!(
+            comments[0].age.ends_with("days ago"),
+            "age for a years-old timestamp must be in days bucket; got: {:?}",
+            comments[0].age
+        );
+        assert_eq!(comments[0].body_lines, vec!["good stuff"]);
+    }
+
+    #[test]
+    fn inline_comments_for_view_comment_index_is_global_review_threads_index() {
+        let thread_other = make_thread(
+            "src/bar.rs",
+            Some(5),
+            Some(1),
+            "other file",
+            "2024-01-15T10:30:00Z",
+        );
+        let thread_match = make_thread(
+            "src/foo.rs",
+            Some(10),
+            Some(2),
+            "matching file",
+            "2024-01-15T11:00:00Z",
+        );
+        let mut pr = make_pr();
+        pr.review_threads.push(thread_other);
+        pr.review_threads.push(thread_match);
+        let mut surface = GgrSurface::new(pr);
+        surface.state = State::CommitDiff {
+            index: 1,
+            diff: Diff {
+                files: vec![DiffFile::Modified {
+                    path: std::path::PathBuf::from("src/foo.rs"),
+                    hunks: vec![],
+                }],
+            },
+        };
+        let comments = surface.inline_comments_for_view(std::time::SystemTime::UNIX_EPOCH, 1, None);
+        assert_eq!(
+            comments.len(),
+            1,
+            "only the matching thread must be returned"
+        );
+        assert_eq!(
+            comments[0].comment_index, 1,
+            "comment_index must be the global index in review_threads (1), not the filtered-slice index (0)"
+        );
+    }
+
+    #[test]
+    fn inline_comments_for_view_skips_mismatched_file() {
+        // Thread is on src/bar.rs; diff file is src/foo.rs.
+        let thread = make_thread(
+            "src/bar.rs",
+            Some(10),
+            Some(1),
+            "body",
+            "2024-01-15T10:30:00Z",
+        );
+        let surface = make_surface_with_thread(thread);
+        assert!(
+            surface
+                .inline_comments_for_view(std::time::SystemTime::UNIX_EPOCH, 1, None)
+                .is_empty(),
+            "thread on different file must be skipped"
+        );
+    }
+
+    #[test]
+    fn inline_comments_for_view_skips_outdated_threads() {
+        // position: None means is_outdated() == true
+        let thread = make_thread("src/foo.rs", None, None, "body", "2024-01-15T10:30:00Z");
+        let surface = make_surface_with_thread(thread);
+        assert!(
+            surface
+                .inline_comments_for_view(std::time::SystemTime::UNIX_EPOCH, 1, None)
+                .is_empty(),
+            "outdated thread (position: None) must be skipped"
+        );
+    }
+
+    #[test]
+    fn inline_comments_for_view_severity_filter_excludes_note() {
+        // GitHub threads are Note; a Required filter must exclude them.
+        let thread = make_thread(
+            "src/foo.rs",
+            Some(10),
+            Some(1),
+            "body",
+            "2024-01-15T10:30:00Z",
+        );
+        let surface = make_surface_with_thread(thread);
+        assert!(
+            surface
+                .inline_comments_for_view(
+                    std::time::SystemTime::UNIX_EPOCH,
+                    1,
+                    Some(Severity::Required)
+                )
+                .is_empty(),
+            "Required filter must exclude Note-severity GitHub threads"
+        );
+    }
+
+    #[test]
+    fn inline_comments_for_view_suggestion_filter_excludes_note_thread() {
+        let thread = make_thread(
+            "src/foo.rs",
+            Some(10),
+            Some(1),
+            "body",
+            "2024-01-15T10:30:00Z",
+        );
+        let surface = make_surface_with_thread(thread);
+        assert!(
+            surface
+                .inline_comments_for_view(
+                    std::time::SystemTime::UNIX_EPOCH,
+                    1,
+                    Some(Severity::Suggestion)
+                )
+                .is_empty(),
+            "Suggestion filter must exclude Note-severity GitHub threads"
+        );
+    }
+
+    #[test]
+    fn inline_comments_for_view_severity_filter_note_includes_thread() {
+        let thread = make_thread(
+            "src/foo.rs",
+            Some(10),
+            Some(1),
+            "body",
+            "2024-01-15T10:30:00Z",
+        );
+        let surface = make_surface_with_thread(thread);
+        assert_eq!(
+            surface
+                .inline_comments_for_view(
+                    std::time::SystemTime::UNIX_EPOCH,
+                    1,
+                    Some(Severity::Note)
+                )
+                .len(),
+            1,
+            "Note filter must include Note-severity threads"
+        );
+    }
+
+    #[test]
+    fn inline_comments_for_view_non_note_severity_filter_includes_matching_thread() {
+        let mut thread = make_thread(
+            "src/foo.rs",
+            Some(10),
+            Some(1),
+            "body",
+            "2024-01-15T10:30:00Z",
+        );
+        thread.severity = Severity::Required;
+        let surface = make_surface_with_thread(thread);
+        let comments = surface.inline_comments_for_view(
+            std::time::SystemTime::UNIX_EPOCH,
+            1,
+            Some(Severity::Required),
+        );
+        assert_eq!(
+            comments.len(),
+            1,
+            "Required filter must include Required-severity thread"
+        );
+        assert_eq!(
+            comments[0].severity,
+            Severity::Required,
+            "InlineComment.severity must match thread.severity"
+        );
+    }
+
+    #[test]
+    fn inline_comments_for_view_strips_control_chars_from_body() {
+        let thread = make_thread(
+            "src/foo.rs",
+            Some(5),
+            Some(1),
+            "\x1b[31mevil\x1b[0m\ngood",
+            "2024-01-15T10:30:00Z",
+        );
+        let surface = make_surface_with_thread(thread);
+        let comments = surface.inline_comments_for_view(std::time::SystemTime::UNIX_EPOCH, 1, None);
+        assert_eq!(comments.len(), 1);
+        let body = &comments[0].body_lines;
+        assert!(
+            body.iter().all(|l| !l.chars().any(char::is_control)),
+            "body_lines must contain no control characters; got: {body:?}"
+        );
+        assert_eq!(body.len(), 2, "newline in body must produce two lines");
+    }
+
+    #[test]
+    fn inline_comments_for_view_age_fallback_strips_control_chars() {
+        let thread = make_thread(
+            "src/foo.rs",
+            Some(5),
+            Some(1),
+            "body",
+            "\x1b[31m2024-01-15T10:30:00Z\x1b[0m",
+        );
+        let surface = make_surface_with_thread(thread);
+        let comments = surface.inline_comments_for_view(std::time::SystemTime::UNIX_EPOCH, 1, None);
+        assert_eq!(comments.len(), 1);
+        assert!(
+            !comments[0].age.chars().any(char::is_control),
+            "age must contain no control characters; got: {:?}",
+            comments[0].age
+        );
+    }
+
+    #[test]
+    fn inline_comments_for_view_empty_review_threads_returns_empty() {
+        let mut surface = GgrSurface::new(make_pr());
+        surface.state = State::CommitDiff {
+            index: 1,
+            diff: Diff {
+                files: vec![DiffFile::Modified {
+                    path: std::path::PathBuf::from("src/foo.rs"),
+                    hunks: vec![],
+                }],
+            },
+        };
+        assert!(
+            surface
+                .inline_comments_for_view(std::time::SystemTime::UNIX_EPOCH, 1, None)
+                .is_empty(),
+            "empty review_threads must yield no comments"
+        );
     }
 
     #[test]
@@ -580,7 +1057,7 @@ mod tests {
         // Start in CommitDiff state to prove that fetch_views(0) actually resets it.
         surface.state = State::CommitDiff {
             index: 1,
-            diff: local_review_core::diff::Diff { files: vec![] },
+            diff: Diff { files: vec![] },
         };
         let views = surface.fetch_views(0).expect("fetch_views(0) must succeed");
         assert_eq!(views.len(), 1, "description page must yield one view");
@@ -614,7 +1091,7 @@ mod tests {
         // Pre-load a CommitDiff state to prove it is not clobbered on Err.
         surface.state = State::CommitDiff {
             index: 1,
-            diff: local_review_core::diff::Diff { files: vec![] },
+            diff: Diff { files: vec![] },
         };
         let result = surface.fetch_views(99);
         assert!(result.is_err(), "out-of-range index must return Err");
@@ -637,7 +1114,6 @@ mod tests {
 
     #[test]
     fn file_picker_entries_for_commit_diff_state_returns_description_plus_files() {
-        use local_review_core::diff::{Diff, DiffFile};
         let mut surface = GgrSurface::new(make_pr());
         let diff = Diff {
             files: vec![

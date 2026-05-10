@@ -1,5 +1,7 @@
 //! Utility functions shared across the local-review-core crate.
 
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
 /// Strip ASCII/Unicode control characters from a string.
 ///
 /// Used when embedding untrusted input (e.g. diff hunk text from a GitHub PR)
@@ -79,6 +81,119 @@ pub fn pluralize(word: &str, count: usize) -> String {
     } else {
         format!("{word}s")
     }
+}
+
+pub(crate) fn format_age_secs(elapsed: u64) -> String {
+    if elapsed < 60 {
+        "just now".to_owned()
+    } else if elapsed < 3_600 {
+        let m = elapsed / 60;
+        format!("{m} min ago")
+    } else if elapsed < 86_400 {
+        let h = elapsed / 3_600;
+        format!("{h} hour{} ago", if h == 1 { "" } else { "s" })
+    } else {
+        let d = elapsed / 86_400;
+        format!("{d} day{} ago", if d == 1 { "" } else { "s" })
+    }
+}
+
+/// Format a GitHub ISO 8601 timestamp as a human-readable relative age.
+///
+/// GitHub's format is always `"YYYY-MM-DDTHH:MM:SSZ"` (UTC, Z suffix).
+/// Returns "just now", "N min ago", "N hour(s) ago", or "N day(s) ago".
+/// Manual parsing avoids constructing `OffsetDateTime` at call sites in `ggr`,
+/// where timestamps arrive as raw `&str` from the GitHub API.
+/// Falls back to `strip_controls(iso_ts)` when the timestamp cannot be parsed.
+pub fn format_age_from_iso_str(now: SystemTime, iso_ts: &str) -> String {
+    let bytes = iso_ts.as_bytes();
+    if bytes.len() != 20
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+        || bytes[19] != b'Z'
+    {
+        return strip_controls(iso_ts);
+    }
+
+    let parse_decimal_u64_2 = |s: &[u8]| -> Option<u64> {
+        let a = u64::from(char::from(s[0]).to_digit(10)?);
+        let b = u64::from(char::from(s[1]).to_digit(10)?);
+        Some(a * 10 + b)
+    };
+    let parse_decimal_u64_4 = |s: &[u8]| -> Option<u64> {
+        let a = u64::from(char::from(s[0]).to_digit(10)?);
+        let b = u64::from(char::from(s[1]).to_digit(10)?);
+        let c = u64::from(char::from(s[2]).to_digit(10)?);
+        let d = u64::from(char::from(s[3]).to_digit(10)?);
+        Some(a * 1_000 + b * 100 + c * 10 + d)
+    };
+
+    let Some(year) = parse_decimal_u64_4(&bytes[0..4]) else {
+        return strip_controls(iso_ts);
+    };
+    let Some(month) = parse_decimal_u64_2(&bytes[5..7]) else {
+        return strip_controls(iso_ts);
+    };
+    let Some(day) = parse_decimal_u64_2(&bytes[8..10]) else {
+        return strip_controls(iso_ts);
+    };
+    let Some(hour) = parse_decimal_u64_2(&bytes[11..13]) else {
+        return strip_controls(iso_ts);
+    };
+    let Some(min) = parse_decimal_u64_2(&bytes[14..16]) else {
+        return strip_controls(iso_ts);
+    };
+    let Some(sec) = parse_decimal_u64_2(&bytes[17..19]) else {
+        return strip_controls(iso_ts);
+    };
+
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return strip_controls(iso_ts);
+    }
+
+    if hour > 23 || min > 59 || sec > 59 {
+        return strip_controls(iso_ts);
+    }
+
+    if year < 1970 {
+        return strip_controls(iso_ts);
+    }
+
+    let is_leap = |y: u64| (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400);
+
+    let years_since_epoch = year.saturating_sub(1970);
+    let leap_count = |y: u64| -> u64 {
+        let y = y.saturating_sub(1);
+        y / 4 - y / 100 + y / 400
+    };
+    let leaps_before_year = leap_count(year).saturating_sub(leap_count(1970));
+    let days_before_year = years_since_epoch * 365 + leaps_before_year;
+
+    let days_per_month: [u64; 13] = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let Some(month_idx) = usize::try_from(month).ok() else {
+        return strip_controls(iso_ts);
+    };
+    let max_day = days_per_month[month_idx] + u64::from(is_leap(year) && month == 2);
+    if day > max_day {
+        return strip_controls(iso_ts);
+    }
+    let leap_extra = u64::from(is_leap(year) && month > 2);
+    let days_before_month: u64 = days_per_month[..month_idx].iter().sum::<u64>() + leap_extra;
+
+    let total_days = days_before_year + days_before_month + day.saturating_sub(1);
+    let ts_secs = total_days * 86_400 + hour * 3_600 + min * 60 + sec;
+
+    let now_secs = now
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_secs();
+
+    let elapsed = now_secs.saturating_sub(ts_secs);
+
+    format_age_secs(elapsed)
 }
 
 #[cfg(test)]
@@ -221,5 +336,251 @@ mod tests {
     #[test]
     fn clamp_with_delta_at_max_positive() {
         assert_eq!(clamp_with_delta(10, 1, 10), 10);
+    }
+
+    // ── format_age tests ──────────────────────────────────────────────────────
+
+    fn epoch_plus(secs: u64) -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    #[test]
+    fn format_age_just_now_for_30_seconds_ago() {
+        let ts = "1970-01-02T03:46:40Z"; // 100_000 secs
+        let now = epoch_plus(100_030);
+        assert_eq!(format_age_from_iso_str(now, ts), "just now");
+    }
+
+    #[test]
+    fn format_age_minutes_ago() {
+        let ts = "1970-01-02T03:46:40Z"; // 100_000 secs
+        let now = epoch_plus(100_300);
+        assert_eq!(format_age_from_iso_str(now, ts), "5 min ago");
+    }
+
+    #[test]
+    fn format_age_hours_ago() {
+        let ts = "1970-01-02T03:46:40Z"; // 100_000 secs
+        let now = epoch_plus(110_800);
+        assert_eq!(format_age_from_iso_str(now, ts), "3 hours ago");
+    }
+
+    #[test]
+    fn format_age_one_hour_ago_singular() {
+        let ts = "1970-01-02T03:46:40Z"; // 100_000 secs
+        let now = epoch_plus(103_600);
+        assert_eq!(format_age_from_iso_str(now, ts), "1 hour ago");
+    }
+
+    #[test]
+    fn format_age_days_ago() {
+        let ts = "1970-01-02T03:46:40Z"; // 100_000 secs
+        let now = epoch_plus(100_000 + 3 * 86_400);
+        assert_eq!(format_age_from_iso_str(now, ts), "3 days ago");
+    }
+
+    #[test]
+    fn format_age_one_day_ago_singular() {
+        let ts = "1970-01-02T03:46:40Z"; // 100_000 secs
+        let now = epoch_plus(100_000 + 86_400);
+        assert_eq!(format_age_from_iso_str(now, ts), "1 day ago");
+    }
+
+    #[test]
+    fn format_age_fallback_for_malformed_timestamp() {
+        let now = epoch_plus(0);
+        let result = format_age_from_iso_str(now, "not-a-timestamp");
+        // strip_controls of "not-a-timestamp" is "not-a-timestamp" (no controls)
+        assert_eq!(result, "not-a-timestamp");
+    }
+
+    #[test]
+    fn format_age_strips_control_chars_in_fallback() {
+        // A string with control chars but wrong format — falls back to strip_controls.
+        let now = epoch_plus(0);
+        let input = "\x1b[31mbad-ts\x1b[0m";
+        let result = format_age_from_iso_str(now, input);
+        assert!(
+            !result.chars().any(char::is_control),
+            "fallback must strip control chars; got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn format_age_future_timestamp_returns_just_now() {
+        assert_eq!(
+            format_age_from_iso_str(UNIX_EPOCH, "2024-01-15T10:30:00Z"),
+            "just now"
+        );
+    }
+
+    #[test]
+    fn format_age_known_timestamp_2024_01_15() {
+        let ts_secs: u64 = 1_705_314_600;
+        // 2 days later
+        let now = epoch_plus(ts_secs + 2 * 86_400);
+        assert_eq!(
+            format_age_from_iso_str(now, "2024-01-15T10:30:00Z"),
+            "2 days ago"
+        );
+    }
+
+    #[test]
+    fn format_age_leap_year_march_date() {
+        let ts_secs: u64 = 1_709_251_200;
+        let now = epoch_plus(ts_secs + 86_400);
+        assert_eq!(
+            format_age_from_iso_str(now, "2024-03-01T00:00:00Z"),
+            "1 day ago"
+        );
+    }
+
+    #[test]
+    fn format_age_just_now_upper_boundary() {
+        // elapsed=59: last second before "just now" flips to "1 min ago"
+        let now = epoch_plus(100_059);
+        assert_eq!(
+            format_age_from_iso_str(now, "1970-01-02T03:46:40Z"),
+            "just now"
+        );
+    }
+
+    #[test]
+    fn format_age_minutes_lower_boundary() {
+        // elapsed=60: first second of minutes bucket
+        let now = epoch_plus(100_060);
+        assert_eq!(
+            format_age_from_iso_str(now, "1970-01-02T03:46:40Z"),
+            "1 min ago"
+        );
+    }
+
+    #[test]
+    fn format_age_minutes_upper_boundary() {
+        // elapsed=3599: last second before "59 min ago" flips to hours
+        let now = epoch_plus(103_599);
+        assert_eq!(
+            format_age_from_iso_str(now, "1970-01-02T03:46:40Z"),
+            "59 min ago"
+        );
+    }
+
+    #[test]
+    fn format_age_hours_upper_boundary() {
+        // elapsed=86399: last second before "23 hours ago" flips to days
+        let now = epoch_plus(186_399);
+        assert_eq!(
+            format_age_from_iso_str(now, "1970-01-02T03:46:40Z"),
+            "23 hours ago"
+        );
+    }
+
+    #[test]
+    fn format_age_century_leap_year_march() {
+        let ts_secs: u64 = 951_868_800;
+        let now = epoch_plus(ts_secs + 86_400);
+        assert_eq!(
+            format_age_from_iso_str(now, "2000-03-01T00:00:00Z"),
+            "1 day ago"
+        );
+    }
+
+    #[test]
+    fn format_age_pre_epoch_year_falls_back() {
+        let now = epoch_plus(0);
+        assert_eq!(
+            format_age_from_iso_str(now, "1969-12-31T23:59:59Z"),
+            "1969-12-31T23:59:59Z"
+        );
+    }
+
+    #[test]
+    fn format_age_invalid_month_zero_falls_back() {
+        // month=00 is out of range; must fall back to strip_controls output
+        let now = epoch_plus(0);
+        assert_eq!(
+            format_age_from_iso_str(now, "1970-00-01T00:00:00Z"),
+            "1970-00-01T00:00:00Z"
+        );
+    }
+
+    #[test]
+    fn format_age_invalid_day_zero_falls_back() {
+        // day=00 is out of range; must fall back to strip_controls output
+        let now = epoch_plus(0);
+        assert_eq!(
+            format_age_from_iso_str(now, "1970-01-00T00:00:00Z"),
+            "1970-01-00T00:00:00Z"
+        );
+    }
+
+    #[test]
+    fn format_age_invalid_day_feb_31_falls_back() {
+        let now = epoch_plus(0);
+        // Feb has at most 29 days; day=31 must fall back
+        assert_eq!(
+            format_age_from_iso_str(now, "2024-02-31T00:00:00Z"),
+            "2024-02-31T00:00:00Z"
+        );
+    }
+
+    #[test]
+    fn format_age_invalid_day_feb_29_non_leap_falls_back() {
+        let now = epoch_plus(0);
+        // 2023 is not a leap year; day=29 for Feb must fall back
+        assert_eq!(
+            format_age_from_iso_str(now, "2023-02-29T00:00:00Z"),
+            "2023-02-29T00:00:00Z"
+        );
+    }
+
+    #[test]
+    fn format_age_valid_day_feb_29_leap_year() {
+        let ts_secs: u64 = 1_709_164_800;
+        let now = epoch_plus(ts_secs + 86_400);
+        assert_eq!(
+            format_age_from_iso_str(now, "2024-02-29T00:00:00Z"),
+            "1 day ago"
+        );
+    }
+
+    #[test]
+    fn format_age_invalid_day_apr_31_falls_back() {
+        let now = epoch_plus(0);
+        // April has 30 days; day=31 must fall back
+        assert_eq!(
+            format_age_from_iso_str(now, "2024-04-31T00:00:00Z"),
+            "2024-04-31T00:00:00Z"
+        );
+    }
+
+    #[test]
+    fn format_age_invalid_hour_falls_back() {
+        // hour=24 is out of range (0..=23); must fall back to strip_controls output
+        let now = epoch_plus(0);
+        assert_eq!(
+            format_age_from_iso_str(now, "2024-01-15T24:00:00Z"),
+            "2024-01-15T24:00:00Z"
+        );
+    }
+
+    #[test]
+    fn format_age_invalid_minute_falls_back() {
+        // min=60 is out of range (0..=59); must fall back to strip_controls output
+        let now = epoch_plus(0);
+        assert_eq!(
+            format_age_from_iso_str(now, "2024-01-15T00:60:00Z"),
+            "2024-01-15T00:60:00Z"
+        );
+    }
+
+    #[test]
+    fn format_age_invalid_second_falls_back() {
+        // sec=60 is out of range (0..=59); must fall back to strip_controls output
+        let now = epoch_plus(0);
+        assert_eq!(
+            format_age_from_iso_str(now, "2024-01-15T00:00:60Z"),
+            "2024-01-15T00:00:60Z"
+        );
     }
 }

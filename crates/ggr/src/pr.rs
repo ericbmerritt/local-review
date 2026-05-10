@@ -8,6 +8,7 @@
 use crate::error::GgrError;
 use local_review_core::comment::Side;
 use local_review_core::util::strip_controls;
+use local_review_core::Severity;
 
 /// Validate a single path/hostname segment: non-empty, no `..`, no leading or
 /// trailing dot, only alphanumeric and separator chars (`-`, `_`, `.`), at
@@ -137,16 +138,8 @@ pub(crate) struct ThreadComment {
     #[expect(dead_code, reason = "consumed by thread rendering TUI (not yet built)")]
     pub(crate) author: String,
     /// ISO 8601 creation timestamp (e.g. `"2024-01-15T10:30:00Z"`).
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "consumed by thread rendering TUI (not yet built)")
-    )]
     pub(crate) created_at: String,
     /// Comment body as returned by the GitHub API.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "consumed by thread rendering TUI (not yet built)")
-    )]
     pub(crate) body: String,
 }
 
@@ -165,11 +158,7 @@ pub(crate) struct ThreadComment {
 pub(crate) struct ReviewThread {
     /// Repo-root-relative file path the thread is anchored to.
     ///
-    /// From the GitHub API; strip control characters before rendering.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "consumed by thread rendering TUI (not yet built)")
-    )]
+    /// From the GitHub API; sanitized at construction (control characters stripped).
     pub(crate) path: String,
     /// 1-based diff-offset position in the PR diff.
     pub(crate) position: Option<u32>,
@@ -180,54 +169,32 @@ pub(crate) struct ReviewThread {
     )]
     pub(crate) original_commit_id: CommitSha,
     /// Root (first) comment for the thread.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "consumed by thread rendering TUI (not yet built)")
-    )]
     pub(crate) root: ThreadComment,
     /// Replies to the root comment, in API-returned order.
     pub(crate) replies: Vec<ThreadComment>,
     /// 1-based line number in the **new** version of the file that the thread
     /// anchors to (`side: "RIGHT"` in the GitHub API).  `None` for hunk-context
     /// lines (which have no file-side line number) and for outdated threads.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "consumed by GgrSurface::inline_comments_for_view (T4.2)"
-        )
-    )]
     pub(crate) line: Option<u32>,
     /// 1-based line number in the **old** version of the file that the thread
     /// anchors to (`side: "LEFT"` in the GitHub API).  `None` for right-side and
     /// hunk-context threads, and for outdated threads.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "consumed by GgrSurface::inline_comments_for_view (T4.2)"
-        )
-    )]
     pub(crate) original_line: Option<u32>,
     /// Which side of the diff this thread is anchored to: [`Side::Old`] (GitHub
     /// `"LEFT"`) or [`Side::New`] (GitHub `"RIGHT"`).  `None` when the GitHub API
     /// returns `null` (hunk-context or outdated threads).
     #[cfg_attr(
         not(test),
-        expect(
-            dead_code,
-            reason = "consumed by GgrSurface::inline_comments_for_view (T4.2)"
-        )
+        expect(dead_code, reason = "consumed by thread rendering TUI (not yet built)")
     )]
     pub(crate) diff_side: Option<Side>,
+    /// Review severity. GitHub threads do not carry an explicit severity field;
+    /// the API always maps to [`Severity::Note`].
+    pub(crate) severity: Severity,
 }
 
 impl ReviewThread {
     /// Returns `true` when the anchored diff line no longer exists in the PR head.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "consumed by thread rendering TUI (not yet built)")
-    )]
     pub(crate) fn is_outdated(&self) -> bool {
         self.position.is_none()
     }
@@ -249,7 +216,6 @@ pub(crate) struct PrDetails {
     /// Ordered commits, oldest-first (as returned by `gh pr view --json commits`).
     pub(crate) commits: Vec<CommitEntry>,
     /// Inline review threads, grouped by root comment, oldest-first within each thread.
-    #[expect(dead_code, reason = "consumed by thread rendering TUI (not yet built)")]
     pub(crate) review_threads: Vec<ReviewThread>,
 }
 
