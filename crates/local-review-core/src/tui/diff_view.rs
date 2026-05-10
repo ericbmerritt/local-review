@@ -6,6 +6,7 @@
 
 use crate::diff::{DiffFile, Hunk, Line, LineKind};
 use crate::severity::Severity;
+use crate::util::strip_injection_controls;
 
 /// Best-case rows added per inline comment when sizing the rebuilt `Vec`:
 /// 1 meta line + 1 body line. Multi-line bodies grow past this; the `Vec`
@@ -323,7 +324,7 @@ fn render_lines(file: &DiffFile) -> Vec<RenderedLine> {
 fn push_hunk(output: &mut Vec<RenderedLine>, hunk: &Hunk) {
     output.push(RenderedLine {
         kind: RenderedLineKind::HunkHeader,
-        text: hunk.header.clone(),
+        text: strip_injection_controls(&hunk.header),
         source_line: None,
         target_line: None,
         hunk_header: Some(hunk.header.clone()),
@@ -412,7 +413,7 @@ fn render_line(line: &Line, hunk_header: &str) -> RenderedLine {
     };
     RenderedLine {
         kind,
-        text: line.text.clone(),
+        text: strip_injection_controls(&line.text),
         source_line: line.source_line,
         target_line: line.target_line,
         hunk_header: Some(hunk_header.to_owned()),
@@ -1245,5 +1246,152 @@ mod tests {
     #[test]
     fn new_pair_returns_none_when_both_sides_are_none() {
         assert_eq!(PairedRow::new_pair(None, None), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // push_hunk — strip invariant: display text stripped, anchor verbatim
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn push_hunk_header_display_stripped_anchor_verbatim() {
+        // Hunk header containing ANSI escape sequences: ESC is a control
+        // character and must be stripped from the rendered display text, but
+        // the verbatim header must be preserved in hunk_header for anchor
+        // identity matching.
+        let header = "\x1b[31m@@ -1,1 +1,1 @@\x1b[0m".to_owned();
+        let hunk = Hunk {
+            header: header.clone(),
+            function_context: None,
+            source_start: 1,
+            source_length: 1,
+            target_start: 1,
+            target_length: 1,
+            lines: vec![],
+        };
+        let mut output = Vec::new();
+        push_hunk(&mut output, &hunk);
+        let header_line = &output[0];
+        assert_eq!(header_line.kind, RenderedLineKind::HunkHeader);
+        assert!(
+            !header_line.text.chars().any(char::is_control),
+            "rendered hunk header text must have no control chars; got: {:?}",
+            header_line.text
+        );
+        assert_eq!(
+            header_line.hunk_header.as_deref(),
+            Some(header.as_str()),
+            "hunk_header anchor key must be the verbatim (unstripped) header"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn render_line_strips_control_chars_from_line_text() {
+        // A diff line whose text contains ANSI escape sequences must have
+        // those control characters stripped in the rendered RenderedLine::text.
+        let file = DiffFile::Modified {
+            path: PathBuf::from("test.rs"),
+            hunks: vec![Hunk {
+                header: "@@ -1,1 +1,1 @@".to_owned(),
+                function_context: None,
+                source_start: 1,
+                source_length: 1,
+                target_start: 1,
+                target_length: 1,
+                lines: vec![Line {
+                    kind: LineKind::Added,
+                    text: "\x1b[32mcolored text\x1b[0m".to_owned(),
+                    source_line: None,
+                    target_line: Some(1),
+                }],
+            }],
+        };
+        let view = DiffView::from_file(&file);
+        let added_line = view
+            .lines
+            .iter()
+            .find(|l| l.kind == RenderedLineKind::Added)
+            .expect("must have an Added line");
+        assert!(
+            !added_line.text.chars().any(char::is_control),
+            "rendered line text must have control chars stripped; got: {:?}",
+            added_line.text
+        );
+        assert!(
+            added_line.text.contains("colored text"),
+            "non-control characters must be preserved; got: {:?}",
+            added_line.text
+        );
+    }
+
+    #[test]
+    fn push_hunk_preserves_tab_in_display_text() {
+        // Hunk headers from some diff tools include tab characters.
+        // Tabs must be preserved in the display text (they are not injection
+        // vectors); ESC sequences are still stripped.
+        let header = "@@ -1,1 +1,1 @@ fn\tfoo()".to_owned();
+        let hunk = Hunk {
+            header: header.clone(),
+            function_context: None,
+            source_start: 1,
+            source_length: 1,
+            target_start: 1,
+            target_length: 1,
+            lines: vec![],
+        };
+        let mut output = Vec::new();
+        push_hunk(&mut output, &hunk);
+        let header_line = &output[0];
+        assert!(
+            header_line.text.contains('\t'),
+            "tab must be preserved in hunk header display text; got: {:?}",
+            header_line.text
+        );
+        assert_eq!(
+            header_line.hunk_header.as_deref(),
+            Some(header.as_str()),
+            "hunk_header anchor key must be the verbatim (unstripped) header"
+        );
+    }
+
+    #[test]
+    fn render_line_preserves_tab_in_line_text() {
+        // Go, Makefile, Python, and Rust source files use tab indentation.
+        // Tabs must survive into RenderedLine::text so the TUI displays correct
+        // indentation; ESC sequences are still stripped.
+        let file = DiffFile::Modified {
+            path: PathBuf::from("Makefile"),
+            hunks: vec![Hunk {
+                header: "@@ -1,1 +1,1 @@".to_owned(),
+                function_context: None,
+                source_start: 1,
+                source_length: 1,
+                target_start: 1,
+                target_length: 1,
+                lines: vec![Line {
+                    kind: LineKind::Added,
+                    text: "\tindented line".to_owned(),
+                    source_line: None,
+                    target_line: Some(1),
+                }],
+            }],
+        };
+        let view = DiffView::from_file(&file);
+        let added_line = view
+            .lines
+            .iter()
+            .find(|l| l.kind == RenderedLineKind::Added)
+            .expect("must have an Added line");
+        assert!(
+            added_line.text.contains('\t'),
+            "tab must be preserved in rendered line text; got: {:?}",
+            added_line.text
+        );
+        assert!(
+            added_line.text.contains("indented line"),
+            "non-tab content must be preserved; got: {:?}",
+            added_line.text
+        );
     }
 }

@@ -15,10 +15,11 @@ use local_review_core::diff::Diff;
 
 use snafu::IntoError as _;
 
+use local_review_core::util::strip_controls;
+
 use crate::error::{GgrError, GhFailedSnafu, GhMissingSnafu, Result};
 use crate::pr::{
-    strip_controls, CommitEntry, CommitSha, PrComment, PrDetails, RepoName, ReviewThread,
-    ThreadComment,
+    CommitEntry, CommitSha, PrComment, PrDetails, RepoName, ReviewThread, ThreadComment,
 };
 
 // ── gh JSON shapes ────────────────────────────────────────────────────────────

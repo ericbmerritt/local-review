@@ -452,21 +452,24 @@ impl<S: ReviewSurfaceExt> App<S> {
             MarkReviewedOutcome::ResetDueToCommitMismatch if self.status_message.is_none() => {
                 self.status_message = Some(STATUS_REVIEWED_RESET.to_owned());
             }
-            MarkReviewedOutcome::ResetDueToCommitMismatch | MarkReviewedOutcome::NoReset => {}
+            MarkReviewedOutcome::ResetDueToCommitMismatch
+            | MarkReviewedOutcome::NoReset
+            | MarkReviewedOutcome::NotTracked => {}
         }
     }
 
     /// Toggle the reviewed bit for the active view.
     pub fn toggle_current_file_reviewed(&mut self) {
         let outcome = self.surface.toggle_view_reviewed(self.file_index);
-        self.status_message = Some(
-            match outcome {
-                ReviewedOutcome::Marked => STATUS_MARKED_REVIEWED,
-                ReviewedOutcome::Unmarked => STATUS_MARKED_UNREVIEWED,
-                ReviewedOutcome::ResetAndMarked => STATUS_RESET_AND_MARKED_REVIEWED,
-            }
-            .to_owned(),
-        );
+        let msg = match outcome {
+            ReviewedOutcome::Marked => Some(STATUS_MARKED_REVIEWED),
+            ReviewedOutcome::Unmarked => Some(STATUS_MARKED_UNREVIEWED),
+            ReviewedOutcome::ResetAndMarked => Some(STATUS_RESET_AND_MARKED_REVIEWED),
+            ReviewedOutcome::NotTracked => None,
+        };
+        if let Some(m) = msg {
+            self.status_message = Some(m.to_owned());
+        }
     }
 
     /// Whether the current view at `file_index` is reviewed.
@@ -1614,9 +1617,10 @@ fn file_picker_enter<S: ReviewSurfaceExt>(app: &mut App<S>) {
 mod app_tests {
     use super::*;
     use crate::tui::{
-        DeleteRequest, DiffView, ExtraKeyAction, ExtraScreenAction, ExtraScreenContext,
-        FilePickerEntry, FilePickerState, MarkReviewedOutcome, RenderedLine, RenderedLineKind,
-        ReviewSurface, ReviewedOutcome, SaveOutcome, SaveRequest, SeverityHistogram, UpdateRequest,
+        DeleteOutcome, DeleteRequest, DiffView, ExtraKeyAction, ExtraScreenAction,
+        ExtraScreenContext, FilePickerEntry, FilePickerState, MarkReviewedOutcome, RenderedLine,
+        RenderedLineKind, ReviewSurface, ReviewedOutcome, SaveOutcome, SaveRequest,
+        SeverityHistogram, UpdateRequest,
     };
 
     // -----------------------------------------------------------------------
@@ -1634,11 +1638,22 @@ mod app_tests {
 
     struct NoopSurface {
         views: Vec<DiffView>,
+        not_tracked: bool,
     }
 
     impl NoopSurface {
         fn new(views: Vec<DiffView>) -> Self {
-            Self { views }
+            Self {
+                views,
+                not_tracked: false,
+            }
+        }
+
+        fn new_not_tracked(views: Vec<DiffView>) -> Self {
+            Self {
+                views,
+                not_tracked: true,
+            }
         }
     }
 
@@ -1676,17 +1691,25 @@ mod app_tests {
                 reason: String::new(),
             })
         }
-        fn delete_comment(&mut self, _: DeleteRequest) -> Result<(), NoopError> {
-            Ok(())
+        fn delete_comment(&mut self, _: DeleteRequest) -> Result<DeleteOutcome, NoopError> {
+            Ok(DeleteOutcome::Deleted)
         }
         fn is_view_reviewed(&self, _: usize) -> bool {
             false
         }
         fn mark_view_reviewed(&mut self, _: usize) -> MarkReviewedOutcome {
-            MarkReviewedOutcome::NoReset
+            if self.not_tracked {
+                MarkReviewedOutcome::NotTracked
+            } else {
+                MarkReviewedOutcome::NoReset
+            }
         }
         fn toggle_view_reviewed(&mut self, _: usize) -> ReviewedOutcome {
-            ReviewedOutcome::Unmarked
+            if self.not_tracked {
+                ReviewedOutcome::NotTracked
+            } else {
+                ReviewedOutcome::Unmarked
+            }
         }
         fn severity_histogram(&self) -> SeverityHistogram {
             SeverityHistogram::default()
@@ -2246,6 +2269,42 @@ mod app_tests {
         assert!(
             app.status_message.is_none(),
             "same-file delta of 2 must not emit 'jumped' message"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // toggle_current_file_reviewed — NotTracked arm
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn toggle_current_file_reviewed_not_tracked_leaves_status_unchanged() {
+        let view = view_with_kinds(&[RenderedLineKind::Added]);
+        let surface = NoopSurface::new_not_tracked(vec![view.clone()]);
+        let mut app = App::new(surface, vec![view], TransitionMode::Never);
+        app.diff_mode = DiffMode::ForceUnified;
+        assert!(
+            app.status_message.is_none(),
+            "precondition: status_message must start as None"
+        );
+        app.toggle_current_file_reviewed();
+        assert!(
+            app.status_message.is_none(),
+            "NotTracked must leave status_message unchanged (None)"
+        );
+    }
+
+    #[test]
+    fn toggle_current_file_reviewed_not_tracked_does_not_clobber_existing_status() {
+        let view = view_with_kinds(&[RenderedLineKind::Added]);
+        let surface = NoopSurface::new_not_tracked(vec![view.clone()]);
+        let mut app = App::new(surface, vec![view], TransitionMode::Never);
+        app.diff_mode = DiffMode::ForceUnified;
+        app.status_message = Some("prior".to_owned());
+        app.toggle_current_file_reviewed();
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("prior"),
+            "NotTracked must not clobber a pre-existing status_message"
         );
     }
 }

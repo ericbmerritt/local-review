@@ -300,7 +300,7 @@ pub trait ReviewSurface: Sized {
 
     /// Invoked when the user presses `^D` in edit mode. The surface deletes
     /// the record keyed by `identity`.
-    fn delete_comment(&mut self, req: DeleteRequest) -> Result<(), Self::Error>;
+    fn delete_comment(&mut self, req: DeleteRequest) -> Result<DeleteOutcome, Self::Error>;
 
     // ------------------------------------------------------------------
     // Reviewed-bit tracking
@@ -492,6 +492,15 @@ impl DeleteRequest {
     }
 }
 
+/// Outcome reported after a delete operation.
+#[derive(Debug)]
+pub enum DeleteOutcome {
+    /// The comment was successfully deleted.
+    Deleted,
+    /// The surface declined to delete the comment (e.g. read-only surface).
+    Refused { reason: String },
+}
+
 /// Outcome reported after a save or update operation.
 #[derive(Debug)]
 pub enum SaveOutcome {
@@ -511,12 +520,15 @@ pub enum MarkReviewedOutcome {
     /// The stored commit id no longer matched (change was amended/rebased).
     /// The previous reviewed bits were cleared.
     ResetDueToCommitMismatch,
+    /// This surface does not implement reviewed tracking; the mark is a no-op.
+    NotTracked,
 }
 
 /// Outcome returned by [`ReviewSurface::toggle_view_reviewed`].
 ///
 /// Carries enough information for the core to surface the right status message:
 /// normal mark/unmark vs. the case where the reviewed state was reset first.
+/// Surfaces that do not implement reviewed tracking return [`ReviewedOutcome::NotTracked`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReviewedOutcome {
     /// The view was not previously reviewed; it is now marked reviewed.
@@ -526,6 +538,8 @@ pub enum ReviewedOutcome {
     /// The stored commit id no longer matched (change was amended/rebased);
     /// the prior reviewed bits were cleared and the view was then marked reviewed.
     ResetAndMarked,
+    /// This surface does not implement reviewed tracking; the toggle is a no-op.
+    NotTracked,
 }
 
 /// Comment counts by severity for the currently loaded entry.
