@@ -6,6 +6,7 @@
 //! `Accept: application/vnd.github.diff` header to get per-commit diffs from
 //! the GitHub API — no local `git clone` required.
 
+use std::collections::HashMap;
 use std::process::Command;
 
 use serde::Deserialize;
@@ -15,7 +16,37 @@ use local_review_core::diff::Diff;
 use snafu::IntoError as _;
 
 use crate::error::{GgrError, GhFailedSnafu, GhMissingSnafu, Result};
-use crate::pr::{CommitEntry, PrComment, PrDetails};
+use crate::pr::{CommitEntry, PrComment, PrDetails, ReviewThread, ThreadComment};
+
+// ── RepoName ──────────────────────────────────────────────────────────────────
+
+/// A validated `owner/repo` slug.
+///
+/// Constructed via [`RepoName::try_from_str`], which enforces the
+/// `owner/repo` format before accepting the value.  Use [`RepoName::as_str`]
+/// to recover the underlying string for API endpoint construction.
+#[derive(Debug, Clone)]
+pub(crate) struct RepoName(String);
+
+impl RepoName {
+    /// Parse and validate an `owner/repo` slug.
+    ///
+    /// Returns [`GgrError::InvalidRepoName`] when the input does not have
+    /// exactly one `/` with non-empty segments on both sides.
+    pub(crate) fn try_from_str(s: &str) -> Result<Self> {
+        let parts: Vec<&str> = s.splitn(3, '/').collect();
+        if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
+            return Err(GgrError::InvalidRepoName {
+                repo_name: s.to_owned(),
+            });
+        }
+        Ok(Self(s.to_owned()))
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
 
 // ── gh JSON shapes ────────────────────────────────────────────────────────────
 
@@ -123,14 +154,17 @@ pub(crate) fn fetch_pr_details(pr: u64, repo: Option<&str>) -> Result<PrDetails>
         })
         .collect();
 
+    let repo_name = RepoName::try_from_str(&parsed.head_repository.name_with_owner)?;
+
     Ok(PrDetails {
         number: parsed.number,
         title: parsed.title,
         body: parsed.body,
         comments,
-        repo_name: parsed.head_repository.name_with_owner,
+        repo_name,
         hostname: None,
         commits,
+        review_threads: None,
     })
 }
 
@@ -138,14 +172,14 @@ pub(crate) fn fetch_pr_details(pr: u64, repo: Option<&str>) -> Result<PrDetails>
 ///
 /// Uses `gh api repos/{repo_name}/commits/{sha}` with
 /// `Accept: application/vnd.github.diff`, which returns a standard unified
-/// diff. No local git clone is required; `repo_name` is `owner/repo`.
-/// Pass `hostname` for GitHub Enterprise Server endpoints.
+/// diff. No local git clone is required; `repo_name` is a validated
+/// [`RepoName`]. Pass `hostname` for GitHub Enterprise Server endpoints.
 pub(crate) fn fetch_commit_diff(
-    repo_name: &str,
+    repo_name: &RepoName,
     sha: &str,
     hostname: Option<&str>,
 ) -> Result<Diff> {
-    let endpoint = format!("repos/{repo_name}/commits/{sha}");
+    let endpoint = format!("repos/{}/commits/{sha}", repo_name.as_str());
     let mut args = vec![
         "api",
         &endpoint,
@@ -171,4 +205,288 @@ pub(crate) fn fetch_commit_diff(
         String::from_utf8(output.stdout).map_err(|source| GgrError::GhOutputEncoding { source })?;
 
     local_review_core::diff::parse(&raw).map_err(GgrError::from)
+}
+
+// ── review comments JSON shapes ───────────────────────────────────────────────
+
+/// Raw shape for one element of `GET /pulls/{pr}/comments`.
+///
+/// GitHub returns a flat JSON array; replies are distinguished by the presence
+/// of `in_reply_to_id`.
+#[derive(Deserialize)]
+struct RawReviewComment {
+    id: u64,
+    path: String,
+    /// `null` when the thread is outdated (the anchored diff line is gone).
+    position: Option<u32>,
+    original_commit_id: String,
+    /// Present and non-null for reply comments; absent/null for root comments.
+    #[serde(default)]
+    in_reply_to_id: Option<u64>,
+    user: CommentAuthorJson,
+    created_at: String,
+    body: String,
+}
+
+// ── grouping logic (pure) ─────────────────────────────────────────────────────
+
+/// Group a flat list of raw review comments into per-root-comment threads.
+///
+/// GitHub returns all review comments for a PR as a flat array in
+/// chronological order.  Root comments have no `in_reply_to_id`; reply
+/// comments carry the `id` of their root.
+///
+/// **Orphan replies** — replies whose `in_reply_to_id` does not match any root
+/// comment in the array — are silently skipped.  This is a defensive choice:
+/// the GitHub API should never produce orphan replies in practice, but if it
+/// does, attaching them to an arbitrary thread would corrupt the display.
+/// Skipping keeps all other threads correct.  Replies that arrive before their
+/// root comment (including pagination edge cases) are treated identically —
+/// silently dropped.
+///
+/// The returned `Vec` preserves the order of root comments as they appeared in
+/// the input array.  Replies within each thread are appended in input order
+/// (GitHub already returns them chronologically).
+fn group_review_comments(raw: Vec<RawReviewComment>) -> Vec<ReviewThread> {
+    let mut threads: Vec<ReviewThread> = Vec::new();
+    let mut root_index: HashMap<u64, usize> = HashMap::new();
+
+    for comment in raw {
+        match comment.in_reply_to_id {
+            None => {
+                let root = ThreadComment {
+                    id: comment.id,
+                    author: comment.user.login,
+                    created_at: comment.created_at,
+                    body: comment.body,
+                };
+                let thread = ReviewThread {
+                    path: comment.path,
+                    position: comment.position,
+                    original_commit_id: comment.original_commit_id,
+                    root,
+                    replies: vec![],
+                };
+                root_index.insert(comment.id, threads.len());
+                threads.push(thread);
+            }
+            Some(parent_id) => {
+                if let Some(&idx) = root_index.get(&parent_id) {
+                    let reply = ThreadComment {
+                        id: comment.id,
+                        author: comment.user.login,
+                        created_at: comment.created_at,
+                        body: comment.body,
+                    };
+                    threads[idx].replies.push(reply);
+                }
+            }
+        }
+    }
+
+    threads
+}
+
+// ── public API (continued) ────────────────────────────────────────────────────
+
+/// Fetch and group inline review threads for a pull request via `gh`.
+///
+/// Calls `gh api repos/{repo_name}/pulls/{pr}/comments`, which returns a flat
+/// JSON array of all inline review comments.  The flat list is grouped into
+/// [`ReviewThread`] values by [`group_review_comments`].
+///
+/// Pass `hostname` for GitHub Enterprise Server endpoints; `None` uses
+/// github.com.
+///
+/// Failures from the `gh` subprocess are returned as hard errors — a missing
+/// thread list is not silently swallowed, because the caller needs accurate
+/// thread state to display existing review context.
+pub(crate) fn fetch_review_threads(
+    pr: u64,
+    repo_name: &RepoName,
+    hostname: Option<&str>,
+) -> Result<Vec<ReviewThread>> {
+    let endpoint = format!("repos/{}/pulls/{pr}/comments", repo_name.as_str());
+    let mut args = vec!["api", &endpoint, "--paginate", "--jq", ".[]"];
+    if let Some(host) = hostname {
+        args.push("--hostname");
+        args.push(host);
+    }
+
+    let output = Command::new("gh")
+        .args(&args)
+        .output()
+        .map_err(|source| GhMissingSnafu.into_error(source))?;
+
+    if !output.status.success() {
+        let message = String::from_utf8_lossy(&output.stderr).into_owned();
+        let exit_code = output.status.code();
+        return GhFailedSnafu { message, exit_code }.fail();
+    }
+
+    let raw =
+        String::from_utf8(output.stdout).map_err(|source| GgrError::GhOutputEncoding { source })?;
+
+    let comments: Vec<RawReviewComment> = raw
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(serde_json::from_str::<RawReviewComment>)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|source| GgrError::ReviewCommentParse { source })?;
+
+    Ok(group_review_comments(comments))
+}
+
+// ── tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::{group_review_comments, CommentAuthorJson, RawReviewComment, RepoName};
+
+    fn make_root(id: u64, path: &str, position: Option<u32>) -> RawReviewComment {
+        RawReviewComment {
+            id,
+            path: path.to_owned(),
+            position,
+            original_commit_id: format!("deadbeef{id:08x}"),
+            in_reply_to_id: None,
+            user: CommentAuthorJson {
+                login: format!("user{id}"),
+            },
+            created_at: format!("2024-01-{id:02}T00:00:00Z"),
+            body: format!("root comment {id}"),
+        }
+    }
+
+    fn make_reply(id: u64, parent_id: u64) -> RawReviewComment {
+        RawReviewComment {
+            id,
+            path: String::new(),
+            position: None,
+            original_commit_id: String::new(),
+            in_reply_to_id: Some(parent_id),
+            user: CommentAuthorJson {
+                login: format!("user{id}"),
+            },
+            created_at: format!("2024-01-{id:02}T01:00:00Z"),
+            body: format!("reply {id} to {parent_id}"),
+        }
+    }
+
+    #[test]
+    fn empty_input_produces_empty_output() {
+        let threads = group_review_comments(vec![]);
+        assert!(threads.is_empty());
+    }
+
+    #[test]
+    fn single_root_no_replies_produces_one_thread() {
+        let threads = group_review_comments(vec![make_root(1, "src/lib.rs", Some(5))]);
+        assert_eq!(threads.len(), 1);
+        assert_eq!(threads[0].root.body, "root comment 1");
+        assert!(threads[0].replies.is_empty());
+    }
+
+    #[test]
+    fn single_root_with_two_replies_root_first_replies_in_order() {
+        let raw = vec![
+            make_root(1, "src/lib.rs", Some(3)),
+            make_reply(2, 1),
+            make_reply(3, 1),
+        ];
+        let threads = group_review_comments(raw);
+        assert_eq!(threads.len(), 1);
+        assert_eq!(threads[0].root.body, "root comment 1");
+        assert_eq!(threads[0].replies.len(), 2);
+        assert_eq!(threads[0].replies[0].body, "reply 2 to 1");
+        assert_eq!(threads[0].replies[1].body, "reply 3 to 1");
+    }
+
+    #[test]
+    fn interleaved_roots_and_replies_routed_correctly() {
+        let raw = vec![
+            make_root(10, "a.rs", Some(1)),
+            make_root(20, "b.rs", Some(2)),
+            make_reply(11, 10),
+            make_reply(21, 20),
+        ];
+        let threads = group_review_comments(raw);
+        assert_eq!(threads.len(), 2);
+        assert_eq!(threads[0].root.body, "root comment 10");
+        assert_eq!(threads[0].replies.len(), 1);
+        assert_eq!(threads[0].replies[0].body, "reply 11 to 10");
+        assert_eq!(threads[1].root.body, "root comment 20");
+        assert_eq!(threads[1].replies.len(), 1);
+        assert_eq!(threads[1].replies[0].body, "reply 21 to 20");
+    }
+
+    #[test]
+    fn thread_path_and_commit_id_preserved() {
+        let threads = group_review_comments(vec![make_root(1, "src/lib.rs", Some(5))]);
+        assert_eq!(threads[0].path, "src/lib.rs");
+        assert_eq!(threads[0].original_commit_id, "deadbeef00000001");
+    }
+
+    #[test]
+    fn null_position_thread_is_outdated() {
+        let threads = group_review_comments(vec![make_root(1, "src/main.rs", None)]);
+        assert_eq!(threads.len(), 1);
+        assert!(threads[0].position.is_none());
+        assert!(threads[0].is_outdated());
+    }
+
+    #[test]
+    fn some_position_thread_is_not_outdated() {
+        let threads = group_review_comments(vec![make_root(1, "src/main.rs", Some(7))]);
+        assert_eq!(threads.len(), 1);
+        assert!(threads[0].position.is_some());
+        assert!(!threads[0].is_outdated());
+    }
+
+    #[test]
+    fn orphan_reply_is_skipped_gracefully() {
+        let raw = vec![make_root(1, "src/lib.rs", Some(2)), make_reply(2, 999)];
+        let threads = group_review_comments(raw);
+        assert_eq!(threads.len(), 1);
+        assert!(
+            threads[0].replies.is_empty(),
+            "orphan reply must be skipped"
+        );
+    }
+
+    #[test]
+    fn reply_before_root_is_treated_as_orphan() {
+        let raw = vec![make_reply(2, 1), make_root(1, "src/lib.rs", Some(3))];
+        let threads = group_review_comments(raw);
+        assert_eq!(threads.len(), 1, "root creates one thread");
+        assert!(
+            threads[0].replies.is_empty(),
+            "reply-before-root is dropped"
+        );
+    }
+
+    #[test]
+    fn validate_repo_name_accepts_valid_slug() {
+        assert!(RepoName::try_from_str("owner/repo").is_ok());
+    }
+
+    #[test]
+    fn validate_repo_name_rejects_missing_slash() {
+        assert!(RepoName::try_from_str("ownerrepo").is_err());
+    }
+
+    #[test]
+    fn validate_repo_name_rejects_extra_slash() {
+        assert!(RepoName::try_from_str("owner/repo/extra").is_err());
+    }
+
+    #[test]
+    fn validate_repo_name_rejects_empty_owner() {
+        assert!(RepoName::try_from_str("/repo").is_err());
+    }
+
+    #[test]
+    fn validate_repo_name_rejects_empty_repo() {
+        assert!(RepoName::try_from_str("owner/").is_err());
+    }
 }

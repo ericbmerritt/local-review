@@ -71,5 +71,11 @@ fn run() -> error::Result<()> {
         return Err(GgrError::PrNotFound { pr: parsed.number });
     }
 
+    pr.review_threads = Some(gh::fetch_review_threads(
+        pr.number,
+        &pr.repo_name,
+        pr.hostname.as_deref(),
+    )?);
+
     tui::run(pr)
 }

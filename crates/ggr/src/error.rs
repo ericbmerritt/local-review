@@ -32,11 +32,17 @@ pub(crate) enum GgrError {
     #[snafu(display("failed to parse PR metadata: {source}"))]
     GhJsonParse { source: serde_json::Error },
 
+    #[snafu(display("failed to parse review comment: {source}"))]
+    ReviewCommentParse { source: serde_json::Error },
+
     #[snafu(display("failed to parse diff for {}: {message}", file.display()))]
     DiffParse { file: PathBuf, message: String },
 
     #[snafu(display("invalid PR reference: {raw}"))]
     InvalidPrRef { raw: String },
+
+    #[snafu(display("invalid repository name '{repo_name}': expected 'owner/repo' format"))]
+    InvalidRepoName { repo_name: String },
 
     #[snafu(display("io error: {source}"))]
     Io { source: std::io::Error },
