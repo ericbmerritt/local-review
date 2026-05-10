@@ -6,6 +6,7 @@
 //! comments API into per-root-comment threads.
 
 use crate::error::GgrError;
+use local_review_core::comment::Side;
 use local_review_core::util::strip_controls;
 
 /// Validate a single path/hostname segment: non-empty, no `..`, no leading or
@@ -186,6 +187,39 @@ pub(crate) struct ReviewThread {
     pub(crate) root: ThreadComment,
     /// Replies to the root comment, in API-returned order.
     pub(crate) replies: Vec<ThreadComment>,
+    /// 1-based line number in the **new** version of the file that the thread
+    /// anchors to (`side: "RIGHT"` in the GitHub API).  `None` for hunk-context
+    /// lines (which have no file-side line number) and for outdated threads.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "consumed by GgrSurface::inline_comments_for_view (T4.2)"
+        )
+    )]
+    pub(crate) line: Option<u32>,
+    /// 1-based line number in the **old** version of the file that the thread
+    /// anchors to (`side: "LEFT"` in the GitHub API).  `None` for right-side and
+    /// hunk-context threads, and for outdated threads.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "consumed by GgrSurface::inline_comments_for_view (T4.2)"
+        )
+    )]
+    pub(crate) original_line: Option<u32>,
+    /// Which side of the diff this thread is anchored to: [`Side::Old`] (GitHub
+    /// `"LEFT"`) or [`Side::New`] (GitHub `"RIGHT"`).  `None` when the GitHub API
+    /// returns `null` (hunk-context or outdated threads).
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "consumed by GgrSurface::inline_comments_for_view (T4.2)"
+        )
+    )]
+    pub(crate) diff_side: Option<Side>,
 }
 
 impl ReviewThread {
