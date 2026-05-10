@@ -64,10 +64,10 @@ use local_review_core::tui::composer::{
     STATUS_DESCRIPTION_UNAVAILABLE, STATUS_LINE_UNAVAILABLE, STATUS_STACK_UNAVAILABLE,
 };
 use local_review_core::tui::{
-    BaseViews, DeleteRequest, ExtraKeyAction, ExtraScreen, ExtraScreenAction, ExtraScreenContext,
-    FilePickerEntry, MarkReviewedOutcome, ReviewSurface, ReviewSurfaceExt, ReviewedOutcome,
-    SaveOutcome as CoreSaveOutcome, SaveRequest, SeverityHistogram as CoreSeverityHistogram,
-    UpdateRequest,
+    BaseViews, DeleteOutcome as CoreDeleteOutcome, DeleteRequest, ExtraKeyAction, ExtraScreen,
+    ExtraScreenAction, ExtraScreenContext, FilePickerEntry, MarkReviewedOutcome, ReviewSurface,
+    ReviewSurfaceExt, ReviewedOutcome, SaveOutcome as CoreSaveOutcome, SaveRequest,
+    SeverityHistogram as CoreSeverityHistogram, UpdateRequest,
 };
 use overview_screen::{OverviewCommentSet, OverviewScreenState, OverviewStackCtx};
 use send_to_claude::{ConfirmData, SendToClaudeState};
@@ -876,18 +876,23 @@ impl ReviewSurface for JjrSurface {
         }
     }
 
-    fn delete_comment(&mut self, req: DeleteRequest) -> std::result::Result<(), JjrError> {
+    fn delete_comment(
+        &mut self,
+        req: DeleteRequest,
+    ) -> std::result::Result<CoreDeleteOutcome, JjrError> {
         let Some(comment) = self
             .loaded_comments
             .iter()
             .find(|c| c.created_at == req.identity.as_offset_date_time())
             .cloned()
         else {
-            return Ok(());
+            return Ok(CoreDeleteOutcome::Refused {
+                reason: "comment not found in loaded set".to_owned(),
+            });
         };
         crate::store::delete_comment(&self.repo_root, &comment)?;
         let _ = self.reload_comments();
-        Ok(())
+        Ok(CoreDeleteOutcome::Deleted)
     }
 
     fn is_view_reviewed(&self, view_idx: usize) -> bool {
@@ -5537,6 +5542,36 @@ mod tests {
         );
         let msg = surface.pending_status_message.as_ref().unwrap();
         assert!(!msg.is_empty(), "surfaced error message must not be empty");
+    }
+
+    /// `JjrSurface::delete_comment` returns `Refused` (not `Deleted`) when the
+    /// provided `CommentId` does not match any record in `loaded_comments`.
+    #[test]
+    fn delete_comment_returns_refused_when_comment_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let change_id = ChangeId::parse(&"a".repeat(32)).unwrap();
+        let commit_id = CommitId::parse(&"a".repeat(40)).unwrap();
+        let details = ChangeDetails {
+            change_id: change_id.clone(),
+            commit_id: commit_id.clone(),
+            description: String::new(),
+            diff: make_single_hunk_diff(),
+        };
+        let mut surface = JjrSurface::new(
+            details,
+            dir.path().to_path_buf(),
+            "@".to_owned(),
+            None,
+            None,
+        );
+        // loaded_comments is empty — any CommentId will be absent.
+        let absent_id = local_review_core::tui::CommentId::new(time::OffsetDateTime::UNIX_EPOCH);
+        let req = DeleteRequest::new(absent_id, None);
+        let outcome = surface.delete_comment(req).unwrap();
+        assert!(
+            matches!(outcome, CoreDeleteOutcome::Refused { .. }),
+            "delete_comment must return Refused when CommentId is not in loaded_comments; got: {outcome:?}"
+        );
     }
 
     fn make_line(

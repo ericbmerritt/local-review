@@ -9,8 +9,10 @@
 //!
 //! `ParsedPrRef` carries enough information to build any `gh` invocation.
 
+use local_review_core::util::strip_controls;
+
 use crate::error::{GgrError, Result};
-use crate::pr::{strip_controls, RepoName};
+use crate::pr::RepoName;
 
 /// Resolved PR reference, ready to drive `gh pr view` and `gh api`.
 #[derive(Debug, Clone)]

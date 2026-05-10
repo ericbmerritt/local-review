@@ -6,16 +6,7 @@
 //! comments API into per-root-comment threads.
 
 use crate::error::GgrError;
-
-// ── RepoName ──────────────────────────────────────────────────────────────────
-
-/// Strip ASCII/Unicode control characters from a string.
-///
-/// Used when embedding untrusted input in error values to prevent
-/// control-character injection into error messages.
-pub(crate) fn strip_controls(s: &str) -> String {
-    s.chars().filter(|c| !c.is_control()).collect()
-}
+use local_review_core::util::strip_controls;
 
 /// Validate a single path/hostname segment: non-empty, no `..`, no leading or
 /// trailing dot, only alphanumeric and separator chars (`-`, `_`, `.`), at
@@ -33,6 +24,8 @@ pub(crate) fn valid_segment(seg: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
         && seg.chars().any(|c| c.is_ascii_alphanumeric())
 }
+
+// ── RepoName ──────────────────────────────────────────────────────────────────
 
 /// A validated `owner/repo` slug.
 ///
