@@ -42,6 +42,28 @@ pub fn strip_controls_preserve_newlines(s: &str) -> String {
         .collect()
 }
 
+/// Atomically write `data` to `path`. Creates parent directories if absent.
+///
+/// Uses [`tempfile::NamedTempFile`] and a same-filesystem rename so a partial
+/// write never corrupts an existing file and concurrent writers do not race on
+/// a shared temp name.
+pub fn atomic_write_bytes(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path has no parent directory",
+        )
+    })?;
+    std::fs::create_dir_all(parent)?;
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+    tmp.write_all(data)?;
+    tmp.flush()?;
+    tmp.persist(path)
+        .map_err(|e| std::io::Error::other(e.error))?;
+    Ok(())
+}
+
 /// Clamp `index + delta` into `[0, max]`.
 pub fn clamp_with_delta(index: usize, delta: isize, max: usize) -> usize {
     if delta >= 0 {
@@ -199,6 +221,44 @@ pub fn format_age_from_iso_str(now: SystemTime, iso_ts: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn atomic_write_bytes_root_path_returns_error() {
+        // Path::new("/").parent() is None — must return an error, not fall back to cwd.
+        let result = atomic_write_bytes(std::path::Path::new("/"), b"x");
+        assert!(result.is_err(), "root path with no parent must return Err");
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn atomic_write_bytes_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("lrc_atomic_write_{}", std::process::id()));
+        let path = dir.join("sub").join("out.bin");
+        atomic_write_bytes(&path, b"hello world").unwrap();
+        let read_back = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(read_back, b"hello world");
+    }
+
+    #[test]
+    fn atomic_write_bytes_creates_parent_dirs() {
+        let dir = std::env::temp_dir().join(format!("lrc_atomic_mkdirs_{}", std::process::id()));
+        let path = dir.join("deep").join("nested").join("file.bin");
+        atomic_write_bytes(&path, b"data").unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn atomic_write_bytes_overwrites_existing_file() {
+        let dir = std::env::temp_dir().join(format!("lrc_atomic_overwrite_{}", std::process::id()));
+        let path = dir.join("out.bin");
+        atomic_write_bytes(&path, b"first").unwrap();
+        atomic_write_bytes(&path, b"second").unwrap();
+        let content = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(content, b"second");
+    }
 
     #[test]
     fn strip_controls_empty_string() {

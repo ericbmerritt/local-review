@@ -86,13 +86,12 @@ impl ReviewedState {
     /// Atomic save via `util::atomic_write_bytes` — crash-safe rename, same
     /// pattern as cursor.json and the comment store.
     pub(crate) fn save(&self, repo_root: &Path) -> Result<()> {
-        let dir = repo_root.join(".jj-review");
         let path = reviewed_path(repo_root);
         let dto = ReviewedStateDto::from_state(self);
         let json = serde_json::to_string_pretty(&dto).map_err(|e| JjrError::Io {
             source: std::io::Error::other(e),
         })?;
-        atomic_write_bytes(&dir, &path, json.as_bytes())
+        atomic_write_bytes(&path, json.as_bytes())
     }
 
     /// Mark `target` reviewed for `(change_id, commit_id)`.
