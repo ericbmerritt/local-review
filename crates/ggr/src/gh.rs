@@ -16,7 +16,9 @@ use local_review_core::diff::Diff;
 use snafu::IntoError as _;
 
 use crate::error::{GgrError, GhFailedSnafu, GhMissingSnafu, Result};
-use crate::pr::{CommitEntry, PrComment, PrDetails, RepoName, ReviewThread, ThreadComment};
+use crate::pr::{
+    CommitEntry, CommitSha, PrComment, PrDetails, RepoName, ReviewThread, ThreadComment,
+};
 
 // ── gh JSON shapes ────────────────────────────────────────────────────────────
 
@@ -111,14 +113,15 @@ pub(crate) fn fetch_pr_details(
         .commits
         .into_iter()
         .map(|c| {
-            let short_sha = c.oid.chars().take(8).collect();
-            CommitEntry {
-                sha: c.oid,
+            let sha = CommitSha::try_from(c.oid.as_str())?;
+            let short_sha = sha.as_str().chars().take(8).collect();
+            Ok(CommitEntry {
+                sha,
                 short_sha,
                 title: c.message_headline,
-            }
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
 
     let comments = parsed
         .comments
@@ -150,13 +153,14 @@ pub(crate) fn fetch_pr_details(
 /// Uses `gh api repos/{repo_name}/commits/{sha}` with
 /// `Accept: application/vnd.github.diff`, which returns a standard unified
 /// diff. No local git clone is required; `repo_name` is a validated
-/// [`RepoName`]. Pass `hostname` for GitHub Enterprise Server endpoints.
+/// [`RepoName`] and `sha` is a validated [`CommitSha`]. Pass `hostname` for
+/// GitHub Enterprise Server endpoints.
 pub(crate) fn fetch_commit_diff(
     repo_name: &RepoName,
-    sha: &str,
+    sha: &CommitSha,
     hostname: Option<&str>,
 ) -> Result<Diff> {
-    let endpoint = format!("repos/{}/commits/{sha}", repo_name.as_str());
+    let endpoint = format!("repos/{}/commits/{}", repo_name.as_str(), sha.as_str());
     let mut args = vec![
         "api",
         &endpoint,

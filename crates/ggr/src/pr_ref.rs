@@ -98,6 +98,12 @@ fn parse_url(url: &str) -> Result<ParsedPrRef> {
             raw: url.to_owned(),
         })?;
 
+    if !valid_hostname(host) {
+        return Err(GgrError::InvalidPrRef {
+            raw: url.to_owned(),
+        });
+    }
+
     // Expect path = "owner/repo/pull/number"
     let parts: Vec<&str> = path.splitn(4, '/').collect();
     if parts.len() != 4 || parts[2] != "pull" {
@@ -115,6 +121,9 @@ fn parse_url(url: &str) -> Result<ParsedPrRef> {
         })?;
 
     let repo_str = format!("{owner}/{repo}");
+    let repo_name = RepoName::try_from(repo_str.as_str()).map_err(|_| GgrError::InvalidPrRef {
+        raw: url.to_owned(),
+    })?;
 
     // Standard github.com — no hostname needed.
     let hostname = if host == "github.com" {
@@ -124,8 +133,8 @@ fn parse_url(url: &str) -> Result<ParsedPrRef> {
     };
 
     let repo_flag = match &hostname {
-        Some(h) => Some(format!("{h}/{repo_str}")),
-        None => Some(repo_str),
+        Some(h) => Some(format!("{h}/{}", repo_name.as_str())),
+        None => Some(repo_name.as_str().to_owned()),
     };
 
     Ok(ParsedPrRef {
@@ -135,6 +144,13 @@ fn parse_url(url: &str) -> Result<ParsedPrRef> {
     })
 }
 
+fn valid_hostname(s: &str) -> bool {
+    !s.is_empty()
+        && !s.contains("..")
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-'))
+}
+
 /// Extract the bare hostname from a base URL string (e.g. `https://github.example.com`
 /// → `github.example.com`). The raw PR ref string is included in error messages.
 fn extract_host(url: &str, pr_raw: &str) -> Result<String> {
@@ -142,7 +158,7 @@ fn extract_host(url: &str, pr_raw: &str) -> Result<String> {
         .trim_start_matches("https://")
         .trim_start_matches("http://")
         .trim_end_matches('/');
-    if host.is_empty() {
+    if host.is_empty() || !valid_hostname(host) {
         return Err(GgrError::InvalidPrRef {
             raw: pr_raw.to_owned(),
         });
@@ -219,5 +235,15 @@ mod tests {
     #[test]
     fn malformed_url_is_error() {
         assert!(parse("https://github.com/nopull", None).is_err());
+    }
+
+    #[test]
+    fn url_with_dotdot_owner_is_error() {
+        assert!(parse("https://github.com/../etc/passwd/pull/42", None).is_err());
+    }
+
+    #[test]
+    fn url_flag_with_dotdot_host_is_error() {
+        assert!(parse("owner/repo#42", Some("https://../etc/passwd")).is_err());
     }
 }

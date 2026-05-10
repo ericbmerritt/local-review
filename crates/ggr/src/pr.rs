@@ -23,6 +23,7 @@ impl TryFrom<&str> for RepoName {
     fn try_from(s: &str) -> Result<Self, Self::Error> {
         fn valid_segment(seg: &str) -> bool {
             !seg.is_empty()
+                && !seg.contains("..")
                 && seg
                     .chars()
                     .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
@@ -47,11 +48,39 @@ impl RepoName {
 
 // ── domain types ─────────────────────────────────────────────────────────────
 
+/// A validated 40-character lowercase-hex SHA-1 commit identifier.
+///
+/// Constructed via [`TryFrom<&str>`], which enforces the 40-char lowercase-hex
+/// constraint at the boundary.  Use [`CommitSha::as_str`] to recover the raw
+/// string for API endpoint construction or display.
+#[derive(Debug, Clone)]
+pub(crate) struct CommitSha(String);
+
+impl TryFrom<&str> for CommitSha {
+    type Error = GgrError;
+
+    fn try_from(s: &str) -> Result<Self, Self::Error> {
+        let valid = s.len() == 40 && s.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f'));
+        if valid {
+            Ok(Self(s.to_owned()))
+        } else {
+            Err(GgrError::InvalidCommitSha { sha: s.to_owned() })
+        }
+    }
+}
+
+impl CommitSha {
+    /// Returns the underlying 40-character SHA string.
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// One commit in a PR, as resolved by `gh pr view --json commits`.
 #[derive(Debug, Clone)]
 pub(crate) struct CommitEntry {
-    /// Full 40-char SHA.
-    pub(crate) sha: String,
+    /// Full 40-char validated SHA.
+    pub(crate) sha: CommitSha,
     /// First 8 characters of the SHA, for display.
     pub(crate) short_sha: String,
     /// First line of the commit message.
@@ -75,12 +104,19 @@ pub(crate) struct ThreadComment {
     pub(crate) id: u64,
     /// Comment author login as returned by the GitHub API.
     ///
-    /// From the GitHub API; strip control characters before rendering.
+    /// # Security
+    /// Content originates from GitHub users and is untrusted.
+    /// Strip terminal control characters before passing to any renderer to
+    /// prevent ANSI escape injection.
     #[expect(dead_code, reason = "consumed by thread rendering TUI (not yet built)")]
     pub(crate) author: String,
-    /// ISO 8601 timestamp as returned by GitHub (e.g. `"2024-01-15T10:30:00Z"`).
+    /// ISO 8601 creation timestamp (e.g. `"2024-01-15T10:30:00Z"`).
     ///
     /// From the GitHub API; strip control characters before rendering.
+    ///
+    /// # Security
+    /// Content originates from the GitHub API and is untrusted.
+    /// Strip terminal control characters before passing to any renderer.
     #[expect(dead_code, reason = "consumed by thread rendering TUI (not yet built)")]
     pub(crate) created_at: String,
     /// Comment body as returned by the GitHub API.
@@ -172,7 +208,37 @@ pub(crate) struct PrDetails {
 
 #[cfg(test)]
 mod tests {
-    use super::RepoName;
+    use super::{CommitSha, RepoName};
+
+    #[test]
+    fn valid_commit_sha_accepts_40_lowercase_hex() {
+        assert!(CommitSha::try_from("a3b4c5d6e7f8a3b4c5d6e7f8a3b4c5d6e7f8a3b4").is_ok());
+    }
+
+    #[test]
+    fn valid_commit_sha_rejects_39_chars() {
+        assert!(CommitSha::try_from("a3b4c5d6e7f8a3b4c5d6e7f8a3b4c5d6e7f8a3b").is_err());
+    }
+
+    #[test]
+    fn valid_commit_sha_rejects_41_chars() {
+        assert!(CommitSha::try_from("a3b4c5d6e7f8a3b4c5d6e7f8a3b4c5d6e7f8a3b40").is_err());
+    }
+
+    #[test]
+    fn valid_commit_sha_rejects_non_hex_char() {
+        assert!(CommitSha::try_from("g3b4c5d6e7f8a3b4c5d6e7f8a3b4c5d6e7f8a3b4").is_err());
+    }
+
+    #[test]
+    fn valid_commit_sha_rejects_uppercase_hex() {
+        assert!(CommitSha::try_from("A3B4C5D6E7F8A3B4C5D6E7F8A3B4C5D6E7F8A3B4").is_err());
+    }
+
+    #[test]
+    fn valid_commit_sha_rejects_empty() {
+        assert!(CommitSha::try_from("").is_err());
+    }
 
     #[test]
     fn validate_repo_name_accepts_valid_slug() {
@@ -217,5 +283,15 @@ mod tests {
     #[test]
     fn validate_repo_name_accepts_dots_hyphens_underscores() {
         assert!(RepoName::try_from("my-org/my.repo_v1").is_ok());
+    }
+
+    #[test]
+    fn validate_repo_name_rejects_dotdot_owner() {
+        assert!(RepoName::try_from("../repo").is_err());
+    }
+
+    #[test]
+    fn validate_repo_name_rejects_dotdot_repo() {
+        assert!(RepoName::try_from("owner/..").is_err());
     }
 }
