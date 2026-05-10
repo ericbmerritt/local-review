@@ -50,6 +50,44 @@ pub(super) enum SendToClaudeState {
     },
 }
 
+impl SendToClaudeState {
+    /// Transition to `PromptView`, consuming `self`.
+    ///
+    /// If called on `Confirm`, moves the data directly. If called on
+    /// `PromptView`, extracts the inner `confirm` data and rebuilds the view.
+    ///
+    /// Callers invoke this only from the `Confirm` state; the
+    /// `PromptView` → `PromptView` path is exercised in tests for completeness
+    /// and is not reachable from the key handler.
+    pub(super) fn into_prompt_view(self) -> Self {
+        let data = match self {
+            Self::Confirm(d) => d,
+            Self::PromptView { confirm, .. } => confirm,
+        };
+        let prompt = crate::packet::render_prompt_with_mode(
+            &data.packet,
+            crate::packet::PromptMode::JsonlPaths,
+        );
+        Self::PromptView {
+            confirm: data,
+            prompt,
+            scroll_offset: 0,
+        }
+    }
+
+    /// Transition to `Confirm`, consuming `self`.
+    ///
+    /// If called on `PromptView`, extracts the inner `confirm` data. If called
+    /// on `Confirm`, the data is preserved unchanged.
+    pub(super) fn into_confirm(self) -> Self {
+        let data = match self {
+            Self::Confirm(d) => d,
+            Self::PromptView { confirm, .. } => confirm,
+        };
+        Self::Confirm(data)
+    }
+}
+
 /// Row order: stack first (Required → Suggestion → Note), then change, then
 /// line. Empty (scope, severity) pairs are omitted.
 pub(super) fn compute_scope_severity_grid(packet: &Packet) -> Vec<ScopeSeverityRow> {
@@ -556,6 +594,72 @@ mod tests {
         assert!(
             rows.is_empty(),
             "no line-scoped comments → empty files_affected"
+        );
+    }
+
+    fn make_confirm_data() -> ConfirmData {
+        ConfirmData {
+            change_id: cid(),
+            change_description: "test change".to_owned(),
+            scope_severity_grid: vec![],
+            files_affected: vec![],
+            stale_count: 0,
+            packet: empty_packet(),
+        }
+    }
+
+    #[test]
+    fn into_prompt_view_from_confirm_produces_prompt_view() {
+        let state = SendToClaudeState::Confirm(make_confirm_data());
+        let result = state.into_prompt_view();
+        assert!(
+            matches!(result, SendToClaudeState::PromptView { .. }),
+            "Confirm.into_prompt_view() must produce PromptView"
+        );
+    }
+
+    #[test]
+    fn into_prompt_view_from_prompt_view_resets_scroll() {
+        let state = SendToClaudeState::PromptView {
+            confirm: make_confirm_data(),
+            prompt: "already a prompt".to_owned(),
+            scroll_offset: 42,
+        };
+        let result = state.into_prompt_view();
+        match result {
+            SendToClaudeState::PromptView { scroll_offset, .. } => {
+                assert_eq!(
+                    scroll_offset, 0,
+                    "scroll must reset when rebuilding PromptView"
+                );
+            }
+            SendToClaudeState::Confirm(_) => {
+                panic!("PromptView.into_prompt_view() must stay PromptView");
+            }
+        }
+    }
+
+    #[test]
+    fn into_confirm_from_prompt_view_produces_confirm() {
+        let state = SendToClaudeState::PromptView {
+            confirm: make_confirm_data(),
+            prompt: "some prompt".to_owned(),
+            scroll_offset: 5,
+        };
+        let result = state.into_confirm();
+        assert!(
+            matches!(result, SendToClaudeState::Confirm(_)),
+            "PromptView.into_confirm() must produce Confirm"
+        );
+    }
+
+    #[test]
+    fn into_confirm_from_confirm_is_identity() {
+        let state = SendToClaudeState::Confirm(make_confirm_data());
+        let result = state.into_confirm();
+        assert!(
+            matches!(result, SendToClaudeState::Confirm(_)),
+            "Confirm.into_confirm() must stay Confirm"
         );
     }
 

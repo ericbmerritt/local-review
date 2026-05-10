@@ -8,9 +8,7 @@ use crate::comment::{Anchor, Comment, MismatchReason, Side, Status};
 use crate::diff::Diff;
 use crate::util::truncate;
 
-use super::{
-    render_view_scrollbar, scrollbar_layout_for_view, severity_color, severity_label, App,
-};
+use super::{render_view_scrollbar, scrollbar_layout_for_view, severity_color, severity_label};
 
 const STALE_MIN_COLS: u16 = 60;
 
@@ -167,7 +165,12 @@ where
         .sum()
 }
 
-pub(super) fn render(frame: &mut Frame<'_>, state: &mut StaleScreenState, app: &App) {
+pub(super) fn render(
+    frame: &mut Frame<'_>,
+    state: &mut StaleScreenState,
+    loaded_comments: &[Comment],
+    diff: &Diff,
+) {
     let area = frame.area();
 
     if area.width < STALE_MIN_COLS {
@@ -196,7 +199,7 @@ pub(super) fn render(frame: &mut Frame<'_>, state: &mut StaleScreenState, app: &
         let anchors: Vec<&Anchor> = state
             .stale_indices
             .iter()
-            .filter_map(|&idx| app.loaded_comments.get(idx))
+            .filter_map(|&idx| loaded_comments.get(idx))
             .map(|c| &c.anchor)
             .collect();
 
@@ -211,7 +214,7 @@ pub(super) fn render(frame: &mut Frame<'_>, state: &mut StaleScreenState, app: &
         let total_rows = total_rendered_rows(anchors.iter().copied(), is_wide);
         let (body_area, scrollbar_area, mut sb_state) =
             scrollbar_layout_for_view(inner, total_rows, state.scroll_offset);
-        render_entries(frame, body_area, state, app, is_wide);
+        render_entries(frame, body_area, state, loaded_comments, diff, is_wide);
         render_view_scrollbar(frame, sb_state.as_mut(), scrollbar_area);
     }
 
@@ -220,18 +223,19 @@ pub(super) fn render(frame: &mut Frame<'_>, state: &mut StaleScreenState, app: &
 }
 
 /// Build the ratatui line list `render_entries` would push to the paragraph
-/// for the given state/app/layout. Pure (no `Frame`) so tests can pin the
-/// emit count against [`total_rendered_rows`] without a `TestBackend`.
+/// for the given state/comments/diff/layout. Pure (no `Frame`) so tests can
+/// pin the emit count against [`total_rendered_rows`] without a `TestBackend`.
 pub(super) fn build_entry_lines<'a>(
     width: u16,
     state: &StaleScreenState,
-    app: &'a App,
+    loaded_comments: &'a [Comment],
+    diff: &'a Diff,
     is_wide: bool,
 ) -> Vec<TuiLine<'a>> {
     let mut lines: Vec<TuiLine<'a>> = Vec::new();
 
     for (display_idx, &comment_idx) in state.stale_indices.iter().enumerate() {
-        let Some(comment) = app.loaded_comments.get(comment_idx) else {
+        let Some(comment) = loaded_comments.get(comment_idx) else {
             continue;
         };
 
@@ -294,7 +298,7 @@ pub(super) fn build_entry_lines<'a>(
         let was_text = truncate(&location.target_text, LINE_TEXT_MAX);
         lines.push(TuiLine::from(Span::raw(format!("  was:    {was_text}"))));
 
-        let now_text = match current_line_at(comment, &app.details.diff) {
+        let now_text = match current_line_at(comment, diff) {
             NowLine::Text(t) => truncate(&t, LINE_TEXT_MAX),
             NowLine::NotPresent => "(line not present in current diff)".to_owned(),
         };
@@ -306,14 +310,19 @@ pub(super) fn build_entry_lines<'a>(
     lines
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "all parameters are distinct rendering inputs; no natural grouping avoids the count"
+)]
 fn render_entries(
     frame: &mut Frame<'_>,
     area: ratatui::layout::Rect,
     state: &StaleScreenState,
-    app: &App,
+    loaded_comments: &[Comment],
+    diff: &Diff,
     is_wide: bool,
 ) {
-    let lines = build_entry_lines(area.width, state, app, is_wide);
+    let lines = build_entry_lines(area.width, state, loaded_comments, diff, is_wide);
     let widget = Paragraph::new(lines).scroll((state.scroll_offset, 0));
     frame.render_widget(widget, area);
 }

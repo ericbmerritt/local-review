@@ -1,24 +1,29 @@
 use std::io::{stdout, Stdout};
 use std::path::PathBuf;
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
+use crossterm::event::{KeyCode, KeyEvent};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
+#[cfg(test)]
 use ratatui::layout::{Constraint, Layout, Rect};
+#[cfg(test)]
 use ratatui::style::{Color, Modifier, Style};
+#[cfg(test)]
 use ratatui::text::{Line as TuiLine, Span};
+#[cfg(test)]
 use ratatui::widgets::{Block, Borders, Paragraph};
 #[cfg(test)]
 use ratatui::widgets::{Scrollbar, ScrollbarOrientation};
 use ratatui::{Frame, Terminal};
 
 use crate::change_id::ChangeId;
+#[cfg(test)]
+use crate::comment::CONTEXT_MAX;
 use crate::comment::{
     Anchor, Comment, DescriptionAnchor, LineAnchor, SchemaVersion, Severity, Side, Status,
-    CONTEXT_MAX,
 };
 use crate::cursor;
 use crate::error::{JjrError, Result};
@@ -26,6 +31,7 @@ use crate::jj::{self, ChangeDetails};
 use crate::reviewed::{MarkOutcome, ReviewTarget, ReviewedState};
 use crate::stack::{ResolvedStack, RevsetHash, StackEntry};
 use crate::stderr_log::StderrLogGuard;
+#[cfg(test)]
 use crate::util::{clamp_with_delta, page_size, pluralize, truncate};
 
 mod composer;
@@ -42,71 +48,104 @@ use composer::{
     default_severity, Composer, ComposerAction, ComposerInit, ComposerScope, DescriptionContext,
     EditedComment, LineTarget, StackContextSnapshot,
 };
+use diff_view::RenderedLineKind;
 use diff_view::{
     change_comment_to_inline, comment_to_inline, description_comment_to_inline, DiffView,
-    InlineComment, PairedRow, RenderedLine, RenderedLineKind,
+    InlineComment,
 };
-use file_picker::{build_entries as build_file_picker_entries, FilePickerState};
+#[cfg(test)]
+use diff_view::{PairedRow, RenderedLine};
+
+use file_picker::build_entries as build_file_picker_entries;
+#[cfg(test)]
+use file_picker::FilePickerState;
 #[cfg(test)]
 use local_review_core::tui::composer::{
     STATUS_DESCRIPTION_UNAVAILABLE, STATUS_LINE_UNAVAILABLE, STATUS_STACK_UNAVAILABLE,
 };
-use overview_screen::{OverviewCommentSet, OverviewScreenState};
+use local_review_core::tui::{
+    BaseViews, DeleteRequest, ExtraKeyAction, ExtraScreen, ExtraScreenAction, ExtraScreenContext,
+    FilePickerEntry, MarkReviewedOutcome, ReviewSurface, ReviewSurfaceExt, ReviewedOutcome,
+    SaveOutcome as CoreSaveOutcome, SaveRequest, SeverityHistogram as CoreSeverityHistogram,
+    UpdateRequest,
+};
+use overview_screen::{OverviewCommentSet, OverviewScreenState, OverviewStackCtx};
 use send_to_claude::{ConfirmData, SendToClaudeState};
 use stale_screen::StaleScreenState;
+
+/// Type alias for the generic TUI app parameterised over [`JjrSurface`].
+pub(crate) type JjrApp = local_review_core::tui::App<JjrSurface>;
 
 const MIN_COLS: u16 = 60;
 const MIN_ROWS: u16 = 10;
 
 /// Column chars consumed by a `Borders::ALL` block (one `│` on each side).
+#[cfg(test)]
 const BLOCK_BORDER_COLS: u16 = 2;
 
 /// Initial value for `App::viewport_rows` before the first render measures the
 /// real diff area height. Overwritten by `render_main` on every frame.
+#[cfg(test)]
 const FALLBACK_VIEWPORT_ROWS: u16 = 20;
 
 /// Stack depth at which `transition_screen = "auto"` starts firing. Per spec,
 /// deep stacks get the beat between changes; short ones don't need the pause.
+#[cfg(test)]
 const AUTO_TRANSITION_THRESHOLD: usize = 8;
 
 /// Width (cells) of the graphical fill in the stack progress bar. Drops to
 /// zero on narrow terminals (see `render_stack_bar`).
+#[cfg(test)]
 const STACK_PROGRESS_BAR_WIDTH: u16 = 20;
 
 /// Below this column count, the stack bar drops the graphical fill and shows
 /// just the textual `N/M change_id desc...` portion (per the resize ladder).
+#[cfg(test)]
 const STACK_BAR_MIN_COLS_FOR_FILL: u16 = 80;
 
 /// Width (cells) of the transition modal.
+#[cfg(test)]
 const TRANSITION_MODAL_WIDTH: u16 = 42;
 
 /// Height (rows) of the transition modal.
+#[cfg(test)]
 const TRANSITION_MODAL_HEIGHT: u16 = 18;
 
 /// Description budget (chars) inside the transition modal. The modal interior
 /// is ~38 cols after borders + indent, so 36 leaves room for the trailing `…`.
+#[cfg(test)]
 const TRANSITION_DESC_BUDGET: usize = 36;
 
 /// Maximum number of `●` dots rendered before truncating with a trailing `…`.
 /// The numeric count stays accurate so the user still sees the true total.
 pub(super) const DOT_BUDGET: usize = 5;
 
+/// Placeholder cursor row used when editing a comment from the overview screen,
+/// where there is no active diff view and therefore no meaningful line cursor.
+/// Always 0 because the `rendered_index` field is unused in this path: the
+/// anchor carries the original `source_line`/`target_line` directly.
+const OVERVIEW_NO_LINE_CURSOR: usize = 0;
+
 /// Status hint surfaced when Tab is pressed at the last file (or description+files
 /// boundary) — the file index is already at its max and cannot advance further.
+#[cfg(test)]
 const STATUS_AT_LAST_FILE: &str = "already at the last file";
 
 /// Status hint surfaced when Shift-Tab is pressed at `file_index` 0 — there is
 /// no previous file to retreat to.
+#[cfg(test)]
 const STATUS_AT_FIRST_FILE: &str = "already at the first file";
 
 /// Status hint surfaced when Tab/Shift-Tab is pressed and the change has only
 /// one navigable view (typical for a description-only change with no diff
 /// files), so cycling cannot move in either direction.
+#[cfg(test)]
 const STATUS_ONLY_ONE_FILE: &str = "only one file";
 
 /// Trailing glyph appended (`DarkGray`) to the file-header title when the
 /// active view is reviewed. A glyph reads as "done, move on" rather than
 /// `(reviewed)` text, which felt achievement-y.
+#[cfg(test)]
 const REVIEWED_TITLE_GLYPH: &str = "\u{2713}";
 
 /// Status surfaced when [`App::mark_current_file_reviewed`] detects the
@@ -114,14 +153,17 @@ const REVIEWED_TITLE_GLYPH: &str = "\u{2713}";
 /// change was amended/rebased) and drops the prior reviewed bits as a
 /// result. Distinct from the no-prior-state "first encounter" case, which
 /// stays silent.
+#[cfg(test)]
 const STATUS_REVIEWED_RESET: &str = "change amended; reviewed state reset";
 
 /// Status set by the manual `U` toggle when the active file goes from
 /// unreviewed to reviewed.
+#[cfg(test)]
 const STATUS_MARKED_REVIEWED: &str = "file marked as reviewed";
 
 /// Status set by the manual `U` toggle when the active file goes from
 /// reviewed to unreviewed.
+#[cfg(test)]
 const STATUS_MARKED_UNREVIEWED: &str = "file marked as unreviewed";
 
 /// Resolve the user's `DiffMode` preference plus the current body width and
@@ -132,6 +174,7 @@ const STATUS_MARKED_UNREVIEWED: &str = "file marked as unreviewed";
 ///   semantic, so it always renders unified regardless of preference.
 /// - `DiffMode::Auto` picks side-by-side iff `body_width >= SIDE_BY_SIDE_MIN_WIDTH`.
 /// - `DiffMode::ForceUnified` and `DiffMode::ForceSideBySide` pin the choice.
+#[cfg(test)]
 pub(super) fn resolve_diff_mode(
     pref: DiffMode,
     body_width: u16,
@@ -161,7 +204,7 @@ pub fn run(change_id: &ChangeId, repo_root: &std::path::Path) -> Result<()> {
     let revset = change_id.as_str().to_owned();
 
     let (mut terminal, guard) = enter_tui_session(repo_root)?;
-    let outcome = run_app(
+    let outcome = run_jjr_app(
         &mut terminal,
         details,
         repo_root.to_owned(),
@@ -261,7 +304,7 @@ pub fn run_stack(
     };
 
     let (mut terminal, guard) = enter_tui_session(repo_root)?;
-    let outcome = run_app(
+    let outcome = run_jjr_app(
         &mut terminal,
         details,
         repo_root.to_owned(),
@@ -309,6 +352,7 @@ fn io_err(source: std::io::Error) -> JjrError {
     JjrError::Io { source }
 }
 
+#[cfg(test)]
 enum Screen {
     Main,
     Help,
@@ -327,6 +371,7 @@ enum Screen {
 }
 
 /// State for the transition screen shown between changes in stack mode.
+#[cfg(test)]
 struct TransitionState {
     /// Index of the change just reviewed.
     reviewed_index: usize,
@@ -337,40 +382,25 @@ struct TransitionState {
     reviewed_comment_count: Option<usize>,
     /// Severity histogram of the reviewed change's comments, ordered
     /// `(required, suggestion, note)`. Empty when the count is `None`.
-    severity_histogram: SeverityHistogram,
+    severity_histogram: CoreSeverityHistogram,
 }
 
-/// Counts of comments by severity. Used by the transition modal and the stack
-/// overview's right-edge dot column. Stale comments are excluded from counts —
-/// they live exclusively in the stale comments view (Screen 5) per spec.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub(super) struct SeverityHistogram {
-    pub(super) required: usize,
-    pub(super) suggestion: usize,
-    pub(super) note: usize,
-}
-
-impl SeverityHistogram {
-    pub(super) fn from_comments(comments: &[Comment]) -> Self {
-        let mut h = Self::default();
-        for c in comments {
-            // Stale and orphaned records do not contribute to active-comment
-            // counts. Stale lives in the stale view; orphaned is out of scope.
-            if matches!(c.status, Some(Status::Stale | Status::Orphaned)) {
-                continue;
-            }
-            match c.severity {
-                Severity::Required => h.required += 1,
-                Severity::Suggestion => h.suggestion += 1,
-                Severity::Note => h.note += 1,
-            }
+/// Count active (non-stale, non-orphaned) comments and return a
+/// [`CoreSeverityHistogram`]. Stale and orphaned records live in the stale
+/// view and are excluded from the active-comment totals.
+pub(super) fn histogram_from_comments(comments: &[Comment]) -> CoreSeverityHistogram {
+    let mut h = CoreSeverityHistogram::default();
+    for c in comments {
+        if matches!(c.status, Some(Status::Stale | Status::Orphaned)) {
+            continue;
         }
-        h
+        match c.severity {
+            Severity::Required => h.required += 1,
+            Severity::Suggestion => h.suggestion += 1,
+            Severity::Note => h.note += 1,
+        }
     }
-
-    pub(super) fn total(self) -> usize {
-        self.required + self.suggestion + self.note
-    }
+    h
 }
 
 /// Context kept while the user is picking a new anchor for a stale comment.
@@ -382,6 +412,7 @@ impl SeverityHistogram {
 struct PendingReanchor {
     /// Used to delete after save succeeds.
     original: Comment,
+    /// Pre-populates the composer when the user picks a new anchor.
     body: String,
     severity: Severity,
 }
@@ -392,6 +423,1524 @@ struct StackContext {
     current_index: usize,
     revset: String,
     revset_hash: RevsetHash,
+}
+
+// ---------------------------------------------------------------------------
+// JjrSurface — the ReviewSurface implementation for jjr
+// ---------------------------------------------------------------------------
+
+/// jjr-specific TUI surface state. Holds the data that differs between jjr
+/// and other future tools (ggr). Plugged into the generic
+/// `local_review_core::tui::App<JjrSurface>` via the `ReviewSurface` and
+/// `ReviewSurfaceExt` traits.
+pub(crate) struct JjrSurface {
+    details: ChangeDetails,
+    /// Repo root for comment storage.
+    repo_root: PathBuf,
+    /// The revset string used to open this view.
+    revset: String,
+    /// Comments loaded for the current change.
+    loaded_comments: Vec<Comment>,
+    /// Stack navigation context; `None` in single-change mode.
+    stack: Option<StackContext>,
+    /// Whether the most recent comment load succeeded.
+    comments_loaded_ok: bool,
+    /// Active when the user is picking a new anchor for a stale comment.
+    pending_reanchor: Option<PendingReanchor>,
+    /// Cached comments for the stack overview.
+    overview_cache: Option<OverviewCommentSet>,
+    /// Persistent reviewed-bits.
+    reviewed: ReviewedState,
+    /// Stderr-redirect guard. `None` in tests.
+    stderr_guard: Option<StderrLogGuard>,
+    /// Deferred status message from a reconcile-and-persist error; taken by
+    /// the core after entry load via `ReviewSurfaceExt::take_pending_status_message`.
+    pending_status_message: Option<String>,
+    /// Base rendered views for the current change, kept in sync with `details`.
+    /// Populated on every `fetch_views` call so `file_picker_entries` can read
+    /// from it instead of re-rendering from scratch on every file-picker open.
+    rendered_views: Vec<DiffView>,
+}
+
+impl JjrSurface {
+    fn new(
+        details: ChangeDetails,
+        repo_root: PathBuf,
+        revset: String,
+        stack: Option<StackContext>,
+        stderr_guard: Option<StderrLogGuard>,
+    ) -> Self {
+        let reviewed = ReviewedState::load(&repo_root).unwrap_or_default();
+        let rendered_views = build_rendered_views(&details);
+        Self {
+            details,
+            repo_root,
+            revset,
+            loaded_comments: Vec::new(),
+            stack,
+            comments_loaded_ok: false,
+            pending_reanchor: None,
+            overview_cache: None,
+            reviewed,
+            stderr_guard,
+            pending_status_message: None,
+            rendered_views,
+        }
+    }
+
+    /// Resolve the current `file_index` to a `ReviewTarget`. `file_index` 0
+    /// is the synthetic description view; indices 1.. map onto diff files.
+    fn review_target_for_index(&self, file_index: usize) -> Option<ReviewTarget> {
+        if file_index == 0 {
+            return Some(ReviewTarget::Description);
+        }
+        let path = self
+            .details
+            .diff
+            .files
+            .get(file_index - 1)?
+            .display_path()
+            .to_owned();
+        Some(ReviewTarget::File(path))
+    }
+
+    /// Load, reconcile, and store comments for the current change.
+    ///
+    /// Returns `None` on success; `Some(msg)` with an error description on
+    /// failure. The caller may surface `msg` as a status message.
+    fn reload_comments(&mut self) -> Option<String> {
+        self.overview_cache = None;
+        match crate::store::load_change_comments(&self.repo_root, &self.details.change_id) {
+            Ok(comments) => {
+                self.loaded_comments = self.reconcile_and_persist(comments);
+                self.comments_loaded_ok = true;
+                None
+            }
+            Err(e) => {
+                self.loaded_comments = Vec::new();
+                self.comments_loaded_ok = false;
+                Some(sanitize_for_status(&e.to_string()))
+            }
+        }
+    }
+
+    fn reconcile_and_persist(&mut self, comments: Vec<Comment>) -> Vec<Comment> {
+        let (reconciled, first_error) = reconcile_comments_with_diff(
+            comments,
+            &self.details.diff,
+            &self.details.description,
+            &self.repo_root,
+        );
+        if let Some(msg) = first_error {
+            self.pending_status_message = Some(msg);
+        }
+        reconciled
+    }
+
+    /// Load comments from all changes in the stack and store in the overview cache.
+    fn load_overview_comments(&mut self) {
+        let Some(ctx) = self.stack.as_ref() else {
+            return;
+        };
+        let revset_hash = ctx.revset_hash;
+        let entries = ctx.entries.clone();
+        let repo_root = self.repo_root.clone();
+
+        let stack_level = crate::store::load_stack_comments(&repo_root, &revset_hash)
+            .unwrap_or_else(|_| Vec::new());
+
+        let per_change: Vec<Vec<Comment>> = entries
+            .iter()
+            .map(|entry| {
+                crate::store::load_change_comments(&repo_root, &entry.change_id).unwrap_or_default()
+            })
+            .collect();
+
+        let diff_paths_per_change: Vec<Vec<PathBuf>> = entries
+            .iter()
+            .map(|entry| match jj::diff_for_change(&entry.change_id) {
+                Ok(diff) => diff
+                    .files
+                    .iter()
+                    .map(|f| f.display_path().to_owned())
+                    .collect(),
+                Err(_) => Vec::new(),
+            })
+            .collect();
+
+        let orphaned = collect_orphaned_comments(&repo_root, &entries);
+
+        self.overview_cache = Some(OverviewCommentSet {
+            stack_level,
+            per_change,
+            orphaned,
+            diff_paths_per_change,
+        });
+    }
+
+    /// Mark the view at `file_index` as reviewed and return the outcome.
+    fn mark_view_reviewed_impl(&mut self, file_index: usize) -> MarkReviewedOutcome {
+        let Some(target) = self.review_target_for_index(file_index) else {
+            return MarkReviewedOutcome::NoReset;
+        };
+        let change_id = self.details.change_id.clone();
+        let commit_id = self.details.commit_id.clone();
+        let outcome = match self.reviewed.mark(change_id, commit_id, target) {
+            MarkOutcome::ResetDueToCommitMismatch => MarkReviewedOutcome::ResetDueToCommitMismatch,
+            MarkOutcome::NoReset => MarkReviewedOutcome::NoReset,
+        };
+        let _ = self.reviewed.save(&self.repo_root); // best-effort
+        outcome
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ExtraScreen wrappers for jjr-specific overlay/full-screen states
+// ---------------------------------------------------------------------------
+
+/// Wraps `Box<Composer>` so it can be stored as `Box<dyn ExtraScreen>`.
+struct ComposerScreen(Box<Composer>);
+impl ExtraScreen for ComposerScreen {
+    fn is_overlay(&self) -> bool {
+        true
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+
+/// Wraps `StaleScreenState` so it can be stored as `Box<dyn ExtraScreen>`.
+struct StaleScreen(StaleScreenState);
+impl ExtraScreen for StaleScreen {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+
+/// Wraps `OverviewScreenState` so it can be stored as `Box<dyn ExtraScreen>`.
+struct OverviewScreen(OverviewScreenState);
+impl ExtraScreen for OverviewScreen {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+
+/// Wraps `Option<Box<SendToClaudeState>>` so it can be stored as
+/// `Box<dyn ExtraScreen>`. The `Option` is `Some` at all times except for the
+/// atomic `take()`/re-assign inside `handle_send_to_claude_key_impl`; no
+/// external code observes `None`.
+struct SendToClaudeScreen(Option<Box<SendToClaudeState>>);
+impl SendToClaudeScreen {
+    fn new(state: SendToClaudeState) -> Self {
+        Self(Some(Box::new(state)))
+    }
+    fn inner(&self) -> &SendToClaudeState {
+        match self.0.as_deref() {
+            Some(s) => s,
+            None => unreachable!(
+                "SendToClaudeScreen.state is always Some outside of transitions; this is a bug"
+            ),
+        }
+    }
+}
+impl ExtraScreen for SendToClaudeScreen {
+    fn is_overlay(&self) -> bool {
+        true
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+
+fn try_downcast_mut<T: 'static>(s: &mut dyn ExtraScreen) -> Option<&mut T> {
+    s.as_any_mut().downcast_mut::<T>()
+}
+
+// ---------------------------------------------------------------------------
+// ReviewSurface + ReviewSurfaceExt implementation for JjrSurface
+// ---------------------------------------------------------------------------
+
+impl ReviewSurface for JjrSurface {
+    type Error = JjrError;
+
+    fn entry_count(&self) -> usize {
+        self.stack.as_ref().map_or(1, |s| s.entries.len())
+    }
+
+    fn current_entry_index(&self) -> usize {
+        self.stack.as_ref().map_or(0, |s| s.current_index)
+    }
+
+    fn entry_id_display(&self, idx: usize) -> String {
+        let Some(ctx) = self.stack.as_ref() else {
+            return self.details.change_id.head().to_owned();
+        };
+        ctx.entries
+            .get(idx)
+            .map(|e| e.change_id.head().to_owned())
+            .unwrap_or_default()
+    }
+
+    fn entry_description(&self, idx: usize) -> String {
+        let Some(ctx) = self.stack.as_ref() else {
+            return self
+                .details
+                .description
+                .lines()
+                .next()
+                .unwrap_or("")
+                .to_owned();
+        };
+        ctx.entries
+            .get(idx)
+            .map(|e| e.description.lines().next().unwrap_or("").to_owned())
+            .unwrap_or_default()
+    }
+
+    fn fetch_views(&mut self, idx: usize) -> std::result::Result<Vec<DiffView>, JjrError> {
+        if let Some(ctx) = self.stack.as_ref() {
+            let change_id = ctx
+                .entries
+                .get(idx)
+                .ok_or_else(|| JjrError::JjUnexpectedOutput {
+                    raw: format!("stack index {idx} out of range"),
+                })?
+                .change_id
+                .clone();
+            let details = jj::show(&change_id)?;
+            if let Some(ctx) = self.stack.as_mut() {
+                ctx.current_index = idx;
+            }
+            self.details = details;
+        } else {
+            let details = jj::show(&self.details.change_id)?;
+            self.details = details;
+        }
+        // Errors surface via the status bar; discard the return value here.
+        let _ = self.reload_comments();
+        self.rendered_views = build_rendered_views(&self.details);
+        Ok(self.rendered_views.clone())
+    }
+
+    fn inline_comments_for_view(
+        &self,
+        view_idx: usize,
+        severity_filter: Option<Severity>,
+    ) -> Vec<InlineComment> {
+        let now = time::OffsetDateTime::now_utc();
+        if view_idx == 0 {
+            self.loaded_comments
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, c)| description_comment_to_inline(c, idx, now))
+                .filter(|ic| severity_filter.is_none_or(|f| ic.severity == f))
+                .collect()
+        } else {
+            let diff_file_idx = view_idx - 1;
+            let file_path = self
+                .details
+                .diff
+                .files
+                .get(diff_file_idx)
+                .map(|f| f.display_path().to_owned());
+            self.loaded_comments
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, c)| comment_to_inline(c, idx, file_path.as_deref(), now))
+                .filter(|ic| severity_filter.is_none_or(|f| ic.severity == f))
+                .collect()
+        }
+    }
+
+    fn appended_comments_for_view(
+        &self,
+        view_idx: usize,
+        severity_filter: Option<Severity>,
+    ) -> Vec<InlineComment> {
+        if view_idx != 0 {
+            return Vec::new();
+        }
+        let now = time::OffsetDateTime::now_utc();
+        let target_change_id = self.details.change_id.clone();
+        self.loaded_comments
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, c)| change_comment_to_inline(c, idx, &target_change_id, now))
+            .filter(|ic| severity_filter.is_none_or(|f| ic.severity == f))
+            .collect()
+    }
+
+    fn save_comment(
+        &mut self,
+        req: SaveRequest<'_>,
+    ) -> std::result::Result<CoreSaveOutcome, JjrError> {
+        let body = req.body;
+        if body.trim().is_empty() {
+            return Ok(CoreSaveOutcome::Refused {
+                reason: "comment body is empty — not saved".to_owned(),
+            });
+        }
+        let oversized = body.chars().count() > crate::comment::BODY_MAX;
+        let scope = req.scope;
+        let severity = req.severity;
+        let now = time::OffsetDateTime::now_utc();
+
+        let anchor = build_anchor_from_scope(scope, &self.details.change_id, &self.details);
+
+        let comment = Comment {
+            schema_version: SchemaVersion,
+            anchor,
+            repo_root: self.repo_root.clone(),
+            revset: self.revset.clone(),
+            commit_id: Some(self.details.commit_id.clone()),
+            body: body.to_owned(),
+            severity,
+            created_at: now,
+            updated_at: None,
+            status: Some(Status::Pending),
+            mismatch_reason: None,
+        };
+
+        match crate::store::save_comment(&self.repo_root, &comment) {
+            Ok(()) => {
+                let _ = self.reload_comments();
+                let status_message = if oversized {
+                    "body truncated to 64 KB on save".to_owned()
+                } else {
+                    save_status_message_for_scope(scope).to_owned()
+                };
+                Ok(CoreSaveOutcome::Saved { status_message })
+            }
+            Err(JjrError::DuplicateCommentTimestamp { .. }) => Ok(CoreSaveOutcome::Errored {
+                message:
+                    "save failed: two comments at the same timestamp — wait a moment and retry"
+                        .to_owned(),
+            }),
+            Err(e) => Ok(CoreSaveOutcome::Errored {
+                message: format!("save failed: {}", sanitize_for_status(&e.to_string())),
+            }),
+        }
+    }
+
+    fn update_comment(
+        &mut self,
+        req: UpdateRequest<'_>,
+    ) -> std::result::Result<CoreSaveOutcome, JjrError> {
+        let body = req.body;
+        if body.trim().is_empty() {
+            return Ok(CoreSaveOutcome::Refused {
+                reason: "comment body is empty — not saved".to_owned(),
+            });
+        }
+        let Some(comment_idx) = self
+            .loaded_comments
+            .iter()
+            .position(|c| c.created_at == req.identity.as_offset_date_time())
+        else {
+            return Ok(CoreSaveOutcome::Errored {
+                message: "could not find comment to update".to_owned(),
+            });
+        };
+        let mut updated = self.loaded_comments[comment_idx].clone();
+        body.clone_into(&mut updated.body);
+        updated.severity = req.severity;
+        updated.updated_at = Some(time::OffsetDateTime::now_utc());
+
+        match crate::store::update_comment(&self.repo_root, &updated) {
+            Ok(()) => {
+                let _ = self.reload_comments();
+                let msg = if req.oversized {
+                    "body truncated to 64 KB on save".to_owned()
+                } else {
+                    "comment updated".to_owned()
+                };
+                Ok(CoreSaveOutcome::Saved {
+                    status_message: msg,
+                })
+            }
+            Err(e) => Ok(CoreSaveOutcome::Errored {
+                message: format!("update failed: {}", sanitize_for_status(&e.to_string())),
+            }),
+        }
+    }
+
+    fn delete_comment(&mut self, req: DeleteRequest) -> std::result::Result<(), JjrError> {
+        let Some(comment) = self
+            .loaded_comments
+            .iter()
+            .find(|c| c.created_at == req.identity.as_offset_date_time())
+            .cloned()
+        else {
+            return Ok(());
+        };
+        crate::store::delete_comment(&self.repo_root, &comment)?;
+        let _ = self.reload_comments();
+        Ok(())
+    }
+
+    fn is_view_reviewed(&self, view_idx: usize) -> bool {
+        let Some(entry) = self.reviewed.entries.get(&self.details.change_id) else {
+            return false;
+        };
+        if entry.commit_id != self.details.commit_id {
+            return false;
+        }
+        if view_idx == 0 {
+            return entry.description_reviewed;
+        }
+        let Some(file) = self.details.diff.files.get(view_idx - 1) else {
+            return false;
+        };
+        entry.reviewed_files.contains(file.display_path())
+    }
+
+    fn mark_view_reviewed(&mut self, view_idx: usize) -> MarkReviewedOutcome {
+        self.mark_view_reviewed_impl(view_idx)
+    }
+
+    fn toggle_view_reviewed(&mut self, view_idx: usize) -> ReviewedOutcome {
+        let Some(target) = self.review_target_for_index(view_idx) else {
+            return ReviewedOutcome::Unmarked;
+        };
+        let change_id = self.details.change_id.clone();
+        let commit_id = self.details.commit_id.clone();
+        let was_reviewed = self.is_view_reviewed(view_idx);
+        if was_reviewed {
+            self.reviewed.unmark(&change_id, &commit_id, &target);
+            let _ = self.reviewed.save(&self.repo_root);
+            ReviewedOutcome::Unmarked
+        } else {
+            let outcome = self.reviewed.mark(change_id, commit_id, target);
+            let _ = self.reviewed.save(&self.repo_root);
+            match outcome {
+                MarkOutcome::ResetDueToCommitMismatch => ReviewedOutcome::ResetAndMarked,
+                MarkOutcome::NoReset => ReviewedOutcome::Marked,
+            }
+        }
+    }
+
+    fn severity_histogram(&self) -> CoreSeverityHistogram {
+        histogram_from_comments(&self.loaded_comments)
+    }
+
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "unhandled KeyCode variants are intentionally passed through as Ignored"
+    )]
+    fn handle_extra_key(&mut self, key: KeyEvent) -> std::result::Result<ExtraKeyAction, JjrError> {
+        // Handle reanchor mode first (pending_reanchor intercepts some keys).
+        if key.code == KeyCode::Esc {
+            if let Some(reanchor) = self.pending_reanchor.take() {
+                let label = match reanchor.severity {
+                    Severity::Required => "required",
+                    Severity::Suggestion => "suggestion",
+                    Severity::Note => "note",
+                };
+                let preview: String = reanchor.body.chars().take(40).collect();
+                return Ok(ExtraKeyAction::StatusMessage(format!(
+                    "re-anchor cancelled ({label}: {preview})"
+                )));
+            }
+        }
+
+        match key.code {
+            KeyCode::Char('S') => {
+                let stale_indices = stale_screen::stale_comment_indices(&self.loaded_comments);
+                let state = StaleScreen(StaleScreenState {
+                    selected_index: 0,
+                    stale_indices,
+                    scroll_offset: 0,
+                });
+                Ok(ExtraKeyAction::OpenScreen(Box::new(state)))
+            }
+            KeyCode::Char('s') => {
+                if self.pending_reanchor.is_some() {
+                    return Ok(ExtraKeyAction::StatusMessage(
+                        "finish or cancel re-anchor mode before opening the stack overview"
+                            .to_owned(),
+                    ));
+                }
+                if self.stack.is_none() {
+                    return Ok(ExtraKeyAction::StatusMessage(
+                        "stack overview requires --stack mode".to_owned(),
+                    ));
+                }
+                if self.overview_cache.is_none() {
+                    self.load_overview_comments();
+                }
+                Ok(ExtraKeyAction::OpenScreen(Box::new(OverviewScreen(
+                    OverviewScreenState::new(),
+                ))))
+            }
+            KeyCode::Char('C') => {
+                // Build the send-to-claude confirmation screen.
+                match self.build_send_to_claude() {
+                    Ok(state) => Ok(ExtraKeyAction::OpenScreen(Box::new(
+                        SendToClaudeScreen::new(state),
+                    ))),
+                    Err(msg) => Ok(ExtraKeyAction::StatusMessage(msg)),
+                }
+            }
+            _ => Ok(ExtraKeyAction::Ignored),
+        }
+    }
+
+    fn render_extra_screen(&self, frame: &mut Frame<'_>, state: &mut dyn ExtraScreen) {
+        if let Some(s) = state.as_any_mut().downcast_mut::<ComposerScreen>() {
+            composer_overlay::render_composer_overlay(frame, &s.0, None);
+        } else if let Some(s) = state.as_any_mut().downcast_mut::<StaleScreen>() {
+            stale_screen::render(frame, &mut s.0, &self.loaded_comments, &self.details.diff);
+        } else if let Some(s) = state.as_any_mut().downcast_mut::<OverviewScreen>() {
+            let stack_ctx = self.stack.as_ref().map(|ctx| OverviewStackCtx {
+                revset: &ctx.revset,
+                entries: &ctx.entries,
+                current_index: ctx.current_index,
+            });
+            if let Some(ref cache) = self.overview_cache {
+                overview_screen::render(frame, &mut s.0, stack_ctx, &self.reviewed, cache);
+            }
+        } else if let Some(s) = state.as_any_mut().downcast_mut::<SendToClaudeScreen>() {
+            send_to_claude::render(frame, s.inner());
+        }
+    }
+
+    fn handle_extra_screen_key(
+        &mut self,
+        state: &mut dyn ExtraScreen,
+        key: KeyEvent,
+        ctx: &mut ExtraScreenContext<'_>,
+    ) -> std::result::Result<ExtraScreenAction, JjrError> {
+        if let Some(s) = try_downcast_mut::<StaleScreen>(state) {
+            return Ok(self.handle_stale_key_impl(&mut s.0, key, ctx));
+        }
+        if let Some(s) = try_downcast_mut::<OverviewScreen>(state) {
+            return Ok(self.handle_overview_key_impl(&mut s.0, key, ctx));
+        }
+        if let Some(s) = try_downcast_mut::<SendToClaudeScreen>(state) {
+            return self.handle_send_to_claude_key_impl(s, key, ctx);
+        }
+        if let Some(s) = try_downcast_mut::<ComposerScreen>(state) {
+            return Ok(self.handle_composer_key_impl(&mut s.0, key, ctx));
+        }
+        Ok(ExtraScreenAction::StayOpen)
+    }
+
+    fn file_picker_entries(&self) -> Vec<FilePickerEntry> {
+        let total_views = self.details.diff.files.len() + 1;
+        let reviewed_view_indices: std::collections::HashSet<usize> = (0..total_views)
+            .filter(|&i| self.is_view_reviewed(i))
+            .collect();
+        build_file_picker_entries(
+            &self.details.diff.files,
+            &self.loaded_comments,
+            &|view_idx| reviewed_view_indices.contains(&view_idx),
+            &|view_idx| first_commentable_row_for_view(&self.rendered_views, view_idx),
+        )
+    }
+
+    fn help_screen_title(&self) -> &'static str {
+        "jjr · keybindings"
+    }
+}
+
+impl ReviewSurfaceExt for JjrSurface {
+    fn on_entry_loaded(&mut self, idx: usize, record_cursor: bool) {
+        if record_cursor {
+            if let Some(ctx) = self.stack.as_ref() {
+                let change_id = ctx.entries.get(idx).map(|e| &e.change_id);
+                if let Some(change_id) = change_id {
+                    let _ =
+                        cursor::record(&self.repo_root, ctx.revset_hash, &ctx.revset, change_id);
+                }
+            }
+        }
+    }
+
+    fn severity_histogram_for_transition(&self) -> (Option<usize>, CoreSeverityHistogram) {
+        if self.comments_loaded_ok {
+            (
+                Some(self.loaded_comments.len()),
+                histogram_from_comments(&self.loaded_comments),
+            )
+        } else {
+            (None, CoreSeverityHistogram::default())
+        }
+    }
+
+    fn take_pending_status_message(&mut self) -> Option<String> {
+        self.pending_status_message.take()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// JjrSurface helper methods (extra-screen handle impls + build helpers)
+// ---------------------------------------------------------------------------
+
+impl JjrSurface {
+    /// Build the `SendToClaudeState` for the current change. Returns
+    /// `Ok(state)` on success or `Err(status_msg)` on failure.
+    fn build_send_to_claude(&self) -> std::result::Result<SendToClaudeState, String> {
+        let change_id = self.details.change_id.clone();
+        let revset_hash = self.stack.as_ref().map(|s| s.revset_hash);
+
+        let entries = match self.stack.as_ref() {
+            Some(stack) => stack.entries.clone(),
+            None => vec![StackEntry {
+                change_id: change_id.clone(),
+                commit_id: self.details.commit_id.clone(),
+                description: self.details.description.clone(),
+            }],
+        };
+
+        let resolved = ResolvedStack {
+            revset_hash: revset_hash.unwrap_or_else(|| RevsetHash::from_revset(&self.revset)),
+            revset: self.revset.clone(),
+            entries,
+        };
+
+        let packet = match crate::packet::build_packet(
+            &self.repo_root,
+            &self.revset,
+            &resolved,
+            false,
+            jj::diff_for_change,
+        ) {
+            Ok(p) => p,
+            Err(JjrError::EmptyPacket { .. }) => {
+                return Err("no comments to send".to_owned());
+            }
+            Err(e) => {
+                return Err(format!(
+                    "could not build packet: {}",
+                    sanitize_for_status(&e.to_string())
+                ));
+            }
+        };
+
+        let stale_count =
+            send_to_claude::stale_count_for_change(&self.repo_root, &change_id, revset_hash);
+        let scope_severity_grid = send_to_claude::compute_scope_severity_grid(&packet);
+        let files_affected = send_to_claude::compute_files_affected(&packet);
+
+        let data = ConfirmData {
+            change_id,
+            change_description: self.details.description.clone(),
+            scope_severity_grid,
+            files_affected,
+            stale_count,
+            packet,
+        };
+        Ok(SendToClaudeState::Confirm(data))
+    }
+
+    /// Build a `StackContextSnapshot` for the current stack (if in stack mode).
+    fn stack_context_snapshot(&self) -> Option<StackContextSnapshot> {
+        self.stack.as_ref().map(|s| StackContextSnapshot {
+            revset: s.revset.clone(),
+            revset_hash: s.revset_hash,
+        })
+    }
+
+    /// Handle a key event while the stale-comments screen is open.
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "unhandled KeyCode variants are intentionally ignored on the stale screen"
+    )]
+    fn handle_stale_key_impl(
+        &mut self,
+        state: &mut StaleScreenState,
+        key: KeyEvent,
+        ctx: &mut ExtraScreenContext<'_>,
+    ) -> ExtraScreenAction {
+        let count = state.stale_indices.len();
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => {
+                return ExtraScreenAction::Close;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                state.selected_index = state.selected_index.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') if count > 0 => {
+                state.selected_index = (state.selected_index + 1).min(count - 1);
+            }
+            KeyCode::Char('d') => {
+                self.stale_delete_focused(state, ctx);
+            }
+            KeyCode::Enter => {
+                return self.stale_jump_to_file(state, ctx);
+            }
+            KeyCode::Char('e') => {
+                return self.stale_enter_reanchor(state, ctx);
+            }
+            _ => {}
+        }
+        ExtraScreenAction::StayOpen
+    }
+
+    /// Delete the focused stale comment and refresh the stale list.
+    fn stale_delete_focused(
+        &mut self,
+        state: &mut StaleScreenState,
+        ctx: &mut ExtraScreenContext<'_>,
+    ) {
+        let focused = state
+            .stale_indices
+            .get(state.selected_index)
+            .and_then(|&idx| self.loaded_comments.get(idx))
+            .cloned();
+        if let Some(comment) = focused {
+            match crate::store::delete_comment(&self.repo_root, &comment) {
+                Ok(()) => {
+                    let _ = self.reload_comments();
+                    let new_indices = stale_screen::stale_comment_indices(&self.loaded_comments);
+                    let new_count = new_indices.len();
+                    state.stale_indices = new_indices;
+                    if new_count == 0 {
+                        state.selected_index = 0;
+                    } else if state.selected_index >= new_count {
+                        state.selected_index = new_count - 1;
+                    }
+                }
+                Err(e) => {
+                    *ctx.status_message = Some(format!(
+                        "delete failed: {}",
+                        sanitize_for_status(&e.to_string())
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Jump to the file+line for the focused stale comment.
+    fn stale_jump_to_file(
+        &mut self,
+        state: &StaleScreenState,
+        ctx: &mut ExtraScreenContext<'_>,
+    ) -> ExtraScreenAction {
+        let focused = state
+            .stale_indices
+            .get(state.selected_index)
+            .and_then(|&idx| self.loaded_comments.get(idx))
+            .cloned();
+        let Some(comment) = focused else {
+            return ExtraScreenAction::StayOpen;
+        };
+        let Anchor::Line { location, .. } = &comment.anchor else {
+            return ExtraScreenAction::StayOpen;
+        };
+        let file_idx = self
+            .details
+            .diff
+            .files
+            .iter()
+            .position(|f| f.display_path() == location.file.as_path());
+        let Some(fidx) = file_idx else {
+            *ctx.status_message = Some("file not in current diff".to_owned());
+            return ExtraScreenAction::StayOpen;
+        };
+        let view_idx = fidx + 1;
+        *ctx.file_index = view_idx;
+        *ctx.scroll = 0;
+        let line_num = match location.side {
+            Side::Old => location.old_line,
+            Side::New => location.new_line,
+        };
+        if let Some(target_line_num) = line_num {
+            if let Some(view) = ctx.base_per_file.0.get(view_idx) {
+                let pos = view.lines.iter().position(|l| match location.side {
+                    Side::Old => l.source_line == Some(target_line_num),
+                    Side::New => l.target_line == Some(target_line_num),
+                });
+                *ctx.line_index = pos.unwrap_or(0);
+            }
+        } else {
+            *ctx.line_index = 0;
+        }
+        let _ = self.mark_view_reviewed_impl(view_idx);
+        ExtraScreenAction::Close
+    }
+
+    /// Enter reanchor mode: close stale screen, navigate to the stale
+    /// comment's file, and record the pending reanchor.
+    fn stale_enter_reanchor(
+        &mut self,
+        state: &StaleScreenState,
+        ctx: &mut ExtraScreenContext<'_>,
+    ) -> ExtraScreenAction {
+        let focused = state
+            .stale_indices
+            .get(state.selected_index)
+            .and_then(|&idx| self.loaded_comments.get(idx))
+            .cloned();
+        let Some(comment) = focused else {
+            return ExtraScreenAction::StayOpen;
+        };
+        let Anchor::Line { location, .. } = &comment.anchor else {
+            return ExtraScreenAction::StayOpen;
+        };
+        let severity = comment.severity;
+        let file = location.file.clone();
+        self.pending_reanchor = Some(PendingReanchor {
+            body: comment.body.clone(),
+            severity,
+            original: comment,
+        });
+        let file_idx = self
+            .details
+            .diff
+            .files
+            .iter()
+            .position(|f| f.display_path() == file.as_path());
+        match file_idx {
+            Some(fidx) => {
+                *ctx.file_index = fidx + 1;
+                *ctx.line_index = 0;
+                *ctx.scroll = 0;
+                let _ = self.mark_view_reviewed_impl(fidx + 1);
+            }
+            None => {
+                *ctx.status_message = Some(
+                    "re-anchor: file not in current diff; pick a line in the visible file"
+                        .to_owned(),
+                );
+            }
+        }
+        ExtraScreenAction::Close
+    }
+
+    /// Handle a key event while the stack overview screen is open.
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "unhandled KeyCode variants are intentionally ignored on the overview screen"
+    )]
+    fn handle_overview_key_impl(
+        &mut self,
+        state: &mut OverviewScreenState,
+        key: KeyEvent,
+        ctx: &mut ExtraScreenContext<'_>,
+    ) -> ExtraScreenAction {
+        let rows = if let (Some(stack_ctx), Some(cache)) =
+            (self.stack.as_ref(), self.overview_cache.as_ref())
+        {
+            overview_screen::build_rows(
+                cache,
+                &stack_ctx.entries,
+                cache.stale_count(),
+                cache.total_count(),
+            )
+        } else {
+            Vec::new()
+        };
+
+        let current_selected = state.selected_row;
+
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => {
+                return ExtraScreenAction::Close;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                state.selected_row = overview_screen::move_cursor(&rows, current_selected, -1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                state.selected_row = overview_screen::move_cursor(&rows, current_selected, 1);
+            }
+            KeyCode::Enter => {
+                let Some(row) = rows.get(current_selected) else {
+                    return ExtraScreenAction::StayOpen;
+                };
+                match row {
+                    overview_screen::OverviewRow::ChangeRow(change_idx) => {
+                        let idx = *change_idx;
+                        *ctx.navigate_to_entry = Some(idx);
+                        return ExtraScreenAction::Close;
+                    }
+                    overview_screen::OverviewRow::StackComment(ci) => {
+                        let ci = *ci;
+                        if let Some(composer) = self.build_stack_comment_composer(ci) {
+                            return ExtraScreenAction::OpenScreen(Box::new(ComposerScreen(
+                                Box::new(composer),
+                            )));
+                        }
+                    }
+                    overview_screen::OverviewRow::ChangeComment {
+                        change_idx,
+                        comment_idx,
+                    } => {
+                        if let Some(composer) =
+                            self.build_change_comment_composer(*change_idx, *comment_idx)
+                        {
+                            return ExtraScreenAction::OpenScreen(Box::new(ComposerScreen(
+                                Box::new(composer),
+                            )));
+                        }
+                    }
+                    overview_screen::OverviewRow::StackHeader
+                    | overview_screen::OverviewRow::Separator
+                    | overview_screen::OverviewRow::SummaryFooterStale
+                    | overview_screen::OverviewRow::SummaryFooterTotal => {}
+                }
+            }
+            KeyCode::Char('c') => {
+                let composer = self.build_overview_new_composer(&rows, current_selected, ctx);
+                return ExtraScreenAction::OpenScreen(Box::new(ComposerScreen(Box::new(composer))));
+            }
+            // '?' and other keys: help is handled by core; everything else ignored.
+            _ => {}
+        }
+        ExtraScreenAction::StayOpen
+    }
+
+    /// Build a new-comment composer opened from the overview screen.
+    fn build_overview_new_composer(
+        &self,
+        rows: &[overview_screen::OverviewRow],
+        selected: usize,
+        ctx: &ExtraScreenContext<'_>,
+    ) -> Composer {
+        let (use_stack_scope, change_idx_for_change_scope) = rows
+            .get(selected)
+            .map(|row| match row {
+                overview_screen::OverviewRow::StackHeader
+                | overview_screen::OverviewRow::StackComment(_) => (true, None),
+                overview_screen::OverviewRow::ChangeRow(ci) => (false, Some(*ci)),
+                overview_screen::OverviewRow::ChangeComment { change_idx, .. } => {
+                    (false, Some(*change_idx))
+                }
+                overview_screen::OverviewRow::Separator
+                | overview_screen::OverviewRow::SummaryFooterStale
+                | overview_screen::OverviewRow::SummaryFooterTotal => (false, None),
+            })
+            .unwrap_or((false, None));
+
+        let target_change_id: ChangeId = change_idx_for_change_scope
+            .and_then(|idx| {
+                self.stack
+                    .as_ref()
+                    .and_then(|s| s.entries.get(idx).map(|e| e.change_id.clone()))
+            })
+            .unwrap_or_else(|| self.details.change_id.clone());
+
+        let stack_available = self.stack_context_snapshot();
+        let change_description = if target_change_id == self.details.change_id {
+            self.details.description.clone()
+        } else {
+            String::new()
+        };
+
+        let scope = if use_stack_scope {
+            match stack_available.clone() {
+                Some(s) => ComposerScope::Stack(s),
+                None => ComposerScope::Change,
+            }
+        } else {
+            ComposerScope::Change
+        };
+
+        let init = ComposerInit {
+            scope,
+            severity: default_severity(*ctx.last_severity),
+            change_id: target_change_id,
+            change_description,
+            line_available: None,
+            stack_available,
+            description_available: None,
+        };
+        Composer::new(init)
+    }
+
+    /// Build an editor composer for a stack-level comment.
+    fn build_stack_comment_composer(&self, comment_idx: usize) -> Option<Composer> {
+        let comment = self
+            .overview_cache
+            .as_ref()
+            .and_then(|c| c.stack_level.get(comment_idx))
+            .cloned()?;
+        Some(self.build_meta_comment_editor(&comment))
+    }
+
+    /// Build an editor composer for a change-level comment from the overview.
+    fn build_change_comment_composer(
+        &self,
+        change_idx: usize,
+        comment_idx: usize,
+    ) -> Option<Composer> {
+        let comment = self
+            .overview_cache
+            .as_ref()
+            .and_then(|c| c.per_change.get(change_idx))
+            .and_then(|v| v.get(comment_idx))
+            .cloned()?;
+        Some(self.build_meta_comment_editor(&comment))
+    }
+
+    /// Build an edit-mode composer for an existing comment.
+    fn build_meta_comment_editor(&self, comment: &Comment) -> Composer {
+        let target_change_id = match &comment.anchor {
+            Anchor::Change { change_id }
+            | Anchor::Line { change_id, .. }
+            | Anchor::Description { change_id, .. } => change_id.clone(),
+            Anchor::Stack { .. } => self.details.change_id.clone(),
+        };
+
+        let stack_available = self.stack_context_snapshot();
+        let change_description = if target_change_id == self.details.change_id {
+            self.details.description.clone()
+        } else {
+            String::new()
+        };
+
+        let (scope, description_available) = match &comment.anchor {
+            Anchor::Line { location, .. } => {
+                let line_target = LineTarget {
+                    file: location.file.clone(),
+                    rendered_index: OVERVIEW_NO_LINE_CURSOR,
+                    source_line: location.old_line,
+                    target_line: location.new_line,
+                    target_text: location.target_text.clone(),
+                    hunk_header: location.hunk_header.clone(),
+                    context_before: location.context_before.clone(),
+                    context_after: location.context_after.clone(),
+                };
+                (ComposerScope::Line(line_target), None)
+            }
+            Anchor::Change { .. } => (ComposerScope::Change, None),
+            Anchor::Stack { revset_hash } => {
+                let snapshot = stack_available
+                    .clone()
+                    .unwrap_or_else(|| StackContextSnapshot {
+                        revset: format!("revset_hash:{}", revset_hash.hex()),
+                        revset_hash: *revset_hash,
+                    });
+                (ComposerScope::Stack(snapshot), None)
+            }
+            Anchor::Description {
+                change_id: anchor_change_id,
+                location,
+            } => {
+                let ctx = DescriptionContext {
+                    change_id: anchor_change_id.clone(),
+                    target_line: location.display_line,
+                    target_text: location.target_text.clone(),
+                    context_before: location.context_before.clone(),
+                    context_after: location.context_after.clone(),
+                };
+                (ComposerScope::Description(ctx.clone()), Some(ctx))
+            }
+        };
+
+        let init = ComposerInit {
+            scope,
+            severity: comment.severity,
+            change_id: target_change_id,
+            change_description,
+            line_available: None,
+            stack_available,
+            description_available,
+        };
+        let edited = EditedComment {
+            init,
+            body: comment.body.clone(),
+            identity: comment.created_at,
+            original: Some(comment.clone()),
+            original_anchor: comment.anchor.clone(),
+        };
+        Composer::for_edit(edited)
+    }
+
+    /// Handle a key event while the send-to-claude confirmation screen is open.
+    fn handle_send_to_claude_key_impl(
+        &mut self,
+        wrapper: &mut SendToClaudeScreen,
+        key: KeyEvent,
+        ctx: &mut ExtraScreenContext<'_>,
+    ) -> std::result::Result<ExtraScreenAction, JjrError> {
+        let current_offset = match wrapper.inner() {
+            SendToClaudeState::PromptView { scroll_offset, .. } => *scroll_offset,
+            SendToClaudeState::Confirm(_) => 0,
+        };
+
+        let owned = *wrapper
+            .0
+            .take()
+            .ok_or_else(|| JjrError::JjUnexpectedOutput {
+                raw: "SendToClaudeScreen.state was None; this is a bug".to_owned(),
+            })?;
+
+        match (&owned, key.code) {
+            (SendToClaudeState::Confirm(_), KeyCode::Esc) => {
+                wrapper.0 = Some(Box::new(owned));
+                return Ok(ExtraScreenAction::Close);
+            }
+            (SendToClaudeState::Confirm(_), KeyCode::Char('v')) => {
+                wrapper.0 = Some(Box::new(owned.into_prompt_view()));
+            }
+            (SendToClaudeState::Confirm(_), KeyCode::Enter) => {
+                wrapper.0 = Some(Box::new(owned));
+                self.invoke_claude_impl(wrapper.inner(), ctx)?;
+                return Ok(ExtraScreenAction::Close);
+            }
+            (SendToClaudeState::PromptView { .. }, KeyCode::Char('q') | KeyCode::Esc) => {
+                wrapper.0 = Some(Box::new(owned.into_confirm()));
+            }
+            (SendToClaudeState::PromptView { .. }, KeyCode::Up | KeyCode::Char('k')) => {
+                let mut state = owned;
+                if let SendToClaudeState::PromptView {
+                    ref mut scroll_offset,
+                    ..
+                } = state
+                {
+                    *scroll_offset = current_offset.saturating_sub(1);
+                }
+                wrapper.0 = Some(Box::new(state));
+            }
+            (SendToClaudeState::PromptView { .. }, KeyCode::Down | KeyCode::Char('j')) => {
+                let mut state = owned;
+                if let SendToClaudeState::PromptView {
+                    ref mut scroll_offset,
+                    ..
+                } = state
+                {
+                    *scroll_offset = current_offset.saturating_add(1);
+                }
+                wrapper.0 = Some(Box::new(state));
+            }
+            _ => {
+                wrapper.0 = Some(Box::new(owned));
+            }
+        }
+        Ok(ExtraScreenAction::StayOpen)
+    }
+
+    /// Suspend TUI, run claude, restore, reload diff.
+    fn invoke_claude_impl(
+        &mut self,
+        state: &SendToClaudeState,
+        ctx: &mut ExtraScreenContext<'_>,
+    ) -> Result<()> {
+        let SendToClaudeState::Confirm(data) = state else {
+            unreachable!("invoke_claude_impl is only called from Confirm arm; PromptView is unreachable here");
+        };
+
+        let change_id = data.change_id.clone();
+        let prompt = crate::packet::render_prompt_with_mode(
+            &data.packet,
+            crate::packet::PromptMode::JsonlPaths,
+        );
+        let repo_root = self.repo_root.clone();
+
+        if let Some(g) = self.stderr_guard.as_ref() {
+            g.suspend()?;
+        }
+        let resume_guard = StderrResumeGuard {
+            guard: self.stderr_guard.as_ref(),
+        };
+
+        suspend_tui()?;
+        let restore = TerminalRestoreGuard;
+
+        let outcome = (|| -> Result<crate::claude::ClaudeOutcome> {
+            let _guard =
+                crate::working_copy_guard::WorkingCopyGuard::enter(&repo_root, &change_id)?;
+            crate::claude::invoke_claude(&prompt)
+        })();
+
+        // Disarm `restore` before calling `restore_tui()` so that the explicit
+        // call can surface its error; if it were not forgotten, `restore`'s Drop
+        // would silently swallow any error on the same path.
+        std::mem::forget(restore);
+        restore_tui()?;
+
+        // Same pattern: disarm `resume_guard` before calling `resume()` so the
+        // explicit call can propagate its error rather than relying on Drop.
+        std::mem::forget(resume_guard);
+        if let Some(g) = self.stderr_guard.as_ref() {
+            g.resume()?;
+        }
+        *ctx.needs_full_redraw = true;
+
+        match outcome? {
+            crate::claude::ClaudeOutcome::Success { tool } => {
+                if let Err(e) = self.reload_after_agent_success(&change_id, ctx) {
+                    *ctx.status_message = Some(format!(
+                        "{tool} completed; could not reload diff: {}",
+                        sanitize_for_status(&e.to_string())
+                    ));
+                }
+            }
+            crate::claude::ClaudeOutcome::Failed { tool, exit_code } => {
+                let code_str = exit_code.map_or_else(|| "signal".to_owned(), |c| c.to_string());
+                *ctx.status_message = Some(format!(
+                    "{tool} exited with {code_str}; working copy restored"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Reload the diff and comments after a successful claude invocation.
+    fn reload_after_agent_success(
+        &mut self,
+        prev_change_id: &ChangeId,
+        ctx: &mut ExtraScreenContext<'_>,
+    ) -> Result<()> {
+        if let Some(stack_ctx) = self.stack.as_ref() {
+            let revset = stack_ctx.revset.clone();
+            let prev_index = stack_ctx.current_index;
+            let resolved = jj::resolve_stack(&revset)?;
+            if resolved.entries.is_empty() {
+                return Err(JjrError::RevsetNoMatch {
+                    revset: resolved.revset,
+                });
+            }
+            let new_index =
+                new_current_index_after_reload(prev_change_id, prev_index, &resolved.entries);
+            let new_change_id = resolved.entries[new_index].change_id.clone();
+            let details = jj::show(&new_change_id)?;
+
+            if let Some(stack_ctx) = self.stack.as_mut() {
+                stack_ctx.entries = resolved.entries;
+                stack_ctx.revset = resolved.revset;
+                stack_ctx.revset_hash = resolved.revset_hash;
+                stack_ctx.current_index = new_index;
+            }
+            self.details = details;
+        } else {
+            let details = jj::show(prev_change_id)?;
+            self.details = details;
+        }
+        *ctx.file_index = 0;
+        *ctx.line_index = 0;
+        *ctx.scroll = 0;
+        let new_views = build_rendered_views(&self.details);
+        self.rendered_views.clone_from(&new_views);
+        ctx.rendered_per_file.clone_from(&new_views);
+        // Write base (un-annotated) views; the core calls refresh_inline_comments
+        // after handle_extra_screen_key returns to re-inject inline comments.
+        *ctx.base_per_file = BaseViews(new_views);
+        let _ = self.reload_comments();
+        let _ = self.mark_view_reviewed_impl(0);
+        Ok(())
+    }
+
+    /// Handle a key event while the composer overlay is open.
+    fn handle_composer_key_impl(
+        &mut self,
+        composer: &mut Composer,
+        key: KeyEvent,
+        ctx: &mut ExtraScreenContext<'_>,
+    ) -> ExtraScreenAction {
+        let action = composer::handle_composer_key(composer, key);
+        match action {
+            ComposerAction::Continue => ExtraScreenAction::StayOpen,
+            ComposerAction::Cancel => ExtraScreenAction::Close,
+            ComposerAction::Save => {
+                match self.save_via_composer(composer, time::OffsetDateTime::now_utc()) {
+                    ComposerSaveOutcome::Saved { status } => {
+                        *ctx.status_message = Some(status);
+                        if let Some(reanchor) = self.pending_reanchor.take() {
+                            match crate::store::delete_comment(&self.repo_root, &reanchor.original)
+                            {
+                                Ok(()) => {}
+                                Err(e) => {
+                                    *ctx.status_message = Some(format!(
+                                        "re-anchor saved; could not delete original: {}",
+                                        sanitize_for_status(&e.to_string())
+                                    ));
+                                }
+                            }
+                        }
+                        let _ = self.reload_comments();
+                        ExtraScreenAction::Close
+                    }
+                    ComposerSaveOutcome::Refused(msg) | ComposerSaveOutcome::Errored(msg) => {
+                        *ctx.status_message = Some(msg);
+                        ExtraScreenAction::StayOpen
+                    }
+                }
+            }
+            ComposerAction::Delete => match self.delete_via_composer(composer) {
+                ComposerSaveOutcome::Saved { .. } => {
+                    let _ = self.reload_comments();
+                    ExtraScreenAction::Close
+                }
+                ComposerSaveOutcome::Refused(msg) | ComposerSaveOutcome::Errored(msg) => {
+                    *ctx.status_message = Some(msg);
+                    ExtraScreenAction::StayOpen
+                }
+            },
+            ComposerAction::RefusedScopeChord(status) => {
+                *ctx.status_message = Some(status.to_owned());
+                ExtraScreenAction::StayOpen
+            }
+        }
+    }
+
+    /// Save a new or edited comment from the composer.
+    ///
+    /// New-comment path delegates to [`JjrSurface::save_comment`] so the
+    /// persistence logic lives in one place. Edit path invokes the store
+    /// directly because it works from a captured `original` snapshot (which
+    /// may belong to a different change and is therefore absent from
+    /// `loaded_comments`).
+    fn save_via_composer(
+        &mut self,
+        composer: &Composer,
+        now: time::OffsetDateTime,
+    ) -> ComposerSaveOutcome {
+        let body = composer.body_text();
+        if body.trim().is_empty() {
+            return ComposerSaveOutcome::Refused("comment body is empty — not saved".to_owned());
+        }
+        let oversized = body.chars().count() > crate::comment::BODY_MAX;
+
+        if let Some(edit_ctx) = composer.editing.as_ref() {
+            // Edit path: use the captured `original` snapshot so the anchor is
+            // authoritative regardless of whether this change is current.
+            let source = if let Some(orig) = edit_ctx.original.as_ref() {
+                orig.clone()
+            } else {
+                return ComposerSaveOutcome::Errored(
+                    "comment was removed between open and save; edit not saved".to_owned(),
+                );
+            };
+            let updated = Comment {
+                body,
+                severity: composer.severity,
+                updated_at: Some(now),
+                ..source
+            };
+            return match crate::store::update_comment(&self.repo_root, &updated) {
+                Ok(()) => ComposerSaveOutcome::Saved {
+                    status: if oversized {
+                        "body truncated to 64 KB on save".to_owned()
+                    } else {
+                        "comment updated".to_owned()
+                    },
+                },
+                Err(e) => ComposerSaveOutcome::Errored(format!(
+                    "update failed: {}",
+                    sanitize_for_status(&e.to_string())
+                )),
+            };
+        }
+
+        // New-comment path: delegate to save_comment so persistence logic
+        // lives in one place.
+        let req = SaveRequest {
+            scope: &composer.scope,
+            severity: composer.severity,
+            body: &body,
+            entry_idx: self.stack.as_ref().map_or(0, |s| s.current_index),
+        };
+        match self.save_comment(req) {
+            Ok(CoreSaveOutcome::Saved { status_message }) => ComposerSaveOutcome::Saved {
+                status: status_message,
+            },
+            Ok(CoreSaveOutcome::Refused { reason }) => ComposerSaveOutcome::Refused(reason),
+            Ok(CoreSaveOutcome::Errored { message }) => ComposerSaveOutcome::Errored(message),
+            Err(e) => ComposerSaveOutcome::Errored(format!(
+                "save failed: {}",
+                sanitize_for_status(&e.to_string())
+            )),
+        }
+    }
+
+    /// Delete a comment via the composer (edit-mode `^D`).
+    fn delete_via_composer(&mut self, composer: &Composer) -> ComposerSaveOutcome {
+        delete_via_composer_impl(&self.repo_root, &self.revset, &self.details, composer)
+    }
+}
+
+/// Local save-outcome for the surface-side composer save path (not the core
+/// `SaveOutcome` — that is the trait's return type).
+enum ComposerSaveOutcome {
+    Saved { status: String },
+    Refused(String),
+    Errored(String),
+}
+
+fn build_anchor_from_scope(
+    scope: &ComposerScope,
+    composer_change_id: &ChangeId,
+    details: &ChangeDetails,
+) -> Anchor {
+    match scope {
+        ComposerScope::Line(target) => {
+            let (change_id, location) = build_line_anchor(target, details.change_id.clone());
+            Anchor::Line {
+                change_id,
+                location,
+            }
+        }
+        ComposerScope::Change => Anchor::Change {
+            change_id: composer_change_id.clone(),
+        },
+        ComposerScope::Stack(stack) => Anchor::Stack {
+            revset_hash: stack.revset_hash,
+        },
+        ComposerScope::Description(ctx) => {
+            let location = DescriptionAnchor {
+                display_line: ctx.target_line,
+                target_text: ctx.target_text.clone(),
+                context_before: ctx.context_before.clone(),
+                context_after: ctx.context_after.clone(),
+            }
+            .normalized();
+            Anchor::Description {
+                change_id: ctx.change_id.clone(),
+                location,
+            }
+        }
+    }
+}
+
+/// Delete a comment via the composer (edit-mode `^D`).
+fn delete_via_composer_impl(
+    repo_root: &std::path::Path,
+    revset: &str,
+    details: &ChangeDetails,
+    composer: &Composer,
+) -> ComposerSaveOutcome {
+    let Some(edit_ctx) = composer.editing.as_ref() else {
+        return ComposerSaveOutcome::Refused("delete only available in edit mode".to_owned());
+    };
+    let comment = match edit_ctx.original.as_ref() {
+        Some(orig) => orig.clone(),
+        None => Comment {
+            schema_version: SchemaVersion,
+            anchor: edit_ctx.original_anchor.clone(),
+            repo_root: repo_root.to_owned(),
+            revset: revset.to_owned(),
+            commit_id: Some(details.commit_id.clone()),
+            body: composer.body_text(),
+            severity: composer.severity,
+            created_at: edit_ctx.identity,
+            updated_at: None,
+            status: Some(Status::Pending),
+            mismatch_reason: None,
+        },
+    };
+    match crate::store::delete_comment(repo_root, &comment) {
+        Ok(()) => ComposerSaveOutcome::Saved {
+            status: "comment deleted".to_owned(),
+        },
+        Err(e) => ComposerSaveOutcome::Errored(format!(
+            "delete failed: {}",
+            sanitize_for_status(&e.to_string())
+        )),
+    }
 }
 
 /// Which transition behavior is configured.
@@ -406,6 +1955,7 @@ enum TransitionMode {
 /// on terminal width; the explicit modes pin the choice regardless of width.
 /// The toggle key (`|`) cycles `Auto -> ForceUnified -> ForceSideBySide -> Auto`
 /// and the choice persists for the session (no on-disk persistence).
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum DiffMode {
     Auto,
@@ -414,6 +1964,7 @@ pub(super) enum DiffMode {
 }
 
 /// Resolved layout for a single render pass.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum EffectiveDiffMode {
     Unified,
@@ -424,25 +1975,30 @@ pub(super) enum EffectiveDiffMode {
 /// to side-by-side. Each side gets ~58 cells + 1 gutter cell + 1 scrollbar
 /// cell. Below this we stay unified — narrower side panes truncate too
 /// aggressively to be useful.
+#[cfg(test)]
 pub(super) const SIDE_BY_SIDE_MIN_WIDTH: u16 = 120;
 
 /// Width (cells) of the divider between the left and right columns in
 /// side-by-side mode. A single `│` glyph plus one space of padding on each
 /// side (3 cells total) reads as a clear vertical seam without crowding the
 /// content.
+#[cfg(test)]
 pub(super) const SIDE_BY_SIDE_GUTTER_WIDTH: u16 = 3;
 
 /// Minimum cells per side cell in side-by-side mode: the `+ ` / `- ` prefix
 /// (2 cells) plus 2 cells of content. Below this each cell collapses into
 /// just-the-prefix and the layout stops conveying anything useful.
+#[cfg(test)]
 pub(super) const MIN_USEFUL_SIDE_CELL_WIDTH: u16 = 4;
 
 /// Below this body width side-by-side rendering falls back to unified mode
 /// at draw time. The user can press `|` to switch back to Auto and let the
 /// width-aware threshold pick again at the next resize.
+#[cfg(test)]
 pub(super) const MIN_USEFUL_SIDE_BY_SIDE_WIDTH: u16 =
     SIDE_BY_SIDE_GUTTER_WIDTH + 2 * MIN_USEFUL_SIDE_CELL_WIDTH;
 
+#[cfg(test)]
 struct App {
     details: ChangeDetails,
     /// Repo root for comment storage; passed from the CLI.
@@ -496,24 +2052,16 @@ struct App {
     /// suspending for `claude`); ratatui's diff cache is now stale and must
     /// be invalidated before the next draw.
     needs_full_redraw: bool,
-    /// `Option` because unit tests construct `App` directly without a real
-    /// stderr redirect. Production paths (`run`, `run_stack`) always pass
-    /// `Some(_)` after `enter_tui_session`.
-    stderr_guard: Option<StderrLogGuard>,
 }
 
+#[cfg(test)]
 impl App {
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "single TUI entry-point constructor; bundling these into a struct adds ceremony"
-    )]
     fn new(
         details: ChangeDetails,
         repo_root: PathBuf,
         revset: String,
         stack: Option<StackContext>,
         transition_mode: TransitionMode,
-        stderr_guard: Option<StderrLogGuard>,
     ) -> Self {
         let rendered_per_file = build_rendered_views(&details);
         let annotated_per_file = rendered_per_file.clone();
@@ -548,7 +2096,6 @@ impl App {
             reviewed,
             diff_mode: DiffMode::Auto,
             needs_full_redraw: false,
-            stderr_guard,
         }
     }
 
@@ -720,30 +2267,14 @@ impl App {
     }
 
     fn reconcile_and_persist(&mut self, comments: Vec<Comment>) -> Vec<Comment> {
-        let mut errors: Vec<String> = Vec::new();
-        let reconciled: Vec<Comment> = comments
-            .into_iter()
-            .map(|comment| {
-                match crate::anchoring::reanchor_comment(
-                    &comment,
-                    &self.details.diff,
-                    &self.details.description,
-                ) {
-                    None => comment,
-                    Some(updated) => {
-                        match crate::store::update_comment(&self.repo_root, &updated) {
-                            Ok(()) => updated,
-                            Err(e) => {
-                                errors.push(format_persist_error(&updated, &e));
-                                comment
-                            }
-                        }
-                    }
-                }
-            })
-            .collect();
-        if let Some(last) = errors.into_iter().last() {
-            self.status_message = Some(last);
+        let (reconciled, first_error) = reconcile_comments_with_diff(
+            comments,
+            &self.details.diff,
+            &self.details.description,
+            &self.repo_root,
+        );
+        if let Some(msg) = first_error {
+            self.status_message = Some(msg);
         }
         reconciled
     }
@@ -964,10 +2495,10 @@ impl App {
         let (reviewed_comment_count, severity_histogram) = if self.comments_loaded_ok {
             (
                 Some(self.loaded_comments.len()),
-                SeverityHistogram::from_comments(&self.loaded_comments),
+                histogram_from_comments(&self.loaded_comments),
             )
         } else {
-            (None, SeverityHistogram::default())
+            (None, CoreSeverityHistogram::default())
         };
 
         if self.transition_enabled(stack_len) {
@@ -1095,6 +2626,7 @@ impl App {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy)]
 enum Edge {
     Top,
@@ -1117,6 +2649,40 @@ fn sanitize_for_status(s: &str) -> String {
             }
         })
         .collect()
+}
+
+/// Reconcile `comments` against the given diff and description, persisting any
+/// re-anchored comments to disk. Returns the reconciled list and the first
+/// persist error (if any) as a status-bar string. All entries are attempted
+/// regardless; only the first error is returned — subsequent errors are
+/// collected but discarded.
+///
+/// Shared by both `JjrSurface::reconcile_and_persist` and the legacy
+/// `cfg(test) App::reconcile_and_persist` so the logic lives in one place.
+fn reconcile_comments_with_diff(
+    comments: Vec<Comment>,
+    diff: &crate::diff::Diff,
+    description: &str,
+    repo_root: &std::path::Path,
+) -> (Vec<Comment>, Option<String>) {
+    let mut errors: Vec<String> = Vec::new();
+    let reconciled: Vec<Comment> = comments
+        .into_iter()
+        .map(
+            |comment| match crate::anchoring::reanchor_comment(&comment, diff, description) {
+                None => comment,
+                Some(updated) => match crate::store::update_comment(repo_root, &updated) {
+                    Ok(()) => updated,
+                    Err(e) => {
+                        errors.push(format_persist_error(&updated, &e));
+                        comment
+                    }
+                },
+            },
+        )
+        .collect();
+    let first_error = errors.into_iter().next();
+    (reconciled, first_error)
 }
 
 fn format_persist_error(comment: &Comment, err: &JjrError) -> String {
@@ -1188,11 +2754,14 @@ fn collect_orphaned_comments(
     orphaned
 }
 
+/// Production entry point: construct a `JjrApp` and run the generic core event
+/// loop. The on-exit closure persists the cursor so subsequent runs resume at
+/// the last-reviewed change.
 #[expect(
     clippy::too_many_arguments,
-    reason = "single TUI entry point; bundling these into a struct is more ceremony than it's worth"
+    reason = "all parameters are distinct surface fields; no natural grouping avoids the count"
 )]
-fn run_app(
+fn run_jjr_app(
     terminal: &mut Term,
     details: ChangeDetails,
     repo_root: PathBuf,
@@ -1200,34 +2769,35 @@ fn run_app(
     stack: Option<StackContext>,
     stderr_guard: Option<StderrLogGuard>,
 ) -> Result<()> {
-    let transition_mode = load_transition_mode();
-    let mut app = App::new(
-        details,
-        repo_root,
-        revset,
-        stack,
-        transition_mode,
-        stderr_guard,
-    );
-    app.refresh_inline_comments();
-    // The reviewer just landed on the initial file_index (0 = description).
-    // Treat that as a review event so a single-view change can flip to
-    // fully-reviewed without requiring further navigation.
-    app.mark_current_file_reviewed();
+    use local_review_core::tui::{
+        run_app as core_run_app, AppError, TransitionMode as CoreTransitionMode,
+    };
+    let core_transition_mode = match load_transition_mode() {
+        TransitionMode::Never => CoreTransitionMode::Never,
+        TransitionMode::Auto => CoreTransitionMode::Auto,
+        TransitionMode::Always => CoreTransitionMode::Always,
+    };
+    let rendered = build_rendered_views(&details);
+    let surface = JjrSurface::new(details, repo_root, revset, stack, stderr_guard);
+    let mut app = JjrApp::new(surface, rendered, core_transition_mode);
+    core_run_app(terminal, &mut app, |app| {
+        persist_cursor_on_jjr_app_exit(app);
+    })
+    .map_err(|e| match e {
+        AppError::Io(io) => JjrError::Io { source: io },
+        AppError::Surface(surf) => surf,
+    })
+}
 
-    while !app.should_quit {
-        maybe_clear_for_full_redraw(terminal, &mut app)?;
-        terminal
-            .draw(|frame| render(frame, &mut app))
-            .map_err(io_err)?;
-        handle_event(&mut app)?;
-    }
-
-    // Persist the cursor at the last-viewed change so a subsequent run
-    // resumes here. Best-effort: a cursor write failure should not block exit.
-    persist_cursor_on_exit(&app);
-
-    Ok(())
+/// Persist the cursor at the last-viewed change so a subsequent run resumes
+/// here. Best-effort: a cursor write failure should not block exit.
+fn persist_cursor_on_jjr_app_exit(app: &JjrApp) {
+    let surface = &app.surface;
+    let Some(ctx) = surface.stack.as_ref() else {
+        return;
+    };
+    let change_id = &ctx.entries[ctx.current_index].change_id;
+    let _ = cursor::record(&surface.repo_root, ctx.revset_hash, &ctx.revset, change_id);
 }
 
 /// Invalidate ratatui's previous-frame buffer cache when the screen has been
@@ -1235,6 +2805,7 @@ fn run_app(
 /// the next `terminal.draw()` only writes diffs against a buffer that no
 /// longer matches the freshly-blank alternate screen, leaving cells ratatui
 /// thinks "unchanged" stale on screen.
+#[cfg(test)]
 fn maybe_clear_for_full_redraw<B>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()>
 where
     B: ratatui::backend::Backend,
@@ -1251,6 +2822,7 @@ where
 
 /// Best-effort cursor write on app exit. Silent on failure — the cursor file
 /// is convenience state, not authoritative.
+#[cfg(test)]
 fn persist_cursor_on_exit(app: &App) {
     let Some(ctx) = app.stack.as_ref() else {
         return;
@@ -1277,12 +2849,13 @@ fn load_transition_mode() -> TransitionMode {
 
 // Full-screen views (Stale, Overview) replace the main view entirely. Modals
 // (Help, Composer, Transition) overlay on top of the main diff view.
+#[cfg(test)]
 fn render(frame: &mut Frame<'_>, app: &mut App) {
     if matches!(app.screen, Screen::Stale(_)) {
         let Screen::Stale(mut state) = std::mem::replace(&mut app.screen, Screen::Main) else {
             unreachable!("matched above");
         };
-        stale_screen::render(frame, &mut state, app);
+        stale_screen::render(frame, &mut state, &app.loaded_comments, &app.details.diff);
         app.screen = Screen::Stale(state);
         return;
     }
@@ -1294,7 +2867,12 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
         };
         let cache = app.overview_cache.take();
         if let Some(ref cache_ref) = cache {
-            overview_screen::render(frame, &mut state, app, cache_ref);
+            let stack_ctx = app.stack.as_ref().map(|ctx| OverviewStackCtx {
+                revset: &ctx.revset,
+                entries: &ctx.entries,
+                current_index: ctx.current_index,
+            });
+            overview_screen::render(frame, &mut state, stack_ctx, &app.reviewed, cache_ref);
         }
         app.overview_cache = cache;
         app.screen = Screen::Overview(state);
@@ -1321,6 +2899,7 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
     }
 }
 
+#[cfg(test)]
 fn render_main(frame: &mut Frame<'_>, app: &mut App) {
     let area = frame.area();
     let layout = Layout::vertical([
@@ -1343,6 +2922,7 @@ fn render_main(frame: &mut Frame<'_>, app: &mut App) {
     render_footer(frame, layout[3], app);
 }
 
+#[cfg(test)]
 fn render_stack_bar(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let (position, total) = match app.stack_index().zip(app.stack_len()) {
         Some((idx, len)) => (idx + 1, len),
@@ -1374,6 +2954,7 @@ fn render_stack_bar(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
 /// Build a `████░░░░  ` style progress fill of fixed `width` cells, followed
 /// by two spaces. `position` is 1-based; `total` must be non-zero.
+#[cfg(test)]
 fn progress_bar_string(position: usize, total: usize, width: u16) -> String {
     let width_usize = usize::from(width);
     if total == 0 || width_usize == 0 {
@@ -1393,6 +2974,7 @@ fn progress_bar_string(position: usize, total: usize, width: u16) -> String {
     s
 }
 
+#[cfg(test)]
 fn file_header_label(app: &App) -> String {
     let total = app.rendered_per_file.len();
     let position = app.file_index.saturating_add(1);
@@ -1402,6 +2984,7 @@ fn file_header_label(app: &App) -> String {
     format!("{path_label}  ·  {position} of {total}")
 }
 
+#[cfg(test)]
 fn render_file_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let label = file_header_label(app);
     let block = Block::default().borders(Borders::ALL).title("File");
@@ -1418,6 +3001,7 @@ fn render_file_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(widget, area);
 }
 
+#[cfg(test)]
 fn render_diff(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     // Snapshot scalars off `app` before borrowing the view: setting
     // `app.diff_body_width` at the end would otherwise overlap with the
@@ -1485,6 +3069,7 @@ fn render_diff(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
 /// `Pair { left, right }` rows put the Removed line in the left column and
 /// the Added line in the right column; either may be `None` and rendered as
 /// blank padding.
+#[cfg(test)]
 fn render_diff_side_by_side(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -1533,6 +3118,7 @@ fn render_diff_side_by_side(
 }
 
 /// Where on a side-by-side row an inline comment should land.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InlineCommentColumn {
     /// `Side::Old` anchor on a row whose right cell is empty (pure deletion):
@@ -1554,6 +3140,7 @@ enum InlineCommentColumn {
 /// `InlineComment`):
 /// - `Side::Old` → `source_line.is_some() && target_line.is_none()`
 /// - `Side::New` → `target_line.is_some()`
+#[cfg(test)]
 fn inline_comment_column(
     rows: &[PairedRow],
     row_idx: usize,
@@ -1586,6 +3173,7 @@ fn inline_comment_column(
 /// Geometry for one side-by-side render pass: per-side cell width and the
 /// full body width (used for non-comment Spanning rows that occupy the
 /// entire row instead of just one column).
+#[cfg(test)]
 #[derive(Debug, Clone, Copy)]
 struct SideBySideGeometry {
     side_width: u16,
@@ -1595,6 +3183,7 @@ struct SideBySideGeometry {
 /// Position of one row within the side-by-side row list: the row's data,
 /// its index, and the full row vector (used by the inline-comment column
 /// resolver to look back at the preceding anchor row).
+#[cfg(test)]
 #[derive(Debug, Clone, Copy)]
 struct PairedRowAt<'a> {
     row: PairedRow,
@@ -1604,6 +3193,7 @@ struct PairedRowAt<'a> {
 
 /// Render a single side-by-side row: `[left] │ [right]` or, for
 /// `Spanning` non-comment rows, a single full-width line.
+#[cfg(test)]
 fn render_paired_row<'a>(
     view: &'a DiffView,
     at: PairedRowAt<'_>,
@@ -1650,6 +3240,7 @@ fn render_paired_row<'a>(
 
 /// Render a non-comment `Spanning` row across the full body width as a
 /// single styled span. Focus rule via [`focus_style`].
+#[cfg(test)]
 fn render_full_width_row(line: &RenderedLine, focused: bool, full_width: u16) -> TuiLine<'_> {
     let (body, fg_color) = prefix_truncate_pad(line, full_width);
     TuiLine::from(vec![Span::styled(body, focus_style(fg_color, focused))])
@@ -1658,6 +3249,7 @@ fn render_full_width_row(line: &RenderedLine, focused: bool, full_width: u16) ->
 /// Render an inline-comment `Spanning` row. The comment occupies one column
 /// (per `column`); the other column is blank-padded so the gutter aligns
 /// with neighboring rows.
+#[cfg(test)]
 fn render_inline_comment_row(
     line: &RenderedLine,
     column: InlineCommentColumn,
@@ -1676,6 +3268,7 @@ fn render_inline_comment_row(
 
 /// Render a single side cell for a paired row. Body via
 /// [`prefix_truncate_pad`]; focus rule via [`focus_style`].
+#[cfg(test)]
 fn side_cell_spans(line: &RenderedLine, side_width: u16, focused: bool) -> Vec<Span<'_>> {
     let (body, fg_color) = prefix_truncate_pad(line, side_width);
     vec![Span::styled(body, focus_style(fg_color, focused))]
@@ -1684,6 +3277,7 @@ fn side_cell_spans(line: &RenderedLine, side_width: u16, focused: bool) -> Vec<S
 /// Resolve the per-line `Style` from the line's fg color and the focus flag.
 /// Single source of truth for the "REVERSED strips fg" rule applied across
 /// every diff row in both layouts.
+#[cfg(test)]
 fn focus_style(fg_color: Color, focused: bool) -> Style {
     if focused {
         Style::default().add_modifier(Modifier::REVERSED)
@@ -1694,11 +3288,13 @@ fn focus_style(fg_color: Color, focused: bool) -> Style {
     }
 }
 
+#[cfg(test)]
 fn blank_cell_spans<'a>(side_width: u16, focused: bool) -> Vec<Span<'a>> {
     let body: String = " ".repeat(usize::from(side_width));
     vec![Span::styled(body, focus_style(Color::Reset, focused))]
 }
 
+#[cfg(test)]
 fn side_by_side_gutter_spans<'a>() -> Vec<Span<'a>> {
     // ` │ ` — single space, vertical bar, single space — matches
     // `SIDE_BY_SIDE_GUTTER_WIDTH`. The DarkGray fg is the same regardless
@@ -1722,6 +3318,7 @@ pub(super) use local_review_core::tui::{
 /// `RenderedLine`. The `prefix` is the two-cell `+ ` / `- ` / `  ` glyph
 /// prepended to the line content; `fg_color` is the foreground used when the
 /// row is not focused.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct LineVisual {
     prefix: &'static str,
@@ -1732,6 +3329,7 @@ struct LineVisual {
 /// `prefix + truncated text + space-padding`. Returns the assembled body and
 /// the line's foreground color; callers apply the focus rule via
 /// [`focus_style`].
+#[cfg(test)]
 fn prefix_truncate_pad(line: &RenderedLine, width: u16) -> (String, Color) {
     let attrs = line_visual_attrs(line);
     let prefix_chars = attrs.prefix.chars().count();
@@ -1745,6 +3343,7 @@ fn prefix_truncate_pad(line: &RenderedLine, width: u16) -> (String, Color) {
     )
 }
 
+#[cfg(test)]
 fn line_visual_attrs(line: &RenderedLine) -> LineVisual {
     match line.kind {
         RenderedLineKind::Added => LineVisual {
@@ -1774,6 +3373,7 @@ fn line_visual_attrs(line: &RenderedLine) -> LineVisual {
     }
 }
 
+#[cfg(test)]
 fn render_rendered_line(line: &RenderedLine, focused: bool, width: u16) -> TuiLine<'_> {
     // Inline comment lines have no `+`/`-` prefix and don't pad to full
     // width — their `┃ ●` decoration glyph already establishes the column
@@ -1810,13 +3410,16 @@ fn render_rendered_line(line: &RenderedLine, focused: bool, width: u16) -> TuiLi
     }
 }
 
+#[cfg(test)]
 const FOOTER_IRREDUCIBLE: &str = " \u{2191}\u{2193} line  Tab file  n/p revision  Enter comment";
 
+#[cfg(test)]
 struct FooterSegment {
     text: &'static str,
     stack_only: bool,
 }
 
+#[cfg(test)]
 const FOOTER_OPTIONAL: &[FooterSegment] = &[
     FooterSegment {
         text: "  ?",
@@ -1838,6 +3441,7 @@ const FOOTER_OPTIONAL: &[FooterSegment] = &[
 
 /// Build the main-view footer text for the given terminal width. Drops
 /// optional bindings right-to-left (least-essential first) until the text fits.
+#[cfg(test)]
 pub(super) fn footer_text_for_width(
     width: u16,
     has_stack: bool,
@@ -1880,6 +3484,7 @@ pub(super) fn footer_text_for_width(
     unreachable!("loop returns at drop_count == candidates.len()")
 }
 
+#[cfg(test)]
 fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let (text, style) = if let Some(msg) = app.status_message.as_deref() {
         (msg.to_owned(), Style::default().fg(Color::Yellow))
@@ -1902,6 +3507,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(widget, area);
 }
 
+#[cfg(test)]
 fn reanchor_prompt(body: &str, width: u16) -> String {
     // 74 chars of fixed text in the long form: `re-anchoring "" — navigate and
     // press c to pick the new line; Esc to cancel` (count excludes the body).
@@ -1920,27 +3526,7 @@ fn reanchor_prompt(body: &str, width: u16) -> String {
     }
 }
 
-fn handle_event(app: &mut App) -> Result<()> {
-    let evt = event::read().map_err(io_err)?;
-    if let Event::Key(key) = evt {
-        if key.kind != KeyEventKind::Press {
-            return Ok(());
-        }
-        // Match on the screen discriminant to avoid moving out of app.screen.
-        match &app.screen {
-            Screen::Main => handle_main_key(app, key)?,
-            Screen::Help => handle_help_key(app, key),
-            Screen::Composer(_) => handle_composer_event(app, key),
-            Screen::Transition(_) => handle_transition_key(app, key)?,
-            Screen::Stale(_) => handle_stale_key(app, key),
-            Screen::Overview(_) => handle_overview_key(app, key)?,
-            Screen::SendToClaude(_) => handle_send_to_claude_key(app, key)?,
-            Screen::FilePicker(_) => handle_file_picker_key(app, key),
-        }
-    }
-    Ok(())
-}
-
+#[cfg(test)]
 #[expect(
     clippy::wildcard_enum_match_arm,
     reason = "unhandled KeyCode variants are intentionally ignored"
@@ -1994,12 +3580,7 @@ fn handle_main_key(app: &mut App, key: KeyEvent) -> Result<()> {
     Ok(())
 }
 
-fn handle_help_key(app: &mut App, key: KeyEvent) {
-    if matches!(key.code, KeyCode::Char('q' | '?') | KeyCode::Esc) {
-        app.screen = Screen::Main;
-    }
-}
-
+#[cfg(test)]
 #[expect(
     clippy::wildcard_enum_match_arm,
     reason = "unhandled KeyCode variants are intentionally ignored on the stale screen"
@@ -2040,6 +3621,7 @@ fn handle_stale_key(app: &mut App, key: KeyEvent) {
     }
 }
 
+#[cfg(test)]
 fn focused_stale(app: &App) -> Option<&Comment> {
     let Screen::Stale(ref state) = app.screen else {
         return None;
@@ -2048,6 +3630,7 @@ fn focused_stale(app: &App) -> Option<&Comment> {
     app.loaded_comments.get(comment_idx)
 }
 
+#[cfg(test)]
 fn delete_focused_stale(app: &mut App, comment: &Comment) {
     match crate::store::delete_comment(&app.repo_root, comment) {
         Ok(()) => {
@@ -2072,6 +3655,7 @@ fn delete_focused_stale(app: &mut App, comment: &Comment) {
     }
 }
 
+#[cfg(test)]
 fn view_in_source(app: &mut App) {
     let focused = focused_stale(app).cloned();
     let Some(comment) = focused else {
@@ -2117,6 +3701,7 @@ fn view_in_source(app: &mut App) {
     app.mark_current_file_reviewed();
 }
 
+#[cfg(test)]
 fn enter_reanchor_mode(app: &mut App) {
     let focused = focused_stale(app).cloned();
     let Some(comment) = focused else {
@@ -2160,6 +3745,7 @@ fn enter_reanchor_mode(app: &mut App) {
     }
 }
 
+#[cfg(test)]
 fn open_stale_screen(app: &mut App) {
     let stale_indices = stale_screen::stale_comment_indices(&app.loaded_comments);
     app.screen = Screen::Stale(StaleScreenState {
@@ -2169,6 +3755,7 @@ fn open_stale_screen(app: &mut App) {
     });
 }
 
+#[cfg(test)]
 fn open_overview_screen(app: &mut App) {
     if app.pending_reanchor.is_some() {
         app.status_message =
@@ -2185,6 +3772,7 @@ fn open_overview_screen(app: &mut App) {
     app.screen = Screen::Overview(OverviewScreenState::new());
 }
 
+#[cfg(test)]
 fn open_send_to_claude(app: &mut App) {
     let change_id = app.details.change_id.clone();
     let revset_hash = app.stack.as_ref().map(|s| s.revset_hash);
@@ -2246,182 +3834,6 @@ fn open_send_to_claude(app: &mut App) {
     app.screen = Screen::SendToClaude(Box::new(SendToClaudeState::Confirm(data)));
 }
 
-#[expect(
-    clippy::wildcard_enum_match_arm,
-    reason = "unhandled KeyCode variants are intentionally ignored on the send-to-claude screen"
-)]
-fn handle_send_to_claude_key(app: &mut App, key: KeyEvent) -> Result<()> {
-    let Screen::SendToClaude(ref state) = app.screen else {
-        return Ok(());
-    };
-
-    match state.as_ref() {
-        SendToClaudeState::Confirm(_) => match key.code {
-            KeyCode::Esc => {
-                app.screen = Screen::Main;
-            }
-            KeyCode::Char('v') => {
-                let Screen::SendToClaude(boxed) = std::mem::replace(&mut app.screen, Screen::Main)
-                else {
-                    unreachable!("matched above");
-                };
-                let SendToClaudeState::Confirm(data) = *boxed else {
-                    unreachable!("matched Confirm above");
-                };
-                let prompt = crate::packet::render_prompt_with_mode(
-                    &data.packet,
-                    crate::packet::PromptMode::JsonlPaths,
-                );
-                app.screen = Screen::SendToClaude(Box::new(SendToClaudeState::PromptView {
-                    confirm: data,
-                    prompt,
-                    scroll_offset: 0,
-                }));
-            }
-            KeyCode::Enter => {
-                invoke_claude_from_tui(app)?;
-            }
-            _ => {}
-        },
-        SendToClaudeState::PromptView { scroll_offset, .. } => {
-            let offset = *scroll_offset;
-            match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => {
-                    let Screen::SendToClaude(boxed) =
-                        std::mem::replace(&mut app.screen, Screen::Main)
-                    else {
-                        unreachable!("matched above");
-                    };
-                    let SendToClaudeState::PromptView { confirm, .. } = *boxed else {
-                        unreachable!("matched PromptView above");
-                    };
-                    app.screen =
-                        Screen::SendToClaude(Box::new(SendToClaudeState::Confirm(confirm)));
-                }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    if let Screen::SendToClaude(ref mut s) = app.screen {
-                        if let SendToClaudeState::PromptView {
-                            ref mut scroll_offset,
-                            ..
-                        } = s.as_mut()
-                        {
-                            *scroll_offset = offset.saturating_sub(1);
-                        }
-                    }
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    if let Screen::SendToClaude(ref mut s) = app.screen {
-                        if let SendToClaudeState::PromptView {
-                            ref mut scroll_offset,
-                            ..
-                        } = s.as_mut()
-                        {
-                            *scroll_offset = offset.saturating_add(1);
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Suspend the TUI, run Claude with the current change's packet, then
-/// restore the alternate screen and redraw.
-///
-/// The normal exit path uses `restore_tui()?` so I/O errors propagate. A
-/// `TerminalRestoreGuard` covers the panic path: if anything inside the
-/// closure unwinds, the guard's Drop best-effort-restores raw mode and the
-/// alternate screen so the user's shell isn't left wedged.
-fn invoke_claude_from_tui(app: &mut App) -> Result<()> {
-    let Screen::SendToClaude(ref state) = app.screen else {
-        return Ok(());
-    };
-    let SendToClaudeState::Confirm(data) = state.as_ref() else {
-        return Ok(());
-    };
-
-    let change_id = data.change_id.clone();
-    let prompt =
-        crate::packet::render_prompt_with_mode(&data.packet, crate::packet::PromptMode::JsonlPaths);
-    let repo_root = app.repo_root.clone();
-
-    // Restore real stderr BEFORE leaving the alt screen so claude (spawned
-    // below) inherits the user's terminal stderr. Without this, claude's
-    // interactive permission prompts get captured by the stderr-log guard
-    // and the user sees nothing on the restored shell.
-    if let Some(g) = app.stderr_guard.as_ref() {
-        g.suspend()?;
-    }
-    // If anything between here and the `mem::forget` below errors or panics,
-    // resume_guard's Drop re-redirects fd 2 back to the log so the next
-    // `log_warning` doesn't corrupt the alt screen. The normal path forgets
-    // the guard and calls `resume()?` explicitly to surface its error.
-    let resume_guard = StderrResumeGuard {
-        guard: app.stderr_guard.as_ref(),
-    };
-
-    suspend_tui()?;
-    let restore = TerminalRestoreGuard;
-
-    let outcome = (|| -> Result<crate::claude::ClaudeOutcome> {
-        let _guard = crate::working_copy_guard::WorkingCopyGuard::enter(&repo_root, &change_id)?;
-        crate::claude::invoke_claude(&prompt)
-    })();
-
-    std::mem::forget(restore);
-    restore_tui()?;
-
-    std::mem::forget(resume_guard);
-    if let Some(g) = app.stderr_guard.as_ref() {
-        g.resume()?;
-    }
-    app.needs_full_redraw = true;
-
-    app.screen = Screen::Main;
-
-    match outcome? {
-        crate::claude::ClaudeOutcome::Success { tool } => {
-            if let Err(e) = reload_after_agent_success(app, &change_id) {
-                app.status_message = Some(format!(
-                    "{tool} completed; could not reload diff: {}",
-                    sanitize_for_status(&e.to_string())
-                ));
-            }
-        }
-        crate::claude::ClaudeOutcome::Failed { tool, exit_code } => {
-            let code_str = exit_code.map_or_else(|| "signal".to_owned(), |c| c.to_string());
-            app.status_message = Some(format!(
-                "{tool} exited with {code_str}; working copy restored"
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// In stack mode, the agent may have split, squashed, abandoned, or reordered
-/// changes — so the in-memory `entries` list itself can be stale, not just the
-/// current change's diff. Re-resolve the revset and pick a sensible new index
-/// before reloading the diff. In single-change mode, just reload the one
-/// change.
-fn reload_after_agent_success(app: &mut App, prev_change_id: &ChangeId) -> Result<()> {
-    if let Some(ctx) = app.stack.as_ref() {
-        let revset = ctx.revset.clone();
-        let prev_index = ctx.current_index;
-        let resolved = jj::resolve_stack(&revset)?;
-        let new_index =
-            new_current_index_after_reload(prev_change_id, prev_index, &resolved.entries);
-        let new_change_id = resolved.entries[new_index].change_id.clone();
-        let details = jj::show(&new_change_id)?;
-        apply_post_claude_stack_reload(app, resolved, new_index, details);
-    } else {
-        let details = jj::show(prev_change_id)?;
-        apply_post_claude_reload(app, details);
-    }
-    Ok(())
-}
-
 /// Pick the new `current_index` after a stack re-resolution. Prefer the
 /// previously-current `change_id` if it still exists; otherwise clamp the old
 /// index into the new range so the cursor lands somewhere reasonable when the
@@ -2440,12 +3852,13 @@ fn new_current_index_after_reload(
     {
         return idx;
     }
-    prev_index.min(new_entries.len() - 1)
+    prev_index.min(new_entries.len().saturating_sub(1))
 }
 
 /// Pure in-memory side of the stack-mode reload. Replaces `app.stack` entries
 /// with the freshly-resolved set, advances `current_index` to the chosen
 /// position, resets the cursor, and rebuilds views from the new details.
+#[cfg(test)]
 fn apply_post_claude_stack_reload(
     app: &mut App,
     resolved: ResolvedStack,
@@ -2470,6 +3883,7 @@ fn apply_post_claude_stack_reload(
 /// doesn't land mid-file in code that no longer corresponds to where they
 /// were. Extracted so the auto-mark wiring is unit-testable without spawning
 /// the agent or `jj show`.
+#[cfg(test)]
 fn apply_post_claude_reload(app: &mut App, details: ChangeDetails) {
     app.file_index = 0;
     app.line_index = 0;
@@ -2522,6 +3936,7 @@ impl Drop for StderrResumeGuard<'_> {
     }
 }
 
+#[cfg(test)]
 #[expect(
     clippy::wildcard_enum_match_arm,
     reason = "unhandled KeyCode variants are intentionally ignored on the overview screen"
@@ -2575,6 +3990,7 @@ fn handle_overview_key(app: &mut App, key: KeyEvent) -> Result<()> {
 }
 
 /// Handle `Enter` on the overview screen.
+#[cfg(test)]
 fn overview_enter(
     app: &mut App,
     rows: &[overview_screen::OverviewRow],
@@ -2612,25 +4028,22 @@ fn overview_enter(
 /// may differ from the change loaded in the main view). For `Stack` and any
 /// non-actionable rows we fall back to the current change as a placeholder
 /// only — the `change_id` is unused for `Stack` scope.
+#[cfg(test)]
 fn overview_open_composer(app: &mut App, rows: &[overview_screen::OverviewRow], selected: usize) {
-    let (initial_tag, change_idx_for_change_scope) = rows
+    let (use_stack_scope, change_idx_for_change_scope) = rows
         .get(selected)
         .map(|row| match row {
             overview_screen::OverviewRow::StackHeader
-            | overview_screen::OverviewRow::StackComment(_) => (OverviewInitialScope::Stack, None),
-            overview_screen::OverviewRow::ChangeRow(ci) => {
-                (OverviewInitialScope::Change, Some(*ci))
-            }
+            | overview_screen::OverviewRow::StackComment(_) => (true, None),
+            overview_screen::OverviewRow::ChangeRow(ci) => (false, Some(*ci)),
             overview_screen::OverviewRow::ChangeComment { change_idx, .. } => {
-                (OverviewInitialScope::Change, Some(*change_idx))
+                (false, Some(*change_idx))
             }
             overview_screen::OverviewRow::Separator
             | overview_screen::OverviewRow::SummaryFooterStale
-            | overview_screen::OverviewRow::SummaryFooterTotal => {
-                (OverviewInitialScope::Change, None)
-            }
+            | overview_screen::OverviewRow::SummaryFooterTotal => (false, None),
         })
-        .unwrap_or((OverviewInitialScope::Change, None));
+        .unwrap_or((false, None));
 
     let target_change_id: ChangeId = change_idx_for_change_scope
         .and_then(|idx| {
@@ -2640,31 +4053,15 @@ fn overview_open_composer(app: &mut App, rows: &[overview_screen::OverviewRow], 
         })
         .unwrap_or_else(|| app.details.change_id.clone());
 
-    open_composer_with_scope(app, initial_tag, target_change_id);
+    open_composer_with_scope(app, use_stack_scope, target_change_id);
 }
 
-/// Cursor-derived hint for the composer's initial scope when opened from the
-/// overview screen. The actual `ComposerScope` is constructed inside
-/// `open_composer_with_scope` from the availability snapshots — this hint
-/// only encodes the cursor-row's intent, not the per-variant payload.
-#[derive(Debug, Clone, Copy)]
-enum OverviewInitialScope {
-    Change,
-    Stack,
-}
-
-/// Open a new-comment composer with an initial-scope hint from the cursor.
-/// `target_change_id` binds the composer's Change-scope target — the overview
-/// path passes the cursor's change; the main-view path passes the current
-/// change. If the requested initial scope's availability is missing
-/// (e.g., Stack hint in single-change mode), the composer falls back to a
-/// scope that does have backing context (Line if the cursor is on a
-/// commentable line, otherwise Change).
-fn open_composer_with_scope(
-    app: &mut App,
-    initial: OverviewInitialScope,
-    target_change_id: ChangeId,
-) {
+/// Open a new-comment composer. When `use_stack_scope` is true, the composer
+/// opens with Stack scope (falling back to Line or Change if unavailable).
+/// When false, the composer opens with Change scope. The `target_change_id`
+/// binds the Change-scope target.
+#[cfg(test)]
+fn open_composer_with_scope(app: &mut App, use_stack_scope: bool, target_change_id: ChangeId) {
     let line_available = match build_line_target(app) {
         BuildTargetResult::Ready(t) => Some(t),
         BuildTargetResult::DescriptionLine { .. }
@@ -2673,12 +4070,13 @@ fn open_composer_with_scope(
     };
     let stack_available = stack_snapshot(app);
     let change_description = change_description_for_target(app, &target_change_id);
-    let scope = match initial {
-        OverviewInitialScope::Stack => match stack_available.clone() {
+    let scope = if use_stack_scope {
+        match stack_available.clone() {
             Some(s) => ComposerScope::Stack(s),
             None => fallback_scope(line_available.clone()),
-        },
-        OverviewInitialScope::Change => ComposerScope::Change,
+        }
+    } else {
+        ComposerScope::Change
     };
     let init = ComposerInit {
         scope,
@@ -2695,6 +4093,7 @@ fn open_composer_with_scope(
 /// Pick the next-best scope when the requested one has no backing snapshot.
 /// `Line` if the cursor was on a commentable line; otherwise `Change`
 /// (always available because the `change_id` is universal).
+#[cfg(test)]
 fn fallback_scope(line_available: Option<LineTarget>) -> ComposerScope {
     match line_available {
         Some(line) => ComposerScope::Line(line),
@@ -2702,6 +4101,7 @@ fn fallback_scope(line_available: Option<LineTarget>) -> ComposerScope {
     }
 }
 
+#[cfg(test)]
 fn stack_snapshot(app: &App) -> Option<StackContextSnapshot> {
     app.stack.as_ref().map(|s| StackContextSnapshot {
         revset: s.revset.clone(),
@@ -2712,6 +4112,7 @@ fn stack_snapshot(app: &App) -> Option<StackContextSnapshot> {
 /// The Change-scope chrome shows the change's description text. We carry it
 /// only for the current change (the only one whose body is loaded in
 /// `app.details`); for non-current changes the description is empty.
+#[cfg(test)]
 fn change_description_for_target(app: &App, target: &ChangeId) -> String {
     if *target == app.details.change_id {
         app.details.description.clone()
@@ -2721,6 +4122,7 @@ fn change_description_for_target(app: &App, target: &ChangeId) -> String {
 }
 
 /// Open the composer in edit mode for a stack-level comment.
+#[cfg(test)]
 fn open_overview_stack_comment_editor(app: &mut App, comment_idx: usize) {
     let comment = app
         .overview_cache
@@ -2735,6 +4137,7 @@ fn open_overview_stack_comment_editor(app: &mut App, comment_idx: usize) {
 }
 
 /// Open the composer in edit mode for a change-level comment from the overview.
+#[cfg(test)]
 fn open_overview_change_comment_editor(app: &mut App, change_idx: usize, comment_idx: usize) {
     let comment = app
         .overview_cache
@@ -2754,6 +4157,7 @@ fn open_overview_change_comment_editor(app: &mut App, change_idx: usize, comment
 /// Open the composer in edit mode for an existing comment. Builds the
 /// matching `ComposerScope` variant directly from the source `Anchor` so the
 /// scope payload is non-synthetic.
+#[cfg(test)]
 fn open_meta_comment_editor(app: &mut App, comment: &Comment) {
     // Bind the composer's `change_id` to the source comment's change when it
     // carries one; otherwise use the current change. Used by the picker label
@@ -2839,40 +4243,7 @@ fn open_meta_comment_editor(app: &mut App, comment: &Comment) {
     app.screen = Screen::Composer(Box::new(Composer::for_edit(edited)));
 }
 
-#[expect(
-    clippy::wildcard_enum_match_arm,
-    reason = "unhandled KeyCode variants are intentionally ignored on the transition modal"
-)]
-fn handle_transition_key(app: &mut App, key: KeyEvent) -> Result<()> {
-    let Screen::Transition(ref state) = app.screen else {
-        return Ok(());
-    };
-    let next_index = state.next_index;
-    match key.code {
-        KeyCode::Enter => {
-            app.screen = Screen::Main;
-            app.load_stack_entry(next_index, true)?;
-        }
-        // `p` retreats: closes the transition modal AND moves to the change
-        // before the reviewed one. Same semantics as `p` on the main screen
-        // (previous from current position) — at transition time `current_index`
-        // is still the reviewed change, so `retreat_stack` lands at
-        // `reviewed_index - 1`. To cancel the advance without moving, press Esc.
-        KeyCode::Char('p') => {
-            app.screen = Screen::Main;
-            app.retreat_stack()?;
-        }
-        KeyCode::Esc => {
-            app.screen = Screen::Main;
-        }
-        KeyCode::Char('q') => {
-            app.should_quit = true;
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
+#[cfg(test)]
 fn render_transition(frame: &mut Frame<'_>, app: &App, state: &TransitionState) {
     use ratatui::layout::{Constraint, Layout};
     use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
@@ -2924,10 +4295,12 @@ fn render_transition(frame: &mut Frame<'_>, app: &App, state: &TransitionState) 
 /// Footer hint for the transition modal. Kept short enough to fit inside the
 /// modal's interior (`TRANSITION_MODAL_WIDTH - 2` cols for the borders).
 /// Tested in `transition_footer_fits_inside_modal`.
+#[cfg(test)]
 const TRANSITION_FOOTER_TEXT: &str = "  Enter  p prev  Esc cancel  q quit";
 
 /// Render the `●●● 3 required · ● 1 suggestion` line (or honest fallback when
 /// the comment load failed).
+#[cfg(test)]
 fn render_transition_comment_summary(frame: &mut Frame<'_>, area: Rect, state: &TransitionState) {
     let Some(count) = state.reviewed_comment_count else {
         let widget = Paragraph::new("  comments could not be loaded")
@@ -2992,6 +4365,7 @@ fn render_transition_comment_summary(frame: &mut Frame<'_>, area: Rect, state: &
 ///
 /// Caps at [`DOT_BUDGET`]; any overflow becomes a trailing `…`. The
 /// numeric count next to the dots still tells the truth.
+#[cfg(test)]
 pub(super) fn render_dots(count: usize) -> String {
     if count == 0 {
         String::new()
@@ -3006,7 +4380,7 @@ pub(super) fn render_dots(count: usize) -> String {
 /// severities. Dots emit in severity order (required, suggestion, note) and
 /// stop at the budget; if the histogram total exceeds the budget, a trailing
 /// `…` is appended.
-pub(super) fn render_dots_mixed(hist: SeverityHistogram) -> String {
+pub(super) fn render_dots_mixed(hist: CoreSeverityHistogram) -> String {
     let mut dots = String::new();
     let mut budget = DOT_BUDGET;
     for count in [hist.required, hist.suggestion, hist.note] {
@@ -3025,6 +4399,7 @@ pub(super) fn render_dots_mixed(hist: SeverityHistogram) -> String {
     dots
 }
 
+#[cfg(test)]
 fn handle_composer_event(app: &mut App, key: KeyEvent) {
     let Screen::Composer(mut composer) = std::mem::replace(&mut app.screen, Screen::Main) else {
         return;
@@ -3096,6 +4471,7 @@ fn refused_scope_chord_status_strings_are_byte_stable() {
     );
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 enum SaveOutcome {
     /// Comment persisted; composer should close.
@@ -3110,6 +4486,7 @@ enum SaveOutcome {
 
 /// On-disk anchor stores the full window (`CONTEXT_MAX` each side); the
 /// chrome-time render is responsible for re-capping if needed.
+#[cfg(test)]
 fn build_description_context(app: &App, target_line: Option<u32>) -> DescriptionContext {
     let (context_before, context_after) = app
         .current_view()
@@ -3129,13 +4506,14 @@ fn build_description_context(app: &App, target_line: Option<u32>) -> Description
     }
 }
 
+#[cfg(test)]
 fn open_composer(app: &mut App) {
     // New-comment on an existing change-comment row defaults to Change scope.
     // Line- and description-comment rows fall through to `build_line_target`,
     // which classifies them as `NonCommentable`.
     if focused_comment(app).is_some_and(|c| matches!(c.anchor, Anchor::Change { .. })) {
         let target_change_id = app.details.change_id.clone();
-        open_composer_with_scope(app, OverviewInitialScope::Change, target_change_id);
+        open_composer_with_scope(app, false, target_change_id);
         return;
     }
     match build_line_target(app) {
@@ -3186,6 +4564,7 @@ fn open_composer(app: &mut App) {
     }
 }
 
+#[cfg(test)]
 fn open_composer_for_edit(app: &mut App) {
     let Some(comment) = focused_comment(app) else {
         app.status_message = Some("cursor is not on a comment".to_owned());
@@ -3239,6 +4618,7 @@ fn open_composer_for_edit(app: &mut App) {
 }
 
 /// Single-keystroke delete without confirmation.
+#[cfg(test)]
 fn delete_focused_comment(app: &mut App) {
     let Some(comment) = focused_comment(app).cloned() else {
         app.status_message = Some("cursor is not on a comment".to_owned());
@@ -3264,6 +4644,7 @@ fn delete_focused_comment(app: &mut App) {
     }
 }
 
+#[cfg(test)]
 enum BuildTargetResult {
     Ready(LineTarget),
     /// Cursor is on a description line; use description scope.
@@ -3276,6 +4657,7 @@ enum BuildTargetResult {
     NoView,
 }
 
+#[cfg(test)]
 fn build_line_target(app: &App) -> BuildTargetResult {
     let Some(view) = app.current_view() else {
         return BuildTargetResult::NoView;
@@ -3303,10 +4685,6 @@ fn build_line_target(app: &App) -> BuildTargetResult {
     // on a diff line and `file_index >= 1` is invariant — make it load-bearing
     // by panicking explicitly if a future change leaks a non-Description line
     // into view 0 (vs. silently sliding `0` through saturating_sub).
-    #[expect(
-        clippy::expect_used,
-        reason = "load-bearing invariant: DescriptionLine arm above returns early, so file_index >= 1 here"
-    )]
     let diff_file_idx = app
         .file_index
         .checked_sub(1)
@@ -3332,6 +4710,7 @@ fn build_line_target(app: &App) -> BuildTargetResult {
 
 /// Collect up to [`CONTEXT_MAX`] lines of context before and after `idx` in
 /// `lines`, skipping non-diff lines (hunk headers, separators, inline comments).
+#[cfg(test)]
 fn collect_context(lines: &[RenderedLine], idx: usize) -> (Vec<String>, Vec<String>) {
     let is_content = |k: RenderedLineKind| {
         matches!(
@@ -3342,11 +4721,13 @@ fn collect_context(lines: &[RenderedLine], idx: usize) -> (Vec<String>, Vec<Stri
     collect_context_with(lines, idx, is_content)
 }
 
+#[cfg(test)]
 fn collect_description_context(lines: &[RenderedLine], idx: usize) -> (Vec<String>, Vec<String>) {
     let is_content = |k: RenderedLineKind| matches!(k, RenderedLineKind::DescriptionLine);
     collect_context_with(lines, idx, is_content)
 }
 
+#[cfg(test)]
 fn collect_context_with(
     lines: &[RenderedLine],
     idx: usize,
@@ -3393,6 +4774,7 @@ fn build_line_anchor(target: &LineTarget, change_id: ChangeId) -> (ChangeId, Lin
     (change_id, location)
 }
 
+#[cfg(test)]
 fn save_composer(app: &mut App, composer: &Composer, now: time::OffsetDateTime) -> SaveOutcome {
     let body = composer.body_text();
     if body.trim().is_empty() {
@@ -3459,6 +4841,7 @@ fn save_status_message_for_scope(scope: &ComposerScope) -> &'static str {
 /// needed to build its `Anchor`, so this function never refuses on a missing
 /// snapshot. Save-time refusals (empty body, etc.) are handled upstream in
 /// `save_composer`.
+#[cfg(test)]
 fn build_comment_from_composer(
     app: &App,
     composer: &Composer,
@@ -3512,12 +4895,14 @@ fn build_comment_from_composer(
     }
 }
 
+#[cfg(test)]
 struct UpdateArgs {
     body: String,
     now: time::OffsetDateTime,
     oversized: bool,
 }
 
+#[cfg(test)]
 fn persist_update_from_composer(
     app: &mut App,
     composer: &Composer,
@@ -3573,6 +4958,7 @@ fn persist_update_from_composer(
     }
 }
 
+#[cfg(test)]
 fn delete_via_composer(app: &mut App, composer: &Composer) -> SaveOutcome {
     let Some(edit_ctx) = composer.editing.as_ref() else {
         return SaveOutcome::Refused("delete only available in edit mode".to_owned());
@@ -3618,6 +5004,7 @@ fn delete_via_composer(app: &mut App, composer: &Composer) -> SaveOutcome {
 /// cursor file. Callers (only `retreat_stack`) are responsible for routing the
 /// resulting index through `load_stack_entry` with `advance=false`, which is
 /// what guarantees the cursor-no-write contract for retreat.
+#[cfg(test)]
 fn pick_retreat_index(current: usize) -> Option<usize> {
     if current == 0 {
         None
@@ -3649,17 +5036,21 @@ fn build_rendered_views(details: &ChangeDetails) -> Vec<DiffView> {
     views
 }
 
+#[cfg(test)]
 fn open_file_picker(app: &mut App) {
     // Snapshot the current change_id+commit_id and reviewed entry once, so
-    // the closure handed to `build_entries` resolves view-by-view without
+    // the closures handed to `build_entries` resolve view-by-view without
     // re-borrowing `app` per row.
     let reviewed_view_indices: std::collections::HashSet<usize> = (0..app.rendered_per_file.len())
         .filter(|i| app.is_view_reviewed(*i))
         .collect();
-    let entries =
-        build_file_picker_entries(&app.details.diff.files, &app.loaded_comments, &|view_idx| {
-            reviewed_view_indices.contains(&view_idx)
-        });
+    let annotated = app.annotated_per_file.clone();
+    let entries = build_file_picker_entries(
+        &app.details.diff.files,
+        &app.loaded_comments,
+        &|view_idx| reviewed_view_indices.contains(&view_idx),
+        &|view_idx| first_commentable_row_for_view(&annotated, view_idx),
+    );
     app.screen = Screen::FilePicker(FilePickerState {
         selected_index: 0,
         scroll_offset: 0,
@@ -3667,6 +5058,102 @@ fn open_file_picker(app: &mut App) {
     });
 }
 
+/// Return the index of the first commentable row in the rendered view at `view_idx`.
+fn first_commentable_row_for_view(views: &[DiffView], view_idx: usize) -> usize {
+    views
+        .get(view_idx)
+        .and_then(|v| {
+            v.lines.iter().position(|l| {
+                matches!(
+                    l.kind,
+                    RenderedLineKind::Added
+                        | RenderedLineKind::Removed
+                        | RenderedLineKind::Context
+                        | RenderedLineKind::DescriptionLine
+                )
+            })
+        })
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod first_commentable_row_tests {
+    use super::*;
+
+    fn make_line(kind: RenderedLineKind) -> RenderedLine {
+        RenderedLine {
+            kind,
+            text: String::new(),
+            source_line: None,
+            target_line: None,
+            hunk_header: None,
+            comment_severity: None,
+        }
+    }
+
+    fn make_view(kinds: &[RenderedLineKind]) -> DiffView {
+        let lines: Vec<RenderedLine> = kinds.iter().copied().map(make_line).collect();
+        // paired_rows is not consulted by first_commentable_row_for_view.
+        DiffView {
+            title: String::new(),
+            lines,
+            paired_rows: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn empty_views_returns_zero() {
+        assert_eq!(first_commentable_row_for_view(&[], 0), 0);
+        assert_eq!(first_commentable_row_for_view(&[], 5), 0);
+    }
+
+    #[test]
+    fn out_of_bounds_view_idx_returns_zero() {
+        let v = make_view(&[RenderedLineKind::Added]);
+        assert_eq!(first_commentable_row_for_view(&[v], 1), 0);
+    }
+
+    #[test]
+    fn all_hunk_separators_returns_zero() {
+        let v = make_view(&[
+            RenderedLineKind::HunkSeparator,
+            RenderedLineKind::HunkSeparator,
+        ]);
+        assert_eq!(first_commentable_row_for_view(&[v], 0), 0);
+    }
+
+    #[test]
+    fn hunk_header_at_index_zero_is_not_commentable_skips_to_first_added() {
+        let v = make_view(&[RenderedLineKind::HunkHeader, RenderedLineKind::Added]);
+        assert_eq!(first_commentable_row_for_view(&[v], 0), 1);
+    }
+
+    #[test]
+    fn first_row_is_hunk_separator_second_is_added() {
+        let v = make_view(&[RenderedLineKind::HunkSeparator, RenderedLineKind::Added]);
+        assert_eq!(first_commentable_row_for_view(&[v], 0), 1);
+    }
+
+    #[test]
+    fn first_row_is_added_returns_zero() {
+        let v = make_view(&[RenderedLineKind::Added, RenderedLineKind::Context]);
+        assert_eq!(first_commentable_row_for_view(&[v], 0), 0);
+    }
+
+    #[test]
+    fn description_view_returns_zero_for_first_description_line() {
+        let v = make_view(&[RenderedLineKind::DescriptionLine]);
+        assert_eq!(first_commentable_row_for_view(&[v], 0), 0);
+    }
+
+    #[test]
+    fn notice_only_view_returns_zero_fallback() {
+        let v = make_view(&[RenderedLineKind::Notice]);
+        assert_eq!(first_commentable_row_for_view(&[v], 0), 0);
+    }
+}
+
+#[cfg(test)]
 #[expect(
     clippy::wildcard_enum_match_arm,
     reason = "unhandled KeyCode variants are intentionally ignored on the file picker"
@@ -3693,6 +5180,7 @@ fn handle_file_picker_key(app: &mut App, key: KeyEvent) {
     }
 }
 
+#[cfg(test)]
 fn file_picker_enter(app: &mut App) {
     let Screen::FilePicker(ref state) = app.screen else {
         return;
@@ -3736,6 +5224,7 @@ fn file_picker_enter(app: &mut App) {
     app.mark_current_file_reviewed();
 }
 
+#[cfg(test)]
 fn refresh_current_change(app: &mut App) {
     let change_id = app.details.change_id.clone();
     match jj::show(&change_id) {
@@ -3756,6 +5245,7 @@ fn refresh_current_change(app: &mut App) {
 /// (preserves cursor; reviewer is mid-thought) and the post-Claude reload
 /// path (resets cursor; Claude may have rewritten the file under them).
 /// Caller is responsible for any cursor-reset bookkeeping BEFORE calling.
+#[cfg(test)]
 fn rebuild_views_and_mark(app: &mut App, details: ChangeDetails) {
     app.rendered_per_file = build_rendered_views(&details);
     app.annotated_per_file = app.rendered_per_file.clone();
@@ -3768,10 +5258,12 @@ fn rebuild_views_and_mark(app: &mut App, details: ChangeDetails) {
 /// Pure in-memory side of `refresh_current_change`. Refresh preserves the
 /// cursor position because the reviewer is mid-thought. Pulled out so the
 /// auto-mark wiring is unit-testable without spawning `jj show`.
+#[cfg(test)]
 fn apply_refreshed_change(app: &mut App, details: ChangeDetails) {
     rebuild_views_and_mark(app, details);
 }
 
+#[cfg(test)]
 fn toggle_severity_filter(app: &mut App, severity: Severity) {
     if app.severity_filter == Some(severity) {
         app.severity_filter = None;
@@ -3783,6 +5275,7 @@ fn toggle_severity_filter(app: &mut App, severity: Severity) {
 
 /// Return the `Comment` under the cursor when the focused `RenderedLine` is
 /// an `InlineCommentMeta` and its embedded index falls within `loaded_comments`.
+#[cfg(test)]
 fn focused_comment(app: &App) -> Option<&Comment> {
     let view = app.current_view()?;
     let line = view.lines.get(app.line_index)?;
@@ -3793,6 +5286,7 @@ fn focused_comment(app: &App) -> Option<&Comment> {
 }
 
 /// Park the cursor on the diff line a deleted comment was attached to.
+#[cfg(test)]
 fn anchor_line_index(app: &App, comment: &Comment) -> Option<usize> {
     let Anchor::Line { location, .. } = &comment.anchor else {
         return None;
@@ -3928,6 +5422,123 @@ mod tests {
         }
     }
 
+    /// Build a minimal `Diff` with one hunk containing "target line" at line 3.
+    fn make_single_hunk_diff() -> Diff {
+        Diff {
+            files: vec![DiffFile::Modified {
+                path: PathBuf::from("foo.rs"),
+                hunks: vec![Hunk {
+                    header: "@@ -2,3 +2,3 @@".to_owned(),
+                    function_context: None,
+                    source_start: 2,
+                    source_length: 3,
+                    target_start: 2,
+                    target_length: 3,
+                    lines: vec![
+                        Line {
+                            kind: LineKind::Context,
+                            text: "ctx before".to_owned(),
+                            source_line: Some(2),
+                            target_line: Some(2),
+                        },
+                        Line {
+                            kind: LineKind::Context,
+                            text: "target line".to_owned(),
+                            source_line: Some(3),
+                            target_line: Some(3),
+                        },
+                        Line {
+                            kind: LineKind::Context,
+                            text: "ctx after".to_owned(),
+                            source_line: Some(4),
+                            target_line: Some(4),
+                        },
+                    ],
+                }],
+            }],
+        }
+    }
+
+    /// Build a comment anchored to the OLD hunk header so `reanchor_comment`
+    /// detects a shift.
+    fn make_shifted_comment(
+        change_id: &ChangeId,
+        commit_id: &CommitId,
+        repo_root: &std::path::Path,
+        ts: time::OffsetDateTime,
+    ) -> Comment {
+        Comment {
+            schema_version: SchemaVersion,
+            anchor: Anchor::Line {
+                change_id: change_id.clone(),
+                location: LineAnchor {
+                    file: PathBuf::from("foo.rs"),
+                    side: Side::New,
+                    old_line: None,
+                    new_line: Some(2),
+                    hunk_header: "@@ -1,3 +1,3 @@".to_owned(),
+                    target_text: "target line".to_owned(),
+                    context_before: vec!["ctx before".to_owned()],
+                    context_after: vec!["ctx after".to_owned()],
+                },
+            },
+            repo_root: repo_root.to_path_buf(),
+            revset: "@".to_owned(),
+            commit_id: Some(commit_id.clone()),
+            body: "comment".to_owned(),
+            severity: Severity::Required,
+            created_at: ts,
+            updated_at: None,
+            status: Some(Status::Pending),
+            mismatch_reason: None,
+        }
+    }
+
+    /// `reconcile_and_persist` must surface at least one error when reanchoring
+    /// fails to write back. Uses a `repo_root` with no `.jj-review/` dir so
+    /// `update_comment` returns an I/O error. Proves first-error-wins semantics
+    /// and no panic with multiple failing comments.
+    #[test]
+    fn reconcile_and_persist_surfaces_first_error_when_multiple_fail() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_root = dir.path().join("empty_repo");
+        std::fs::create_dir_all(&repo_root).unwrap();
+
+        let change_id = ChangeId::parse(&"d".repeat(32)).unwrap();
+        let commit_id = CommitId::parse(&"d".repeat(40)).unwrap();
+
+        let details = ChangeDetails {
+            change_id: change_id.clone(),
+            commit_id: commit_id.clone(),
+            description: String::new(),
+            diff: make_single_hunk_diff(),
+        };
+
+        let c1 = make_shifted_comment(
+            &change_id,
+            &commit_id,
+            &repo_root,
+            time::OffsetDateTime::UNIX_EPOCH,
+        );
+        let c2 = make_shifted_comment(
+            &change_id,
+            &commit_id,
+            &repo_root,
+            time::OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1),
+        );
+
+        let mut surface = JjrSurface::new(details, repo_root.clone(), "@".to_owned(), None, None);
+        surface.loaded_comments = vec![c1.clone(), c2.clone()];
+        let _ = surface.reconcile_and_persist(vec![c1, c2]);
+
+        assert!(
+            surface.pending_status_message.is_some(),
+            "expected pending_status_message to be set after error"
+        );
+        let msg = surface.pending_status_message.as_ref().unwrap();
+        assert!(!msg.is_empty(), "surfaced error message must not be empty");
+    }
+
     fn make_line(
         kind: RenderedLineKind,
         text: &str,
@@ -4058,7 +5669,6 @@ mod tests {
             "@".to_owned(),
             None,
             TransitionMode::Never,
-            None,
         );
         // Start on the first diff file (view_index 1). Description view is
         // at index 0 but most tests target diff-file content.
@@ -5253,7 +6863,6 @@ mod tests {
             "@".to_owned(),
             None,
             TransitionMode::Never,
-            None,
         );
         let comment = Comment {
             schema_version: SchemaVersion,
@@ -5337,7 +6946,6 @@ mod tests {
             "@".to_owned(),
             None,
             TransitionMode::Never,
-            None,
         );
         let comment = Comment {
             schema_version: SchemaVersion,
@@ -5430,7 +7038,6 @@ mod tests {
             "@".to_owned(),
             None,
             TransitionMode::Never,
-            None,
         );
         let t0 = time::OffsetDateTime::UNIX_EPOCH;
         for (offset, body) in [(0, "first"), (60, "second"), (120, "third")] {
@@ -5837,7 +7444,7 @@ mod tests {
             comment_with_severity(Severity::Suggestion),
             comment_with_severity(Severity::Note),
         ];
-        let h = SeverityHistogram::from_comments(&comments);
+        let h = histogram_from_comments(&comments);
         assert_eq!(h.required, 2);
         assert_eq!(h.suggestion, 1);
         assert_eq!(h.note, 1);
@@ -5914,7 +7521,6 @@ mod tests {
             revset.clone(),
             Some(stack_ctx),
             TransitionMode::Never,
-            None,
         );
 
         persist_cursor_on_exit(&app);
@@ -6029,7 +7635,6 @@ mod tests {
             "@".to_owned(),
             None,
             TransitionMode::Never,
-            None,
         );
         let label = file_header_label(&app);
         assert!(
@@ -6653,7 +8258,6 @@ mod tests {
             "trunk()..@".to_owned(),
             Some(stack_ctx),
             TransitionMode::Never,
-            None,
         );
         (app, id_a, id_b)
     }
@@ -6828,7 +8432,7 @@ mod tests {
         let mut required = comment_with_severity(Severity::Required);
         required.status = Some(Status::Orphaned);
         let active = comment_with_severity(Severity::Note);
-        let h = SeverityHistogram::from_comments(&[required, active]);
+        let h = histogram_from_comments(&[required, active]);
         assert_eq!(h.required, 0, "orphaned required must not be counted");
         assert_eq!(h.note, 1, "active note must be counted");
         assert_eq!(h.total(), 1);
@@ -6841,7 +8445,7 @@ mod tests {
         let mut orphaned = comment_with_severity(Severity::Suggestion);
         orphaned.status = Some(Status::Orphaned);
         let active = comment_with_severity(Severity::Note);
-        let h = SeverityHistogram::from_comments(&[stale, orphaned, active]);
+        let h = histogram_from_comments(&[stale, orphaned, active]);
         assert_eq!(h.required, 0);
         assert_eq!(h.suggestion, 0);
         assert_eq!(h.note, 1);
@@ -7317,7 +8921,6 @@ mod tests {
             "@".to_owned(),
             None,
             TransitionMode::Never,
-            None,
         );
         app.file_index = 0;
         open_file_picker(&mut app);
@@ -7473,7 +9076,6 @@ mod tests {
             "@".to_owned(),
             None,
             TransitionMode::Never,
-            None,
         );
         open_file_picker(&mut app);
         // Entry 0 is description; binary file is at entry 1.
@@ -7559,7 +9161,6 @@ mod tests {
             "@".to_owned(),
             None,
             TransitionMode::Never,
-            None,
         );
         open_file_picker(&mut app);
         // Entry 0 is always the description view.
@@ -7844,7 +9445,6 @@ mod tests {
             "@".to_owned(),
             None,
             TransitionMode::Never,
-            None,
         )
     }
 
@@ -7863,7 +9463,6 @@ mod tests {
             "@".to_owned(),
             None,
             TransitionMode::Never,
-            None,
         )
     }
 
@@ -8213,7 +9812,6 @@ mod tests {
             "@".to_owned(),
             None,
             TransitionMode::Never,
-            None,
         );
         app.file_index = 0;
         let buf = render_to_buffer(&mut app, 80, 24);
@@ -8444,7 +10042,13 @@ mod tests {
         };
 
         for is_wide in [true, false] {
-            let lines = stale_screen::build_entry_lines(80, &state, &app, is_wide);
+            let lines = stale_screen::build_entry_lines(
+                80,
+                &state,
+                &app.loaded_comments,
+                &app.details.diff,
+                is_wide,
+            );
             let anchors: Vec<&Anchor> = state
                 .stale_indices
                 .iter()
@@ -8490,7 +10094,13 @@ mod tests {
         };
 
         for is_wide in [true, false] {
-            let lines = stale_screen::build_entry_lines(80, &state, &app, is_wide);
+            let lines = stale_screen::build_entry_lines(
+                80,
+                &state,
+                &app.loaded_comments,
+                &app.details.diff,
+                is_wide,
+            );
             let anchors: Vec<&Anchor> = state
                 .stale_indices
                 .iter()
@@ -8586,7 +10196,6 @@ mod tests {
             "@".to_owned(),
             None,
             TransitionMode::Never,
-            None,
         )
     }
 
@@ -8867,7 +10476,7 @@ mod tests {
     fn file_picker_enter_non_binary_auto_marks_landed_file() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = make_app_in_dir(dir.path().to_owned(), vec![sample_diff_file()]);
-        let entries = file_picker::build_entries(&app.details.diff.files, &[], &|_| false);
+        let entries = file_picker::build_entries(&app.details.diff.files, &[], &|_| false, &|_| 0);
         // Pick the foo.txt entry (view_index=1).
         let target_idx = entries
             .iter()
@@ -8895,7 +10504,7 @@ mod tests {
             path: PathBuf::from("image.png"),
         };
         let mut app = make_app_in_dir(dir.path().to_owned(), vec![binary_file]);
-        let entries = file_picker::build_entries(&app.details.diff.files, &[], &|_| false);
+        let entries = file_picker::build_entries(&app.details.diff.files, &[], &|_| false, &|_| 0);
         let bin_idx = entries
             .iter()
             .position(|e| e.view_index == 1)
@@ -9089,6 +10698,23 @@ mod tests {
         assert_eq!(
             new_current_index_after_reload(&abandoned_id, 5, &new_entries),
             0
+        );
+    }
+
+    /// When the new stack is empty (all changes squashed away), the function
+    /// must not underflow — it returns 0 regardless of `prev_index`.
+    #[test]
+    fn new_current_index_after_reload_empty_entries_returns_zero() {
+        let abandoned_id = make_stack_entry('d').change_id;
+        assert_eq!(
+            new_current_index_after_reload(&abandoned_id, 0, &[]),
+            0,
+            "empty slice: prev_index=0"
+        );
+        assert_eq!(
+            new_current_index_after_reload(&abandoned_id, 99, &[]),
+            0,
+            "empty slice: large prev_index must not underflow"
         );
     }
 
@@ -9773,6 +11399,70 @@ mod tests {
         assert_eq!(
             app.line_index, 3,
             "move_line in side-by-side must clamp at paired_rows.len() - 1"
+        );
+    }
+
+    /// delta=0 with the cursor on an interior skip row (`HunkSeparator`) must
+    /// move the cursor to the nearest navigable row rather than leaving it on
+    /// the non-navigable row.
+    #[test]
+    fn move_line_delta_zero_on_skip_row_finds_navigable_row() {
+        // Build a diff file with two hunks so the rendered view contains a
+        // HunkSeparator at an interior position.
+        let file = DiffFile::Modified {
+            path: PathBuf::from("foo.txt"),
+            hunks: vec![
+                Hunk {
+                    header: "@@ -1,1 +1,1 @@".to_owned(),
+                    function_context: None,
+                    source_start: 1,
+                    source_length: 1,
+                    target_start: 1,
+                    target_length: 1,
+                    lines: vec![Line {
+                        kind: LineKind::Context,
+                        text: "ctx1".to_owned(),
+                        source_line: Some(1),
+                        target_line: Some(1),
+                    }],
+                },
+                Hunk {
+                    header: "@@ -5,1 +5,1 @@".to_owned(),
+                    function_context: None,
+                    source_start: 5,
+                    source_length: 1,
+                    target_start: 5,
+                    target_length: 1,
+                    lines: vec![Line {
+                        kind: LineKind::Context,
+                        text: "ctx2".to_owned(),
+                        source_line: Some(5),
+                        target_line: Some(5),
+                    }],
+                },
+            ],
+        };
+        let mut app = make_app_with_single_file(file);
+        app.refresh_inline_comments();
+        // Find the HunkSeparator row (between the two hunks).
+        let view = app.current_view().expect("view");
+        let sep_idx = view
+            .lines
+            .iter()
+            .position(|l| l.kind == RenderedLineKind::HunkSeparator)
+            .expect("HunkSeparator must be present between hunks");
+        app.line_index = sep_idx;
+        // delta=0: cursor is already on a skip row. move_line must find a
+        // navigable neighbor.
+        app.move_line(0);
+        assert!(
+            !app.is_skip_row(app.line_index),
+            "delta=0 on a HunkSeparator must move cursor off the skip row; \
+             landed at {}, kind={:?}",
+            app.line_index,
+            app.current_view()
+                .and_then(|v| v.lines.get(app.line_index))
+                .map(|l| l.kind),
         );
     }
 

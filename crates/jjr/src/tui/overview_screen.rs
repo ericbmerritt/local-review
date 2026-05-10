@@ -8,9 +8,13 @@ use crate::comment::Comment;
 use crate::stack::StackEntry;
 use crate::util::truncate;
 
+use crate::reviewed::ReviewedState;
+
+use local_review_core::tui::SeverityHistogram;
+
 use super::{
-    render_dots_mixed, render_view_scrollbar, scrollbar_layout_for_view, severity_color,
-    severity_label, App, SeverityHistogram,
+    histogram_from_comments, render_dots_mixed, render_view_scrollbar, scrollbar_layout_for_view,
+    severity_color, severity_label,
 };
 
 /// Box-drawing Unicode block: U+2500..=U+257F.
@@ -178,7 +182,7 @@ impl OverviewScreenState {
 }
 
 /// All comments needed for the overview, loaded once and cached.
-pub(super) struct OverviewCommentSet {
+pub(crate) struct OverviewCommentSet {
     pub(super) stack_level: Vec<Comment>,
     /// Per-change comments in stack order (parallel to `ResolvedStack.entries`).
     pub(super) per_change: Vec<Vec<Comment>>,
@@ -334,7 +338,7 @@ fn render_stack_header_line<'a>(
         NO_CURSOR
     };
     let label = "STACK-LEVEL COMMENTS";
-    let hist = SeverityHistogram::from_comments(stack_comments);
+    let hist = histogram_from_comments(stack_comments);
     let ds = dot_string(hist);
 
     if ds.is_empty() {
@@ -518,7 +522,7 @@ fn render_change_row_line(args: ChangeRowArgs<'_>) -> TuiLine<'_> {
         .get(args.change_idx)
         .map(Vec::as_slice)
         .unwrap_or(&[]);
-    let hist = SeverityHistogram::from_comments(comments);
+    let hist = histogram_from_comments(comments);
     let ds = dot_string(hist);
     let desc = truncate(
         &args.entry.description,
@@ -707,16 +711,24 @@ fn rows_to_lines<'a>(rows: &'a [OverviewRow], ctx: &'a RowsCtx<'a>) -> Vec<TuiLi
         .collect()
 }
 
+/// Stack context needed by the overview renderer.
+pub(super) struct OverviewStackCtx<'a> {
+    pub(super) revset: &'a str,
+    pub(super) entries: &'a [StackEntry],
+    pub(super) current_index: usize,
+}
+
 pub(super) fn render(
     frame: &mut Frame<'_>,
     state: &mut OverviewScreenState,
-    app: &App,
+    stack_ctx: Option<OverviewStackCtx<'_>>,
+    reviewed: &ReviewedState,
     cache: &OverviewCommentSet,
 ) {
     let area = frame.area();
     let layout = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(area);
 
-    let Some(ctx) = app.stack.as_ref() else {
+    let Some(ctx) = stack_ctx else {
         let msg = Paragraph::new("  Stack overview is not available in single-change mode.");
         frame.render_widget(msg, area);
         return;
@@ -730,7 +742,7 @@ pub(super) fn render(
     let stale_count = cache.stale_count();
     let total_count = cache.total_count();
 
-    let rows = build_rows(cache, &ctx.entries, stale_count, total_count);
+    let rows = build_rows(cache, ctx.entries, stale_count, total_count);
 
     state.selected_row = clamp_selected(&rows, state.selected_row);
     state.scroll_offset =
@@ -746,9 +758,8 @@ pub(super) fn render(
         scrollbar_layout_for_view(inner, rows.len(), state.scroll_offset);
 
     // Pre-compute "fully reviewed" per stack entry so the per-row renderer
-    // stays a pure function of `ChangeRowArgs`. The reviewed-state lives on
-    // `App` and is keyed by `(change_id, commit_id)` — both available on
-    // each `StackEntry`.
+    // stays a pure function of `ChangeRowArgs`. The reviewed-state is keyed
+    // by `(change_id, commit_id)` — both available on each `StackEntry`.
     let fully_reviewed: Vec<bool> = ctx
         .entries
         .iter()
@@ -759,15 +770,14 @@ pub(super) fn render(
                 .get(idx)
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
-            app.reviewed
-                .is_marked_fully_reviewed(&entry.change_id, &entry.commit_id, diff_paths)
+            reviewed.is_marked_fully_reviewed(&entry.change_id, &entry.commit_id, diff_paths)
         })
         .collect();
 
     let rows_ctx = RowsCtx {
         selected_row: state.selected_row,
         cache,
-        entries: &ctx.entries,
+        entries: ctx.entries,
         current_change_idx: ctx.current_index,
         budget,
         stale_count,
@@ -865,7 +875,7 @@ mod tests {
             make_comment(&id, Severity::Required, "active"),
             make_stale_comment(&id, Severity::Required, "stale"),
         ];
-        let hist = SeverityHistogram::from_comments(&comments);
+        let hist = histogram_from_comments(&comments);
         assert_eq!(hist.required, 1, "stale should not be counted");
         assert_eq!(hist.total(), 1);
     }

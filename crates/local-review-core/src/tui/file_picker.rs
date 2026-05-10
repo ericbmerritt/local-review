@@ -38,6 +38,10 @@ pub struct FilePickerEntry {
     /// unreviewed rows render an equivalent-width blank so the path column
     /// stays aligned across states.
     pub reviewed: bool,
+    /// Whether the file is binary (no commentable lines).
+    pub is_binary: bool,
+    /// Index of the first commentable row in the rendered view, or 0.
+    pub first_commentable_row: usize,
 }
 
 /// Build file picker entries from diff file metadata.
@@ -48,10 +52,14 @@ pub struct FilePickerEntry {
 ///
 /// `is_reviewed` is called with the view index and returns whether the view
 /// has been marked reviewed.
+///
+/// `first_commentable_for_view` is called with the view index and returns the
+/// index of the first commentable row (0 when unknown or not applicable).
 pub fn build_entries(
     files: &[crate::diff::DiffFile],
     comment_count_for_view: &dyn Fn(usize) -> usize,
     is_reviewed: &dyn Fn(usize) -> bool,
+    first_commentable_for_view: &dyn Fn(usize) -> usize,
 ) -> Vec<FilePickerEntry> {
     let mut entries = Vec::with_capacity(files.len() + 1);
 
@@ -60,16 +68,25 @@ pub fn build_entries(
         view_index: 0,
         comment_count: comment_count_for_view(0),
         reviewed: is_reviewed(0),
+        is_binary: false,
+        first_commentable_row: first_commentable_for_view(0),
     });
 
     for (diff_file_index, file) in files.iter().enumerate() {
         let display_path = file.display_path().to_owned();
         let view_index = diff_file_index + 1;
+        let is_binary = matches!(file, crate::diff::DiffFile::Binary { .. });
         entries.push(FilePickerEntry {
             display_path,
             view_index,
             comment_count: comment_count_for_view(view_index),
             reviewed: is_reviewed(view_index),
+            is_binary,
+            first_commentable_row: if is_binary {
+                0
+            } else {
+                first_commentable_for_view(view_index)
+            },
         });
     }
 
@@ -246,7 +263,7 @@ mod tests {
     #[test]
     fn build_entries_empty_comments_all_zero() {
         let files = diff_files();
-        let entries = build_entries(&files, &|_| 0, &|_| false);
+        let entries = build_entries(&files, &|_| 0, &|_| false, &|_| 0);
         assert!(entries.iter().all(|e| e.comment_count == 0));
     }
 
@@ -254,7 +271,7 @@ mod tests {
     fn build_entries_comment_counts_from_closure() {
         let files = diff_files();
         // view 0 = description (2 comments), view 1 = foo.rs (3), view 2 = bar.rs (1)
-        let entries = build_entries(&files, &|v| [2usize, 3, 1][v], &|_| false);
+        let entries = build_entries(&files, &|v| [2usize, 3, 1][v], &|_| false, &|_| 0);
         assert_eq!(entries[0].comment_count, 2);
         assert_eq!(entries[1].comment_count, 3);
         assert_eq!(entries[2].comment_count, 1);
@@ -263,7 +280,7 @@ mod tests {
     #[test]
     fn build_entries_reviewed_flag_propagates_per_view_index() {
         let files = diff_files();
-        let entries = build_entries(&files, &|_| 0, &|view_idx| view_idx == 1);
+        let entries = build_entries(&files, &|_| 0, &|view_idx| view_idx == 1, &|_| 0);
         assert!(!entries[0].reviewed, "description must be unreviewed");
         assert!(entries[1].reviewed, "foo.rs must be reviewed");
         assert!(!entries[2].reviewed, "bar.rs must be unreviewed");
@@ -272,7 +289,7 @@ mod tests {
     #[test]
     fn build_entries_view_indices_start_at_zero_for_description() {
         let files = diff_files();
-        let entries = build_entries(&files, &|_| 0, &|_| false);
+        let entries = build_entries(&files, &|_| 0, &|_| false, &|_| 0);
         assert_eq!(entries[0].view_index, 0);
         for (i, entry) in entries[1..].iter().enumerate() {
             assert_eq!(entry.view_index, i + 1);
@@ -357,7 +374,7 @@ mod tests {
         let mut state = FilePickerState {
             selected_index: 0,
             scroll_offset: 0,
-            entries: build_entries(&files, &|_| 0, &|_| false),
+            entries: build_entries(&files, &|_| 0, &|_| false, &|_| 0),
         };
         move_cursor(&mut state, 1);
         assert_eq!(state.selected_index, 1);
@@ -369,7 +386,7 @@ mod tests {
         let mut state = FilePickerState {
             selected_index: 0,
             scroll_offset: 0,
-            entries: build_entries(&files, &|_| 0, &|_| false),
+            entries: build_entries(&files, &|_| 0, &|_| false, &|_| 0),
         };
         move_cursor(&mut state, -1);
         assert_eq!(state.selected_index, 0);
@@ -378,7 +395,7 @@ mod tests {
     #[test]
     fn move_cursor_down_clamps_at_last() {
         let files = diff_files();
-        let entries = build_entries(&files, &|_| 0, &|_| false);
+        let entries = build_entries(&files, &|_| 0, &|_| false, &|_| 0);
         let entry_count = entries.len();
         let mut state = FilePickerState {
             selected_index: entry_count - 1,
@@ -404,6 +421,8 @@ mod tests {
                 view_index: i,
                 comment_count: 0,
                 reviewed: false,
+                is_binary: false,
+                first_commentable_row: 0,
             })
             .collect();
         FilePickerState {

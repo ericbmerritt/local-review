@@ -6,4 +6,5 @@
 //! when its keybindings are defined. This file exists only to satisfy the
 //! `mod help_screen;` declaration in `tui.rs`.
 
+#[cfg(test)]
 pub(super) use local_review_core::tui::help_screen::render;
