@@ -1,6 +1,19 @@
 //! Shared layout and navigation helpers.
 use std::process::Command;
 
+/// Normalise a hostname: return `None` for `github.com` (no override needed),
+/// `Some(host.to_owned())` for any other host.
+///
+/// Used wherever a hostname string must be converted to the `hostname` field of
+/// `ParsedPrRef`: github.com is the default and needs no `--hostname` flag.
+pub(crate) fn hostname_from_host(host: &str) -> Option<String> {
+    if host == "github.com" {
+        None
+    } else {
+        Some(host.to_owned())
+    }
+}
+
 /// Try to infer the GitHub host from the local git remote.
 ///
 /// Runs `git remote get-url origin`, parses SSH (`git@HOST:OWNER/REPO.git`) or
@@ -25,11 +38,7 @@ pub(crate) fn detect_remote_host(expected_slug: Option<&str>) -> Option<String> 
             return None;
         }
     }
-    if host == "github.com" {
-        None
-    } else {
-        Some(host.to_owned())
-    }
+    hostname_from_host(host)
 }
 
 /// Parse `(host, owner/repo)` from an SSH or HTTPS git remote URL.

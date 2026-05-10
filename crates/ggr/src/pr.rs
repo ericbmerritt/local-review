@@ -17,15 +17,17 @@ pub(crate) fn strip_controls(s: &str) -> String {
     s.chars().filter(|c| !c.is_control()).collect()
 }
 
-/// Validate a single path/hostname segment: non-empty, no `..`, only
-/// alphanumeric and separator chars (`-`, `_`, `.`), at least one alphanumeric.
+/// Validate a single path/hostname segment: non-empty, no `..`, no leading or
+/// trailing dot, only alphanumeric and separator chars (`-`, `_`, `.`), at
+/// least one alphanumeric.
 ///
 /// Used by both [`RepoName::try_from`] for owner/repo segments and by
-/// `pr_ref::extract_host` for hostname validation (hostname character rules
-/// match repo-segment rules).
+/// `pr_ref::extract_host` for hostname validation.
 pub(crate) fn valid_segment(seg: &str) -> bool {
     !seg.is_empty()
         && !seg.contains("..")
+        && !seg.starts_with('.')
+        && !seg.ends_with('.')
         && seg
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
@@ -356,6 +358,31 @@ mod tests {
     #[test]
     fn validate_repo_name_accepts_trailing_hyphen() {
         assert!(RepoName::try_from("owner/repo-").is_ok());
+    }
+
+    #[test]
+    fn validate_repo_name_rejects_leading_dot_owner() {
+        assert!(RepoName::try_from(".owner/repo").is_err());
+    }
+
+    #[test]
+    fn validate_repo_name_rejects_trailing_dot_owner() {
+        assert!(RepoName::try_from("owner./repo").is_err());
+    }
+
+    #[test]
+    fn validate_repo_name_rejects_leading_dot_repo() {
+        assert!(RepoName::try_from("owner/.repo").is_err());
+    }
+
+    #[test]
+    fn validate_repo_name_rejects_trailing_dot_repo() {
+        assert!(RepoName::try_from("owner/repo.").is_err());
+    }
+
+    #[test]
+    fn validate_repo_name_accepts_internal_dot() {
+        assert!(RepoName::try_from("my.org/my.repo").is_ok());
     }
 
     #[test]

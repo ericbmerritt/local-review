@@ -17,7 +17,8 @@ use snafu::IntoError as _;
 
 use crate::error::{GgrError, GhFailedSnafu, GhMissingSnafu, Result};
 use crate::pr::{
-    CommitEntry, CommitSha, PrComment, PrDetails, RepoName, ReviewThread, ThreadComment,
+    strip_controls, CommitEntry, CommitSha, PrComment, PrDetails, RepoName, ReviewThread,
+    ThreadComment,
 };
 
 // ── gh JSON shapes ────────────────────────────────────────────────────────────
@@ -88,13 +89,16 @@ pub(crate) fn fetch_pr_details(
         args.push(host);
     }
 
+    // Inline subprocess rather than run_gh: only here can we inspect gh's exit
+    // code and stderr to distinguish PrNotFound from RepoNotFound.  run_gh
+    // collapses all non-zero exits to GhFailed, losing that discrimination.
     let output = Command::new("gh")
         .args(&args)
         .output()
         .map_err(|source| GhMissingSnafu.into_error(source))?;
 
     if !output.status.success() {
-        let message = String::from_utf8_lossy(&output.stderr).into_owned();
+        let message = strip_controls(&String::from_utf8_lossy(&output.stderr));
         let exit_code = output.status.code();
         let msg_lower = message.to_lowercase();
         if msg_lower.contains("could not resolve to a repository") {
@@ -157,24 +161,20 @@ pub(crate) fn fetch_pr_details(
 /// Run `gh <args>` and return stdout as UTF-8.
 ///
 /// Returns `Err` if the binary is missing, the process exits non-zero, or the
-/// output is not valid UTF-8.  `fetch_pr_details` is intentionally excluded:
-/// it inspects `stderr` to distinguish `PrNotFound` from `RepoNotFound`.
-/// Using this helper there would collapse both into `GhFailed`, losing the
-/// distinction.
+/// output is not valid UTF-8. stderr is stripped of control characters before
+/// inclusion in error values to prevent terminal injection via hostile server error messages.
 fn run_gh(args: &[&str]) -> Result<String> {
     let output = Command::new("gh")
         .args(args)
         .output()
         .map_err(|source| GhMissingSnafu.into_error(source))?;
     if !output.status.success() {
-        let message = String::from_utf8_lossy(&output.stderr).into_owned();
+        let message = strip_controls(&String::from_utf8_lossy(&output.stderr));
         let exit_code = output.status.code();
         return GhFailedSnafu { message, exit_code }.fail();
     }
     String::from_utf8(output.stdout).map_err(|source| GgrError::GhOutputEncoding { source })
 }
-
-// ── public API (continued) ────────────────────────────────────────────────────
 
 /// Fetch the diff for a single commit via the GitHub API.
 ///
@@ -348,8 +348,10 @@ mod tests {
             id,
             path: String::new(),
             position: None,
-            // Replies carry original_commit_id in the GitHub API response, but
-            // group_review_comments only validates it for root comments; any string is fine here.
+            // Replies carry original_commit_id in the API response but it is not
+            // structurally meaningful: the field anchors root comments to a diff
+            // position; group_review_comments skips SHA validation for replies, so
+            // any string (including empty) is valid here.
             original_commit_id: String::new(),
             in_reply_to_id: Some(parent_id),
             user: CommentAuthorJson {
