@@ -83,6 +83,10 @@ pub(crate) fn fetch_pr_details(
         args.push("--repo");
         args.push(r);
     }
+    if let Some(host) = hostname {
+        args.push("--hostname");
+        args.push(host);
+    }
 
     let output = Command::new("gh")
         .args(&args)
@@ -148,6 +152,30 @@ pub(crate) fn fetch_pr_details(
     })
 }
 
+// ── private subprocess helper ─────────────────────────────────────────────────
+
+/// Run `gh <args>` and return stdout as UTF-8.
+///
+/// Returns `Err` if the binary is missing, the process exits non-zero, or the
+/// output is not valid UTF-8.  `fetch_pr_details` is intentionally excluded:
+/// it inspects `stderr` to distinguish `PrNotFound` from `RepoNotFound`.
+/// Using this helper there would collapse both into `GhFailed`, losing the
+/// distinction.
+fn run_gh(args: &[&str]) -> Result<String> {
+    let output = Command::new("gh")
+        .args(args)
+        .output()
+        .map_err(|source| GhMissingSnafu.into_error(source))?;
+    if !output.status.success() {
+        let message = String::from_utf8_lossy(&output.stderr).into_owned();
+        let exit_code = output.status.code();
+        return GhFailedSnafu { message, exit_code }.fail();
+    }
+    String::from_utf8(output.stdout).map_err(|source| GgrError::GhOutputEncoding { source })
+}
+
+// ── public API (continued) ────────────────────────────────────────────────────
+
 /// Fetch the diff for a single commit via the GitHub API.
 ///
 /// Uses `gh api repos/{repo_name}/commits/{sha}` with
@@ -171,20 +199,7 @@ pub(crate) fn fetch_commit_diff(
         args.push("--hostname");
         args.push(host);
     }
-    let output = Command::new("gh")
-        .args(&args)
-        .output()
-        .map_err(|source| GhMissingSnafu.into_error(source))?;
-
-    if !output.status.success() {
-        let message = String::from_utf8_lossy(&output.stderr).into_owned();
-        let exit_code = output.status.code();
-        return GhFailedSnafu { message, exit_code }.fail();
-    }
-
-    let raw =
-        String::from_utf8(output.stdout).map_err(|source| GgrError::GhOutputEncoding { source })?;
-
+    let raw = run_gh(&args)?;
     local_review_core::diff::parse(&raw).map_err(GgrError::from)
 }
 
@@ -226,13 +241,14 @@ struct RawReviewComment {
 /// The returned `Vec` preserves the order of root comments as they appeared in
 /// the input array.  Replies within each thread are appended in input order
 /// (GitHub already returns them chronologically).
-fn group_review_comments(raw: Vec<RawReviewComment>) -> Vec<ReviewThread> {
+fn group_review_comments(raw: Vec<RawReviewComment>) -> Result<Vec<ReviewThread>> {
     let mut threads: Vec<ReviewThread> = Vec::new();
     let mut root_index: HashMap<u64, usize> = HashMap::new();
 
     for comment in raw {
         match comment.in_reply_to_id {
             None => {
+                let original_commit_id = CommitSha::try_from(comment.original_commit_id.as_str())?;
                 let root = ThreadComment {
                     id: comment.id,
                     author: comment.user.login,
@@ -242,7 +258,7 @@ fn group_review_comments(raw: Vec<RawReviewComment>) -> Vec<ReviewThread> {
                 let thread = ReviewThread {
                     path: comment.path,
                     position: comment.position,
-                    original_commit_id: comment.original_commit_id,
+                    original_commit_id,
                     root,
                     replies: vec![],
                 };
@@ -263,10 +279,8 @@ fn group_review_comments(raw: Vec<RawReviewComment>) -> Vec<ReviewThread> {
         }
     }
 
-    threads
+    Ok(threads)
 }
-
-// ── public API (continued) ────────────────────────────────────────────────────
 
 /// Fetch and group inline review threads for a pull request via `gh`.
 ///
@@ -292,19 +306,7 @@ pub(crate) fn fetch_review_threads(
         args.push(host);
     }
 
-    let output = Command::new("gh")
-        .args(&args)
-        .output()
-        .map_err(|source| GhMissingSnafu.into_error(source))?;
-
-    if !output.status.success() {
-        let message = String::from_utf8_lossy(&output.stderr).into_owned();
-        let exit_code = output.status.code();
-        return GhFailedSnafu { message, exit_code }.fail();
-    }
-
-    let raw =
-        String::from_utf8(output.stdout).map_err(|source| GgrError::GhOutputEncoding { source })?;
+    let raw = run_gh(&args)?;
 
     let comments: Vec<RawReviewComment> = {
         let mut all: Vec<RawReviewComment> = Vec::new();
@@ -317,7 +319,7 @@ pub(crate) fn fetch_review_threads(
         all
     };
 
-    Ok(group_review_comments(comments))
+    group_review_comments(comments)
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
@@ -331,7 +333,7 @@ mod tests {
             id,
             path: path.to_owned(),
             position,
-            original_commit_id: format!("deadbeef{id:08x}"),
+            original_commit_id: format!("{id:040x}"),
             in_reply_to_id: None,
             user: CommentAuthorJson {
                 login: format!("user{id}"),
@@ -346,6 +348,8 @@ mod tests {
             id,
             path: String::new(),
             position: None,
+            // Replies carry original_commit_id in the GitHub API response, but
+            // group_review_comments only validates it for root comments; any string is fine here.
             original_commit_id: String::new(),
             in_reply_to_id: Some(parent_id),
             user: CommentAuthorJson {
@@ -358,13 +362,13 @@ mod tests {
 
     #[test]
     fn empty_input_produces_empty_output() {
-        let threads = group_review_comments(vec![]);
+        let threads = group_review_comments(vec![]).unwrap();
         assert!(threads.is_empty());
     }
 
     #[test]
     fn single_root_no_replies_produces_one_thread() {
-        let threads = group_review_comments(vec![make_root(1, "src/lib.rs", Some(5))]);
+        let threads = group_review_comments(vec![make_root(1, "src/lib.rs", Some(5))]).unwrap();
         assert_eq!(threads.len(), 1);
         assert_eq!(threads[0].root.body, "root comment 1");
         assert!(threads[0].replies.is_empty());
@@ -377,7 +381,7 @@ mod tests {
             make_reply(2, 1),
             make_reply(3, 1),
         ];
-        let threads = group_review_comments(raw);
+        let threads = group_review_comments(raw).unwrap();
         assert_eq!(threads.len(), 1);
         assert_eq!(threads[0].root.body, "root comment 1");
         assert_eq!(threads[0].replies.len(), 2);
@@ -393,7 +397,7 @@ mod tests {
             make_reply(11, 10),
             make_reply(21, 20),
         ];
-        let threads = group_review_comments(raw);
+        let threads = group_review_comments(raw).unwrap();
         assert_eq!(threads.len(), 2);
         assert_eq!(threads[0].root.body, "root comment 10");
         assert_eq!(threads[0].replies.len(), 1);
@@ -405,14 +409,17 @@ mod tests {
 
     #[test]
     fn thread_path_and_commit_id_preserved() {
-        let threads = group_review_comments(vec![make_root(1, "src/lib.rs", Some(5))]);
+        let threads = group_review_comments(vec![make_root(1, "src/lib.rs", Some(5))]).unwrap();
         assert_eq!(threads[0].path, "src/lib.rs");
-        assert_eq!(threads[0].original_commit_id, "deadbeef00000001");
+        assert_eq!(
+            threads[0].original_commit_id.as_str(),
+            "0000000000000000000000000000000000000001"
+        );
     }
 
     #[test]
     fn null_position_thread_is_outdated() {
-        let threads = group_review_comments(vec![make_root(1, "src/main.rs", None)]);
+        let threads = group_review_comments(vec![make_root(1, "src/main.rs", None)]).unwrap();
         assert_eq!(threads.len(), 1);
         assert!(threads[0].position.is_none());
         assert!(threads[0].is_outdated());
@@ -420,7 +427,7 @@ mod tests {
 
     #[test]
     fn some_position_thread_is_not_outdated() {
-        let threads = group_review_comments(vec![make_root(1, "src/main.rs", Some(7))]);
+        let threads = group_review_comments(vec![make_root(1, "src/main.rs", Some(7))]).unwrap();
         assert_eq!(threads.len(), 1);
         assert!(threads[0].position.is_some());
         assert!(!threads[0].is_outdated());
@@ -429,7 +436,7 @@ mod tests {
     #[test]
     fn orphan_reply_is_skipped_gracefully() {
         let raw = vec![make_root(1, "src/lib.rs", Some(2)), make_reply(2, 999)];
-        let threads = group_review_comments(raw);
+        let threads = group_review_comments(raw).unwrap();
         assert_eq!(threads.len(), 1);
         assert!(
             threads[0].replies.is_empty(),
@@ -438,9 +445,46 @@ mod tests {
     }
 
     #[test]
+    fn root_with_invalid_sha_returns_err() {
+        let raw = vec![RawReviewComment {
+            id: 1,
+            path: "src/lib.rs".to_owned(),
+            position: Some(1),
+            original_commit_id: "bad_sha".to_owned(),
+            in_reply_to_id: None,
+            user: CommentAuthorJson {
+                login: "user1".to_owned(),
+            },
+            created_at: "2024-01-01T00:00:00Z".to_owned(),
+            body: "comment".to_owned(),
+        }];
+        assert!(group_review_comments(raw).is_err());
+    }
+
+    #[test]
+    fn group_review_comments_returns_err_for_invalid_sha_on_second_root() {
+        let raw = vec![
+            make_root(1, "src/lib.rs", Some(1)),
+            RawReviewComment {
+                id: 2,
+                path: "src/main.rs".to_owned(),
+                position: Some(2),
+                original_commit_id: "bad_sha".to_owned(),
+                in_reply_to_id: None,
+                user: CommentAuthorJson {
+                    login: "user2".to_owned(),
+                },
+                created_at: "2024-01-02T00:00:00Z".to_owned(),
+                body: "second root".to_owned(),
+            },
+        ];
+        assert!(group_review_comments(raw).is_err());
+    }
+
+    #[test]
     fn reply_before_root_is_treated_as_orphan() {
         let raw = vec![make_reply(2, 1), make_root(1, "src/lib.rs", Some(3))];
-        let threads = group_review_comments(raw);
+        let threads = group_review_comments(raw).unwrap();
         assert_eq!(threads.len(), 1, "root creates one thread");
         assert!(
             threads[0].replies.is_empty(),
@@ -448,5 +492,47 @@ mod tests {
         );
         assert_eq!(threads[0].root.body, "root comment 1");
         assert_eq!(threads[0].path, "src/lib.rs");
+    }
+
+    #[test]
+    fn control_char_created_at_survives_into_thread_comment() {
+        let raw = vec![RawReviewComment {
+            created_at: "2024-01-01T\x1b[1m10:30:00Z".to_owned(),
+            ..make_root(1, "src/lib.rs", Some(1))
+        }];
+        let threads = group_review_comments(raw).unwrap();
+        assert!(
+            threads[0].root.created_at.contains('\x1b'),
+            "control character must survive unmodified; stripping is the renderer's responsibility"
+        );
+    }
+
+    #[test]
+    fn control_char_created_at_in_reply_survives_into_thread_comment() {
+        let raw = vec![
+            make_root(1, "src/lib.rs", Some(1)),
+            RawReviewComment {
+                created_at: "2024-01-02T\x1b[1m10:30:00Z".to_owned(),
+                ..make_reply(2, 1)
+            },
+        ];
+        let threads = group_review_comments(raw).unwrap();
+        assert!(
+            threads[0].replies[0].created_at.contains('\x1b'),
+            "control character must survive in reply created_at; stripping is the renderer's responsibility"
+        );
+    }
+
+    #[test]
+    fn reply_with_invalid_sha_is_not_validated() {
+        let raw = vec![
+            make_root(1, "src/lib.rs", Some(1)),
+            RawReviewComment {
+                original_commit_id: "bad_sha_not_validated".to_owned(),
+                ..make_reply(2, 1)
+            },
+        ];
+        let threads = group_review_comments(raw).unwrap();
+        assert_eq!(threads[0].replies.len(), 1);
     }
 }
