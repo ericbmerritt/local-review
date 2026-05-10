@@ -4,12 +4,10 @@
 //! Adds a `build_entries` adapter that accepts jjr `Comment` slices and computes
 //! the per-view comment counts needed by the core version.
 
-pub(super) use local_review_core::tui::file_picker::{
-    move_cursor, render, FilePickerEntry, FilePickerState,
-};
+pub(super) use local_review_core::tui::file_picker::FilePickerEntry;
 #[cfg(test)]
 pub(super) use local_review_core::tui::file_picker::{
-    reviewed_indicator_text, truncate_path_for_width,
+    move_cursor, render, reviewed_indicator_text, truncate_path_for_width, FilePickerState,
 };
 
 use crate::comment::{Anchor, Comment, Status};
@@ -21,10 +19,14 @@ use std::path::Path;
 /// Computes the number of active (non-stale, non-orphaned) comments for each
 /// view index (0 = description, 1..N = diff file N-1) and delegates to the
 /// core's `build_entries` closure-based API.
+///
+/// `first_commentable_for_view` returns the first commentable row index for
+/// each view index; pass `&|_| 0` when not needed.
 pub(super) fn build_entries(
     files: &[DiffFile],
     comments: &[Comment],
     is_reviewed: &dyn Fn(usize) -> bool,
+    first_commentable_for_view: &dyn Fn(usize) -> usize,
 ) -> Vec<FilePickerEntry> {
     let description_count = count_description_comments(comments);
     let file_paths: Vec<_> = files.iter().map(|f| f.display_path().to_owned()).collect();
@@ -42,6 +44,7 @@ pub(super) fn build_entries(
             }
         },
         is_reviewed,
+        first_commentable_for_view,
     )
 }
 
@@ -146,7 +149,7 @@ mod tests {
             make_comment("bar.rs", Some(Status::Pending)),
             make_comment("foo.rs", Some(Status::Stale)),
         ];
-        let entries = build_entries(&files, &comments, &|_| false);
+        let entries = build_entries(&files, &comments, &|_| false, &|_| 0);
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].display_path, PathBuf::from("<description>"));
         assert_eq!(entries[0].view_index, 0);
@@ -165,21 +168,21 @@ mod tests {
             make_comment("foo.rs", Some(Status::Stale)),
             make_comment("foo.rs", Some(Status::Orphaned)),
         ];
-        let entries = build_entries(&files, &comments, &|_| false);
+        let entries = build_entries(&files, &comments, &|_| false, &|_| 0);
         assert_eq!(entries[1].comment_count, 0);
     }
 
     #[test]
     fn build_entries_empty_comments_all_zero() {
         let files = diff_files();
-        let entries = build_entries(&files, &[], &|_| false);
+        let entries = build_entries(&files, &[], &|_| false, &|_| 0);
         assert!(entries.iter().all(|e| e.comment_count == 0));
     }
 
     #[test]
     fn build_entries_reviewed_flag_propagates_per_view_index() {
         let files = diff_files();
-        let entries = build_entries(&files, &[], &|view_idx| view_idx == 1);
+        let entries = build_entries(&files, &[], &|view_idx| view_idx == 1, &|_| 0);
         assert!(!entries[0].reviewed, "description must be unreviewed");
         assert!(entries[1].reviewed, "foo.rs must be reviewed");
         assert!(!entries[2].reviewed, "bar.rs must be unreviewed");
@@ -188,7 +191,7 @@ mod tests {
     #[test]
     fn build_entries_view_indices_start_at_zero_for_description() {
         let files = diff_files();
-        let entries = build_entries(&files, &[], &|_| false);
+        let entries = build_entries(&files, &[], &|_| false, &|_| 0);
         assert_eq!(entries[0].view_index, 0);
         for (i, entry) in entries[1..].iter().enumerate() {
             assert_eq!(entry.view_index, i + 1);
@@ -220,7 +223,7 @@ mod tests {
         let mut state = FilePickerState {
             selected_index: 0,
             scroll_offset: 0,
-            entries: build_entries(&files, &[], &|_| false),
+            entries: build_entries(&files, &[], &|_| false, &|_| 0),
         };
         move_cursor(&mut state, 1);
         assert_eq!(state.selected_index, 1);
@@ -232,7 +235,7 @@ mod tests {
         let mut state = FilePickerState {
             selected_index: 0,
             scroll_offset: 0,
-            entries: build_entries(&files, &[], &|_| false),
+            entries: build_entries(&files, &[], &|_| false, &|_| 0),
         };
         move_cursor(&mut state, -1);
         assert_eq!(state.selected_index, 0);
@@ -241,7 +244,7 @@ mod tests {
     #[test]
     fn move_cursor_down_clamps_at_last() {
         let files = diff_files();
-        let entries = build_entries(&files, &[], &|_| false);
+        let entries = build_entries(&files, &[], &|_| false, &|_| 0);
         let entry_count = entries.len();
         let mut state = FilePickerState {
             selected_index: entry_count - 1,
@@ -269,6 +272,8 @@ mod tests {
                 view_index: i,
                 comment_count: 0,
                 reviewed: false,
+                is_binary: false,
+                first_commentable_row: 0,
             })
             .collect();
         FilePickerState {
@@ -394,7 +399,7 @@ mod tests {
     fn build_entries_comment_count_for_oob_view_index_returns_zero() {
         let files = diff_files();
         let comments = vec![make_comment("foo.rs", Some(Status::Pending))];
-        let entries = build_entries(&files, &comments, &|_| false);
+        let entries = build_entries(&files, &comments, &|_| false, &|_| 0);
         assert!(
             entries.iter().all(|e| e.comment_count <= 1),
             "no panic and counts within expected range even for unusual inputs"

@@ -9,6 +9,7 @@
 //! The `tui.rs` + `tui/` layout (no `mod.rs`) is required by the workspace's
 //! `mod_module_files = "deny"` / `self_named_module_files = "allow"` policy.
 
+pub mod app;
 pub mod composer;
 pub mod composer_overlay;
 pub mod diff_view;
@@ -16,6 +17,11 @@ pub mod file_picker;
 pub mod help_screen;
 pub mod textarea;
 
+pub use app::{
+    run_app, App, AppError, BaseViews, DiffMode, Edge, EffectiveDiffMode, ExtraScreenContext,
+    ReviewSurfaceExt, TransitionMode, TransitionState, MIN_COLS, MIN_ROWS,
+    SIDE_BY_SIDE_GUTTER_WIDTH, SIDE_BY_SIDE_MIN_WIDTH,
+};
 pub use diff_view::{DiffView, InlineComment, PairedRow, RenderedLine, RenderedLineKind};
 pub use file_picker::{FilePickerEntry, FilePickerState};
 
@@ -263,6 +269,19 @@ pub trait ReviewSurface: Sized {
         severity_filter: Option<Severity>,
     ) -> Vec<InlineComment>;
 
+    /// Return comments to append to the END of view `view_idx`, outside any
+    /// hunk context. The default implementation returns an empty slice.
+    ///
+    /// Used by jjr for change-scope comments that appear at the bottom of the
+    /// description view rather than anchored to a specific line.
+    fn appended_comments_for_view(
+        &self,
+        _view_idx: usize,
+        _severity_filter: Option<Severity>,
+    ) -> Vec<InlineComment> {
+        Vec::new()
+    }
+
     // ------------------------------------------------------------------
     // Comment persistence (composer hooks)
     // ------------------------------------------------------------------
@@ -300,8 +319,10 @@ pub trait ReviewSurface: Sized {
 
     /// Toggle the reviewed bit for view `view_idx`. Used by the `U` keybind.
     ///
-    /// Returns the new state so the caller can surface the appropriate toast.
-    fn toggle_view_reviewed(&mut self, view_idx: usize) -> bool;
+    /// Returns a [`ReviewedOutcome`] so the caller can surface the appropriate
+    /// toast, including the case where the reviewed state was reset due to a
+    /// commit mismatch before being re-marked.
+    fn toggle_view_reviewed(&mut self, view_idx: usize) -> ReviewedOutcome;
 
     // ------------------------------------------------------------------
     // Severity histogram (used by transition modal and stack overview)
@@ -328,20 +349,70 @@ pub trait ReviewSurface: Sized {
     ) -> Result<ExtraKeyAction, Self::Error>;
 
     /// Render the extra screen. Called when `app.screen` is `Screen::Extra`.
-    fn render_extra_screen(&self, frame: &mut Frame<'_>, state: &dyn ExtraScreen);
+    fn render_extra_screen(&self, frame: &mut Frame<'_>, state: &mut dyn ExtraScreen);
 
-    /// Handle a key while the extra screen is open. Return `true` to signal
-    /// that the extra screen should be closed and `Screen::Main` restored.
+    /// Handle a key while the extra screen is open.
+    ///
+    /// Returns an [`ExtraScreenAction`] to tell the core what to do next:
+    /// - `StayOpen` — keep the current screen open.
+    /// - `Close` — close the screen and return to `Screen::Main`.
+    /// - `OpenScreen(state)` — replace the current screen with a new one.
+    ///
+    /// The `ctx` bundle gives mutable access to the core `App` fields the
+    /// surface may need to update (status message, last severity, etc.).
     fn handle_extra_screen_key(
         &mut self,
         state: &mut dyn ExtraScreen,
         key: crossterm::event::KeyEvent,
-    ) -> Result<bool, Self::Error>;
+        ctx: &mut ExtraScreenContext<'_>,
+    ) -> Result<ExtraScreenAction, Self::Error>;
+
+    /// Return the file-picker entries for the currently loaded entry.
+    ///
+    /// Called by the core when the user presses `f`. The surface builds the
+    /// list from its loaded diff + comment state.
+    fn file_picker_entries(&self) -> Vec<FilePickerEntry>;
+
+    /// Title shown in the `?` help screen. Each surface supplies its own
+    /// tool name so the generic core does not hard-code "jjr".
+    fn help_screen_title(&self) -> &'static str;
 }
 
 /// Opaque extra-screen state owned by the core `App` but whose type is only
 /// known to the surface implementation.
-pub trait ExtraScreen: Send + 'static {}
+///
+/// The `as_any` / `as_any_mut` methods allow the surface's
+/// `render_extra_screen` and `handle_extra_screen_key` implementations to
+/// downcast `&dyn ExtraScreen` to a concrete wrapper type.
+pub trait ExtraScreen: Send + 'static {
+    /// When `true` the core renders the main diff view first, then calls
+    /// [`ReviewSurface::render_extra_screen`] to draw the overlay on top.
+    /// When `false` (the default) the extra screen replaces the main view
+    /// entirely.
+    fn is_overlay(&self) -> bool {
+        false
+    }
+
+    /// Upcast to `&dyn Any` for downcasting to the concrete wrapper type.
+    fn as_any(&self) -> &dyn std::any::Any;
+
+    /// Upcast to `&mut dyn Any` for downcasting to the concrete wrapper type.
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
+}
+
+/// Action returned by [`ReviewSurface::handle_extra_screen_key`].
+///
+/// Richer than a plain `bool` so the surface can close its current screen and
+/// immediately open a different one (e.g. overview → composer) in a single
+/// round-trip.
+pub enum ExtraScreenAction {
+    /// Keep the current extra screen open.
+    StayOpen,
+    /// Close the extra screen and return to `Screen::Main`.
+    Close,
+    /// Close the current extra screen and open `state` in its place.
+    OpenScreen(Box<dyn ExtraScreen>),
+}
 
 /// Action returned by [`ReviewSurface::handle_extra_key`].
 pub enum ExtraKeyAction {
@@ -353,6 +424,26 @@ pub enum ExtraKeyAction {
     StatusMessage(String),
     /// Quit the application.
     Quit,
+}
+
+/// Opaque identity key for a comment record.
+///
+/// Wraps the `created_at` timestamp that serves as the comment's primary key.
+/// Using a newtype prevents accidental interchange with arbitrary
+/// `OffsetDateTime` values and makes intent explicit at call sites.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommentId(time::OffsetDateTime);
+
+impl CommentId {
+    /// Construct a `CommentId` from an `OffsetDateTime`.
+    pub fn new(t: time::OffsetDateTime) -> Self {
+        Self(t)
+    }
+
+    /// Extract the underlying `OffsetDateTime`.
+    pub fn as_offset_date_time(self) -> time::OffsetDateTime {
+        self.0
+    }
 }
 
 /// Request bundle passed to [`ReviewSurface::save_comment`].
@@ -369,8 +460,8 @@ pub struct SaveRequest<'a> {
 
 /// Request bundle passed to [`ReviewSurface::update_comment`].
 pub struct UpdateRequest<'a> {
-    /// Opaque timestamp key identifying the comment record to update.
-    pub identity: time::OffsetDateTime,
+    /// Opaque key identifying the comment record to update.
+    pub identity: CommentId,
     /// New body text.
     pub body: &'a str,
     /// New severity.
@@ -381,8 +472,8 @@ pub struct UpdateRequest<'a> {
 
 /// Request bundle passed to [`ReviewSurface::delete_comment`].
 pub struct DeleteRequest {
-    /// Opaque timestamp key identifying the comment record to delete.
-    pub identity: time::OffsetDateTime,
+    /// Opaque key identifying the comment record to delete.
+    pub identity: CommentId,
     /// The `comment_index` carried by the focused `RenderedLineKind::InlineCommentMeta`
     /// row, so the surface can look the record up in its loaded list. `None`
     /// when the composer was opened outside the main-view inline list (e.g.
@@ -393,7 +484,7 @@ pub struct DeleteRequest {
 
 impl DeleteRequest {
     #[must_use]
-    pub fn new(identity: time::OffsetDateTime, comment_index: Option<usize>) -> Self {
+    pub fn new(identity: CommentId, comment_index: Option<usize>) -> Self {
         Self {
             identity,
             comment_index,
@@ -420,6 +511,21 @@ pub enum MarkReviewedOutcome {
     /// The stored commit id no longer matched (change was amended/rebased).
     /// The previous reviewed bits were cleared.
     ResetDueToCommitMismatch,
+}
+
+/// Outcome returned by [`ReviewSurface::toggle_view_reviewed`].
+///
+/// Carries enough information for the core to surface the right status message:
+/// normal mark/unmark vs. the case where the reviewed state was reset first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewedOutcome {
+    /// The view was not previously reviewed; it is now marked reviewed.
+    Marked,
+    /// The view was previously reviewed; it is now marked unreviewed.
+    Unmarked,
+    /// The stored commit id no longer matched (change was amended/rebased);
+    /// the prior reviewed bits were cleared and the view was then marked reviewed.
+    ResetAndMarked,
 }
 
 /// Comment counts by severity for the currently loaded entry.

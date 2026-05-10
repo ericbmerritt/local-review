@@ -32,6 +32,8 @@ pub(crate) fn load_agent_config() -> AgentConfig {
         return AgentConfig::default();
     };
 
+    // Assumes same-uid ownership; trust relies on this file living under the
+    // user's home directory, not shared or arbitrary paths — not verified at runtime.
     let tool = agent
         .get("tool")
         .and_then(toml::Value::as_str)

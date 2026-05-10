@@ -30,6 +30,7 @@ pub mod error;
 pub mod revset_hash;
 pub mod severity;
 pub mod tui;
+pub mod util;
 
 pub use anchoring::{match_anchor, match_description_anchor, AnchorOutcome};
 pub use change_id::{ChangeId, CommitId};

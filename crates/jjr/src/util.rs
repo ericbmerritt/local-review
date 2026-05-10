@@ -7,39 +7,10 @@ pub fn confirm_response(input: &str) -> bool {
     matches!(input.trim().to_lowercase().as_str(), "y" | "yes")
 }
 
-/// Clamp `value + delta` to `[0, max]`, saturating at each bound.
-pub(crate) fn clamp_with_delta(value: usize, delta: isize, max: usize) -> usize {
-    let signed_value: isize = isize::try_from(value).unwrap_or(isize::MAX);
-    let target = signed_value.saturating_add(delta);
-    if target <= 0 {
-        0
-    } else {
-        let unsigned: usize = usize::try_from(target).unwrap_or(0);
-        unsigned.min(max)
-    }
-}
-
-/// Number of lines to scroll for a page movement given the current viewport height.
-pub(crate) fn page_size(viewport_rows: u16) -> usize {
-    usize::from(viewport_rows.saturating_sub(1)).max(1)
-}
-
-/// Truncate `input` to at most `max` characters, appending `…` if truncated.
-///
-/// When `max == 0` returns an empty string — the ellipsis itself would
-/// overflow the budget. Callers that want a non-empty indicator at zero
-/// budget must allocate at least one column.
-pub(crate) fn truncate(input: &str, max: usize) -> String {
-    if max == 0 {
-        return String::new();
-    }
-    if input.chars().count() <= max {
-        return input.to_owned();
-    }
-    let mut result: String = input.chars().take(max.saturating_sub(1)).collect();
-    result.push('…');
-    result
-}
+pub use local_review_core::util::pluralize;
+pub(crate) use local_review_core::util::truncate;
+#[cfg(test)]
+pub(crate) use local_review_core::util::{clamp_with_delta, page_size};
 
 /// Emit a `warning: <msg>` line to stderr, locked for the duration of the
 /// write so concurrent calls do not interleave. Mirrors `store.rs`'s prior
@@ -164,17 +135,6 @@ fn find_repo_root_from(start: &std::path::Path) -> crate::error::Result<std::pat
                 });
             }
         }
-    }
-}
-
-/// Append `s` to `word` when `count != 1`. English plurals only; deliberately
-/// simple — the only words this serves are short, regular nouns ("comment",
-/// "change", "suggestion", "note").
-pub fn pluralize(word: &str, count: usize) -> String {
-    if count == 1 {
-        word.to_owned()
-    } else {
-        format!("{word}s")
     }
 }
 
