@@ -1,5 +1,54 @@
 //! Shared layout and navigation helpers.
+use std::path::{Path, PathBuf};
 use std::process::Command;
+
+/// Canonical data directory for a specific PR under `base`.
+///
+/// Segments that fail [`crate::pr::valid_segment`] fall back to safe
+/// placeholders so crafted hostnames or repo slugs cannot escape `base`.
+pub(crate) fn pr_data_dir(
+    base: &Path,
+    host: &str,
+    owner: &str,
+    repo: &str,
+    pr_number: u64,
+) -> PathBuf {
+    let host_seg = if crate::pr::valid_segment(host) {
+        host
+    } else {
+        "github.com"
+    };
+    let owner_seg = if crate::pr::valid_segment(owner) {
+        owner
+    } else {
+        "_invalid"
+    };
+    let repo_seg = if crate::pr::valid_segment(repo) {
+        repo
+    } else {
+        "_invalid"
+    };
+    base.join("ggr")
+        .join(host_seg)
+        .join(owner_seg)
+        .join(repo_seg)
+        .join(pr_number.to_string())
+}
+
+/// Shared by `cursor` and `draft` modules; centralised here so XDG lookup
+/// logic is not duplicated across two storage paths.
+pub(crate) fn data_home() -> Option<PathBuf> {
+    std::env::var("XDG_DATA_HOME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(|h| PathBuf::from(h).join(".local").join("share"))
+        })
+}
 
 /// Normalise a hostname: return `None` for `github.com` (no override needed),
 /// `Some(host.to_owned())` for any other host.

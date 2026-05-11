@@ -7,6 +7,7 @@
 //!   `ggr https://github.example.com/owner/repo/pull/2429`  — full pull URL
 
 mod cursor;
+mod draft;
 mod error;
 mod gh;
 mod pr;

@@ -28,17 +28,7 @@ pub(crate) struct CursorState {
 /// Returns `None` when neither `$XDG_DATA_HOME` nor `$HOME` is set, which is
 /// vanishingly rare but must not panic.
 pub(crate) fn cursor_path(pr: &PrDetails) -> Option<PathBuf> {
-    let data_home = std::env::var("XDG_DATA_HOME")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var("HOME")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .map(|h| PathBuf::from(h).join(".local").join("share"))
-        })?;
-
+    let data_home = crate::util::data_home()?;
     Some(cursor_path_from_base(&data_home, pr))
 }
 
@@ -48,23 +38,10 @@ pub(crate) fn cursor_path(pr: &PrDetails) -> Option<PathBuf> {
 /// environment variables.
 fn cursor_path_from_base(data_home: &Path, pr: &PrDetails) -> PathBuf {
     let host = pr.hostname.as_deref().unwrap_or("github.com");
-    // Guard against unvalidated hostnames from git-remote detection; fall back to
-    // the public github.com path so a crafted remote cannot escape XDG_DATA_HOME.
-    let host = if crate::pr::valid_segment(host) {
-        host
-    } else {
-        "github.com"
-    };
     let repo = pr.repo_name.as_str();
-    // RepoName enforces owner/repo at construction; split is infallible.
+    // RepoName guarantees owner/repo format at construction; the fallback is unreachable in practice.
     let (owner, repo_slug) = repo.split_once('/').unwrap_or(("", repo));
-    data_home
-        .join("ggr")
-        .join(host)
-        .join(owner)
-        .join(repo_slug)
-        .join(pr.number.to_string())
-        .join("cursor.json")
+    crate::util::pr_data_dir(data_home, host, owner, repo_slug, pr.number).join("cursor.json")
 }
 
 /// Load a saved cursor from `path`. Returns `None` on any failure so the
