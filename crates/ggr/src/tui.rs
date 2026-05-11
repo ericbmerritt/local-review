@@ -11,12 +11,22 @@ use crossterm::terminal::{
 use ratatui::backend::CrosstermBackend;
 use ratatui::{Frame, Terminal};
 
+use local_review_core::change_id::ChangeId;
+use local_review_core::comment::Side;
+use local_review_core::revset_hash::RevsetHash;
+use local_review_core::tui::composer::{
+    handle_composer_key, Composer, ComposerAction, ComposerInit, ComposerScope, LineTarget,
+    StackContextSnapshot,
+};
+use local_review_core::tui::composer_overlay;
 use local_review_core::tui::diff_view::InlineComment;
+use local_review_core::tui::try_downcast_mut;
 use local_review_core::tui::{
-    file_picker, run_app as core_run_app, App, AppError, DeleteOutcome, DeleteRequest, DiffView,
-    ExtraKeyAction, ExtraScreen, ExtraScreenAction, ExtraScreenContext, FilePickerEntry,
-    MarkReviewedOutcome, ReviewSurface, ReviewSurfaceExt, ReviewedOutcome, SaveOutcome,
-    SaveRequest, SeverityHistogram, TransitionMode, UpdateRequest, MIN_COLS, MIN_ROWS,
+    collect_context, file_picker, run_app as core_run_app, App, AppError, CommentId, CommentIndex,
+    ComposerScreen, DeleteOutcome, DeleteRequest, DiffView, ExtraKeyAction, ExtraScreen,
+    ExtraScreenAction, ExtraScreenContext, FilePickerEntry, MarkReviewedOutcome, RenderedLineKind,
+    ReviewSurface, ReviewSurfaceExt, ReviewedOutcome, SaveOutcome, SaveRequest, SeverityHistogram,
+    TransitionMode, UpdateRequest, MIN_COLS, MIN_ROWS,
 };
 use local_review_core::util::{strip_controls, strip_controls_preserve_newlines};
 use local_review_core::Severity;
@@ -30,6 +40,10 @@ use crate::pr::PrDetails;
 
 const THREADS_EXPANDED_MSG: &str = "threads expanded";
 const THREADS_COLLAPSED_MSG: &str = "threads collapsed";
+
+/// Maximum body size accepted without the "body truncated" warning. 64 KiB
+/// matches the GitHub API limit for review comment bodies.
+const DRAFT_BODY_MAX: usize = 65_536;
 
 // ── GgrSurface ────────────────────────────────────────────────────────────────
 
@@ -65,6 +79,11 @@ pub(crate) struct GgrSurface {
     /// Consumed once by `initial_view_position` so the initial scroll position
     /// is applied exactly once on first render; subsequent calls return `(0, 0)`.
     pending_cursor: Option<(String, usize)>,
+    /// Local draft comments for the currently loaded commit entry.
+    /// Refreshed on each `fetch_views` call and after each save/update/delete.
+    loaded_drafts: Vec<crate::draft::GgrDraft>,
+    /// Last severity used, so new composers default to the same severity.
+    last_severity: Option<Severity>,
 }
 
 impl GgrSurface {
@@ -77,13 +96,15 @@ impl GgrSurface {
         });
         let pending_cursor = pending_initial_index
             .and(initial_cursor)
-            .map(|c| (c.file.clone(), c.line));
+            .map(|c| (strip_controls(&c.file), c.line));
         Self {
             pr,
             state: State::Description,
             threads_expanded: true,
             pending_initial_index,
             pending_cursor,
+            loaded_drafts: Vec::new(),
+            last_severity: None,
         }
     }
 
@@ -130,6 +151,463 @@ impl GgrSurface {
             out.push_str(&strip_controls_preserve_newlines(&c.body));
         }
         out
+    }
+
+    /// Reload `loaded_drafts` from disk for the current commit-diff state.
+    fn reload_drafts(&mut self) {
+        let Some(base) = crate::util::data_home() else {
+            self.loaded_drafts.clear();
+            return;
+        };
+        let State::CommitDiff { index, .. } = &self.state else {
+            self.loaded_drafts.clear();
+            return;
+        };
+        let Some(commit) = self.pr.commits.get(index.wrapping_sub(1)) else {
+            self.loaded_drafts.clear();
+            return;
+        };
+        let host = self.pr.hostname.as_deref().unwrap_or("github.com");
+        let slug = self.pr.repo_name.as_str();
+        let Some((owner, repo)) = slug.split_once('/') else {
+            self.loaded_drafts.clear();
+            return;
+        };
+        let drafts_dir =
+            crate::draft::drafts_dir_from_base(&base, host, owner, repo, self.pr.number);
+
+        let mut all: Vec<crate::draft::GgrDraft> = Vec::new();
+        // Load commit-scope + line-scope drafts for current commit.
+        let commit_file = drafts_dir.join(format!("{}.jsonl", commit.sha.as_str()));
+        match crate::draft::list_drafts(&commit_file) {
+            Ok(ds) => all.extend(ds),
+            Err(e) => {
+                let mut stderr = std::io::stderr().lock();
+                let _ = writeln!(stderr, "ggr: warning: failed to load drafts: {e}");
+            }
+        }
+        // Load PR-scope drafts.
+        let pr_file = drafts_dir.join("_pr.jsonl");
+        match crate::draft::list_drafts(&pr_file) {
+            Ok(ds) => all.extend(ds),
+            Err(e) => {
+                let mut stderr = std::io::stderr().lock();
+                let _ = writeln!(stderr, "ggr: warning: failed to load PR drafts: {e}");
+            }
+        }
+        self.loaded_drafts = all;
+    }
+
+    /// Return the `CommitSha` for the currently-loaded commit entry, or `None` in
+    /// `Description` state.
+    fn current_commit_sha(&self) -> Option<&crate::pr::CommitSha> {
+        let State::CommitDiff { index, .. } = &self.state else {
+            return None;
+        };
+        self.pr.commits.get(index.wrapping_sub(1)).map(|c| &c.sha)
+    }
+
+    /// Build a `ChangeId` from a commit SHA (using the first 8 hex chars).
+    ///
+    /// `CommitSha` is validated as 40 lowercase hex chars; the first 8 always
+    /// satisfy `ChangeId`'s ≥8-char alphanumeric requirement.
+    fn commit_change_id(sha: &crate::pr::CommitSha) -> ChangeId {
+        match ChangeId::parse(&sha.as_str()[..8]) {
+            Ok(id) => id,
+            Err(_) => match ChangeId::parse("00000000") {
+                Ok(id) => id,
+                Err(_) => unreachable!("8-char all-zero hex always satisfies ChangeId invariants"),
+            },
+        }
+    }
+
+    /// Build a `ChangeId` from a PR number (formatted as 16-char lowercase hex).
+    fn pr_change_id(pr_number: u64) -> ChangeId {
+        match ChangeId::parse(&format!("{pr_number:016x}")) {
+            Ok(id) => id,
+            Err(_) => match ChangeId::parse("00000000") {
+                Ok(id) => id,
+                Err(_) => unreachable!("8-char all-zero hex always satisfies ChangeId invariants"),
+            },
+        }
+    }
+
+    /// Open a new line- or commit-scoped composer at the current cursor position.
+    fn open_composer_at(
+        &self,
+        file_index: usize,
+        line_index: usize,
+        current_view: Option<&DiffView>,
+    ) -> ExtraKeyAction {
+        let State::CommitDiff { index, ref diff } = self.state else {
+            return ExtraKeyAction::StatusMessage("use P to add a PR-scope comment".to_owned());
+        };
+        let Some(sha) = self.current_commit_sha() else {
+            return ExtraKeyAction::StatusMessage("no commit selected".to_owned());
+        };
+        let change_id = Self::commit_change_id(sha);
+        let commit_title = self
+            .pr
+            .commits
+            .get(index.wrapping_sub(1))
+            .map(|c| strip_controls(&c.title))
+            .unwrap_or_default();
+
+        let line_target = Self::build_line_target(file_index, line_index, diff, current_view);
+
+        let (scope, line_available) = match line_target {
+            Some(target) => (ComposerScope::Line(target.clone()), Some(target)),
+            None => (ComposerScope::Change, None),
+        };
+
+        let stack_available = Some(StackContextSnapshot {
+            revset: format!("PR #{}", self.pr.number),
+            revset_hash: RevsetHash::from_revset(&format!("pr:{}", self.pr.number)),
+        });
+
+        let init = ComposerInit {
+            scope,
+            severity: self.last_severity.unwrap_or(Severity::Note),
+            change_id,
+            change_description: commit_title,
+            line_available,
+            stack_available,
+            description_available: None,
+        };
+        ExtraKeyAction::OpenScreen(Box::new(ComposerScreen(Box::new(Composer::new(init)))))
+    }
+
+    /// Open a commit-scoped composer (key 'm').
+    fn open_commit_scope_composer(&self) -> ExtraKeyAction {
+        let State::CommitDiff { index, .. } = &self.state else {
+            return ExtraKeyAction::StatusMessage(
+                "open a commit diff to add a commit comment".to_owned(),
+            );
+        };
+        let Some(sha) = self.current_commit_sha() else {
+            return ExtraKeyAction::StatusMessage("no commit selected".to_owned());
+        };
+        let change_id = Self::commit_change_id(sha);
+        let commit_title = self
+            .pr
+            .commits
+            .get(index.wrapping_sub(1))
+            .map(|c| strip_controls(&c.title))
+            .unwrap_or_default();
+        let stack_available = Some(StackContextSnapshot {
+            revset: format!("PR #{}", self.pr.number),
+            revset_hash: RevsetHash::from_revset(&format!("pr:{}", self.pr.number)),
+        });
+        let init = ComposerInit {
+            scope: ComposerScope::Change,
+            severity: self.last_severity.unwrap_or(Severity::Note),
+            change_id,
+            change_description: commit_title,
+            line_available: None,
+            stack_available,
+            description_available: None,
+        };
+        ExtraKeyAction::OpenScreen(Box::new(ComposerScreen(Box::new(Composer::new(init)))))
+    }
+
+    /// Open a PR-scoped composer (key 'P').
+    fn open_pr_scope_composer(&self) -> ExtraKeyAction {
+        let change_id = Self::pr_change_id(self.pr.number);
+        let stack = StackContextSnapshot {
+            revset: format!("PR #{}", self.pr.number),
+            revset_hash: RevsetHash::from_revset(&format!("pr:{}", self.pr.number)),
+        };
+        let init = ComposerInit {
+            scope: ComposerScope::Stack(stack.clone()),
+            severity: self.last_severity.unwrap_or(Severity::Note),
+            change_id,
+            change_description: strip_controls(&self.pr.title),
+            line_available: None,
+            stack_available: Some(stack),
+            description_available: None,
+        };
+        ExtraKeyAction::OpenScreen(Box::new(ComposerScreen(Box::new(Composer::new(init)))))
+    }
+
+    /// Resolve `change_id` and commit title for edit-mode from current state.
+    fn draft_change_id_and_title(&self) -> (ChangeId, String) {
+        match self.current_commit_sha() {
+            Some(sha) => (
+                Self::commit_change_id(sha),
+                self.pr
+                    .commits
+                    .iter()
+                    .find(|c| c.sha.as_str() == sha.as_str())
+                    .map(|c| strip_controls(&c.title))
+                    .unwrap_or_default(),
+            ),
+            None => (
+                Self::pr_change_id(self.pr.number),
+                strip_controls(&self.pr.title),
+            ),
+        }
+    }
+
+    /// Open an edit-mode composer for the draft comment at `line_index` (key 'e').
+    fn open_edit_composer(
+        &self,
+        line_index: usize,
+        current_view: Option<&DiffView>,
+    ) -> ExtraKeyAction {
+        let Some(view) = current_view else {
+            return ExtraKeyAction::StatusMessage("no view loaded".to_owned());
+        };
+        let Some(row) = view.lines.get(line_index) else {
+            return ExtraKeyAction::StatusMessage("cursor out of bounds".to_owned());
+        };
+        let RenderedLineKind::InlineCommentMeta { comment_index } = row.kind else {
+            return ExtraKeyAction::StatusMessage("cursor is not on a comment".to_owned());
+        };
+        let draft_idx = match comment_index {
+            CommentIndex::Local(idx) => idx,
+            CommentIndex::GitHubThread(_) => {
+                return ExtraKeyAction::StatusMessage(
+                    "GitHub review threads cannot be edited locally".to_owned(),
+                );
+            }
+        };
+        let Some(draft) = self.loaded_drafts.get(draft_idx) else {
+            return ExtraKeyAction::StatusMessage(
+                "draft not found — navigate away and back to refresh".to_owned(),
+            );
+        };
+
+        let (change_id, commit_title) = self.draft_change_id_and_title();
+        let stack_available = Some(StackContextSnapshot {
+            revset: format!("PR #{}", self.pr.number),
+            revset_hash: RevsetHash::from_revset(&format!("pr:{}", self.pr.number)),
+        });
+
+        let scope = draft_anchor_to_scope(&draft.anchor, line_index, stack_available.as_ref());
+
+        // Parse the draft's created_at as the edit identity.
+        let Ok(identity_dt) = time::OffsetDateTime::parse(
+            &draft.created_at,
+            &time::format_description::well_known::Rfc3339,
+        ) else {
+            return ExtraKeyAction::StatusMessage(
+                "draft has invalid timestamp — cannot edit".to_owned(),
+            );
+        };
+
+        let init = ComposerInit {
+            scope,
+            severity: draft.severity,
+            change_id,
+            change_description: commit_title,
+            line_available: None,
+            stack_available,
+            description_available: None,
+        };
+        let edited = local_review_core::tui::composer::EditedComment {
+            init,
+            body: draft.body.clone(),
+            identity: identity_dt,
+            comment_index: Some(draft_idx),
+        };
+        ExtraKeyAction::OpenScreen(Box::new(ComposerScreen(Box::new(Composer::for_edit(
+            edited,
+        )))))
+    }
+
+    /// Build a `LineTarget` from the annotated view at the given cursor position.
+    fn build_line_target(
+        file_index: usize,
+        line_index: usize,
+        diff: &local_review_core::diff::Diff,
+        current_view: Option<&DiffView>,
+    ) -> Option<LineTarget> {
+        let view = current_view?;
+        let row = view.lines.get(line_index)?;
+        // Only diff content kinds are commentable.
+        match row.kind {
+            RenderedLineKind::Added | RenderedLineKind::Removed | RenderedLineKind::Context => {}
+            RenderedLineKind::HunkHeader
+            | RenderedLineKind::HunkSeparator
+            | RenderedLineKind::Notice
+            | RenderedLineKind::InlineCommentMeta { .. }
+            | RenderedLineKind::InlineCommentBody
+            | RenderedLineKind::DescriptionLine => return None,
+        }
+        // file_index 0 is the commit description sub-view — no diff file.
+        let diff_file_idx = file_index.checked_sub(1)?;
+        let diff_file = diff.files.get(diff_file_idx)?;
+
+        let (context_before, context_after) = collect_context(&view.lines, line_index);
+
+        Some(LineTarget {
+            file: diff_file.display_path().to_path_buf(),
+            rendered_index: line_index,
+            source_line: row.source_line,
+            target_line: row.target_line,
+            target_text: row.text.clone(),
+            hunk_header: row.hunk_header.clone().unwrap_or_default(),
+            context_before,
+            context_after,
+        })
+    }
+
+    /// Handle composer key dispatch and save/delete.
+    fn handle_composer_key_impl(
+        &mut self,
+        composer: &mut Composer,
+        key: KeyEvent,
+        ctx: &mut ExtraScreenContext<'_>,
+    ) -> ExtraScreenAction {
+        match handle_composer_key(composer, key) {
+            ComposerAction::Continue => ExtraScreenAction::StayOpen,
+            ComposerAction::Cancel => ExtraScreenAction::Close,
+            ComposerAction::Save => match self.save_via_composer(composer) {
+                Ok(msg) => {
+                    self.last_severity = Some(composer.severity());
+                    *ctx.status_message = Some(msg);
+                    ExtraScreenAction::Close
+                }
+                Err(msg) => {
+                    *ctx.status_message = Some(msg);
+                    ExtraScreenAction::StayOpen
+                }
+            },
+            ComposerAction::Delete => match self.delete_via_composer(composer) {
+                Ok(()) => ExtraScreenAction::Close,
+                Err(msg) => {
+                    *ctx.status_message = Some(msg);
+                    ExtraScreenAction::StayOpen
+                }
+            },
+            ComposerAction::RefusedScopeChord(status) => {
+                *ctx.status_message = Some(status.to_owned());
+                ExtraScreenAction::StayOpen
+            }
+        }
+    }
+
+    /// Route save through the surface's `save_comment` / `update_comment`.
+    fn save_via_composer(&mut self, composer: &Composer) -> std::result::Result<String, String> {
+        let body = composer.body_text();
+        if body.trim().is_empty() {
+            return Err("comment body is empty — not saved".to_owned());
+        }
+
+        if let Some(edit_ctx) = composer.editing() {
+            let req = UpdateRequest {
+                identity: CommentId::new(edit_ctx.identity),
+                severity: composer.severity(),
+                body: &body,
+                oversized: body.len() > DRAFT_BODY_MAX,
+            };
+            return match self.update_comment(req) {
+                Ok(SaveOutcome::Saved { status_message }) => Ok(status_message),
+                Ok(SaveOutcome::Refused { reason }) => Err(reason),
+                Ok(SaveOutcome::Errored { message }) => Err(message),
+                Err(e) => Err(format!("update failed: {}", strip_controls(&e.to_string()))),
+            };
+        }
+
+        let req = SaveRequest {
+            scope: composer.scope(),
+            severity: composer.severity(),
+            body: &body,
+            entry_idx: 0,
+        };
+        match self.save_comment(req) {
+            Ok(SaveOutcome::Saved { status_message }) => Ok(status_message),
+            Ok(SaveOutcome::Refused { reason }) => Err(reason),
+            Ok(SaveOutcome::Errored { message }) => Err(message),
+            Err(e) => Err(format!("save failed: {}", strip_controls(&e.to_string()))),
+        }
+    }
+
+    /// Route delete through the surface's `delete_comment`.
+    fn delete_via_composer(&mut self, composer: &Composer) -> std::result::Result<(), String> {
+        let Some(edit_ctx) = composer.editing() else {
+            return Err("nothing to delete — composer is not in edit mode".to_owned());
+        };
+        let req = DeleteRequest::new(CommentId::new(edit_ctx.identity), edit_ctx.comment_index);
+        match self.delete_comment(req) {
+            Ok(DeleteOutcome::Deleted) => Ok(()),
+            Ok(DeleteOutcome::Refused { reason }) => Err(reason),
+            Err(e) => Err(format!("delete failed: {}", strip_controls(&e.to_string()))),
+        }
+    }
+
+    /// Build a `GgrDraft` from the composer scope, or return a `SaveOutcome`
+    /// indicating a refused/errored save.
+    fn build_draft_from_scope(
+        &self,
+        scope: &ComposerScope,
+        common: &crate::draft::CommonParams,
+    ) -> std::result::Result<crate::draft::GgrDraft, SaveOutcome> {
+        match scope {
+            ComposerScope::Line(line_target) => {
+                let sha = match self.current_commit_sha() {
+                    Some(s) => s.clone(),
+                    None => {
+                        return Err(SaveOutcome::Errored {
+                            message: "no commit selected; cannot save line comment".to_owned(),
+                        })
+                    }
+                };
+                let file_str = line_target.file.to_string_lossy().into_owned();
+                if file_str
+                    .split('/')
+                    .any(|seg| !crate::pr::valid_segment(seg))
+                {
+                    return Err(SaveOutcome::Refused {
+                        reason: "file path contains invalid segment".to_owned(),
+                    });
+                }
+                let side = if line_target.target_line.is_some() {
+                    Side::New
+                } else {
+                    Side::Old
+                };
+                let anchor = crate::draft::LineAnchorParams {
+                    commit_sha: sha,
+                    file: file_str,
+                    side,
+                    old_line: line_target.source_line,
+                    new_line: line_target.target_line,
+                    hunk_header: line_target.hunk_header.clone(),
+                    target_text: line_target.target_text.clone(),
+                    context_before: line_target.context_before.clone(),
+                    context_after: line_target.context_after.clone(),
+                };
+                crate::draft::GgrDraft::new_line(common, &anchor).map_err(|e| {
+                    SaveOutcome::Errored {
+                        message: e.to_string(),
+                    }
+                })
+            }
+            ComposerScope::Change => {
+                let sha = match self.current_commit_sha() {
+                    Some(s) => s.clone(),
+                    None => {
+                        return Err(SaveOutcome::Errored {
+                            message: "no commit selected; cannot save commit comment".to_owned(),
+                        })
+                    }
+                };
+                crate::draft::GgrDraft::new_commit(common, sha.as_str()).map_err(|e| {
+                    SaveOutcome::Errored {
+                        message: e.to_string(),
+                    }
+                })
+            }
+            ComposerScope::Stack(_) => {
+                crate::draft::GgrDraft::new_pr(common).map_err(|e| SaveOutcome::Errored {
+                    message: e.to_string(),
+                })
+            }
+            ComposerScope::Description(_) => Err(SaveOutcome::Refused {
+                reason: "description scope not supported in ggr".to_owned(),
+            }),
+        }
     }
 }
 
@@ -179,7 +657,9 @@ impl ReviewSurface for GgrSurface {
         if idx == 0 {
             self.state = State::Description;
             let desc = self.pr_description_text();
-            return Ok(vec![DiffView::from_description(&desc)]);
+            let views = vec![DiffView::from_description(&desc)];
+            self.loaded_drafts.clear();
+            return Ok(views);
         }
         let commit_idx = idx - 1;
         let Some(commit) = self.pr.commits.get(commit_idx) else {
@@ -199,6 +679,7 @@ impl ReviewSurface for GgrSurface {
             views.push(DiffView::from_file(file));
         }
         self.state = State::CommitDiff { index: idx, diff };
+        self.reload_drafts();
         Ok(views)
     }
 
@@ -223,60 +704,223 @@ impl ReviewSurface for GgrSurface {
             return Vec::new();
         };
         let file_path_str = file.display_path().to_string_lossy();
-        self.pr
-            .review_threads
-            .iter()
-            .enumerate()
-            .filter(|(_, t)| t.path == file_path_str.as_ref() && !t.is_outdated())
-            .filter_map(|(comment_index, thread)| {
-                if let Some(f) = severity_filter {
-                    if thread.severity != f {
-                        return None;
-                    }
+
+        let mut result: Vec<InlineComment> = Vec::new();
+
+        // Local line-scope drafts: indices 0..N (editable).
+        for (draft_idx, draft) in self.loaded_drafts.iter().enumerate() {
+            let crate::draft::GgrAnchor::Line {
+                old_line,
+                new_line,
+                file: draft_file,
+                ..
+            } = &draft.anchor
+            else {
+                continue;
+            };
+            if draft_file.as_str() != file_path_str.as_ref() {
+                continue;
+            }
+            if let Some(f) = severity_filter {
+                if draft.severity != f {
+                    continue;
                 }
-                Some(InlineComment {
-                    source_line: thread.original_line,
-                    target_line: thread.line,
-                    severity: thread.severity,
-                    age: local_review_core::util::format_age_from_iso_str(
-                        now,
-                        &thread.root.created_at,
-                    ),
-                    body_lines: strip_controls_preserve_newlines(&thread.root.body)
-                        .lines()
-                        .map(str::to_owned)
-                        .collect(),
-                    comment_index,
-                })
-            })
-            .collect()
+            }
+            result.push(InlineComment {
+                source_line: *old_line,
+                target_line: *new_line,
+                severity: draft.severity,
+                age: "[draft]".to_owned(),
+                body_lines: strip_controls_preserve_newlines(&draft.body)
+                    .lines()
+                    .map(str::to_owned)
+                    .collect(),
+                comment_index: CommentIndex::Local(draft_idx),
+            });
+        }
+
+        // GitHub review threads: large indices (usize::MAX - enumerate_idx),
+        // ensuring they never collide with local draft indices.
+        for (enumerate_idx, thread) in self.pr.review_threads.iter().enumerate() {
+            if thread.path != file_path_str.as_ref() || thread.is_outdated() {
+                continue;
+            }
+            if let Some(f) = severity_filter {
+                if thread.severity != f {
+                    continue;
+                }
+            }
+            result.push(InlineComment {
+                source_line: thread.original_line,
+                target_line: thread.line,
+                severity: thread.severity,
+                age: local_review_core::util::format_age_from_iso_str(now, &thread.root.created_at),
+                body_lines: strip_controls_preserve_newlines(&thread.root.body)
+                    .lines()
+                    .map(str::to_owned)
+                    .collect(),
+                comment_index: CommentIndex::GitHubThread(enumerate_idx),
+            });
+        }
+
+        result
     }
 
-    fn save_comment(
-        &mut self,
-        _req: SaveRequest<'_>,
-    ) -> std::result::Result<SaveOutcome, GgrError> {
-        Ok(SaveOutcome::Refused {
-            reason: "ggr is read-only in this version".to_owned(),
+    fn save_comment(&mut self, req: SaveRequest<'_>) -> std::result::Result<SaveOutcome, GgrError> {
+        let body = req.body;
+        if body.trim().is_empty() {
+            return Ok(SaveOutcome::Refused {
+                reason: "comment body is empty — not saved".to_owned(),
+            });
+        }
+        let Some(base) = crate::util::data_home() else {
+            return Ok(SaveOutcome::Errored {
+                message: "could not determine data directory; XDG_DATA_HOME and HOME unset"
+                    .to_owned(),
+            });
+        };
+        let created_at = time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .map_err(|e| GgrError::Io {
+                source: std::io::Error::other(e.to_string()),
+            })?;
+        let host = self
+            .pr
+            .hostname
+            .as_deref()
+            .unwrap_or("github.com")
+            .to_owned();
+        let slug = self.pr.repo_name.as_str();
+        // RepoName is validated as "owner/repo"; split_once always succeeds for
+        // valid values. Fallback to ("_", "_") satisfies the linter without unwrap.
+        let (owner, repo) = slug.split_once('/').unwrap_or(("_", "_"));
+        let owner = owner.to_owned();
+        let repo = repo.to_owned();
+        let common = crate::draft::CommonParams {
+            host,
+            owner,
+            repo,
+            pr_number: self.pr.number,
+            body: body.to_owned(),
+            severity: req.severity,
+            created_at,
+        };
+
+        let draft = match self.build_draft_from_scope(req.scope, &common) {
+            Ok(d) => d,
+            Err(outcome) => return Ok(outcome),
+        };
+
+        let path = crate::draft::draft_path_from_base(&base, &draft);
+        crate::draft::append_draft(&path, &draft)?;
+        self.reload_drafts();
+
+        let msg = match &draft.anchor {
+            crate::draft::GgrAnchor::Line { .. } => "line draft saved",
+            crate::draft::GgrAnchor::Commit { .. } => "commit draft saved",
+            crate::draft::GgrAnchor::Pr => "PR draft saved",
+        };
+        Ok(SaveOutcome::Saved {
+            status_message: msg.to_owned(),
         })
     }
 
     fn update_comment(
         &mut self,
-        _req: UpdateRequest<'_>,
+        req: UpdateRequest<'_>,
     ) -> std::result::Result<SaveOutcome, GgrError> {
-        Ok(SaveOutcome::Refused {
-            reason: "ggr is read-only in this version".to_owned(),
-        })
+        let body = req.body;
+        if body.trim().is_empty() {
+            return Ok(SaveOutcome::Refused {
+                reason: "comment body is empty — not saved".to_owned(),
+            });
+        }
+        let created_at_key = req
+            .identity
+            .as_offset_date_time()
+            .format(&time::format_description::well_known::Rfc3339)
+            .map_err(|e| GgrError::Io {
+                source: std::io::Error::other(e.to_string()),
+            })?;
+        let Some(base) = crate::util::data_home() else {
+            return Ok(SaveOutcome::Errored {
+                message: "could not determine data directory".to_owned(),
+            });
+        };
+        // Compute path within a borrow scope so the immutable borrow on
+        // loaded_drafts ends before the mutable reload_drafts call below.
+        let path = {
+            let Some(draft) = self
+                .loaded_drafts
+                .iter()
+                .find(|d| d.created_at == created_at_key)
+            else {
+                return Ok(SaveOutcome::Refused {
+                    reason: "comment not found".to_owned(),
+                });
+            };
+            crate::draft::draft_path_from_base(&base, draft)
+        };
+        let updated_at = time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .map_err(|e| GgrError::Io {
+                source: std::io::Error::other(e.to_string()),
+            })?;
+        if crate::draft::update_draft(&path, &created_at_key, body, req.severity, &updated_at)? {
+            self.reload_drafts();
+            let msg = if req.oversized {
+                "draft updated (body exceeds 64 KB — will be trimmed on submit)"
+            } else {
+                "draft updated"
+            };
+            Ok(SaveOutcome::Saved {
+                status_message: msg.to_owned(),
+            })
+        } else {
+            Ok(SaveOutcome::Refused {
+                reason: "comment not found on disk".to_owned(),
+            })
+        }
     }
 
     fn delete_comment(
         &mut self,
-        _req: DeleteRequest,
+        req: DeleteRequest,
     ) -> std::result::Result<DeleteOutcome, GgrError> {
-        Ok(DeleteOutcome::Refused {
-            reason: "ggr is read-only; comments cannot be deleted".to_owned(),
-        })
+        let created_at_key = req
+            .identity
+            .as_offset_date_time()
+            .format(&time::format_description::well_known::Rfc3339)
+            .map_err(|e| GgrError::Io {
+                source: std::io::Error::other(e.to_string()),
+            })?;
+        let Some(base) = crate::util::data_home() else {
+            return Ok(DeleteOutcome::Refused {
+                reason: "could not determine data directory".to_owned(),
+            });
+        };
+        // Compute path within a borrow scope so the immutable borrow on
+        // loaded_drafts ends before the mutable reload_drafts call below.
+        let path = {
+            let Some(draft) = self
+                .loaded_drafts
+                .iter()
+                .find(|d| d.created_at == created_at_key)
+            else {
+                return Ok(DeleteOutcome::Refused {
+                    reason: "comment not found".to_owned(),
+                });
+            };
+            crate::draft::draft_path_from_base(&base, draft)
+        };
+        if crate::draft::delete_draft(&path, |d| d.created_at == created_at_key)? {
+            self.reload_drafts();
+            Ok(DeleteOutcome::Deleted)
+        } else {
+            Ok(DeleteOutcome::Refused {
+                reason: "comment not found on disk".to_owned(),
+            })
+        }
     }
 
     fn is_view_reviewed(&self, _view_idx: usize) -> bool {
@@ -292,14 +936,28 @@ impl ReviewSurface for GgrSurface {
     }
 
     fn severity_histogram(&self) -> SeverityHistogram {
-        SeverityHistogram::default()
+        let mut h = SeverityHistogram::default();
+        for draft in &self.loaded_drafts {
+            match draft.severity {
+                Severity::Required => h.required = h.required.saturating_add(1),
+                Severity::Suggestion => h.suggestion = h.suggestion.saturating_add(1),
+                Severity::Note => h.note = h.note.saturating_add(1),
+            }
+        }
+        h
     }
 
     #[expect(
         clippy::wildcard_enum_match_arm,
         reason = "unhandled KeyCode variants are intentionally passed through as Ignored"
     )]
-    fn handle_extra_key(&mut self, key: KeyEvent) -> std::result::Result<ExtraKeyAction, GgrError> {
+    fn handle_extra_key(
+        &mut self,
+        key: KeyEvent,
+        file_index: usize,
+        line_index: usize,
+        current_view: Option<&DiffView>,
+    ) -> std::result::Result<ExtraKeyAction, GgrError> {
         match key.code {
             KeyCode::Char('T') => {
                 self.threads_expanded = !self.threads_expanded;
@@ -310,19 +968,32 @@ impl ReviewSurface for GgrSurface {
                 };
                 Ok(ExtraKeyAction::StatusMessage(msg.to_owned()))
             }
+            KeyCode::Char('c') | KeyCode::Enter => {
+                Ok(self.open_composer_at(file_index, line_index, current_view))
+            }
+            KeyCode::Char('m') => Ok(self.open_commit_scope_composer()),
+            KeyCode::Char('P') => Ok(self.open_pr_scope_composer()),
+            KeyCode::Char('e') => Ok(self.open_edit_composer(line_index, current_view)),
             _ => Ok(ExtraKeyAction::Ignored),
         }
     }
 
-    fn render_extra_screen(&self, _frame: &mut Frame<'_>, _state: &mut dyn ExtraScreen) {}
+    fn render_extra_screen(&self, frame: &mut Frame<'_>, state: &mut dyn ExtraScreen) {
+        if let Some(s) = state.as_any_mut().downcast_mut::<ComposerScreen>() {
+            composer_overlay::render_composer_overlay(frame, &s.0, None);
+        }
+    }
 
     fn handle_extra_screen_key(
         &mut self,
-        _state: &mut dyn ExtraScreen,
-        _key: KeyEvent,
-        _ctx: &mut ExtraScreenContext<'_>,
+        state: &mut dyn ExtraScreen,
+        key: KeyEvent,
+        ctx: &mut ExtraScreenContext<'_>,
     ) -> std::result::Result<ExtraScreenAction, GgrError> {
-        Ok(ExtraScreenAction::Close)
+        if let Some(s) = try_downcast_mut::<ComposerScreen>(state) {
+            return Ok(self.handle_composer_key_impl(&mut s.0, key, ctx));
+        }
+        Ok(ExtraScreenAction::StayOpen)
     }
 
     fn file_picker_entries(&self) -> Vec<FilePickerEntry> {
@@ -365,6 +1036,51 @@ impl ReviewSurfaceExt for GgrSurface {
             .map(|pos| pos + 1)
             .unwrap_or(0);
         (file_idx, line)
+    }
+}
+
+/// Convert a `GgrAnchor` to a `ComposerScope` for use in edit-mode composers.
+///
+/// `line_index` is the rendered cursor row, used when reconstructing a
+/// `LineTarget`. `stack_available` is cloned for the `Pr` variant.
+fn draft_anchor_to_scope(
+    anchor: &crate::draft::GgrAnchor,
+    line_index: usize,
+    stack_available: Option<&StackContextSnapshot>,
+) -> ComposerScope {
+    match anchor {
+        crate::draft::GgrAnchor::Line {
+            file,
+            old_line,
+            new_line,
+            hunk_header,
+            target_text,
+            context_before,
+            context_after,
+            ..
+        } => ComposerScope::Line(LineTarget {
+            file: std::path::PathBuf::from(file),
+            rendered_index: line_index,
+            source_line: *old_line,
+            target_line: *new_line,
+            target_text: target_text.clone(),
+            hunk_header: hunk_header.clone(),
+            context_before: context_before.clone(),
+            context_after: context_after.clone(),
+        }),
+        crate::draft::GgrAnchor::Commit { .. } => ComposerScope::Change,
+        crate::draft::GgrAnchor::Pr => {
+            // stack_available is always Some at this call site; the
+            // unwrap_or_else path is a lint-compliant fallback.
+            ComposerScope::Stack(
+                stack_available
+                    .cloned()
+                    .unwrap_or_else(|| StackContextSnapshot {
+                        revset: String::new(),
+                        revset_hash: RevsetHash::from_revset(""),
+                    }),
+            )
+        }
     }
 }
 
@@ -431,8 +1147,13 @@ mod tests {
     use super::*;
     use crate::pr::{CommitEntry, CommitSha, PrComment, RepoName, ReviewThread, ThreadComment};
     use crossterm::event::{KeyCode, KeyModifiers};
+    use local_review_core::change_id::ChangeId;
     use local_review_core::diff::{Diff, DiffFile};
-    use local_review_core::tui::{composer::ComposerScope, CommentId};
+    use local_review_core::tui::{
+        composer::{ComposerScope, DescriptionContext},
+        CommentId,
+    };
+    use serial_test::serial;
 
     fn make_pr_zero_commits() -> PrDetails {
         let mut pr = make_pr();
@@ -599,7 +1320,7 @@ mod tests {
         assert!(surface.threads_expanded);
 
         let result = surface
-            .handle_extra_key(make_key(KeyCode::Char('T')))
+            .handle_extra_key(make_key(KeyCode::Char('T')), 0, 0, None)
             .unwrap();
         assert!(!surface.threads_expanded, "T must collapse when expanded");
         assert!(
@@ -608,7 +1329,7 @@ mod tests {
         );
 
         let result = surface
-            .handle_extra_key(make_key(KeyCode::Char('T')))
+            .handle_extra_key(make_key(KeyCode::Char('T')), 0, 0, None)
             .unwrap();
         assert!(surface.threads_expanded, "T must expand when collapsed");
         assert!(
@@ -621,7 +1342,7 @@ mod tests {
     fn handle_extra_key_unknown_returns_ignored() {
         let mut surface = GgrSurface::new(make_pr(), None);
         let result = surface
-            .handle_extra_key(make_key(KeyCode::Char('x')))
+            .handle_extra_key(make_key(KeyCode::Char('x')), 0, 0, None)
             .unwrap();
         assert!(
             matches!(result, ExtraKeyAction::Ignored),
@@ -721,7 +1442,8 @@ mod tests {
     }
 
     #[test]
-    fn inline_comments_for_view_comment_index_is_global_review_threads_index() {
+    fn inline_comments_for_view_comment_index_is_github_thread_variant() {
+        // GitHub thread indices are encoded as CommentIndex::GitHubThread(enumerate_idx).
         let thread_other = make_thread(
             "src/bar.rs",
             Some(5),
@@ -755,9 +1477,11 @@ mod tests {
             1,
             "only the matching thread must be returned"
         );
+        // thread_match is at enumerate_idx=1 (second thread in the vec).
         assert_eq!(
-            comments[0].comment_index, 1,
-            "comment_index must be the global index in review_threads (1), not the filtered-slice index (0)"
+            comments[0].comment_index,
+            CommentIndex::GitHubThread(1),
+            "comment_index for GitHub threads is CommentIndex::GitHubThread(enumerate_idx)"
         );
     }
 
@@ -948,38 +1672,370 @@ mod tests {
         );
     }
 
+    // ── save_comment tests ────────────────────────────────────────────────────
+
+    fn set_commit_diff_state(surface: &mut GgrSurface) {
+        surface.state = State::CommitDiff {
+            index: 1,
+            diff: Diff {
+                files: vec![DiffFile::Modified {
+                    path: std::path::PathBuf::from("src/foo.rs"),
+                    hunks: vec![],
+                }],
+            },
+        };
+    }
+
     #[test]
-    fn save_comment_returns_refused() {
+    fn save_comment_empty_body_returns_refused() {
         let mut surface = GgrSurface::new(make_pr(), None);
+        set_commit_diff_state(&mut surface);
         let scope = ComposerScope::Change;
         let req = SaveRequest {
             scope: &scope,
             severity: Severity::Note,
-            body: "test comment",
+            body: "   ",
             entry_idx: 0,
         };
         let outcome = surface.save_comment(req).unwrap();
         assert!(
             matches!(outcome, SaveOutcome::Refused { .. }),
-            "save_comment must return Refused in read-only ggr"
+            "empty body must return Refused"
         );
     }
 
     #[test]
-    fn update_comment_returns_refused() {
+    fn save_comment_description_scope_returns_refused() {
         let mut surface = GgrSurface::new(make_pr(), None);
+        set_commit_diff_state(&mut surface);
+        let scope = ComposerScope::Description(DescriptionContext {
+            change_id: ChangeId::parse("a3b4c5d6").unwrap(),
+            target_line: None,
+            target_text: String::new(),
+            context_before: vec![],
+            context_after: vec![],
+        });
+        let req = SaveRequest {
+            scope: &scope,
+            severity: Severity::Note,
+            body: "some text",
+            entry_idx: 0,
+        };
+        let outcome = surface.save_comment(req).unwrap();
+        assert!(
+            matches!(outcome, SaveOutcome::Refused { .. }),
+            "description scope must return Refused"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn save_comment_commit_scope_writes_draft() {
+        let dir = tempfile::tempdir().unwrap();
+        let prev = std::env::var("XDG_DATA_HOME").ok();
+        std::env::set_var("XDG_DATA_HOME", dir.path());
+
+        let mut surface = GgrSurface::new(make_pr(), None);
+        set_commit_diff_state(&mut surface);
+        let scope = ComposerScope::Change;
+        let req = SaveRequest {
+            scope: &scope,
+            severity: Severity::Note,
+            body: "commit-level review note",
+            entry_idx: 0,
+        };
+        let outcome = surface.save_comment(req).unwrap();
+        assert!(
+            matches!(outcome, SaveOutcome::Saved { .. }),
+            "commit-scope save must succeed; got: {outcome:?}"
+        );
+        assert_eq!(
+            surface.loaded_drafts.len(),
+            1,
+            "one draft must be loaded after save"
+        );
+        assert!(
+            matches!(
+                surface.loaded_drafts[0].anchor,
+                crate::draft::GgrAnchor::Commit { .. }
+            ),
+            "anchor must be Commit"
+        );
+
+        if let Some(p) = prev {
+            std::env::set_var("XDG_DATA_HOME", p);
+        } else {
+            std::env::remove_var("XDG_DATA_HOME");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn save_comment_pr_scope_writes_draft() {
+        let dir = tempfile::tempdir().unwrap();
+        let prev = std::env::var("XDG_DATA_HOME").ok();
+        std::env::set_var("XDG_DATA_HOME", dir.path());
+
+        let mut surface = GgrSurface::new(make_pr(), None);
+        // PR scope does not require CommitDiff state.
+        let stack = StackContextSnapshot {
+            revset: "PR #42".to_owned(),
+            revset_hash: RevsetHash::from_revset("pr:42"),
+        };
+        let scope = ComposerScope::Stack(stack);
+        let req = SaveRequest {
+            scope: &scope,
+            severity: Severity::Suggestion,
+            body: "overall PR comment",
+            entry_idx: 0,
+        };
+        let outcome = surface.save_comment(req).unwrap();
+        assert!(
+            matches!(outcome, SaveOutcome::Saved { .. }),
+            "PR-scope save must succeed; got: {outcome:?}"
+        );
+        // Verify the _pr.jsonl file was written to disk.
+        let base = dir.path();
+        let drafts_dir =
+            crate::draft::drafts_dir_from_base(base, "github.com", "owner", "repo", 42);
+        assert!(
+            drafts_dir.join("_pr.jsonl").exists(),
+            "_pr.jsonl must exist after PR-scope save"
+        );
+
+        if let Some(p) = prev {
+            std::env::set_var("XDG_DATA_HOME", p);
+        } else {
+            std::env::remove_var("XDG_DATA_HOME");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn save_comment_line_scope_writes_draft() {
+        use local_review_core::tui::composer::LineTarget;
+
+        let dir = tempfile::tempdir().unwrap();
+        let prev = std::env::var("XDG_DATA_HOME").ok();
+        std::env::set_var("XDG_DATA_HOME", dir.path());
+
+        let mut surface = GgrSurface::new(make_pr(), None);
+        set_commit_diff_state(&mut surface);
+
+        let target = LineTarget {
+            file: std::path::PathBuf::from("src/foo.rs"),
+            rendered_index: 3,
+            source_line: None,
+            target_line: Some(42),
+            target_text: "let x = 1;".to_owned(),
+            hunk_header: "@@ -40,6 +40,7 @@".to_owned(),
+            context_before: vec!["fn foo() {".to_owned()],
+            context_after: vec!["}".to_owned()],
+        };
+        let scope = ComposerScope::Line(target);
+        let req = SaveRequest {
+            scope: &scope,
+            severity: Severity::Required,
+            body: "fix this",
+            entry_idx: 0,
+        };
+        let outcome = surface.save_comment(req).unwrap();
+        assert!(
+            matches!(outcome, SaveOutcome::Saved { .. }),
+            "line-scope save must succeed; got: {outcome:?}"
+        );
+        assert_eq!(surface.loaded_drafts.len(), 1);
+        assert!(
+            matches!(
+                surface.loaded_drafts[0].anchor,
+                crate::draft::GgrAnchor::Line { ref file, new_line: Some(42), .. }
+                if file == "src/foo.rs"
+            ),
+            "draft anchor must be Line with correct file and line"
+        );
+
+        if let Some(p) = prev {
+            std::env::set_var("XDG_DATA_HOME", p);
+        } else {
+            std::env::remove_var("XDG_DATA_HOME");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn update_comment_changes_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let prev = std::env::var("XDG_DATA_HOME").ok();
+        std::env::set_var("XDG_DATA_HOME", dir.path());
+
+        let mut surface = GgrSurface::new(make_pr(), None);
+        set_commit_diff_state(&mut surface);
+        // Save a commit-scope draft first.
+        let scope = ComposerScope::Change;
+        let req = SaveRequest {
+            scope: &scope,
+            severity: Severity::Note,
+            body: "original body",
+            entry_idx: 0,
+        };
+        surface.save_comment(req).unwrap();
+        assert_eq!(surface.loaded_drafts.len(), 1);
+        let identity = time::OffsetDateTime::parse(
+            &surface.loaded_drafts[0].created_at,
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
+
+        let update_req = UpdateRequest {
+            identity: CommentId::new(identity),
+            body: "updated body",
+            severity: Severity::Required,
+            oversized: false,
+        };
+        let outcome = surface.update_comment(update_req).unwrap();
+        assert!(
+            matches!(outcome, SaveOutcome::Saved { .. }),
+            "update must succeed; got: {outcome:?}"
+        );
+        assert_eq!(surface.loaded_drafts[0].body, "updated body");
+        assert_eq!(surface.loaded_drafts[0].severity, Severity::Required);
+
+        if let Some(p) = prev {
+            std::env::set_var("XDG_DATA_HOME", p);
+        } else {
+            std::env::remove_var("XDG_DATA_HOME");
+        }
+    }
+
+    #[test]
+    fn update_comment_not_found_returns_refused() {
+        let mut surface = GgrSurface::new(make_pr(), None);
+        set_commit_diff_state(&mut surface);
         let identity = CommentId::new(time::OffsetDateTime::UNIX_EPOCH);
         let req = UpdateRequest {
             identity,
-            body: "updated body",
+            body: "new body",
             severity: Severity::Note,
             oversized: false,
         };
         let outcome = surface.update_comment(req).unwrap();
         assert!(
             matches!(outcome, SaveOutcome::Refused { .. }),
-            "update_comment must return Refused in read-only ggr"
+            "update with unknown identity must return Refused"
         );
+    }
+
+    #[test]
+    fn update_comment_empty_body_returns_refused() {
+        let mut surface = GgrSurface::new(make_pr(), None);
+        set_commit_diff_state(&mut surface);
+        let identity = CommentId::new(time::OffsetDateTime::UNIX_EPOCH);
+        let req = UpdateRequest {
+            identity,
+            body: "",
+            severity: Severity::Note,
+            oversized: false,
+        };
+        let outcome = surface.update_comment(req).unwrap();
+        assert!(
+            matches!(outcome, SaveOutcome::Refused { .. }),
+            "empty body must return Refused"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn delete_comment_removes_draft() {
+        let dir = tempfile::tempdir().unwrap();
+        let prev = std::env::var("XDG_DATA_HOME").ok();
+        std::env::set_var("XDG_DATA_HOME", dir.path());
+
+        let mut surface = GgrSurface::new(make_pr(), None);
+        set_commit_diff_state(&mut surface);
+        let scope = ComposerScope::Change;
+        let req = SaveRequest {
+            scope: &scope,
+            severity: Severity::Note,
+            body: "to be deleted",
+            entry_idx: 0,
+        };
+        surface.save_comment(req).unwrap();
+        assert_eq!(surface.loaded_drafts.len(), 1);
+        let identity = time::OffsetDateTime::parse(
+            &surface.loaded_drafts[0].created_at,
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
+
+        let del_req = DeleteRequest::new(CommentId::new(identity), None);
+        let outcome = surface.delete_comment(del_req).unwrap();
+        assert!(
+            matches!(outcome, DeleteOutcome::Deleted),
+            "delete must succeed; got: {outcome:?}"
+        );
+        assert!(
+            surface.loaded_drafts.is_empty(),
+            "loaded_drafts must be empty after delete"
+        );
+
+        if let Some(p) = prev {
+            std::env::set_var("XDG_DATA_HOME", p);
+        } else {
+            std::env::remove_var("XDG_DATA_HOME");
+        }
+    }
+
+    #[test]
+    fn delete_comment_not_found_returns_refused() {
+        let mut surface = GgrSurface::new(make_pr(), None);
+        set_commit_diff_state(&mut surface);
+        let identity = CommentId::new(time::OffsetDateTime::UNIX_EPOCH);
+        let req = DeleteRequest::new(identity, None);
+        let outcome = surface.delete_comment(req).unwrap();
+        assert!(
+            matches!(outcome, DeleteOutcome::Refused { .. }),
+            "delete with unknown identity must return Refused"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn severity_histogram_counts_loaded_drafts() {
+        let dir = tempfile::tempdir().unwrap();
+        let prev = std::env::var("XDG_DATA_HOME").ok();
+        std::env::set_var("XDG_DATA_HOME", dir.path());
+
+        let mut surface = GgrSurface::new(make_pr(), None);
+        set_commit_diff_state(&mut surface);
+
+        let scope = ComposerScope::Change;
+        surface
+            .save_comment(SaveRequest {
+                scope: &scope,
+                severity: Severity::Note,
+                body: "note comment",
+                entry_idx: 0,
+            })
+            .unwrap();
+        surface
+            .save_comment(SaveRequest {
+                scope: &scope,
+                severity: Severity::Required,
+                body: "required comment",
+                entry_idx: 0,
+            })
+            .unwrap();
+
+        let hist = surface.severity_histogram();
+        assert_eq!(hist.note, 1);
+        assert_eq!(hist.required, 1);
+        assert_eq!(hist.suggestion, 0);
+
+        if let Some(p) = prev {
+            std::env::set_var("XDG_DATA_HOME", p);
+        } else {
+            std::env::remove_var("XDG_DATA_HOME");
+        }
     }
 
     #[test]
@@ -990,7 +2046,7 @@ mod tests {
     }
 
     #[test]
-    fn severity_histogram_returns_default() {
+    fn severity_histogram_returns_default_with_no_drafts() {
         let surface = GgrSurface::new(make_pr(), None);
         assert_eq!(surface.severity_histogram(), SeverityHistogram::default());
     }
@@ -1103,7 +2159,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_comment_returns_refused() {
+    fn delete_comment_returns_refused_when_no_drafts() {
         let mut surface = GgrSurface::new(make_pr(), None);
         let identity = CommentId::new(time::OffsetDateTime::UNIX_EPOCH);
         let req = DeleteRequest::new(identity, None);
@@ -1112,14 +2168,8 @@ mod tests {
             .expect("delete_comment must not error");
         assert!(
             matches!(result, DeleteOutcome::Refused { .. }),
-            "delete_comment must return Refused in read-only ggr"
+            "delete_comment must return Refused when no drafts exist"
         );
-        if let DeleteOutcome::Refused { reason } = result {
-            assert!(
-                reason.contains("read-only"),
-                "expected 'read-only' in refused reason; got: {reason}"
-            );
-        }
     }
 
     #[test]
@@ -1240,7 +2290,7 @@ mod tests {
         );
     }
 
-    // ── current_cursor_state tests (pier-p2) ──────────────────────────────────
+    // ── current_cursor_state tests ────────────────────────────────────────────
 
     #[test]
     fn current_cursor_state_returns_none_in_description_state() {
@@ -1314,7 +2364,7 @@ mod tests {
         assert_eq!(state.line, 7);
     }
 
-    // ── GgrSurface::new with cursor tests (priya-p3) ──────────────────────────
+    // ── GgrSurface::new with cursor tests ─────────────────────────────────────
 
     fn make_cursor_state(sha: &str, file: &str, line: usize) -> cursor::CursorState {
         cursor::CursorState {
@@ -1370,7 +2420,7 @@ mod tests {
         );
     }
 
-    // ── initial_view_position tests (priya-p4) ────────────────────────────────
+    // ── initial_view_position tests ───────────────────────────────────────────
 
     #[test]
     fn initial_view_position_returns_zero_zero_when_no_cursor() {
@@ -1411,10 +2461,6 @@ mod tests {
 
     #[test]
     fn initial_view_position_empty_file_falls_back_to_description_subview_preserving_line() {
-        // Two cases where the saved cursor file is not found in diff.files:
-        //   1. file="" (commit description sub-view sentinel)
-        //   2. file="src/removed.rs" (stale: file was deleted from the diff)
-        // In both cases file_idx falls back to 0; line is preserved.
         let make_surface_with_file = |file: &str, line: usize| {
             let pr = make_pr();
             let sha = pr.commits[0].sha.as_str().to_owned();
@@ -1476,22 +2522,11 @@ mod tests {
 
     #[test]
     fn initial_view_position_strip_controls_applied_consistently() {
-        // current_cursor_state stores strip_controls(display_path) in CursorState.file.
-        // initial_view_position must also strip_controls on the lookup side so the
-        // comparison is stripped-vs-stripped; without it a path containing control
-        // characters would fail to match and silently fall back to file_idx=0.
-        //
-        // We simulate a file whose display path contains ANSI control chars. The
-        // saved cursor holds the already-stripped name; the lookup path is the raw
-        // DiffFile path (which, after strip_controls, matches the saved name).
         let pr = make_pr();
         let sha = pr.commits[0].sha.as_str().to_owned();
-        // Stripped form — as current_cursor_state would have stored it.
         let stripped_name = "src/file.rs";
         let cursor = make_cursor_state(&sha, stripped_name, 3);
         let mut surface = GgrSurface::new(pr, Some(&cursor));
-        // DiffFile path contains a control character that strip_controls removes,
-        // producing the same string as the saved cursor file.
         surface.state = State::CommitDiff {
             index: 1,
             diff: Diff {
@@ -1501,8 +2536,6 @@ mod tests {
                 }],
             },
         };
-        // strip_controls("src/\x1bfile.rs") == "src/file.rs" == saved cursor file.
-        // The lookup must find the file at index 1, not fall back to 0.
         let pos = surface.initial_view_position();
         assert_eq!(
             pos.0, 1,

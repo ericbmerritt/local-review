@@ -5,6 +5,8 @@
 //!   `ggr acme/myrepo#2429`                                 — explicit repo, works anywhere
 //!   `ggr --url https://github.example.com owner/repo#2429` — GHE host + short form
 //!   `ggr https://github.example.com/owner/repo/pull/2429`  — full pull URL
+//!   `ggr drafts <pr-ref>`                                  — list local draft comments
+//!   `ggr clear <pr-ref>`                                   — clear local draft comments
 
 mod cursor;
 mod draft;
@@ -16,9 +18,10 @@ mod tui;
 mod util;
 
 use std::io::Write as _;
+use std::path::Path;
 use std::process::ExitCode;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 
 use error::GgrError;
 
@@ -29,12 +32,39 @@ use error::GgrError;
 )]
 struct Cli {
     /// PR to review: number, owner/repo#number, or full pull URL.
-    pr: String,
+    #[arg(value_name = "PR", required = false)]
+    pr: Option<String>,
 
     /// Base URL of a GitHub Enterprise Server instance (e.g. `https://github.example.com`).
     /// Required when using the owner/repo#number form against a GHE host.
     #[arg(long)]
     url: Option<String>,
+
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// List local draft comments for a PR in human-readable form.
+    Drafts {
+        /// PR reference: number, owner/repo#number, or full pull URL.
+        pr: String,
+        /// Base URL of a GitHub Enterprise Server instance.
+        #[arg(long)]
+        url: Option<String>,
+    },
+    /// Clear local draft comments for a PR (preserves the drafts directory).
+    Clear {
+        /// PR reference: number, owner/repo#number, or full pull URL.
+        pr: String,
+        /// Base URL of a GitHub Enterprise Server instance.
+        #[arg(long)]
+        url: Option<String>,
+        /// [no-op until P4] Clear only drafts that are stale due to force-push.
+        #[arg(long)]
+        stale: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -51,12 +81,20 @@ fn main() -> ExitCode {
 
 fn run() -> error::Result<()> {
     let cli = Cli::parse();
+    match cli.command {
+        Some(Commands::Drafts { pr, url }) => cmd_drafts(&pr, url.as_deref()),
+        Some(Commands::Clear { pr, url, stale: _ }) => cmd_clear(&pr, url.as_deref()),
+        None => {
+            let pr_str = cli.pr.ok_or_else(|| GgrError::InvalidPrRef {
+                raw: "no PR reference given; run `ggr --help` for usage".to_owned(),
+            })?;
+            cmd_review(&pr_str, cli.url.as_deref())
+        }
+    }
+}
 
-    let mut parsed = pr_ref::parse(&cli.pr, cli.url.as_deref())?;
-
-    // If no host was supplied explicitly, check the local git remote.
-    // For owner/repo#number, only use the remote host when the slug matches.
-    // For bare numbers, accept any remote host (gh resolves the repo itself).
+fn cmd_review(pr_str: &str, url: Option<&str>) -> error::Result<()> {
+    let mut parsed = pr_ref::parse(pr_str, url)?;
     if parsed.hostname.is_none() {
         if let Some(host) = util::detect_remote_host(parsed.repo_flag.as_deref()) {
             if let Some(repo) = parsed.repo_flag.take() {
@@ -65,16 +103,210 @@ fn run() -> error::Result<()> {
             parsed.hostname = Some(host);
         }
     }
-
     let pr = gh::fetch_pr_details(
         parsed.number,
         parsed.repo_flag.as_deref(),
         parsed.hostname.as_deref(),
     )?;
-
     if pr.commits.is_empty() {
         return Err(GgrError::PrNotFound { pr: parsed.number });
     }
-
     tui::run(pr)
+}
+
+/// Resolve a PR reference string to `(host, owner, repo, pr_number)` for
+/// storage path construction.
+///
+/// For bare PR numbers the git remote is queried. If the remote can't be
+/// detected the caller should use the `owner/repo#N` or full-URL form.
+fn resolve_pr_coords(
+    pr_str: &str,
+    url: Option<&str>,
+) -> error::Result<(String, String, String, u64)> {
+    let parsed = pr_ref::parse(pr_str, url)?;
+
+    let Some(repo_flag) = parsed.repo_flag else {
+        // Bare number — derive coords from the local git remote.
+        let Some((host, owner, repo)) = util::detect_remote_coords() else {
+            return Err(GgrError::InvalidPrRef {
+                raw: "cannot locate drafts for a bare PR number without a detectable git \
+                      remote; use owner/repo#N or a full URL"
+                    .to_owned(),
+            });
+        };
+        return Ok((host, owner, repo, parsed.number));
+    };
+
+    let host = parsed
+        .hostname
+        .as_deref()
+        .unwrap_or("github.com")
+        .to_owned();
+    // For GHE, repo_flag is "HOST/owner/repo"; strip the leading host segment.
+    let slug = if parsed.hostname.is_some() {
+        repo_flag
+            .strip_prefix(&format!("{host}/"))
+            .unwrap_or(repo_flag.as_str())
+            .to_owned()
+    } else {
+        repo_flag.clone()
+    };
+    let (owner, repo) = slug.split_once('/').ok_or_else(|| GgrError::InvalidPrRef {
+        raw: format!("expected owner/repo, got: {slug}"),
+    })?;
+    Ok((host, owner.to_owned(), repo.to_owned(), parsed.number))
+}
+
+fn cmd_drafts(pr_str: &str, url: Option<&str>) -> error::Result<()> {
+    let (host, owner, repo, pr_number) = resolve_pr_coords(pr_str, url)?;
+    let Some(base) = util::data_home() else {
+        return Err(GgrError::Io {
+            source: std::io::Error::other("could not determine data directory"),
+        });
+    };
+    let drafts_dir = draft::drafts_dir_from_base(&base, &host, &owner, &repo, pr_number);
+
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+
+    if !drafts_dir.exists() {
+        writeln!(out, "no drafts for {owner}/{repo}#{pr_number}")
+            .map_err(|source| GgrError::Io { source })?;
+        return Ok(());
+    }
+
+    let files = collect_draft_files(&drafts_dir)?;
+    let total: usize = files
+        .iter()
+        .map(|p| draft::list_drafts(p).map(|v| v.len()).unwrap_or(0))
+        .sum();
+
+    if total == 0 {
+        writeln!(out, "no drafts for {owner}/{repo}#{pr_number}")
+            .map_err(|source| GgrError::Io { source })?;
+        return Ok(());
+    }
+
+    writeln!(out, "{owner}/{repo}#{pr_number} — {total} draft(s)")
+        .map_err(|source| GgrError::Io { source })?;
+
+    for path in &files {
+        let drafts = draft::list_drafts(path)?;
+        if drafts.is_empty() {
+            continue;
+        }
+        print_draft_group(&mut out, path, &drafts)?;
+    }
+
+    Ok(())
+}
+
+fn cmd_clear(pr_str: &str, url: Option<&str>) -> error::Result<()> {
+    let (host, owner, repo, pr_number) = resolve_pr_coords(pr_str, url)?;
+    let Some(base) = util::data_home() else {
+        return Err(GgrError::Io {
+            source: std::io::Error::other("could not determine data directory"),
+        });
+    };
+    let drafts_dir = draft::drafts_dir_from_base(&base, &host, &owner, &repo, pr_number);
+
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+
+    if !drafts_dir.exists() {
+        writeln!(out, "no drafts for {owner}/{repo}#{pr_number}")
+            .map_err(|source| GgrError::Io { source })?;
+        return Ok(());
+    }
+
+    let files = collect_draft_files(&drafts_dir)?;
+    let mut cleared = 0usize;
+    for path in &files {
+        let count = draft::list_drafts(path)?.len();
+        if count > 0 {
+            draft::clear_drafts(path)?;
+            cleared += count;
+        }
+    }
+
+    if cleared == 0 {
+        writeln!(out, "no drafts to clear for {owner}/{repo}#{pr_number}")
+            .map_err(|source| GgrError::Io { source })?;
+    } else {
+        writeln!(
+            out,
+            "cleared {cleared} draft(s) for {owner}/{repo}#{pr_number}"
+        )
+        .map_err(|source| GgrError::Io { source })?;
+    }
+
+    Ok(())
+}
+
+/// Collect draft files from `drafts_dir`: `_pr.jsonl` first, then commit
+/// files sorted by name.
+fn collect_draft_files(drafts_dir: &Path) -> error::Result<Vec<std::path::PathBuf>> {
+    let mut files: Vec<std::path::PathBuf> = Vec::new();
+    let pr_file = drafts_dir.join("_pr.jsonl");
+    if pr_file.exists() {
+        files.push(pr_file);
+    }
+    let mut commit_files: Vec<std::path::PathBuf> = std::fs::read_dir(drafts_dir)
+        .map_err(|source| GgrError::DraftIo { source })?
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| {
+            p.extension().and_then(|e| e.to_str()) == Some("jsonl")
+                && p.file_name().and_then(|n| n.to_str()) != Some("_pr.jsonl")
+        })
+        .collect();
+    commit_files.sort();
+    files.extend(commit_files);
+    Ok(files)
+}
+
+fn print_draft_group(
+    out: &mut impl std::io::Write,
+    path: &Path,
+    drafts: &[draft::GgrDraft],
+) -> error::Result<()> {
+    let label = match path.file_name().and_then(|n| n.to_str()) {
+        Some("_pr.jsonl") => "PR".to_owned(),
+        Some(name) => format!("Commit {}", name.trim_end_matches(".jsonl")),
+        None => "Unknown".to_owned(),
+    };
+    writeln!(out, "\n── {label} ──").map_err(|source| GgrError::Io { source })?;
+
+    for d in drafts {
+        let severity = match d.severity {
+            local_review_core::Severity::Required => "[REQUIRED]",
+            local_review_core::Severity::Suggestion => "[SUGGESTION]",
+            local_review_core::Severity::Note => "[NOTE]",
+        };
+        let anchor = match &d.anchor {
+            draft::GgrAnchor::Line {
+                file,
+                new_line,
+                old_line,
+                ..
+            } => {
+                let line = new_line
+                    .map(|l| (l, "new"))
+                    .or_else(|| old_line.map(|l| (l, "old")));
+                match line {
+                    Some((n, side)) => format!("{file}:{n} ({side})"),
+                    None => file.clone(),
+                }
+            }
+            draft::GgrAnchor::Commit { .. } => "(commit-scope)".to_owned(),
+            draft::GgrAnchor::Pr => "(PR-scope)".to_owned(),
+        };
+        writeln!(out, "{severity} {anchor}").map_err(|source| GgrError::Io { source })?;
+        for line in local_review_core::util::strip_controls(&d.body).lines() {
+            writeln!(out, "  {line}").map_err(|source| GgrError::Io { source })?;
+        }
+        writeln!(out).map_err(|source| GgrError::Io { source })?;
+    }
+
+    Ok(())
 }

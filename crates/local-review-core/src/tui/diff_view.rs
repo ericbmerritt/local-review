@@ -13,6 +13,23 @@ use crate::util::strip_injection_controls;
 /// reallocates as needed. Bound is total comment count, not user input rate.
 const ROWS_PER_INLINE_COMMENT_HINT: usize = 2;
 
+/// Context window used by [`collect_context`].
+pub const CONTEXT_LINES: usize = 3;
+
+/// Discriminates between a locally-editable draft comment and a read-only
+/// GitHub review thread when stored in [`InlineComment::comment_index`] and
+/// [`RenderedLineKind::InlineCommentMeta`].
+///
+/// - `Local(idx)` — index into the surface's loaded-drafts / loaded-comments
+///   list; the comment can be edited or deleted locally.
+/// - `GitHubThread(idx)` — enumerate index of a GitHub review thread fetched
+///   from the API; the comment is read-only in the local tool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommentIndex {
+    Local(usize),
+    GitHubThread(usize),
+}
+
 /// A rendered snapshot of one diff file (or the synthetic description view)
 /// ready for the TUI renderer. Rebuilt whenever the underlying diff or
 /// comments change.
@@ -62,10 +79,10 @@ pub enum RenderedLineKind {
     Removed,
     Notice,
     /// Synthetic line injected below a diff line to display a saved comment.
-    /// Carries the index into the surface's loaded-comments list so `e`/`d`
-    /// can resolve the focused comment in O(1) without a separate lookup.
+    /// Carries the comment identity so `e`/`d` can resolve the focused comment
+    /// in O(1) without a separate lookup.
     InlineCommentMeta {
-        comment_index: usize,
+        comment_index: CommentIndex,
     },
     /// Continuation line for a multi-line inline comment body.
     InlineCommentBody,
@@ -85,8 +102,8 @@ pub struct InlineComment {
     pub age: String,
     /// Comment body lines (already split on `\n`).
     pub body_lines: Vec<String>,
-    /// Index into the surface's loaded-comments list for edit/delete lookup.
-    pub comment_index: usize,
+    /// Identity of this comment for edit/delete lookup.
+    pub comment_index: CommentIndex,
 }
 
 /// One row of the side-by-side diff view.
@@ -438,6 +455,43 @@ pub fn severity_label(severity: Severity) -> &'static str {
     }
 }
 
+/// Collect up to [`CONTEXT_LINES`] commentable lines before and after `idx`
+/// in `lines`, skipping non-diff kinds (hunk headers, separators, inline
+/// comment rows, notices, description lines).
+///
+/// Returns `(before, after)` where `before` is in source order (earliest
+/// first) and `after` contains lines immediately following the cursor.
+pub fn collect_context(lines: &[RenderedLine], idx: usize) -> (Vec<String>, Vec<String>) {
+    let is_content = |kind: &RenderedLineKind| {
+        matches!(
+            kind,
+            RenderedLineKind::Added | RenderedLineKind::Removed | RenderedLineKind::Context
+        )
+    };
+
+    let before: Vec<String> = lines[..idx.min(lines.len())]
+        .iter()
+        .rev()
+        .filter(|l| is_content(&l.kind))
+        .take(CONTEXT_LINES)
+        .map(|l| l.text.clone())
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+
+    let after: Vec<String> = lines
+        .get(idx + 1..)
+        .unwrap_or(&[])
+        .iter()
+        .filter(|l| is_content(&l.kind))
+        .take(CONTEXT_LINES)
+        .map(|l| l.text.clone())
+        .collect();
+
+    (before, after)
+}
+
 fn inject_comment_lines(output: &mut Vec<RenderedLine>, comment: &InlineComment) {
     let label = severity_label(comment.severity);
     let meta = format!("┃ ● {label} · {}", comment.age);
@@ -625,7 +679,7 @@ mod tests {
             severity: Severity::Note,
             age: "just now".to_owned(),
             body_lines: vec!["body".to_owned()],
-            comment_index: 0,
+            comment_index: CommentIndex::Local(0),
         }];
         let annotated = view.with_inline_comments(&comments);
         let meta_count = annotated
@@ -931,7 +985,9 @@ mod tests {
         let lines = vec![
             line(RenderedLineKind::Removed, "old"),
             line(
-                RenderedLineKind::InlineCommentMeta { comment_index: 0 },
+                RenderedLineKind::InlineCommentMeta {
+                    comment_index: CommentIndex::Local(0),
+                },
                 "┃ ● note",
             ),
             line(RenderedLineKind::Added, "new"),
@@ -1063,7 +1119,9 @@ mod tests {
             line(RenderedLineKind::Removed, "old1"),
             line(RenderedLineKind::Removed, "old2"),
             line(
-                RenderedLineKind::InlineCommentMeta { comment_index: 0 },
+                RenderedLineKind::InlineCommentMeta {
+                    comment_index: CommentIndex::Local(0),
+                },
                 "┃ ● note",
             ),
             line(RenderedLineKind::Added, "new1"),
@@ -1111,7 +1169,7 @@ mod tests {
             severity: Severity::Required,
             age: "just now".to_owned(),
             body_lines: vec!["Fix this.".to_owned()],
-            comment_index: 0,
+            comment_index: CommentIndex::Local(0),
         };
         let augmented = view.with_inline_comments(&[comment]);
         assert_eq!(augmented.lines.len(), 6);
@@ -1144,7 +1202,7 @@ mod tests {
             severity: Severity::Required,
             body_lines: vec!["fix".to_owned()],
             age: "just now".to_owned(),
-            comment_index: 0,
+            comment_index: CommentIndex::Local(0),
         };
         let augmented = view.with_inline_comments(&[comment]);
         assert!(
@@ -1160,7 +1218,7 @@ mod tests {
             severity,
             age: "just now".to_owned(),
             body_lines: vec![body.to_owned()],
-            comment_index: 0,
+            comment_index: CommentIndex::Local(0),
         }
     }
 
@@ -1172,7 +1230,7 @@ mod tests {
             severity: Severity::Note,
             age: "just now".to_owned(),
             body_lines: vec!["desc note".to_owned()],
-            comment_index: 0,
+            comment_index: CommentIndex::Local(0),
         };
         let change_inline = make_change_inline(Severity::Required, "split");
         let augmented_desc = DiffView::from_description("first description line")
@@ -1202,7 +1260,7 @@ mod tests {
             severity: Severity::Note,
             age: "just now".to_owned(),
             body_lines: vec!["change-scoped body".to_owned()],
-            comment_index: 0,
+            comment_index: CommentIndex::Local(0),
         };
         let augmented_file = file_view.with_inline_comments(&[change_comment]);
         let change_metas = augmented_file

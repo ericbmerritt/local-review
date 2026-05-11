@@ -83,7 +83,7 @@ Workspace lints (per `CLAUDE.md`): strict — `unwrap_used`, `expect_used`,
 
 | Status         | Started    | Completed |
 | -------------- | ---------- | --------- |
-| 🟡 in-progress | 2026-05-11 |           |
+| ✅ complete    | 2026-05-11 | 2026-05-16 |
 
 Build the comment data model in `local-review-core`, parameterized over the
 identifier type (jjr's `ChangeId` vs ggr's `CommitId`) and over the scope shape

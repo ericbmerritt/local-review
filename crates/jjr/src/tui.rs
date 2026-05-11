@@ -63,6 +63,9 @@ use file_picker::FilePickerState;
 use local_review_core::tui::composer::{
     STATUS_DESCRIPTION_UNAVAILABLE, STATUS_LINE_UNAVAILABLE, STATUS_STACK_UNAVAILABLE,
 };
+use local_review_core::tui::try_downcast_mut;
+#[cfg(test)]
+use local_review_core::tui::CommentIndex;
 use local_review_core::tui::{
     BaseViews, DeleteOutcome as CoreDeleteOutcome, DeleteRequest, ExtraKeyAction, ExtraScreen,
     ExtraScreenAction, ExtraScreenContext, FilePickerEntry, MarkReviewedOutcome, ReviewSurface,
@@ -599,6 +602,10 @@ impl JjrSurface {
 // ---------------------------------------------------------------------------
 
 /// Wraps `Box<Composer>` so it can be stored as `Box<dyn ExtraScreen>`.
+///
+/// Uses jjr's own `Composer` wrapper (not the core type) because jjr's save/
+/// update/delete paths need the extra `original_anchor` field carried on the
+/// jjr `Composer`.
 struct ComposerScreen(Box<Composer>);
 impl ExtraScreen for ComposerScreen {
     fn is_overlay(&self) -> bool {
@@ -662,10 +669,6 @@ impl ExtraScreen for SendToClaudeScreen {
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
     }
-}
-
-fn try_downcast_mut<T: 'static>(s: &mut dyn ExtraScreen) -> Option<&mut T> {
-    s.as_any_mut().downcast_mut::<T>()
 }
 
 // ---------------------------------------------------------------------------
@@ -945,7 +948,13 @@ impl ReviewSurface for JjrSurface {
         clippy::wildcard_enum_match_arm,
         reason = "unhandled KeyCode variants are intentionally passed through as Ignored"
     )]
-    fn handle_extra_key(&mut self, key: KeyEvent) -> std::result::Result<ExtraKeyAction, JjrError> {
+    fn handle_extra_key(
+        &mut self,
+        key: KeyEvent,
+        _file_index: usize,
+        _line_index: usize,
+        _current_view: Option<&DiffView>,
+    ) -> std::result::Result<ExtraKeyAction, JjrError> {
         // Handle reanchor mode first (pending_reanchor intercepts some keys).
         if key.code == KeyCode::Esc {
             if let Some(reanchor) = self.pending_reanchor.take() {
@@ -2058,6 +2067,8 @@ struct App {
     /// suspending for `claude`); ratatui's diff cache is now stale and must
     /// be invalidated before the next draw.
     needs_full_redraw: bool,
+    /// Scroll offset for the help screen; reset to 0 when help opens.
+    help_scroll: u16,
 }
 
 #[cfg(test)]
@@ -2102,6 +2113,7 @@ impl App {
             reviewed,
             diff_mode: DiffMode::Auto,
             needs_full_redraw: false,
+            help_scroll: 0,
         }
     }
 
@@ -2888,7 +2900,7 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
     render_main(frame, app);
     match &app.screen {
         Screen::Main => {}
-        Screen::Help => help_screen::render(frame, "jjr · keybindings"),
+        Screen::Help => help_screen::render(frame, "jjr · keybindings", app.help_scroll),
         Screen::Composer(composer) => {
             composer_overlay::render_composer_overlay(frame, composer, app.current_view());
         }
@@ -3557,7 +3569,10 @@ fn handle_main_key(app: &mut App, key: KeyEvent) -> Result<()> {
 
     match key.code {
         KeyCode::Char('q') => app.should_quit = true,
-        KeyCode::Char('?') => app.screen = Screen::Help,
+        KeyCode::Char('?') => {
+            app.help_scroll = 0;
+            app.screen = Screen::Help;
+        }
         KeyCode::Char('S') => open_stale_screen(app),
         KeyCode::Char('s') => open_overview_screen(app),
         KeyCode::Up | KeyCode::Char('k') => app.move_line(-1),
@@ -3970,6 +3985,7 @@ fn handle_overview_key(app: &mut App, key: KeyEvent) -> Result<()> {
             app.screen = Screen::Main;
         }
         KeyCode::Char('?') => {
+            app.help_scroll = 0;
             app.screen = Screen::Help;
         }
         KeyCode::Up | KeyCode::Char('k') => {
@@ -5280,7 +5296,7 @@ fn toggle_severity_filter(app: &mut App, severity: Severity) {
 }
 
 /// Return the `Comment` under the cursor when the focused `RenderedLine` is
-/// an `InlineCommentMeta` and its embedded index falls within `loaded_comments`.
+/// an `InlineCommentMeta` backed by a local draft index.
 #[cfg(test)]
 fn focused_comment(app: &App) -> Option<&Comment> {
     let view = app.current_view()?;
@@ -5288,7 +5304,10 @@ fn focused_comment(app: &App) -> Option<&Comment> {
     let RenderedLineKind::InlineCommentMeta { comment_index } = line.kind else {
         return None;
     };
-    app.loaded_comments.get(comment_index)
+    let CommentIndex::Local(idx) = comment_index else {
+        return None;
+    };
+    app.loaded_comments.get(idx)
 }
 
 /// Park the cursor on the diff line a deleted comment was attached to.
@@ -5634,7 +5653,9 @@ mod tests {
         let lines = vec![
             make_line(RenderedLineKind::Context, "ctx0", Some(1), Some(1)),
             make_line(
-                RenderedLineKind::InlineCommentMeta { comment_index: 0 },
+                RenderedLineKind::InlineCommentMeta {
+                    comment_index: CommentIndex::Local(0),
+                },
                 "┃ meta",
                 None,
                 None,
@@ -5755,7 +5776,9 @@ mod tests {
             RenderedLineKind::HunkHeader,
             RenderedLineKind::HunkSeparator,
             RenderedLineKind::Notice,
-            RenderedLineKind::InlineCommentMeta { comment_index: 0 },
+            RenderedLineKind::InlineCommentMeta {
+                comment_index: CommentIndex::Local(0),
+            },
             RenderedLineKind::InlineCommentBody,
         ];
 
@@ -7189,10 +7212,13 @@ mod tests {
             .iter()
             .enumerate()
             .find(|(_, l)| match l.kind {
-                RenderedLineKind::InlineCommentMeta { comment_index } => app
-                    .loaded_comments
-                    .get(comment_index)
-                    .is_some_and(|c| c.body == body),
+                RenderedLineKind::InlineCommentMeta { comment_index } => {
+                    if let CommentIndex::Local(idx) = comment_index {
+                        app.loaded_comments.get(idx).is_some_and(|c| c.body == body)
+                    } else {
+                        false
+                    }
+                }
                 RenderedLineKind::HunkHeader
                 | RenderedLineKind::HunkSeparator
                 | RenderedLineKind::Context
@@ -9774,7 +9800,7 @@ mod tests {
                 "line3".to_owned(),
                 "line4".to_owned(),
             ],
-            comment_index: 0,
+            comment_index: CommentIndex::Local(0),
         };
         let augmented = base.with_inline_comments(&[inline]);
         // Augmented total: 18 added + 1 hunk header + 1 meta + 4 body = 24.

@@ -510,10 +510,6 @@ pub(crate) fn drafts_dir_from_base(
     crate::util::pr_data_dir(base, host, owner, repo, pr_number).join("drafts")
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "consumed by CLI subcommands (T8)")
-)]
 pub(crate) fn draft_path_from_base(base: &Path, draft: &GgrDraft) -> PathBuf {
     let dir = drafts_dir_from_base(
         base,
@@ -535,10 +531,6 @@ pub(crate) fn draft_path_from_base(base: &Path, draft: &GgrDraft) -> PathBuf {
 
 /// Append-mode write is safe: a crash at worst loses the new draft but cannot
 /// corrupt lines already in the file.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "consumed by composer integration (T7)")
-)]
 pub(crate) fn append_draft(path: &Path, draft: &GgrDraft) -> Result<()> {
     let parent = path.parent().ok_or_else(|| GgrError::DraftIo {
         source: std::io::Error::new(
@@ -591,10 +583,6 @@ pub(crate) fn list_drafts(path: &Path) -> Result<Vec<GgrDraft>> {
     Ok(drafts)
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "consumed by composer integration (T7)")
-)]
 pub(crate) fn update_draft(
     path: &Path,
     created_at: &str,
@@ -620,13 +608,6 @@ pub(crate) fn update_draft(
 }
 
 /// Rewrites `path` atomically, removing drafts that match `pred`.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "consumed by composer integration (T7) and CLI subcommands (T8)"
-    )
-)]
 pub(crate) fn delete_draft(path: &Path, pred: impl Fn(&GgrDraft) -> bool) -> Result<bool> {
     let drafts = list_drafts(path)?;
     let before = drafts.len();
@@ -636,6 +617,14 @@ pub(crate) fn delete_draft(path: &Path, pred: impl Fn(&GgrDraft) -> bool) -> Res
     }
     write_all(path, &kept)?;
     Ok(true)
+}
+
+/// Truncate `path` to empty content, preserving the file on disk.
+///
+/// Uses the same atomic-rename path as [`write_all`] so a crash mid-write
+/// cannot corrupt a file that had valid content before the call.
+pub(crate) fn clear_drafts(path: &Path) -> Result<()> {
+    write_all(path, &[])
 }
 
 fn write_all(path: &Path, drafts: &[GgrDraft]) -> Result<()> {

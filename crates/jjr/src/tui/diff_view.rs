@@ -7,6 +7,7 @@
 pub(crate) use local_review_core::tui::diff_view::{DiffView, InlineComment, RenderedLineKind};
 #[cfg(test)]
 pub(super) use local_review_core::tui::diff_view::{PairedRow, RenderedLine};
+pub(crate) use local_review_core::tui::CommentIndex;
 
 use crate::comment::{Anchor, Comment, Side, Status};
 
@@ -47,7 +48,7 @@ pub(crate) fn comment_to_inline(
         severity: comment.severity,
         age,
         body_lines,
-        comment_index,
+        comment_index: CommentIndex::Local(comment_index),
     })
 }
 
@@ -73,7 +74,7 @@ pub(crate) fn description_comment_to_inline(
         severity: comment.severity,
         age,
         body_lines,
-        comment_index,
+        comment_index: CommentIndex::Local(comment_index),
     })
 }
 
@@ -107,7 +108,7 @@ pub(crate) fn change_comment_to_inline(
         severity: comment.severity,
         age,
         body_lines,
-        comment_index,
+        comment_index: CommentIndex::Local(comment_index),
     })
 }
 
@@ -191,7 +192,7 @@ mod tests {
         assert_eq!(inline.target_line, Some(2));
         assert_eq!(inline.source_line, None);
         assert_eq!(inline.body_lines, vec!["hello".to_owned()]);
-        assert_eq!(inline.comment_index, 3);
+        assert_eq!(inline.comment_index, CommentIndex::Local(3));
     }
 
     #[test]
@@ -216,7 +217,7 @@ mod tests {
         let now = time::OffsetDateTime::UNIX_EPOCH;
         let inline = comment_to_inline(&comment, 7, Some(std::path::Path::new("foo.txt")), now)
             .expect("matching file should produce Some");
-        assert_eq!(inline.comment_index, 7);
+        assert_eq!(inline.comment_index, CommentIndex::Local(7));
     }
 
     #[test]
@@ -228,7 +229,7 @@ mod tests {
             severity: Severity::Note,
             age: "just now".to_owned(),
             body_lines: vec!["note".to_owned()],
-            comment_index: 5,
+            comment_index: CommentIndex::Local(5),
         };
         let augmented = view.with_inline_comments(&[comment]);
         let meta = augmented
@@ -238,7 +239,7 @@ mod tests {
             .expect("meta line should exist");
         match meta.kind {
             RenderedLineKind::InlineCommentMeta { comment_index } => {
-                assert_eq!(comment_index, 5);
+                assert_eq!(comment_index, CommentIndex::Local(5));
             }
             RenderedLineKind::HunkHeader
             | RenderedLineKind::HunkSeparator
@@ -312,7 +313,7 @@ mod tests {
         assert_eq!(inline.target_line, Some(2));
         assert_eq!(inline.source_line, None);
         assert_eq!(inline.severity, Severity::Required);
-        assert_eq!(inline.comment_index, 7);
+        assert_eq!(inline.comment_index, CommentIndex::Local(7));
         assert_eq!(inline.body_lines, vec!["description note".to_owned()]);
     }
 
@@ -470,7 +471,7 @@ mod tests {
         assert_eq!(inline.severity, Severity::Required);
         assert_eq!(inline.source_line, None);
         assert_eq!(inline.target_line, None);
-        assert_eq!(inline.comment_index, 4);
+        assert_eq!(inline.comment_index, CommentIndex::Local(4));
         assert_eq!(inline.body_lines, vec!["change note".to_owned()]);
     }
 

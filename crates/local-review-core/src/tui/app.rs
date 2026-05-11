@@ -207,6 +207,8 @@ pub struct App<S: ReviewSurfaceExt> {
     pub(crate) diff_mode: DiffMode,
     /// Set when the alternate screen was re-entered out-of-band.
     pub(crate) needs_full_redraw: bool,
+    /// Scroll offset for the help screen.
+    pub(crate) help_scroll: u16,
 }
 
 impl<S: ReviewSurfaceExt> App<S> {
@@ -256,6 +258,7 @@ impl<S: ReviewSurfaceExt> App<S> {
             severity_filter: None,
             diff_mode: DiffMode::Auto,
             needs_full_redraw: false,
+            help_scroll: 0,
         }
     }
 
@@ -844,7 +847,9 @@ pub(crate) fn render<S: ReviewSurfaceExt>(frame: &mut Frame<'_>, app: &mut App<S
     render_main(frame, app);
     match &app.screen {
         Screen::Main => {}
-        Screen::Help => help_screen::render(frame, app.surface.help_screen_title()),
+        Screen::Help => {
+            help_screen::render(frame, app.surface.help_screen_title(), app.help_scroll);
+        }
         Screen::Transition(state) => {
             render_transition(frame, app, state);
         }
@@ -1399,7 +1404,10 @@ fn handle_main_key<S: ReviewSurfaceExt>(app: &mut App<S>, key: KeyEvent) -> Resu
 
     match key.code {
         KeyCode::Char('q') => app.should_quit = true,
-        KeyCode::Char('?') => app.screen = Screen::Help,
+        KeyCode::Char('?') => {
+            app.help_scroll = 0;
+            app.screen = Screen::Help;
+        }
         KeyCode::Up | KeyCode::Char('k') => app.move_line(-1),
         KeyCode::Down | KeyCode::Char('j') => app.move_line(1),
         KeyCode::PageUp => app.move_page(-1),
@@ -1418,7 +1426,10 @@ fn handle_main_key<S: ReviewSurfaceExt>(app: &mut App<S>, key: KeyEvent) -> Resu
         KeyCode::Char('|') => app.cycle_diff_mode(),
         _ => {
             // Delegate to the surface for tool-specific keys.
-            let action = app.surface.handle_extra_key(key)?;
+            let current_view = app.rendered_per_file.get(app.file_index);
+            let action =
+                app.surface
+                    .handle_extra_key(key, app.file_index, app.line_index, current_view)?;
             match action {
                 ExtraKeyAction::Ignored => {}
                 ExtraKeyAction::OpenScreen(state) => {
@@ -1436,9 +1447,29 @@ fn handle_main_key<S: ReviewSurfaceExt>(app: &mut App<S>, key: KeyEvent) -> Resu
     Ok(())
 }
 
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "unhandled KeyCode variants intentionally ignored in help screen"
+)]
 fn handle_help_key<S: ReviewSurfaceExt>(app: &mut App<S>, key: KeyEvent) {
-    if matches!(key.code, KeyCode::Char('q' | '?') | KeyCode::Esc) {
-        app.screen = Screen::Main;
+    match key.code {
+        KeyCode::Char('q' | '?') | KeyCode::Esc => app.screen = Screen::Main,
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.help_scroll = app.help_scroll.saturating_sub(1);
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            app.help_scroll = app.help_scroll.saturating_add(1);
+        }
+        KeyCode::PageUp => {
+            app.help_scroll = app.help_scroll.saturating_sub(10);
+        }
+        KeyCode::PageDown => {
+            app.help_scroll = app.help_scroll.saturating_add(10);
+        }
+        KeyCode::Home | KeyCode::Char('g') => {
+            app.help_scroll = 0;
+        }
+        _ => {}
     }
 }
 
@@ -1734,7 +1765,13 @@ mod app_tests {
         fn severity_histogram(&self) -> SeverityHistogram {
             SeverityHistogram::default()
         }
-        fn handle_extra_key(&mut self, _: KeyEvent) -> Result<ExtraKeyAction, NoopError> {
+        fn handle_extra_key(
+            &mut self,
+            _: KeyEvent,
+            _file_index: usize,
+            _line_index: usize,
+            _current_view: Option<&DiffView>,
+        ) -> Result<ExtraKeyAction, NoopError> {
             Ok(ExtraKeyAction::Ignored)
         }
         fn render_extra_screen(&self, _: &mut Frame<'_>, _: &mut dyn ExtraScreen) {}
