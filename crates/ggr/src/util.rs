@@ -63,16 +63,10 @@ pub(crate) fn hostname_from_host(host: &str) -> Option<String> {
     }
 }
 
-/// Try to infer the GitHub host from the local git remote.
-///
-/// Runs `git remote get-url origin`, parses SSH (`git@HOST:OWNER/REPO.git`) or
-/// HTTPS (`https://HOST/OWNER/REPO`) format, and returns the host when:
-/// - `expected_slug` is `Some("owner/repo")` and the remote slug matches, or
-/// - `expected_slug` is `None` (bare PR number — use whatever host the remote is on).
-///
-/// Returns `None` if git is absent, the remote can't be parsed, the slug doesn't
-/// match, or the host is `github.com` (no special handling needed there).
-pub(crate) fn detect_remote_host(expected_slug: Option<&str>) -> Option<String> {
+/// Run `git remote get-url origin` and return `(host, owner/repo)` as owned
+/// strings. Returns `None` if git is absent, the remote fails, or the URL
+/// can't be parsed.
+fn remote_origin_coords() -> Option<(String, String)> {
     let out = Command::new("git")
         .args(["remote", "get-url", "origin"])
         .output()
@@ -82,12 +76,39 @@ pub(crate) fn detect_remote_host(expected_slug: Option<&str>) -> Option<String> 
     }
     let url = std::str::from_utf8(&out.stdout).ok()?.trim();
     let (host, slug) = parse_remote_url(url)?;
+    Some((host.to_owned(), slug.to_owned()))
+}
+
+/// Try to infer the GitHub host from the local git remote.
+///
+/// Returns the non-github.com hostname when:
+/// - `expected_slug` is `Some("owner/repo")` and the remote slug matches, or
+/// - `expected_slug` is `None` (bare PR number — use whatever host the remote is on).
+///
+/// Returns `None` if git is absent, the remote can't be parsed, the slug doesn't
+/// match, or the host is `github.com` (no special handling needed there).
+pub(crate) fn detect_remote_host(expected_slug: Option<&str>) -> Option<String> {
+    let (host, slug) = remote_origin_coords()?;
     if let Some(expected) = expected_slug {
         if !slug.eq_ignore_ascii_case(expected) {
             return None;
         }
     }
-    hostname_from_host(host)
+    hostname_from_host(&host)
+}
+
+/// Detect `(host, owner, repo)` from the local git remote.
+///
+/// Unlike [`detect_remote_host`], this always returns the full coordinates
+/// including `github.com` (not suppressed), making it suitable for locating
+/// local storage paths which need the full triple regardless of host.
+///
+/// Returns `None` if git is absent, the remote fails, or the URL can't be
+/// parsed as `owner/repo`.
+pub(crate) fn detect_remote_coords() -> Option<(String, String, String)> {
+    let (host, slug) = remote_origin_coords()?;
+    let (owner, repo) = slug.split_once('/')?;
+    Some((host, owner.to_owned(), repo.to_owned()))
 }
 
 /// Parse `(host, owner/repo)` from an SSH or HTTPS git remote URL.

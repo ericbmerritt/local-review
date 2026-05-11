@@ -22,7 +22,10 @@ pub use app::{
     ReviewSurfaceExt, TransitionMode, TransitionState, MIN_COLS, MIN_ROWS,
     SIDE_BY_SIDE_GUTTER_WIDTH, SIDE_BY_SIDE_MIN_WIDTH,
 };
-pub use diff_view::{DiffView, InlineComment, PairedRow, RenderedLine, RenderedLineKind};
+pub use diff_view::{
+    collect_context, CommentIndex, DiffView, InlineComment, PairedRow, RenderedLine,
+    RenderedLineKind,
+};
 pub use file_picker::{FilePickerEntry, FilePickerState};
 
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -344,9 +347,17 @@ pub trait ReviewSurface: Sized {
     /// managed by the surface. The core does not know the screen's type; it
     /// just stores `Box<dyn ExtraScreen>` and dispatches to the surface's
     /// `render_extra_screen` / `handle_extra_screen_key` methods.
+    ///
+    /// `file_index` and `line_index` are the cursor position at call time.
+    /// `current_view` is the annotated `DiffView` for `file_index` (with
+    /// inline comments already injected). Surfaces that open a composer from
+    /// this method use these to build a `LineTarget`.
     fn handle_extra_key(
         &mut self,
         key: crossterm::event::KeyEvent,
+        file_index: usize,
+        line_index: usize,
+        current_view: Option<&DiffView>,
     ) -> Result<ExtraKeyAction, Self::Error>;
 
     /// Render the extra screen. Called when `app.screen` is `Screen::Extra`.
@@ -558,5 +569,36 @@ impl SeverityHistogram {
     #[must_use]
     pub fn total(self) -> usize {
         self.required + self.suggestion + self.note
+    }
+}
+
+// ── Shared ExtraScreen helpers ────────────────────────────────────────────────
+
+/// Downcast `s` to `&mut T` through the `as_any_mut` escape hatch.
+///
+/// Both `jjr` and `ggr` use identical downcast patterns for their composer and
+/// other extra screens; centralising the helper removes the duplicate.
+pub fn try_downcast_mut<T: 'static>(s: &mut dyn ExtraScreen) -> Option<&mut T> {
+    s.as_any_mut().downcast_mut::<T>()
+}
+
+/// Wraps `Box<Composer>` so it can be stored as `Box<dyn ExtraScreen>`.
+///
+/// Both `jjr` and `ggr` open a `Composer` overlay for comment entry; a shared
+/// wrapper avoids duplicating the struct and its `ExtraScreen` impl in both
+/// crates.
+pub struct ComposerScreen(pub Box<composer::Composer>);
+
+impl ExtraScreen for ComposerScreen {
+    fn is_overlay(&self) -> bool {
+        true
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
     }
 }
