@@ -50,6 +50,12 @@ pub(crate) enum GgrError {
     #[snafu(display("io error: {source}"))]
     Io { source: std::io::Error },
 
+    #[snafu(display("invalid draft: {reason}"))]
+    InvalidDraft { reason: String },
+
+    #[snafu(display("draft I/O error: {source}"))]
+    DraftIo { source: std::io::Error },
+
     #[snafu(display("terminal is too narrow: {} columns (minimum 60)", cols))]
     TerminalTooNarrow { cols: u16 },
 
