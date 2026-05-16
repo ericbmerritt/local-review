@@ -639,6 +639,262 @@ fn write_all(path: &Path, drafts: &[GgrDraft]) -> Result<()> {
     atomic_write_bytes(path, &buf).map_err(|source| GgrError::DraftIo { source })
 }
 
+// ── GgrReply ──────────────────────────────────────────────────────────────────
+
+/// Filename for reply drafts. Leading underscore avoids collision with commit
+/// SHAs; distinct from `_pr.jsonl` so each file has a single purpose.
+const REPLY_DRAFT_FILENAME: &str = "_replies.jsonl";
+
+/// A pending reply to an existing GitHub review comment.
+///
+/// Constructed via [`GgrReply::new`]; deserialized via [`GgrReply::from_wire`].
+/// All string fields from external input are stripped of control characters at
+/// construction.
+pub(crate) struct GgrReply {
+    pub(crate) host: String,
+    pub(crate) owner: String,
+    pub(crate) repo: String,
+    pub(crate) pr_number: u64,
+    /// GitHub review comment ID of the comment being replied to. Stored as a
+    /// string because the spec treats it as an opaque identifier from the API.
+    pub(crate) parent_comment_id: String,
+    pub(crate) body: String,
+    pub(crate) severity: Severity,
+    pub(crate) created_at: String,
+    pub(crate) updated_at: Option<String>,
+}
+
+/// Construction parameters for [`GgrReply::new`].
+pub(crate) struct ReplyParams {
+    pub(crate) host: String,
+    pub(crate) owner: String,
+    pub(crate) repo: String,
+    pub(crate) pr_number: u64,
+    pub(crate) parent_comment_id: String,
+    pub(crate) body: String,
+    pub(crate) severity: Severity,
+    pub(crate) created_at: String,
+}
+
+impl GgrReply {
+    pub(crate) fn new(params: &ReplyParams) -> Result<Self> {
+        validate_reply_params(params)?;
+        Ok(Self {
+            host: strip_controls(&params.host),
+            owner: strip_controls(&params.owner),
+            repo: strip_controls(&params.repo),
+            pr_number: params.pr_number,
+            parent_comment_id: strip_controls(&params.parent_comment_id),
+            body: strip_controls(&params.body),
+            severity: params.severity,
+            created_at: strip_controls(&params.created_at),
+            updated_at: None,
+        })
+    }
+
+    fn from_wire(w: WireReply) -> Result<Self> {
+        if w.schema_version != SCHEMA_VERSION {
+            return Err(GgrError::InvalidDraft {
+                reason: format!(
+                    "schema_version mismatch: expected {SCHEMA_VERSION:?}, found {:?}",
+                    strip_controls(&w.schema_version),
+                ),
+            });
+        }
+        let params = ReplyParams {
+            host: w.host,
+            owner: w.owner,
+            repo: w.repo,
+            pr_number: w.pr_number,
+            parent_comment_id: w.parent_comment_id,
+            body: w.body,
+            severity: w.severity,
+            created_at: w.created_at,
+        };
+        let mut reply = Self::new(&params)?;
+        reply.updated_at = w.updated_at.as_deref().map(strip_controls);
+        Ok(reply)
+    }
+
+    fn to_wire(&self) -> WireReply {
+        WireReply {
+            schema_version: SCHEMA_VERSION.to_owned(),
+            kind: "reply".to_owned(),
+            host: self.host.clone(),
+            owner: self.owner.clone(),
+            repo: self.repo.clone(),
+            pr_number: self.pr_number,
+            parent_comment_id: self.parent_comment_id.clone(),
+            body: self.body.clone(),
+            severity: self.severity,
+            created_at: self.created_at.clone(),
+            updated_at: self.updated_at.clone(),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct WireReply {
+    schema_version: String,
+    kind: String,
+    host: String,
+    owner: String,
+    repo: String,
+    pr_number: u64,
+    parent_comment_id: String,
+    body: String,
+    severity: Severity,
+    created_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    updated_at: Option<String>,
+}
+
+fn validate_reply_params(p: &ReplyParams) -> Result<()> {
+    if !valid_segment(&p.host) {
+        return Err(GgrError::InvalidDraft {
+            reason: format!("invalid host {:?}", strip_controls(&p.host)),
+        });
+    }
+    if !valid_segment(&p.owner) {
+        return Err(GgrError::InvalidDraft {
+            reason: format!("invalid owner {:?}", strip_controls(&p.owner)),
+        });
+    }
+    if !valid_segment(&p.repo) {
+        return Err(GgrError::InvalidDraft {
+            reason: format!("invalid repo {:?}", strip_controls(&p.repo)),
+        });
+    }
+    if p.body.is_empty() {
+        return Err(GgrError::InvalidDraft {
+            reason: "body must not be empty".to_owned(),
+        });
+    }
+    if p.parent_comment_id.is_empty() {
+        return Err(GgrError::InvalidDraft {
+            reason: "parent_comment_id must not be empty".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+// ── reply path construction ───────────────────────────────────────────────────
+
+/// Path of the `_replies.jsonl` file for a PR under `base`.
+pub(crate) fn replies_file_from_base(
+    base: &Path,
+    host: &str,
+    owner: &str,
+    repo: &str,
+    pr_number: u64,
+) -> PathBuf {
+    drafts_dir_from_base(base, host, owner, repo, pr_number).join(REPLY_DRAFT_FILENAME)
+}
+
+// ── reply storage operations ──────────────────────────────────────────────────
+
+/// Append a single reply to `path` (`O_APPEND`; crash-safe).
+pub(crate) fn append_reply(path: &Path, reply: &GgrReply) -> Result<()> {
+    let parent = path.parent().ok_or_else(|| GgrError::DraftIo {
+        source: std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "reply path has no parent directory",
+        ),
+    })?;
+    std::fs::create_dir_all(parent).map_err(|source| GgrError::DraftIo { source })?;
+
+    let line = serde_json::to_string(&reply.to_wire()).map_err(|e| GgrError::DraftIo {
+        source: std::io::Error::other(e),
+    })?;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|source| GgrError::DraftIo { source })?;
+    writeln!(file, "{line}").map_err(|source| GgrError::DraftIo { source })?;
+    Ok(())
+}
+
+/// Read all replies from `path`. Returns empty vec if the file does not exist.
+pub(crate) fn list_replies(path: &Path) -> Result<Vec<GgrReply>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let file = std::fs::File::open(path).map_err(|source| GgrError::DraftIo { source })?;
+    let reader = std::io::BufReader::new(file);
+    let mut replies = Vec::new();
+    for (idx, result) in reader.lines().enumerate() {
+        let line = result.map_err(|source| GgrError::DraftIo { source })?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let wire: WireReply = serde_json::from_str(trimmed).map_err(|e| GgrError::DraftIo {
+            source: std::io::Error::other(format!(
+                "JSON parse error at line {} in {}: {e}",
+                idx + 1,
+                path.display()
+            )),
+        })?;
+        replies.push(GgrReply::from_wire(wire)?);
+    }
+    Ok(replies)
+}
+
+/// Atomically rewrite `path`, updating the reply identified by `created_at`.
+pub(crate) fn update_reply(
+    path: &Path,
+    created_at: &str,
+    new_body: &str,
+    new_severity: Severity,
+    new_updated_at: &str,
+) -> Result<bool> {
+    if new_body.is_empty() {
+        return Err(GgrError::InvalidDraft {
+            reason: "body must not be empty".to_owned(),
+        });
+    }
+    let mut replies = list_replies(path)?;
+    let pos = replies.iter().position(|r| r.created_at == created_at);
+    let Some(idx) = pos else {
+        return Ok(false);
+    };
+    replies[idx].body = strip_controls(new_body);
+    replies[idx].severity = new_severity;
+    replies[idx].updated_at = Some(strip_controls(new_updated_at));
+    write_all_replies(path, &replies)?;
+    Ok(true)
+}
+
+/// Atomically rewrite `path`, removing replies that match `pred`.
+pub(crate) fn delete_reply(path: &Path, pred: impl Fn(&GgrReply) -> bool) -> Result<bool> {
+    let replies = list_replies(path)?;
+    let before = replies.len();
+    let kept: Vec<GgrReply> = replies.into_iter().filter(|r| !pred(r)).collect();
+    if kept.len() == before {
+        return Ok(false);
+    }
+    write_all_replies(path, &kept)?;
+    Ok(true)
+}
+
+/// Truncate `path` to empty, preserving the file on disk.
+pub(crate) fn clear_replies(path: &Path) -> Result<()> {
+    write_all_replies(path, &[])
+}
+
+fn write_all_replies(path: &Path, replies: &[GgrReply]) -> Result<()> {
+    let mut buf: Vec<u8> = Vec::new();
+    for reply in replies {
+        let line = serde_json::to_string(&reply.to_wire()).map_err(|e| GgrError::DraftIo {
+            source: std::io::Error::other(e),
+        })?;
+        buf.extend_from_slice(line.as_bytes());
+        buf.push(b'\n');
+    }
+    atomic_write_bytes(path, &buf).map_err(|source| GgrError::DraftIo { source })
+}
+
 // ── tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1485,5 +1741,264 @@ mod tests {
             "control chars must be stripped from new_body: {:?}",
             loaded[0].body
         );
+    }
+
+    // ── GgrReply tests ────────────────────────────────────────────────────────
+
+    fn reply_params(body: &str) -> ReplyParams {
+        ReplyParams {
+            host: "github.com".to_owned(),
+            owner: "acme".to_owned(),
+            repo: "widget".to_owned(),
+            pr_number: 42,
+            parent_comment_id: "123456789".to_owned(),
+            body: body.to_owned(),
+            severity: Severity::Note,
+            created_at: "2026-01-01T00:00:00Z".to_owned(),
+        }
+    }
+
+    fn unique_reply_path(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "ggr_reply_test_{}_{}.jsonl",
+            tag,
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn new_reply_constructs_ok() {
+        let reply = GgrReply::new(&reply_params("looks good")).unwrap();
+        assert_eq!(reply.host, "github.com");
+        assert_eq!(reply.parent_comment_id, "123456789");
+        assert_eq!(reply.body, "looks good");
+        assert_eq!(reply.severity, Severity::Note);
+        assert!(reply.updated_at.is_none());
+    }
+
+    #[test]
+    fn new_reply_strips_controls_from_body() {
+        let p = reply_params("\x1b[31mevil\x1b[0m");
+        let reply = GgrReply::new(&p).unwrap();
+        assert!(!reply.body.chars().any(char::is_control));
+    }
+
+    #[test]
+    fn new_reply_strips_controls_from_parent_id() {
+        let mut p = reply_params("ok");
+        p.parent_comment_id = "123\x1b[31m".to_owned();
+        let reply = GgrReply::new(&p).unwrap();
+        assert!(!reply.parent_comment_id.chars().any(char::is_control));
+    }
+
+    #[test]
+    fn new_reply_rejects_empty_body() {
+        let p = reply_params("");
+        assert!(GgrReply::new(&p).is_err());
+    }
+
+    #[test]
+    fn new_reply_rejects_empty_parent_comment_id() {
+        let mut p = reply_params("ok");
+        p.parent_comment_id = String::new();
+        assert!(GgrReply::new(&p).is_err());
+    }
+
+    #[test]
+    fn new_reply_rejects_invalid_host() {
+        let mut p = reply_params("ok");
+        p.host = "../evil".to_owned();
+        assert!(GgrReply::new(&p).is_err());
+    }
+
+    #[test]
+    fn reply_wire_roundtrip() {
+        let reply = GgrReply::new(&reply_params("roundtrip body")).unwrap();
+        let wire = reply.to_wire();
+        assert_eq!(wire.kind, "reply");
+        assert_eq!(wire.schema_version, SCHEMA_VERSION);
+        let restored = GgrReply::from_wire(wire).unwrap();
+        assert_eq!(restored.body, "roundtrip body");
+        assert_eq!(restored.parent_comment_id, "123456789");
+    }
+
+    #[test]
+    fn reply_from_wire_rejects_wrong_schema_version() {
+        let reply = GgrReply::new(&reply_params("ok")).unwrap();
+        let mut wire = reply.to_wire();
+        wire.schema_version = "wrong/v99".to_owned();
+        assert!(GgrReply::from_wire(wire).is_err());
+    }
+
+    #[test]
+    fn replies_file_from_base_has_correct_structure() {
+        let base = PathBuf::from("/data");
+        let path = replies_file_from_base(&base, "github.com", "acme", "widget", 42);
+        assert_eq!(
+            path,
+            PathBuf::from("/data/ggr/github.com/acme/widget/42/drafts/_replies.jsonl")
+        );
+    }
+
+    #[test]
+    fn list_replies_returns_empty_for_nonexistent_file() {
+        let path = unique_reply_path("nonexistent");
+        let result = list_replies(&path).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn append_and_list_replies_roundtrip() {
+        let path = unique_reply_path("append_list");
+        let _ = std::fs::remove_file(&path);
+
+        let reply = GgrReply::new(&reply_params("first")).unwrap();
+        append_reply(&path, &reply).unwrap();
+
+        let mut p2 = reply_params("second");
+        p2.parent_comment_id = "987654321".to_owned();
+        p2.severity = Severity::Required;
+        let reply2 = GgrReply::new(&p2).unwrap();
+        append_reply(&path, &reply2).unwrap();
+
+        let loaded = list_replies(&path).unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].body, "first");
+        assert_eq!(loaded[1].body, "second");
+        assert_eq!(loaded[1].parent_comment_id, "987654321");
+        assert_eq!(loaded[1].severity, Severity::Required);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn update_reply_changes_body_and_severity() {
+        let path = unique_reply_path("update");
+        let _ = std::fs::remove_file(&path);
+
+        let reply = GgrReply::new(&reply_params("original")).unwrap();
+        let created_at = reply.created_at.clone();
+        append_reply(&path, &reply).unwrap();
+
+        let updated = update_reply(
+            &path,
+            &created_at,
+            "updated body",
+            Severity::Required,
+            "2026-02-01T00:00:00Z",
+        )
+        .unwrap();
+        assert!(updated);
+
+        let loaded = list_replies(&path).unwrap();
+        assert_eq!(loaded[0].body, "updated body");
+        assert_eq!(loaded[0].severity, Severity::Required);
+        assert_eq!(
+            loaded[0].updated_at.as_deref(),
+            Some("2026-02-01T00:00:00Z")
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn update_reply_returns_false_when_not_found() {
+        let path = unique_reply_path("update_notfound");
+        let _ = std::fs::remove_file(&path);
+
+        let reply = GgrReply::new(&reply_params("body")).unwrap();
+        append_reply(&path, &reply).unwrap();
+
+        let updated = update_reply(
+            &path,
+            "1999-01-01T00:00:00Z",
+            "new body",
+            Severity::Note,
+            "2026-02-01T00:00:00Z",
+        )
+        .unwrap();
+        assert!(!updated);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn update_reply_rejects_empty_body() {
+        let path = unique_reply_path("update_empty");
+        let reply = GgrReply::new(&reply_params("body")).unwrap();
+        let created_at = reply.created_at.clone();
+        append_reply(&path, &reply).unwrap();
+
+        assert!(update_reply(
+            &path,
+            &created_at,
+            "",
+            Severity::Note,
+            "2026-01-01T00:00:00Z"
+        )
+        .is_err());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn delete_reply_removes_matching_entry() {
+        let path = unique_reply_path("delete");
+        let _ = std::fs::remove_file(&path);
+
+        let r1 = GgrReply::new(&reply_params("keep")).unwrap();
+        let mut p2 = reply_params("remove");
+        p2.parent_comment_id = "999".to_owned();
+        p2.created_at = "2026-06-01T00:00:00Z".to_owned();
+        let r2 = GgrReply::new(&p2).unwrap();
+        append_reply(&path, &r1).unwrap();
+        append_reply(&path, &r2).unwrap();
+
+        let deleted = delete_reply(&path, |r| r.parent_comment_id == "999").unwrap();
+        assert!(deleted);
+
+        let remaining = list_replies(&path).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].body, "keep");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn delete_reply_returns_false_when_not_found() {
+        let path = unique_reply_path("delete_notfound");
+        let _ = std::fs::remove_file(&path);
+
+        let reply = GgrReply::new(&reply_params("body")).unwrap();
+        append_reply(&path, &reply).unwrap();
+
+        let deleted = delete_reply(&path, |r| r.parent_comment_id == "nonexistent").unwrap();
+        assert!(!deleted);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn clear_replies_truncates_to_empty() {
+        let path = unique_reply_path("clear");
+        let _ = std::fs::remove_file(&path);
+
+        let reply = GgrReply::new(&reply_params("body")).unwrap();
+        append_reply(&path, &reply).unwrap();
+        assert_eq!(list_replies(&path).unwrap().len(), 1);
+
+        clear_replies(&path).unwrap();
+        assert_eq!(list_replies(&path).unwrap().len(), 0);
+        assert!(path.exists(), "file must be preserved after clear");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn list_replies_malformed_json_returns_error() {
+        let path = unique_reply_path("malformed");
+        std::fs::write(&path, b"not valid json\n").unwrap();
+        assert!(list_replies(&path).is_err());
+        let _ = std::fs::remove_file(&path);
     }
 }

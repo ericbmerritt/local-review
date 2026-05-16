@@ -132,7 +132,6 @@ pub(crate) struct PrComment {
 #[derive(Debug, Clone)]
 pub(crate) struct ThreadComment {
     /// GitHub's numeric review comment ID.
-    #[expect(dead_code, reason = "consumed by thread rendering TUI (not yet built)")]
     pub(crate) id: u64,
     /// Comment author login as returned by the GitHub API.
     #[expect(dead_code, reason = "consumed by thread rendering TUI (not yet built)")]

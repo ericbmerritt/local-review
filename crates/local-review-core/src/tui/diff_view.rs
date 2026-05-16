@@ -20,13 +20,14 @@ pub const CONTEXT_LINES: usize = 3;
 /// GitHub review thread when stored in [`InlineComment::comment_index`] and
 /// [`RenderedLineKind::InlineCommentMeta`].
 ///
-/// - `Local(idx)` — index into the surface's loaded-drafts / loaded-comments
-///   list; the comment can be edited or deleted locally.
+/// - `Local(idx)` — index into the surface's loaded-drafts list; editable.
+/// - `LocalReply(idx)` — index into the surface's loaded-replies list; editable.
 /// - `GitHubThread(idx)` — enumerate index of a GitHub review thread fetched
-///   from the API; the comment is read-only in the local tool.
+///   from the API; read-only in the local tool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommentIndex {
     Local(usize),
+    LocalReply(usize),
     GitHubThread(usize),
 }
 
