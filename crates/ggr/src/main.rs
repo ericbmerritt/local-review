@@ -228,6 +228,15 @@ fn cmd_clear(pr_str: &str, url: Option<&str>) -> error::Result<()> {
             cleared += count;
         }
     }
+    // Also clear pending reply drafts.
+    let replies_file = draft::replies_file_from_base(&base, &host, &owner, &repo, pr_number);
+    if replies_file.exists() {
+        let reply_count = draft::list_replies(&replies_file)?.len();
+        if reply_count > 0 {
+            draft::clear_replies(&replies_file)?;
+            cleared += reply_count;
+        }
+    }
 
     if cleared == 0 {
         writeln!(out, "no drafts to clear for {owner}/{repo}#{pr_number}")

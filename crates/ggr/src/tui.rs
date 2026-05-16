@@ -15,8 +15,8 @@ use local_review_core::change_id::ChangeId;
 use local_review_core::comment::Side;
 use local_review_core::revset_hash::RevsetHash;
 use local_review_core::tui::composer::{
-    handle_composer_key, Composer, ComposerAction, ComposerInit, ComposerScope, LineTarget,
-    StackContextSnapshot,
+    handle_composer_key, Composer, ComposerAction, ComposerInit, ComposerScope, EditedComment,
+    LineTarget, StackContextSnapshot,
 };
 use local_review_core::tui::composer_overlay;
 use local_review_core::tui::diff_view::InlineComment;
@@ -82,6 +82,9 @@ pub(crate) struct GgrSurface {
     /// Local draft comments for the currently loaded commit entry.
     /// Refreshed on each `fetch_views` call and after each save/update/delete.
     loaded_drafts: Vec<crate::draft::GgrDraft>,
+    /// Pending reply drafts for the current PR.
+    /// Refreshed alongside `loaded_drafts`.
+    loaded_replies: Vec<crate::draft::GgrReply>,
     /// Last severity used, so new composers default to the same severity.
     last_severity: Option<Severity>,
 }
@@ -104,6 +107,7 @@ impl GgrSurface {
             pending_initial_index,
             pending_cursor,
             loaded_drafts: Vec::new(),
+            loaded_replies: Vec::new(),
             last_severity: None,
         }
     }
@@ -153,31 +157,34 @@ impl GgrSurface {
         out
     }
 
-    /// Reload `loaded_drafts` from disk for the current commit-diff state.
+    /// Reload `loaded_drafts` and `loaded_replies` from disk.
     fn reload_drafts(&mut self) {
         let Some(base) = crate::util::data_home() else {
             self.loaded_drafts.clear();
+            self.loaded_replies.clear();
             return;
         };
         let State::CommitDiff { index, .. } = &self.state else {
             self.loaded_drafts.clear();
+            self.loaded_replies.clear();
             return;
         };
         let Some(commit) = self.pr.commits.get(index.wrapping_sub(1)) else {
             self.loaded_drafts.clear();
+            self.loaded_replies.clear();
             return;
         };
         let host = self.pr.hostname.as_deref().unwrap_or("github.com");
         let slug = self.pr.repo_name.as_str();
         let Some((owner, repo)) = slug.split_once('/') else {
             self.loaded_drafts.clear();
+            self.loaded_replies.clear();
             return;
         };
         let drafts_dir =
             crate::draft::drafts_dir_from_base(&base, host, owner, repo, self.pr.number);
 
         let mut all: Vec<crate::draft::GgrDraft> = Vec::new();
-        // Load commit-scope + line-scope drafts for current commit.
         let commit_file = drafts_dir.join(format!("{}.jsonl", commit.sha.as_str()));
         match crate::draft::list_drafts(&commit_file) {
             Ok(ds) => all.extend(ds),
@@ -186,7 +193,6 @@ impl GgrSurface {
                 let _ = writeln!(stderr, "ggr: warning: failed to load drafts: {e}");
             }
         }
-        // Load PR-scope drafts.
         let pr_file = drafts_dir.join("_pr.jsonl");
         match crate::draft::list_drafts(&pr_file) {
             Ok(ds) => all.extend(ds),
@@ -196,6 +202,17 @@ impl GgrSurface {
             }
         }
         self.loaded_drafts = all;
+
+        let replies_file =
+            crate::draft::replies_file_from_base(&base, host, owner, repo, self.pr.number);
+        match crate::draft::list_replies(&replies_file) {
+            Ok(rs) => self.loaded_replies = rs,
+            Err(e) => {
+                let mut stderr = std::io::stderr().lock();
+                let _ = writeln!(stderr, "ggr: warning: failed to load reply drafts: {e}");
+                self.loaded_replies.clear();
+            }
+        }
     }
 
     /// Return the `CommitSha` for the currently-loaded commit entry, or `None` in
@@ -365,6 +382,9 @@ impl GgrSurface {
         };
         let draft_idx = match comment_index {
             CommentIndex::Local(idx) => idx,
+            CommentIndex::LocalReply(idx) => {
+                return self.open_edit_reply_composer(idx, line_index);
+            }
             CommentIndex::GitHubThread(_) => {
                 return ExtraKeyAction::StatusMessage(
                     "GitHub review threads cannot be edited locally".to_owned(),
@@ -404,7 +424,7 @@ impl GgrSurface {
             stack_available,
             description_available: None,
         };
-        let edited = local_review_core::tui::composer::EditedComment {
+        let edited = EditedComment {
             init,
             body: draft.body.clone(),
             identity: identity_dt,
@@ -611,6 +631,97 @@ impl GgrSurface {
     }
 }
 
+// ── inline comment helpers ────────────────────────────────────────────────────
+
+impl GgrSurface {
+    fn collect_draft_inline(
+        &self,
+        file_path: &str,
+        severity_filter: Option<Severity>,
+        out: &mut Vec<InlineComment>,
+    ) {
+        for (draft_idx, draft) in self.loaded_drafts.iter().enumerate() {
+            let crate::draft::GgrAnchor::Line {
+                old_line,
+                new_line,
+                file: draft_file,
+                ..
+            } = &draft.anchor
+            else {
+                continue;
+            };
+            if draft_file.as_str() != file_path {
+                continue;
+            }
+            if severity_filter.is_some_and(|f| draft.severity != f) {
+                continue;
+            }
+            out.push(InlineComment {
+                source_line: *old_line,
+                target_line: *new_line,
+                severity: draft.severity,
+                age: "[draft]".to_owned(),
+                body_lines: strip_controls_preserve_newlines(&draft.body)
+                    .lines()
+                    .map(str::to_owned)
+                    .collect(),
+                comment_index: CommentIndex::Local(draft_idx),
+            });
+        }
+    }
+
+    fn collect_thread_inline(
+        &self,
+        now: std::time::SystemTime,
+        file_path: &str,
+        severity_filter: Option<Severity>,
+        out: &mut Vec<InlineComment>,
+    ) {
+        for (enumerate_idx, thread) in self.pr.review_threads.iter().enumerate() {
+            if thread.path != file_path || thread.is_outdated() {
+                continue;
+            }
+            if severity_filter.is_some_and(|f| thread.severity != f) {
+                continue;
+            }
+            out.push(InlineComment {
+                source_line: thread.original_line,
+                target_line: thread.line,
+                severity: thread.severity,
+                age: local_review_core::util::format_age_from_iso_str(now, &thread.root.created_at),
+                body_lines: strip_controls_preserve_newlines(&thread.root.body)
+                    .lines()
+                    .map(str::to_owned)
+                    .collect(),
+                comment_index: CommentIndex::GitHubThread(enumerate_idx),
+            });
+        }
+    }
+
+    fn collect_reply_inline(&self, file_path: &str, out: &mut Vec<InlineComment>) {
+        for (reply_idx, reply) in self.loaded_replies.iter().enumerate() {
+            let Some(thread) = self.pr.review_threads.iter().find(|t| {
+                t.root.id.to_string() == reply.parent_comment_id
+                    && t.path == file_path
+                    && !t.is_outdated()
+            }) else {
+                continue;
+            };
+            out.push(InlineComment {
+                source_line: thread.original_line,
+                target_line: thread.line,
+                severity: reply.severity,
+                age: "[pending reply]".to_owned(),
+                body_lines: strip_controls_preserve_newlines(&reply.body)
+                    .lines()
+                    .map(str::to_owned)
+                    .collect(),
+                comment_index: CommentIndex::LocalReply(reply_idx),
+            });
+        }
+    }
+}
+
 // ── ReviewSurface impl ────────────────────────────────────────────────────────
 
 impl ReviewSurface for GgrSurface {
@@ -699,70 +810,14 @@ impl ReviewSurface for GgrSurface {
         if view_idx == 0 {
             return Vec::new();
         }
-        let file_idx = view_idx - 1;
-        let Some(file) = diff.files.get(file_idx) else {
+        let Some(file) = diff.files.get(view_idx - 1) else {
             return Vec::new();
         };
-        let file_path_str = file.display_path().to_string_lossy();
-
+        let file_path = file.display_path().to_string_lossy();
         let mut result: Vec<InlineComment> = Vec::new();
-
-        // Local line-scope drafts: indices 0..N (editable).
-        for (draft_idx, draft) in self.loaded_drafts.iter().enumerate() {
-            let crate::draft::GgrAnchor::Line {
-                old_line,
-                new_line,
-                file: draft_file,
-                ..
-            } = &draft.anchor
-            else {
-                continue;
-            };
-            if draft_file.as_str() != file_path_str.as_ref() {
-                continue;
-            }
-            if let Some(f) = severity_filter {
-                if draft.severity != f {
-                    continue;
-                }
-            }
-            result.push(InlineComment {
-                source_line: *old_line,
-                target_line: *new_line,
-                severity: draft.severity,
-                age: "[draft]".to_owned(),
-                body_lines: strip_controls_preserve_newlines(&draft.body)
-                    .lines()
-                    .map(str::to_owned)
-                    .collect(),
-                comment_index: CommentIndex::Local(draft_idx),
-            });
-        }
-
-        // GitHub review threads: large indices (usize::MAX - enumerate_idx),
-        // ensuring they never collide with local draft indices.
-        for (enumerate_idx, thread) in self.pr.review_threads.iter().enumerate() {
-            if thread.path != file_path_str.as_ref() || thread.is_outdated() {
-                continue;
-            }
-            if let Some(f) = severity_filter {
-                if thread.severity != f {
-                    continue;
-                }
-            }
-            result.push(InlineComment {
-                source_line: thread.original_line,
-                target_line: thread.line,
-                severity: thread.severity,
-                age: local_review_core::util::format_age_from_iso_str(now, &thread.root.created_at),
-                body_lines: strip_controls_preserve_newlines(&thread.root.body)
-                    .lines()
-                    .map(str::to_owned)
-                    .collect(),
-                comment_index: CommentIndex::GitHubThread(enumerate_idx),
-            });
-        }
-
+        self.collect_draft_inline(&file_path, severity_filter, &mut result);
+        self.collect_thread_inline(now, &file_path, severity_filter, &mut result);
+        self.collect_reply_inline(&file_path, &mut result);
         result
     }
 
@@ -974,6 +1029,7 @@ impl ReviewSurface for GgrSurface {
             KeyCode::Char('m') => Ok(self.open_commit_scope_composer()),
             KeyCode::Char('P') => Ok(self.open_pr_scope_composer()),
             KeyCode::Char('e') => Ok(self.open_edit_composer(line_index, current_view)),
+            KeyCode::Char('r') => Ok(self.open_reply_composer(line_index, current_view)),
             _ => Ok(ExtraKeyAction::Ignored),
         }
     }
@@ -981,6 +1037,8 @@ impl ReviewSurface for GgrSurface {
     fn render_extra_screen(&self, frame: &mut Frame<'_>, state: &mut dyn ExtraScreen) {
         if let Some(s) = state.as_any_mut().downcast_mut::<ComposerScreen>() {
             composer_overlay::render_composer_overlay(frame, &s.0, None);
+        } else if let Some(s) = state.as_any_mut().downcast_mut::<ReplyComposerScreen>() {
+            composer_overlay::render_composer_overlay(frame, &s.composer, None);
         }
     }
 
@@ -992,6 +1050,10 @@ impl ReviewSurface for GgrSurface {
     ) -> std::result::Result<ExtraScreenAction, GgrError> {
         if let Some(s) = try_downcast_mut::<ComposerScreen>(state) {
             return Ok(self.handle_composer_key_impl(&mut s.0, key, ctx));
+        }
+        if let Some(s) = try_downcast_mut::<ReplyComposerScreen>(state) {
+            let parent_id = s.parent_comment_id.clone();
+            return Ok(self.handle_reply_composer_key(&mut s.composer, &parent_id, key, ctx));
         }
         Ok(ExtraScreenAction::StayOpen)
     }
@@ -1080,6 +1142,272 @@ fn draft_anchor_to_scope(
                         revset_hash: RevsetHash::from_revset(""),
                     }),
             )
+        }
+    }
+}
+
+// ── ReplyComposerScreen ───────────────────────────────────────────────────────
+
+/// Wraps a `Composer` for replying to an existing GitHub review comment.
+/// Carries the `parent_comment_id` so `handle_reply_composer_key` can route
+/// the save to `save_reply` instead of `save_comment`.
+struct ReplyComposerScreen {
+    composer: Box<Composer>,
+    parent_comment_id: String,
+}
+
+impl ExtraScreen for ReplyComposerScreen {
+    fn is_overlay(&self) -> bool {
+        true
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+
+// ── GgrSurface reply helpers ──────────────────────────────────────────────────
+
+impl GgrSurface {
+    /// Open a reply composer when the cursor is on a `GitHubThread` line.
+    fn open_reply_composer(
+        &self,
+        line_index: usize,
+        current_view: Option<&DiffView>,
+    ) -> ExtraKeyAction {
+        let Some(view) = current_view else {
+            return ExtraKeyAction::StatusMessage("no view loaded".to_owned());
+        };
+        let Some(row) = view.lines.get(line_index) else {
+            return ExtraKeyAction::StatusMessage("cursor out of bounds".to_owned());
+        };
+        let RenderedLineKind::InlineCommentMeta { comment_index } = row.kind else {
+            return ExtraKeyAction::StatusMessage("cursor is not on a comment thread".to_owned());
+        };
+        let CommentIndex::GitHubThread(enumerate_idx) = comment_index else {
+            return ExtraKeyAction::StatusMessage(
+                "cursor is not on a GitHub review thread".to_owned(),
+            );
+        };
+        let Some(thread) = self.pr.review_threads.get(enumerate_idx) else {
+            return ExtraKeyAction::StatusMessage("thread index out of bounds".to_owned());
+        };
+
+        let parent_comment_id = thread.root.id.to_string();
+        let (change_id, commit_title) = self.draft_change_id_and_title();
+        let stack_available = Some(StackContextSnapshot {
+            revset: format!("PR #{}", self.pr.number),
+            revset_hash: RevsetHash::from_revset(&format!("pr:{}", self.pr.number)),
+        });
+        let init = ComposerInit {
+            scope: ComposerScope::Change,
+            severity: self.last_severity.unwrap_or(Severity::Note),
+            change_id,
+            change_description: commit_title,
+            line_available: None,
+            stack_available,
+            description_available: None,
+        };
+        ExtraKeyAction::OpenScreen(Box::new(ReplyComposerScreen {
+            composer: Box::new(Composer::new(init)),
+            parent_comment_id,
+        }))
+    }
+
+    /// Handle key dispatch for the reply composer overlay.
+    fn handle_reply_composer_key(
+        &mut self,
+        composer: &mut Composer,
+        parent_comment_id: &str,
+        key: KeyEvent,
+        ctx: &mut ExtraScreenContext<'_>,
+    ) -> ExtraScreenAction {
+        use local_review_core::tui::composer::{handle_composer_key, ComposerAction};
+        match handle_composer_key(composer, key) {
+            ComposerAction::Continue => ExtraScreenAction::StayOpen,
+            ComposerAction::Cancel => ExtraScreenAction::Close,
+            ComposerAction::Save => match self.save_reply(composer, parent_comment_id) {
+                Ok(msg) => {
+                    self.last_severity = Some(composer.severity());
+                    *ctx.status_message = Some(msg);
+                    ExtraScreenAction::Close
+                }
+                Err(msg) => {
+                    *ctx.status_message = Some(msg);
+                    ExtraScreenAction::StayOpen
+                }
+            },
+            ComposerAction::Delete => match self.delete_reply_via_composer(composer) {
+                Ok(()) => ExtraScreenAction::Close,
+                Err(msg) => {
+                    *ctx.status_message = Some(msg);
+                    ExtraScreenAction::StayOpen
+                }
+            },
+            ComposerAction::RefusedScopeChord(status) => {
+                *ctx.status_message = Some(status.to_owned());
+                ExtraScreenAction::StayOpen
+            }
+        }
+    }
+
+    /// Persist a new or edited reply draft.
+    fn save_reply(
+        &mut self,
+        composer: &Composer,
+        parent_comment_id: &str,
+    ) -> std::result::Result<String, String> {
+        let body = composer.body_text();
+        if body.trim().is_empty() {
+            return Err("reply body is empty — not saved".to_owned());
+        }
+
+        // Edit path: update existing reply.
+        if let Some(edit_ctx) = composer.editing() {
+            let created_at_key = edit_ctx
+                .identity
+                .format(&time::format_description::well_known::Rfc3339)
+                .map_err(|e| format!("timestamp format error: {e}"))?;
+            let updated_at = time::OffsetDateTime::now_utc()
+                .format(&time::format_description::well_known::Rfc3339)
+                .map_err(|e| format!("timestamp format error: {e}"))?;
+            let Some(base) = crate::util::data_home() else {
+                return Err("could not determine data directory".to_owned());
+            };
+            let host = self.pr.hostname.as_deref().unwrap_or("github.com");
+            let slug = self.pr.repo_name.as_str();
+            let (owner, repo) = slug.split_once('/').unwrap_or(("_", "_"));
+            let path =
+                crate::draft::replies_file_from_base(&base, host, owner, repo, self.pr.number);
+            return match crate::draft::update_reply(
+                &path,
+                &created_at_key,
+                &body,
+                composer.severity(),
+                &updated_at,
+            ) {
+                Ok(true) => {
+                    self.reload_drafts();
+                    Ok("reply updated".to_owned())
+                }
+                Ok(false) => Err("reply not found on disk".to_owned()),
+                Err(e) => Err(format!("update failed: {}", strip_controls(&e.to_string()))),
+            };
+        }
+
+        // New reply path.
+        let Some(base) = crate::util::data_home() else {
+            return Err(
+                "could not determine data directory; XDG_DATA_HOME and HOME unset".to_owned(),
+            );
+        };
+        let created_at = time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .map_err(|e| format!("timestamp format error: {e}"))?;
+        let host = self
+            .pr
+            .hostname
+            .as_deref()
+            .unwrap_or("github.com")
+            .to_owned();
+        let slug = self.pr.repo_name.as_str();
+        let (owner, repo) = slug.split_once('/').unwrap_or(("_", "_"));
+        let params = crate::draft::ReplyParams {
+            host,
+            owner: owner.to_owned(),
+            repo: repo.to_owned(),
+            pr_number: self.pr.number,
+            parent_comment_id: parent_comment_id.to_owned(),
+            body: body.clone(),
+            severity: composer.severity(),
+            created_at,
+        };
+        let reply = crate::draft::GgrReply::new(&params)
+            .map_err(|e| format!("save failed: {}", strip_controls(&e.to_string())))?;
+        let path = crate::draft::replies_file_from_base(
+            &base,
+            &reply.host,
+            &reply.owner,
+            &reply.repo,
+            reply.pr_number,
+        );
+        crate::draft::append_reply(&path, &reply)
+            .map_err(|e| format!("save failed: {}", strip_controls(&e.to_string())))?;
+        self.reload_drafts();
+        Ok("reply draft saved".to_owned())
+    }
+
+    /// Open the reply composer in edit mode for an existing reply draft.
+    fn open_edit_reply_composer(&self, reply_idx: usize, line_index: usize) -> ExtraKeyAction {
+        let Some(reply) = self.loaded_replies.get(reply_idx) else {
+            return ExtraKeyAction::StatusMessage(
+                "reply draft not found — navigate away and back to refresh".to_owned(),
+            );
+        };
+        let Ok(identity_dt) = time::OffsetDateTime::parse(
+            &reply.created_at,
+            &time::format_description::well_known::Rfc3339,
+        ) else {
+            return ExtraKeyAction::StatusMessage(
+                "reply draft has invalid timestamp — cannot edit".to_owned(),
+            );
+        };
+        let (change_id, commit_title) = self.draft_change_id_and_title();
+        let stack_available = Some(StackContextSnapshot {
+            revset: format!("PR #{}", self.pr.number),
+            revset_hash: RevsetHash::from_revset(&format!("pr:{}", self.pr.number)),
+        });
+        let init = ComposerInit {
+            scope: ComposerScope::Change,
+            severity: reply.severity,
+            change_id,
+            change_description: commit_title,
+            line_available: None,
+            stack_available,
+            description_available: None,
+        };
+        let edited = EditedComment {
+            init,
+            body: reply.body.clone(),
+            identity: identity_dt,
+            comment_index: Some(line_index),
+        };
+        ExtraKeyAction::OpenScreen(Box::new(ReplyComposerScreen {
+            composer: Box::new(Composer::for_edit(edited)),
+            parent_comment_id: reply.parent_comment_id.clone(),
+        }))
+    }
+
+    /// Delete a reply draft via the edit composer's identity.
+    fn delete_reply_via_composer(
+        &mut self,
+        composer: &Composer,
+    ) -> std::result::Result<(), String> {
+        let Some(edit_ctx) = composer.editing() else {
+            return Err("nothing to delete — composer is not in edit mode".to_owned());
+        };
+        let created_at_key = edit_ctx
+            .identity
+            .format(&time::format_description::well_known::Rfc3339)
+            .map_err(|e| format!("timestamp format error: {e}"))?;
+        let Some(base) = crate::util::data_home() else {
+            return Err("could not determine data directory".to_owned());
+        };
+        let host = self.pr.hostname.as_deref().unwrap_or("github.com");
+        let slug = self.pr.repo_name.as_str();
+        let (owner, repo) = slug.split_once('/').unwrap_or(("_", "_"));
+        let path = crate::draft::replies_file_from_base(&base, host, owner, repo, self.pr.number);
+        match crate::draft::delete_reply(&path, |r| r.created_at == created_at_key) {
+            Ok(true) => {
+                self.reload_drafts();
+                Ok(())
+            }
+            Ok(false) => Err("reply not found — already deleted?".to_owned()),
+            Err(e) => Err(format!("delete failed: {}", strip_controls(&e.to_string()))),
         }
     }
 }
