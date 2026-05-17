@@ -216,21 +216,33 @@ fn clear_review_drafts(coords: &PrCoords<'_>, commits: &[CommitEntry]) -> Result
 // ── submit helpers ────────────────────────────────────────────────────────────
 
 /// Build the review payload from drafts and POST it to GitHub.
+///
+/// Stale drafts (anchors that no longer match the current diff) are excluded
+/// from the payload per spec: they cannot be reliably posted and must be
+/// re-anchored or cleared first.
 fn post_review_from_drafts(
     pr: &PrDetails,
     verdict: Verdict,
     all_drafts: &[GgrDraft],
 ) -> Result<()> {
-    let pr_scope: Vec<&GgrDraft> = all_drafts
+    use crate::draft::DraftStatus;
+    let submittable: Vec<&GgrDraft> = all_drafts
         .iter()
+        .filter(|d| d.status != Some(DraftStatus::Stale))
+        .collect();
+    let pr_scope: Vec<&GgrDraft> = submittable
+        .iter()
+        .copied()
         .filter(|d| matches!(d.anchor, GgrAnchor::Pr))
         .collect();
-    let commit_scope: Vec<&GgrDraft> = all_drafts
+    let commit_scope: Vec<&GgrDraft> = submittable
         .iter()
+        .copied()
         .filter(|d| matches!(d.anchor, GgrAnchor::Commit { .. }))
         .collect();
-    let line_scope: Vec<&GgrDraft> = all_drafts
+    let line_scope: Vec<&GgrDraft> = submittable
         .iter()
+        .copied()
         .filter(|d| matches!(d.anchor, GgrAnchor::Line { .. }))
         .collect();
     let review_body = build_review_body(&pr_scope, &commit_scope, &pr.commits);
@@ -250,11 +262,16 @@ fn post_review_from_drafts(
     )
 }
 
-/// POST reply drafts serially. Returns `(posted, failed, first_error_message)`.
+/// POST reply drafts serially. Stale replies are skipped.
+/// Returns `(posted, failed, first_error_message)`.
 fn fan_out_replies(pr: &PrDetails, replies: &[GgrReply]) -> (usize, usize, Option<String>) {
+    use crate::draft::DraftStatus;
     let mut posted_ats: Vec<String> = Vec::new();
     let mut first_error: Option<String> = None;
-    for reply in replies {
+    for reply in replies
+        .iter()
+        .filter(|r| r.status != Some(DraftStatus::Stale))
+    {
         let body = format_comment_body(&reply.body, reply.severity);
         match crate::gh::post_reply(
             &pr.repo_name,
@@ -338,7 +355,13 @@ pub(crate) fn submit(pr: &PrDetails, verdict: Verdict, base: &Path) -> Result<Su
 
     let (all_drafts, all_replies) = collect_all_pr_drafts(&coords, &pr.commits)?;
 
-    if matches!(verdict, Verdict::Comment) && all_drafts.is_empty() && all_replies.is_empty() {
+    let has_submittable = all_drafts
+        .iter()
+        .any(|d| d.status != Some(crate::draft::DraftStatus::Stale))
+        || all_replies
+            .iter()
+            .any(|r| r.status != Some(crate::draft::DraftStatus::Stale));
+    if matches!(verdict, Verdict::Comment) && !has_submittable {
         return Err(GgrError::InvalidDraft {
             reason:
                 "nothing to submit; use approve or request-changes to weigh in without comments"
@@ -526,7 +549,48 @@ mod tests {
     }
 
     #[test]
-    fn verdict_api_strings() {
+    fn submit_comment_with_only_stale_drafts_returns_error() {
+        use crate::draft::DraftStatus;
+        use crate::pr::{PrDetails, RepoName};
+
+        let dir = tempfile::tempdir().unwrap();
+        // Write a stale draft so all_drafts is non-empty but fully stale.
+        let drafts_dir = drafts_dir_from_base(dir.path(), "github.com", "acme", "widget", 1);
+        let sha_str = "a".repeat(40);
+        let mut d = GgrDraft::new_commit(&common("stale body", Severity::Note), &sha_str).unwrap();
+        d.status = Some(DraftStatus::Stale);
+        let path = drafts_dir.join(format!("{sha_str}.jsonl"));
+        crate::draft::write_drafts_to_path(&path, &[d]).unwrap();
+
+        let pr = PrDetails {
+            number: 1,
+            title: "t".to_owned(),
+            body: String::new(),
+            comments: vec![],
+            repo_name: RepoName::try_from("acme/widget").unwrap(),
+            hostname: None,
+            commits: vec![make_commit('a', "commit")],
+            review_threads: vec![],
+        };
+
+        let err = submit(&pr, Verdict::Comment, dir.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("nothing to submit"),
+            "wrong error: {err}"
+        );
+    }
+
+    #[test]
+    fn build_review_body_excludes_nothing_for_non_stale() {
+        // PR-scope draft with no status (None) should be included.
+        let draft = GgrDraft::new_pr(&common("body", Severity::Note)).unwrap();
+        let body = build_review_body(&[&draft], &[], &[]);
+        assert!(body.contains("[NOTE]"));
+        assert!(body.contains("body"));
+    }
+
+    #[test]
+    fn verdict_api_strings_after_stale_fix() {
         assert_eq!(Verdict::Approve.as_api_str(), "APPROVE");
         assert_eq!(Verdict::RequestChanges.as_api_str(), "REQUEST_CHANGES");
         assert_eq!(Verdict::Comment.as_api_str(), "COMMENT");

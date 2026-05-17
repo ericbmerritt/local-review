@@ -54,6 +54,7 @@ pub(crate) struct LineAnchorParams {
 /// The sum type makes illegal field combinations unrepresentable: a PR-scoped
 /// draft cannot carry a `commit_sha`, a commit-scoped draft cannot carry a
 /// `file`, and so on.
+#[derive(Clone)]
 pub(crate) enum GgrAnchor {
     Line {
         commit_sha: CommitSha,
@@ -79,6 +80,45 @@ pub(crate) enum GgrAnchor {
 /// Constructed via [`GgrDraft::new_line`], [`GgrDraft::new_commit`], or
 /// [`GgrDraft::new_pr`]; deserialized via [`GgrDraft::from_wire`]. Construction
 /// validates all invariants and strips control characters from external strings.
+/// Re-anchor status written by the stale-detection pass.
+///
+/// `Pending` means the draft is ready to submit. `Stale` means the anchor
+/// no longer matches the current diff and the draft needs reviewer attention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DraftStatus {
+    Pending,
+    Stale,
+}
+
+impl Serialize for DraftStatus {
+    fn serialize<S>(&self, s: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        s.serialize_str(match self {
+            Self::Pending => "pending",
+            Self::Stale => "stale",
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for DraftStatus {
+    fn deserialize<D>(d: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(d)?;
+        match s.as_str() {
+            "pending" => Ok(Self::Pending),
+            "stale" => Ok(Self::Stale),
+            other => Err(serde::de::Error::custom(format!(
+                "unknown draft status {other:?}"
+            ))),
+        }
+    }
+}
+
+#[derive(Clone)]
 pub(crate) struct GgrDraft {
     /// GitHub hostname (`github.com` or a GHE hostname).
     pub(crate) host: String,
@@ -92,6 +132,10 @@ pub(crate) struct GgrDraft {
     pub(crate) created_at: String,
     pub(crate) updated_at: Option<String>,
     pub(crate) anchor: GgrAnchor,
+    /// Set by the re-anchor pass; absent until first reopen after creation.
+    pub(crate) status: Option<DraftStatus>,
+    /// Human-readable reason set when `status == Stale`.
+    pub(crate) mismatch_reason: Option<String>,
 }
 
 // ── construction ──────────────────────────────────────────────────────────────
@@ -119,6 +163,8 @@ impl GgrDraft {
             severity: common.severity,
             created_at: strip_controls(&common.created_at),
             updated_at: None,
+            status: None,
+            mismatch_reason: None,
             anchor: GgrAnchor::Line {
                 commit_sha: anchor.commit_sha.clone(),
                 file: strip_controls(&anchor.file),
@@ -155,6 +201,8 @@ impl GgrDraft {
             severity: common.severity,
             created_at: strip_controls(&common.created_at),
             updated_at: None,
+            status: None,
+            mismatch_reason: None,
             anchor: GgrAnchor::Commit { commit_sha: sha },
         })
     }
@@ -170,6 +218,8 @@ impl GgrDraft {
             severity: common.severity,
             created_at: strip_controls(&common.created_at),
             updated_at: None,
+            status: None,
+            mismatch_reason: None,
             anchor: GgrAnchor::Pr,
         })
     }
@@ -198,8 +248,10 @@ impl GgrDraft {
             })?
             .to_owned();
 
-        // Preserve updated_at before w is consumed by common/wire_anchor below.
+        // Preserve these before w is partially consumed below.
         let updated_at = w.updated_at.as_deref().map(strip_controls);
+        let status = w.status;
+        let mismatch_reason = w.mismatch_reason.as_deref().map(strip_controls);
 
         let common = CommonParams {
             host: w.host,
@@ -242,11 +294,14 @@ impl GgrDraft {
             }),
         }?;
         draft.updated_at = updated_at;
+        draft.status = status;
+        draft.mismatch_reason = mismatch_reason;
         Ok(draft)
     }
 
     /// Serialize this draft to the flat JSONL wire format.
     fn to_wire(&self) -> WireDraft {
+        let mut w = self.wire_base();
         match &self.anchor {
             GgrAnchor::Line {
                 commit_sha,
@@ -258,69 +313,52 @@ impl GgrDraft {
                 target_text,
                 context_before,
                 context_after,
-            } => WireDraft {
-                schema_version: SCHEMA_VERSION.to_owned(),
-                scope: Some("line".to_owned()),
-                host: self.host.clone(),
-                owner: self.owner.clone(),
-                repo: self.repo.clone(),
-                pr_number: self.pr_number,
-                body: self.body.clone(),
-                severity: self.severity,
-                created_at: self.created_at.clone(),
-                updated_at: self.updated_at.clone(),
-                commit_sha: Some(commit_sha.as_str().to_owned()),
-                file: Some(file.clone()),
-                side: Some(*side),
-                old_line: *old_line,
-                new_line: *new_line,
-                hunk_header: Some(hunk_header.clone()),
-                target_text: Some(target_text.clone()),
-                context_before: Some(context_before.clone()),
-                context_after: Some(context_after.clone()),
-            },
-            GgrAnchor::Commit { commit_sha } => WireDraft {
-                schema_version: SCHEMA_VERSION.to_owned(),
-                scope: Some("commit".to_owned()),
-                host: self.host.clone(),
-                owner: self.owner.clone(),
-                repo: self.repo.clone(),
-                pr_number: self.pr_number,
-                body: self.body.clone(),
-                severity: self.severity,
-                created_at: self.created_at.clone(),
-                updated_at: self.updated_at.clone(),
-                commit_sha: Some(commit_sha.as_str().to_owned()),
-                file: None,
-                side: None,
-                old_line: None,
-                new_line: None,
-                hunk_header: None,
-                target_text: None,
-                context_before: None,
-                context_after: None,
-            },
-            GgrAnchor::Pr => WireDraft {
-                schema_version: SCHEMA_VERSION.to_owned(),
-                scope: Some("pr".to_owned()),
-                host: self.host.clone(),
-                owner: self.owner.clone(),
-                repo: self.repo.clone(),
-                pr_number: self.pr_number,
-                body: self.body.clone(),
-                severity: self.severity,
-                created_at: self.created_at.clone(),
-                updated_at: self.updated_at.clone(),
-                commit_sha: None,
-                file: None,
-                side: None,
-                old_line: None,
-                new_line: None,
-                hunk_header: None,
-                target_text: None,
-                context_before: None,
-                context_after: None,
-            },
+            } => {
+                w.scope = Some("line".to_owned());
+                w.commit_sha = Some(commit_sha.as_str().to_owned());
+                w.file = Some(file.clone());
+                w.side = Some(*side);
+                w.old_line = *old_line;
+                w.new_line = *new_line;
+                w.hunk_header = Some(hunk_header.clone());
+                w.target_text = Some(target_text.clone());
+                w.context_before = Some(context_before.clone());
+                w.context_after = Some(context_after.clone());
+            }
+            GgrAnchor::Commit { commit_sha } => {
+                w.scope = Some("commit".to_owned());
+                w.commit_sha = Some(commit_sha.as_str().to_owned());
+            }
+            GgrAnchor::Pr => {
+                w.scope = Some("pr".to_owned());
+            }
+        }
+        w
+    }
+
+    fn wire_base(&self) -> WireDraft {
+        WireDraft {
+            schema_version: SCHEMA_VERSION.to_owned(),
+            scope: None,
+            host: self.host.clone(),
+            owner: self.owner.clone(),
+            repo: self.repo.clone(),
+            pr_number: self.pr_number,
+            body: self.body.clone(),
+            severity: self.severity,
+            created_at: self.created_at.clone(),
+            updated_at: self.updated_at.clone(),
+            commit_sha: None,
+            file: None,
+            side: None,
+            old_line: None,
+            new_line: None,
+            hunk_header: None,
+            target_text: None,
+            context_before: None,
+            context_after: None,
+            status: self.status,
+            mismatch_reason: self.mismatch_reason.clone(),
         }
     }
 }
@@ -404,6 +442,10 @@ struct WireDraft {
     context_before: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     context_after: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<DraftStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mismatch_reason: Option<String>,
 }
 
 // ── validation ────────────────────────────────────────────────────────────────
@@ -627,6 +669,11 @@ pub(crate) fn clear_drafts(path: &Path) -> Result<()> {
     write_all(path, &[])
 }
 
+/// Atomically rewrite `path` with `drafts` (used by the re-anchor pass).
+pub(crate) fn write_drafts_to_path(path: &Path, drafts: &[GgrDraft]) -> Result<()> {
+    write_all(path, drafts)
+}
+
 fn write_all(path: &Path, drafts: &[GgrDraft]) -> Result<()> {
     let mut buf: Vec<u8> = Vec::new();
     for draft in drafts {
@@ -650,6 +697,7 @@ const REPLY_DRAFT_FILENAME: &str = "_replies.jsonl";
 /// Constructed via [`GgrReply::new`]; deserialized via [`GgrReply::from_wire`].
 /// All string fields from external input are stripped of control characters at
 /// construction.
+#[derive(Clone)]
 pub(crate) struct GgrReply {
     pub(crate) host: String,
     pub(crate) owner: String,
@@ -662,6 +710,8 @@ pub(crate) struct GgrReply {
     pub(crate) severity: Severity,
     pub(crate) created_at: String,
     pub(crate) updated_at: Option<String>,
+    pub(crate) status: Option<DraftStatus>,
+    pub(crate) mismatch_reason: Option<String>,
 }
 
 /// Construction parameters for [`GgrReply::new`].
@@ -689,6 +739,8 @@ impl GgrReply {
             severity: params.severity,
             created_at: strip_controls(&params.created_at),
             updated_at: None,
+            status: None,
+            mismatch_reason: None,
         })
     }
 
@@ -713,6 +765,8 @@ impl GgrReply {
         };
         let mut reply = Self::new(&params)?;
         reply.updated_at = w.updated_at.as_deref().map(strip_controls);
+        reply.status = w.status;
+        reply.mismatch_reason = w.mismatch_reason.as_deref().map(strip_controls);
         Ok(reply)
     }
 
@@ -729,6 +783,8 @@ impl GgrReply {
             severity: self.severity,
             created_at: self.created_at.clone(),
             updated_at: self.updated_at.clone(),
+            status: self.status,
+            mismatch_reason: self.mismatch_reason.clone(),
         }
     }
 }
@@ -747,6 +803,10 @@ struct WireReply {
     created_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     updated_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<DraftStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mismatch_reason: Option<String>,
 }
 
 fn validate_reply_params(p: &ReplyParams) -> Result<()> {
@@ -883,6 +943,11 @@ pub(crate) fn clear_replies(path: &Path) -> Result<()> {
     write_all_replies(path, &[])
 }
 
+/// Atomically rewrite `path` with `replies` (used by the re-anchor pass).
+pub(crate) fn write_replies_to_path(path: &Path, replies: &[GgrReply]) -> Result<()> {
+    write_all_replies(path, replies)
+}
+
 fn write_all_replies(path: &Path, replies: &[GgrReply]) -> Result<()> {
     let mut buf: Vec<u8> = Vec::new();
     for reply in replies {
@@ -900,6 +965,84 @@ fn write_all_replies(path: &Path, replies: &[GgrReply]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── DraftStatus tests ─────────────────────────────────────────────────────
+
+    #[test]
+    fn draft_status_serializes_to_string() {
+        assert_eq!(
+            serde_json::to_string(&DraftStatus::Pending).unwrap(),
+            "\"pending\""
+        );
+        assert_eq!(
+            serde_json::to_string(&DraftStatus::Stale).unwrap(),
+            "\"stale\""
+        );
+    }
+
+    #[test]
+    fn draft_status_deserializes_from_string() {
+        let p: DraftStatus = serde_json::from_str("\"pending\"").unwrap();
+        let s: DraftStatus = serde_json::from_str("\"stale\"").unwrap();
+        assert_eq!(p, DraftStatus::Pending);
+        assert_eq!(s, DraftStatus::Stale);
+    }
+
+    #[test]
+    fn draft_status_unknown_string_is_error() {
+        assert!(serde_json::from_str::<DraftStatus>("\"unknown\"").is_err());
+    }
+
+    #[test]
+    fn draft_status_survives_wire_roundtrip() {
+        let mut draft = GgrDraft::new_pr(&CommonParams {
+            host: "github.com".to_owned(),
+            owner: "acme".to_owned(),
+            repo: "widget".to_owned(),
+            pr_number: 1,
+            body: "body".to_owned(),
+            severity: Severity::Note,
+            created_at: "2026-01-01T00:00:00Z".to_owned(),
+        })
+        .unwrap();
+        draft.status = Some(DraftStatus::Stale);
+        draft.mismatch_reason = Some("commit not in PR".to_owned());
+
+        let wire = draft.to_wire();
+        let json = serde_json::to_string(&wire).unwrap();
+        let restored_wire: WireDraft = serde_json::from_str(&json).unwrap();
+        let restored = GgrDraft::from_wire(restored_wire).unwrap();
+
+        assert_eq!(restored.status, Some(DraftStatus::Stale));
+        assert_eq!(
+            restored.mismatch_reason.as_deref(),
+            Some("commit not in PR")
+        );
+    }
+
+    #[test]
+    fn reply_status_survives_wire_roundtrip() {
+        let mut reply = GgrReply::new(&ReplyParams {
+            host: "github.com".to_owned(),
+            owner: "acme".to_owned(),
+            repo: "widget".to_owned(),
+            pr_number: 1,
+            parent_comment_id: "123".to_owned(),
+            body: "body".to_owned(),
+            severity: Severity::Note,
+            created_at: "2026-01-01T00:00:00Z".to_owned(),
+        })
+        .unwrap();
+        reply.status = Some(DraftStatus::Pending);
+
+        let wire = reply.to_wire();
+        let json = serde_json::to_string(&wire).unwrap();
+        let restored_wire: WireReply = serde_json::from_str(&json).unwrap();
+        let restored = GgrReply::from_wire(restored_wire).unwrap();
+
+        assert_eq!(restored.status, Some(DraftStatus::Pending));
+        assert!(restored.mismatch_reason.is_none());
+    }
 
     // ── helpers ───────────────────────────────────────────────────────────────
 

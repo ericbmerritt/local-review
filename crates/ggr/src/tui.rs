@@ -1035,6 +1035,7 @@ impl ReviewSurface for GgrSurface {
             KeyCode::Char('e') => Ok(self.open_edit_composer(line_index, current_view)),
             KeyCode::Char('r') => Ok(self.open_reply_composer(line_index, current_view)),
             KeyCode::Char('S') => Ok(ExtraKeyAction::OpenScreen(Box::new(VerdictScreen))),
+            KeyCode::Char('R') => Ok(self.run_refresh()),
             _ => Ok(ExtraKeyAction::Ignored),
         }
     }
@@ -1046,6 +1047,8 @@ impl ReviewSurface for GgrSurface {
             composer_overlay::render_composer_overlay(frame, &s.composer, None);
         } else if state.as_any().downcast_ref::<VerdictScreen>().is_some() {
             render_verdict_screen(frame);
+        } else if let Some(panel) = state.as_any().downcast_ref::<StalePanel>() {
+            render_stale_panel(frame, panel);
         }
     }
 
@@ -1061,6 +1064,39 @@ impl ReviewSurface for GgrSurface {
         if let Some(s) = try_downcast_mut::<ReplyComposerScreen>(state) {
             let parent_id = s.parent_comment_id.clone();
             return Ok(self.handle_reply_composer_key(&mut s.composer, &parent_id, key, ctx));
+        }
+        if let Some(panel) = try_downcast_mut::<StalePanel>(state) {
+            #[expect(
+                clippy::wildcard_enum_match_arm,
+                reason = "all non-navigation KeyCode variants pass through as StayOpen"
+            )]
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    panel.cursor = panel.cursor.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    panel.cursor = panel
+                        .cursor
+                        .saturating_add(1)
+                        .min(panel.items.len().saturating_sub(1));
+                }
+                KeyCode::Char('d') => {
+                    let idx = panel.cursor;
+                    if idx < panel.items.len() {
+                        let item = panel.items.remove(idx);
+                        self.delete_stale_item(&item, ctx);
+                        if panel.cursor > 0 && panel.cursor >= panel.items.len() {
+                            panel.cursor -= 1;
+                        }
+                    }
+                    if panel.items.is_empty() {
+                        return Ok(ExtraScreenAction::Close);
+                    }
+                }
+                KeyCode::Esc => return Ok(ExtraScreenAction::Close),
+                _ => {}
+            }
+            return Ok(ExtraScreenAction::StayOpen);
         }
         if try_downcast_mut::<VerdictScreen>(state).is_some() {
             if key.code == KeyCode::Esc {
@@ -1428,6 +1464,149 @@ impl GgrSurface {
     }
 }
 
+// ── StalePanel ────────────────────────────────────────────────────────────────
+
+/// Overlay listing all stale drafts with their mismatch reasons.
+///
+/// Opened automatically on startup when stale drafts are detected, and
+/// reachable via the status bar. Press `d` to delete the focused stale draft,
+/// Esc to dismiss.
+struct StalePanel {
+    items: Vec<StalePanelItem>,
+    cursor: usize,
+}
+
+struct StalePanelItem {
+    created_at: String,
+    anchor_desc: String,
+    reason: String,
+    is_reply: bool,
+}
+
+impl StalePanel {
+    fn new(drafts: &[crate::draft::GgrDraft], replies: &[crate::draft::GgrReply]) -> Self {
+        let mut items = Vec::new();
+        for d in drafts {
+            if d.status != Some(crate::draft::DraftStatus::Stale) {
+                continue;
+            }
+            let anchor_desc = match &d.anchor {
+                crate::draft::GgrAnchor::Line {
+                    file,
+                    new_line,
+                    old_line,
+                    ..
+                } => {
+                    let line = new_line
+                        .map(|l| (l, "new"))
+                        .or_else(|| old_line.map(|l| (l, "old")));
+                    match line {
+                        Some((n, s)) => format!("{file}:{n} ({s})"),
+                        None => file.clone(),
+                    }
+                }
+                crate::draft::GgrAnchor::Commit { commit_sha } => {
+                    format!("commit {}", &commit_sha.as_str()[..8])
+                }
+                crate::draft::GgrAnchor::Pr => "PR-scope".to_owned(),
+            };
+            items.push(StalePanelItem {
+                created_at: d.created_at.clone(),
+                anchor_desc,
+                reason: d.mismatch_reason.clone().unwrap_or_default(),
+                is_reply: false,
+            });
+        }
+        for r in replies {
+            if r.status != Some(crate::draft::DraftStatus::Stale) {
+                continue;
+            }
+            items.push(StalePanelItem {
+                created_at: r.created_at.clone(),
+                anchor_desc: format!("reply to {}", r.parent_comment_id),
+                reason: r.mismatch_reason.clone().unwrap_or_default(),
+                is_reply: true,
+            });
+        }
+        Self { items, cursor: 0 }
+    }
+}
+
+impl ExtraScreen for StalePanel {
+    fn is_overlay(&self) -> bool {
+        true
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+
+fn render_stale_panel(frame: &mut Frame<'_>, panel: &StalePanel) {
+    use ratatui::style::Modifier;
+    use ratatui::text::Span;
+
+    let area = frame.area();
+    let [_, col, _] = Layout::horizontal([
+        Constraint::Fill(1),
+        Constraint::Length(60.min(area.width.saturating_sub(4))),
+        Constraint::Fill(1),
+    ])
+    .flex(Flex::Center)
+    .areas(area);
+    let [_, modal, _] = Layout::vertical([
+        Constraint::Fill(1),
+        Constraint::Length(18.min(area.height.saturating_sub(4))),
+        Constraint::Fill(1),
+    ])
+    .flex(Flex::Center)
+    .areas(col);
+
+    frame.render_widget(Clear, modal);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Red))
+        .title(format!(" Stale drafts ({}) ", panel.items.len()));
+    let inner = block.inner(modal);
+    frame.render_widget(block, modal);
+
+    if panel.items.is_empty() {
+        frame.render_widget(
+            Paragraph::new("  No stale drafts.").style(Style::default()),
+            inner,
+        );
+        return;
+    }
+
+    let mut lines: Vec<TuiLine<'_>> = Vec::new();
+    lines.push(TuiLine::raw("  d — delete focused   Esc — dismiss"));
+    lines.push(TuiLine::raw(""));
+    for (idx, item) in panel.items.iter().enumerate() {
+        let selected = idx == panel.cursor;
+        let prefix = if selected { "▶ " } else { "  " };
+        let style = if selected {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        lines.push(TuiLine::from(Span::styled(
+            format!("{prefix}{}", item.anchor_desc),
+            style,
+        )));
+        lines.push(TuiLine::from(Span::styled(
+            format!("    reason: {}", item.reason),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines).alignment(Alignment::Left), inner);
+}
+
 // ── VerdictScreen ─────────────────────────────────────────────────────────────
 
 /// Modal that prompts the reviewer to choose a submit verdict.
@@ -1504,6 +1683,78 @@ fn verdict_from_key(code: KeyCode) -> Option<crate::submit::Verdict> {
 // ── GgrSurface submit helpers ─────────────────────────────────────────────────
 
 impl GgrSurface {
+    /// Re-fetch PR state and re-run the re-anchor pass in-place.
+    fn run_refresh(&mut self) -> ExtraKeyAction {
+        let pr = match gh::fetch_pr_details(
+            self.pr.number,
+            Some(self.pr.repo_name.as_str()),
+            self.pr.hostname.as_deref(),
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                return ExtraKeyAction::StatusMessage(format!(
+                    "refresh failed: {}",
+                    strip_controls(&e.to_string())
+                ));
+            }
+        };
+        if let Some(base) = crate::util::data_home() {
+            let stale = crate::reanchor::reanchor_all(&pr, &base);
+            self.pr = pr;
+            self.reload_drafts();
+            if stale > 0 {
+                let panel = StalePanel::new(&self.loaded_drafts, &self.loaded_replies);
+                return ExtraKeyAction::OpenScreen(Box::new(panel));
+            }
+            ExtraKeyAction::StatusMessage("refreshed".to_owned())
+        } else {
+            self.pr = pr;
+            self.reload_drafts();
+            ExtraKeyAction::StatusMessage("refreshed".to_owned())
+        }
+    }
+
+    /// Delete a single stale item from disk (called from stale panel `d` key).
+    fn delete_stale_item(&mut self, item: &StalePanelItem, ctx: &mut ExtraScreenContext<'_>) {
+        let Some(base) = crate::util::data_home() else {
+            return;
+        };
+        let host = self.pr.hostname.as_deref().unwrap_or("github.com");
+        let slug = self.pr.repo_name.as_str();
+        let (owner, repo) = slug.split_once('/').unwrap_or(("_", "_"));
+        let created_at = &item.created_at;
+        let result = if item.is_reply {
+            let path =
+                crate::draft::replies_file_from_base(&base, host, owner, repo, self.pr.number);
+            crate::draft::delete_reply(&path, |r| &r.created_at == created_at).map(|_| ())
+        } else {
+            let drafts_dir =
+                crate::draft::drafts_dir_from_base(&base, host, owner, repo, self.pr.number);
+            // Try each commit file to find the matching draft.
+            let mut deleted = false;
+            for commit in &self.pr.commits {
+                let path = drafts_dir.join(format!("{}.jsonl", commit.sha.as_str()));
+                if let Ok(true) = crate::draft::delete_draft(&path, |d| &d.created_at == created_at)
+                {
+                    deleted = true;
+                    break;
+                }
+            }
+            // Also try _pr.jsonl.
+            if !deleted {
+                let pr_path = drafts_dir.join("_pr.jsonl");
+                let _ = crate::draft::delete_draft(&pr_path, |d| &d.created_at == created_at);
+            }
+            Ok(())
+        };
+        if let Err(e) = result {
+            *ctx.status_message =
+                Some(format!("delete failed: {}", strip_controls(&e.to_string())));
+        } else {
+            self.reload_drafts();
+        }
+    }
+
     fn run_submit(
         &mut self,
         verdict: crate::submit::Verdict,

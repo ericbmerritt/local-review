@@ -462,6 +462,38 @@ pub(crate) fn fetch_review_threads(
     group_review_comments(comments)
 }
 
+/// Fetch the single-line commit message headline for `sha`.
+///
+/// Used by the re-anchoring pass to find a subject-based successor when a
+/// commit SHA is no longer in the PR. Returns `None` if the commit is not
+/// accessible (garbage-collected, network error, etc.) so callers can fall
+/// back to marking the draft stale.
+pub(crate) fn fetch_commit_subject(
+    repo_name: &RepoName,
+    sha: &str,
+    hostname: Option<&str>,
+) -> Option<String> {
+    let endpoint = format!(
+        "repos/{}/commits/{}",
+        repo_name.as_str(),
+        strip_controls(sha)
+    );
+    let mut args = vec!["api", &endpoint, "--jq", ".commit.message"];
+    let hostname_flag;
+    if let Some(h) = hostname {
+        hostname_flag = format!("--hostname={h}");
+        args.push(&hostname_flag);
+    }
+    let raw = run_gh(&args).ok()?;
+    // The jq expression returns the full commit message; subject is the first line.
+    let subject = strip_controls(raw.lines().next()?.trim());
+    if subject.is_empty() {
+        None
+    } else {
+        Some(subject)
+    }
+}
+
 // ── tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

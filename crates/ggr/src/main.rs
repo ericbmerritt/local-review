@@ -14,6 +14,7 @@ mod error;
 mod gh;
 mod pr;
 mod pr_ref;
+mod reanchor;
 mod submit;
 mod tui;
 mod util;
@@ -62,7 +63,7 @@ enum Commands {
         /// Base URL of a GitHub Enterprise Server instance.
         #[arg(long)]
         url: Option<String>,
-        /// [no-op until P4] Clear only drafts that are stale due to force-push.
+        /// Clear only drafts that are stale (anchor no longer matches current diff).
         #[arg(long)]
         stale: bool,
     },
@@ -84,7 +85,7 @@ fn run() -> error::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Some(Commands::Drafts { pr, url }) => cmd_drafts(&pr, url.as_deref()),
-        Some(Commands::Clear { pr, url, stale: _ }) => cmd_clear(&pr, url.as_deref()),
+        Some(Commands::Clear { pr, url, stale }) => cmd_clear(&pr, url.as_deref(), stale),
         None => {
             let pr_str = cli.pr.ok_or_else(|| GgrError::InvalidPrRef {
                 raw: "no PR reference given; run `ggr --help` for usage".to_owned(),
@@ -111,6 +112,10 @@ fn cmd_review(pr_str: &str, url: Option<&str>) -> error::Result<()> {
     )?;
     if pr.commits.is_empty() {
         return Err(GgrError::PrNotFound { pr: parsed.number });
+    }
+    // Re-anchor local drafts against the freshly fetched PR state.
+    if let Some(base) = util::data_home() {
+        reanchor::reanchor_all(&pr, &base);
     }
     tui::run(pr)
 }
@@ -202,7 +207,7 @@ fn cmd_drafts(pr_str: &str, url: Option<&str>) -> error::Result<()> {
     Ok(())
 }
 
-fn cmd_clear(pr_str: &str, url: Option<&str>) -> error::Result<()> {
+fn cmd_clear(pr_str: &str, url: Option<&str>, stale_only: bool) -> error::Result<()> {
     let (host, owner, repo, pr_number) = resolve_pr_coords(pr_str, url)?;
     let Some(base) = util::data_home() else {
         return Err(GgrError::Io {
@@ -223,19 +228,41 @@ fn cmd_clear(pr_str: &str, url: Option<&str>) -> error::Result<()> {
     let files = collect_draft_files(&drafts_dir)?;
     let mut cleared = 0usize;
     for path in &files {
-        let count = draft::list_drafts(path)?.len();
-        if count > 0 {
+        let all = draft::list_drafts(path)?;
+        if stale_only {
+            let kept: Vec<_> = all
+                .iter()
+                .filter(|d| d.status != Some(draft::DraftStatus::Stale))
+                .collect();
+            let removed = all.len() - kept.len();
+            if removed > 0 {
+                let kept_owned: Vec<_> = kept.into_iter().cloned().collect();
+                draft::write_drafts_to_path(path, &kept_owned)?;
+                cleared += removed;
+            }
+        } else if !all.is_empty() {
             draft::clear_drafts(path)?;
-            cleared += count;
+            cleared += all.len();
         }
     }
-    // Also clear pending reply drafts.
+    // Handle replies.
     let replies_file = draft::replies_file_from_base(&base, &host, &owner, &repo, pr_number);
     if replies_file.exists() {
-        let reply_count = draft::list_replies(&replies_file)?.len();
-        if reply_count > 0 {
+        let all_replies = draft::list_replies(&replies_file)?;
+        if stale_only {
+            let kept: Vec<_> = all_replies
+                .iter()
+                .filter(|r| r.status != Some(draft::DraftStatus::Stale))
+                .cloned()
+                .collect();
+            let removed = all_replies.len() - kept.len();
+            if removed > 0 {
+                draft::write_replies_to_path(&replies_file, &kept)?;
+                cleared += removed;
+            }
+        } else if !all_replies.is_empty() {
             draft::clear_replies(&replies_file)?;
-            cleared += reply_count;
+            cleared += all_replies.len();
         }
     }
 
