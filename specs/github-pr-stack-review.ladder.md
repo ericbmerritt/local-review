@@ -270,9 +270,9 @@ endpoint is ggr-only code.
 
 ## Phase 4: Re-review across cycles with stale handling
 
-| Status         | Started | Completed |
-| -------------- | ------- | --------- |
-| ⬜ not-started |         |           |
+| Status         | Started    | Completed |
+| -------------- | ---------- | --------- |
+| 🟡 in-progress | 2026-05-17 |           |
 
 Final phase. Closes the cycle loop per the spec at
 `specs/github-pr-stack-review.md` (_Re-Review Semantics_).
