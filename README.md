@@ -1,33 +1,112 @@
 # local-review
 
-Workspace housing two local-first batched code-review tools that share a common
-core.
+Two terminal tools for reviewing code without leaving your editor context. Both
+follow the same model: walk through changes one at a time, draft comments
+locally, submit in one shot. What differs is where the code lives and where the
+comments go.
 
-| Crate                                                             | Binary | Status   | What it reviews                   |
-| ----------------------------------------------------------------- | ------ | -------- | --------------------------------- |
-| [`crates/jjr`](crates/jjr/README.md)                              | `jjr`  | shipped  | local jj stacks, pre-PR           |
-| [`crates/ggr`](crates/ggr/Cargo.toml)                             | `ggr`  | scaffold | GitHub pull requests, by commit   |
-| [`crates/local-review-core`](crates/local-review-core/src/lib.rs) | (lib)  | scaffold | shared diff/anchoring/storage/TUI |
+| Tool  | Reviews                             | Comments go to          | Status  |
+| ----- | ----------------------------------- | ----------------------- | ------- |
+| `jjr` | Your local jj stack, before pushing | Claude (edits the code) | Shipped |
+| `ggr` | A GitHub pull request, by commit    | GitHub PR review API    | Shipped |
 
-The two tools wear the same UX — oldest-first walk through changes, anchored
-inline comments, persistent local draft, batched submit — over different sources
-of truth (`jj` for `jjr`, `gh` for `ggr`).
+## The assumption these tools make
 
-## Layout
+Both tools are built around a single premise: **commits are the unit of
+review.**
 
-- `crates/local-review-core/` — shared library. Currently a stub; code will
-  migrate from `jjr` over follow-up commits.
-- `crates/jjr/` — jj-stack review surface. Functional and shipping; see its
-  [README](crates/jjr/README.md).
-- `crates/ggr/` — GitHub-PR review surface. Scaffold only; not yet functional.
+A commit is an atomic, intentional change with a subject, a body, and a coherent
+diff. A stack of commits tells a story. When you review a stack or a PR, you
+read it in the order it was written — commit by commit — because that's the
+order that makes the author's reasoning legible.
+
+If you squash everything into a single commit before pushing, or if your PR is
+one giant diff with no internal structure, these tools aren't for you. The
+per-commit walk is the whole point. Without commits that mean something, there's
+nothing to walk.
+
+This isn't a limitation to work around. It's a design choice. Tools built around
+"show me the whole diff" already exist. These tools are for people who treat
+commits as communication.
+
+## The shared idea
+
+Code review is a batched operation, not a real-time chat. You read a diff,
+decide what needs changing, and record that judgment. Doing it one comment at a
+time in a browser — with round-trips to GitHub, notifications flying — creates
+friction that makes you review less carefully or skip it entirely.
+
+Both tools eliminate that friction by keeping the whole review session local:
+
+- **Walk oldest-to-newest.** Changes and commits are reviewed in the order they
+  were written, so you see the story of the code rather than a jumbled diff.
+- **Draft locally, submit once.** Comments accumulate on disk. Nothing reaches
+  the network until you explicitly submit. You can quit mid-review and resume
+  exactly where you stopped.
+- **Inline, anchored comments.** Comments attach to specific lines via text
+  matching, not line numbers. When the code shifts under an edit or force-push,
+  the tool re-anchors; if it can't, the comment goes stale and surfaces
+  separately rather than silently drifting to the wrong line.
+- **Same TUI.** Scroll, file picker, severity labels (`[REQUIRED]`,
+  `[SUGGESTION]`, `[NOTE]`), side-by-side diff, stale panel — identical between
+  the two tools.
+
+## `jjr` — review your own stack before it ships
+
+You wrote code with an agent. The agent has your name on it now. `jjr` is how
+you check it before it becomes a PR.
+
+It walks `trunk()..@`, opens the first unreviewed change, and lets you comment
+at line / change / description / stack scope. When you're done, `C` hands the
+comments to Claude; the agent edits the stack in place. You re-review. Repeat
+until you push.
+
+→ See [`crates/jjr/README.md`](crates/jjr/README.md) for full docs.
+
+## `ggr` — review a GitHub PR commit-by-commit
+
+A PR is a stack. `ggr` treats it like one: you open a PR by number or URL, walk
+each commit's diff, and draft inline comments. When you're satisfied, `S` opens
+a verdict modal — approve, request changes, or comment — and posts everything as
+a single GitHub review. Replies to existing threads, partial failure recovery,
+and stale-draft detection on force-push are all handled.
+
+→ See [`crates/ggr/README.md`](crates/ggr/README.md) for full docs.
+
+## Shared core
+
+`crates/local-review-core` provides everything both tools use: the diff
+renderer, line-anchoring algorithm, TUI framework (parameterised by a
+`ReviewSurface` trait), JSONL comment storage helpers, and the severity/scope
+model. Adding a new review surface means implementing `ReviewSurface` and
+writing a thin shell around a data source.
+
+## Install
+
+```sh
+# jjr
+cargo install jjr
+# or: brew install ericbmerritt/jjr/jjr
+
+# ggr
+cargo install ggr
+# or: brew install ericbmerritt/jjr/ggr
+```
+
+Both require their respective CLI dependencies at runtime: `jj` for `jjr`, `gh`
+for `ggr`.
 
 ## Development
 
 ```sh
-cargo build --workspace
-just validate
+git clone https://github.com/ericbmerritt/local-review
+cd local-review
+nix develop            # or direnv allow
+just validate          # build + format + lint + tests (90% coverage floor)
 ```
 
-`jjr` is the only crate with a release pipeline today (auto-tag on
-`crates/jjr/Cargo.toml` version bump, then publish to crates.io and bump the
-Homebrew formula).
+Individual targets: `just build`, `just lint`, `just test`, `just format`.
+
+## License
+
+Dual-licensed under [MIT](LICENSE-MIT) or [Apache 2.0](LICENSE-APACHE).
