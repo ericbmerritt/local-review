@@ -9,6 +9,10 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
+use ratatui::layout::{Alignment, Constraint, Flex, Layout};
+use ratatui::style::{Color, Style};
+use ratatui::text::Line as TuiLine;
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::{Frame, Terminal};
 
 use local_review_core::change_id::ChangeId;
@@ -1030,6 +1034,7 @@ impl ReviewSurface for GgrSurface {
             KeyCode::Char('P') => Ok(self.open_pr_scope_composer()),
             KeyCode::Char('e') => Ok(self.open_edit_composer(line_index, current_view)),
             KeyCode::Char('r') => Ok(self.open_reply_composer(line_index, current_view)),
+            KeyCode::Char('S') => Ok(ExtraKeyAction::OpenScreen(Box::new(VerdictScreen))),
             _ => Ok(ExtraKeyAction::Ignored),
         }
     }
@@ -1039,6 +1044,8 @@ impl ReviewSurface for GgrSurface {
             composer_overlay::render_composer_overlay(frame, &s.0, None);
         } else if let Some(s) = state.as_any_mut().downcast_mut::<ReplyComposerScreen>() {
             composer_overlay::render_composer_overlay(frame, &s.composer, None);
+        } else if state.as_any().downcast_ref::<VerdictScreen>().is_some() {
+            render_verdict_screen(frame);
         }
     }
 
@@ -1054,6 +1061,15 @@ impl ReviewSurface for GgrSurface {
         if let Some(s) = try_downcast_mut::<ReplyComposerScreen>(state) {
             let parent_id = s.parent_comment_id.clone();
             return Ok(self.handle_reply_composer_key(&mut s.composer, &parent_id, key, ctx));
+        }
+        if try_downcast_mut::<VerdictScreen>(state).is_some() {
+            if key.code == KeyCode::Esc {
+                return Ok(ExtraScreenAction::Close);
+            }
+            if let Some(v) = verdict_from_key(key.code) {
+                return Ok(self.run_submit(v, ctx));
+            }
+            return Ok(ExtraScreenAction::StayOpen);
         }
         Ok(ExtraScreenAction::StayOpen)
     }
@@ -1409,6 +1425,106 @@ impl GgrSurface {
             Ok(false) => Err("reply not found — already deleted?".to_owned()),
             Err(e) => Err(format!("delete failed: {}", strip_controls(&e.to_string()))),
         }
+    }
+}
+
+// ── VerdictScreen ─────────────────────────────────────────────────────────────
+
+/// Modal that prompts the reviewer to choose a submit verdict.
+///
+/// Keys: `a` → Approve, `r` → Request changes, `c`/Enter → Comment (default),
+/// Esc → cancel. Each key immediately triggers submit.
+struct VerdictScreen;
+
+impl ExtraScreen for VerdictScreen {
+    fn is_overlay(&self) -> bool {
+        true
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+
+fn render_verdict_screen(frame: &mut Frame<'_>) {
+    let area = frame.area();
+    let [_, center, _] = Layout::horizontal([
+        Constraint::Fill(1),
+        Constraint::Length(46),
+        Constraint::Fill(1),
+    ])
+    .flex(Flex::Center)
+    .areas(area);
+    let [_, modal, _] = Layout::vertical([
+        Constraint::Fill(1),
+        Constraint::Length(10),
+        Constraint::Fill(1),
+    ])
+    .flex(Flex::Center)
+    .areas(center);
+
+    frame.render_widget(Clear, modal);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(" Submit Review ");
+    let inner = block.inner(modal);
+    frame.render_widget(block, modal);
+
+    let lines = vec![
+        TuiLine::raw(""),
+        TuiLine::raw("  [a]  Approve"),
+        TuiLine::raw("  [r]  Request changes"),
+        TuiLine::raw("  [c]  Comment  (default)"),
+        TuiLine::raw(""),
+        TuiLine::raw("  Esc  Cancel"),
+        TuiLine::raw(""),
+    ];
+    frame.render_widget(Paragraph::new(lines).alignment(Alignment::Left), inner);
+}
+
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "unhandled KeyCode variants intentionally ignored in verdict modal"
+)]
+fn verdict_from_key(code: KeyCode) -> Option<crate::submit::Verdict> {
+    use crate::submit::Verdict;
+    match code {
+        KeyCode::Char('a' | 'A') => Some(Verdict::Approve),
+        KeyCode::Char('r' | 'R') => Some(Verdict::RequestChanges),
+        KeyCode::Char('c' | 'C') | KeyCode::Enter => Some(Verdict::Comment),
+        _ => None,
+    }
+}
+
+// ── GgrSurface submit helpers ─────────────────────────────────────────────────
+
+impl GgrSurface {
+    fn run_submit(
+        &mut self,
+        verdict: crate::submit::Verdict,
+        ctx: &mut ExtraScreenContext<'_>,
+    ) -> ExtraScreenAction {
+        let Some(base) = crate::util::data_home() else {
+            *ctx.status_message =
+                Some("submit failed: could not determine data directory".to_owned());
+            return ExtraScreenAction::Close;
+        };
+        match crate::submit::submit(&self.pr, verdict, &base) {
+            Ok(outcome) => {
+                self.reload_drafts();
+                *ctx.status_message = Some(outcome.message);
+            }
+            Err(e) => {
+                *ctx.status_message =
+                    Some(format!("submit failed: {}", strip_controls(&e.to_string())));
+            }
+        }
+        ExtraScreenAction::Close
     }
 }
 

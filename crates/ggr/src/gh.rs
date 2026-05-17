@@ -167,16 +167,119 @@ pub(crate) fn fetch_pr_details(
 /// output is not valid UTF-8. stderr is stripped of control characters before
 /// inclusion in error values to prevent terminal injection via hostile server error messages.
 fn run_gh(args: &[&str]) -> Result<String> {
-    let output = Command::new("gh")
+    run_gh_with_stdin(args, &[])
+}
+
+/// Runs `gh` with the given args, feeding `body` to the process's stdin.
+///
+/// Used for POST endpoints that expect a JSON body via `--input -`.
+fn run_gh_with_stdin(args: &[&str], body: &[u8]) -> Result<String> {
+    use std::io::Write as _;
+    let mut child = Command::new("gh")
         .args(args)
-        .output()
+        .stdin(if body.is_empty() {
+            std::process::Stdio::null()
+        } else {
+            std::process::Stdio::piped()
+        })
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .map_err(|source| GhMissingSnafu.into_error(source))?;
+    if !body.is_empty() {
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin
+                .write_all(body)
+                .map_err(|source| GgrError::Io { source })?;
+        }
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|source| GgrError::Io { source })?;
     if !output.status.success() {
         let message = strip_controls(&String::from_utf8_lossy(&output.stderr));
         let exit_code = output.status.code();
         return GhFailedSnafu { message, exit_code }.fail();
     }
     String::from_utf8(output.stdout).map_err(|source| GgrError::GhOutputEncoding { source })
+}
+
+/// Post a pull request review to GitHub.
+///
+/// Returns `Ok(())` on HTTP 200; propagates `GhFailed` on any API error.
+pub(crate) fn post_review(
+    repo_name: &RepoName,
+    pr_number: u64,
+    hostname: Option<&str>,
+    payload: &crate::submit::ReviewPayload<'_>,
+) -> Result<()> {
+    use serde_json::json;
+    let endpoint = format!("repos/{}/pulls/{}/reviews", repo_name.as_str(), pr_number);
+    let comment_values: Vec<serde_json::Value> = payload
+        .comments
+        .iter()
+        .map(|c| {
+            json!({
+                "path": c.path,
+                "line": c.line,
+                "side": c.side,
+                "commit_id": c.commit_id,
+                "body": c.body,
+            })
+        })
+        .collect();
+    let json_payload = json!({
+        "event": payload.event,
+        "body": payload.body,
+        "comments": comment_values,
+    });
+    let json_bytes = serde_json::to_vec(&json_payload).map_err(|e| GgrError::Io {
+        source: std::io::Error::other(e),
+    })?;
+    let mut args = vec!["api", &endpoint, "-X", "POST", "--input", "-"];
+    let hostname_flag;
+    if let Some(h) = hostname {
+        hostname_flag = format!("--hostname={h}");
+        args.push(&hostname_flag);
+    }
+    run_gh_with_stdin(&args, &json_bytes)?;
+    Ok(())
+}
+
+/// Post a reply to an existing review comment thread.
+///
+/// `in_reply_to_id` is the GitHub numeric comment ID of the root comment.
+pub(crate) fn post_reply(
+    repo_name: &RepoName,
+    pr_number: u64,
+    hostname: Option<&str>,
+    body: &str,
+    in_reply_to_id: &str,
+) -> Result<()> {
+    use serde_json::json;
+    let endpoint = format!("repos/{}/pulls/{}/comments", repo_name.as_str(), pr_number);
+    let in_reply_to: u64 = in_reply_to_id.parse().map_err(|_| GgrError::GhFailed {
+        message: format!(
+            "invalid parent_comment_id: {}",
+            strip_controls(in_reply_to_id)
+        ),
+        exit_code: None,
+    })?;
+    let payload = json!({
+        "body": body,
+        "in_reply_to": in_reply_to,
+    });
+    let json_bytes = serde_json::to_vec(&payload).map_err(|e| GgrError::Io {
+        source: std::io::Error::other(e),
+    })?;
+    let mut args = vec!["api", &endpoint, "-X", "POST", "--input", "-"];
+    let hostname_flag;
+    if let Some(h) = hostname {
+        hostname_flag = format!("--hostname={h}");
+        args.push(&hostname_flag);
+    }
+    run_gh_with_stdin(&args, &json_bytes)?;
+    Ok(())
 }
 
 /// Fetch the diff for a single commit via the GitHub API.
