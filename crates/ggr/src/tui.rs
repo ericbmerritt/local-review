@@ -91,6 +91,8 @@ pub(crate) struct GgrSurface {
     loaded_replies: Vec<crate::draft::GgrReply>,
     /// Last severity used, so new composers default to the same severity.
     last_severity: Option<Severity>,
+    /// Shown once on the first entry load if stale drafts were found on open.
+    pending_stale_message: Option<String>,
 }
 
 impl GgrSurface {
@@ -113,6 +115,7 @@ impl GgrSurface {
             loaded_drafts: Vec::new(),
             loaded_replies: Vec::new(),
             last_severity: None,
+            pending_stale_message: None,
         }
     }
 
@@ -1158,6 +1161,10 @@ impl ReviewSurface for GgrSurface {
 impl ReviewSurfaceExt for GgrSurface {
     fn on_entry_loaded(&mut self, _idx: usize, _record_cursor: bool) {}
 
+    fn take_pending_status_message(&mut self) -> Option<String> {
+        self.pending_stale_message.take()
+    }
+
     fn severity_histogram_for_transition(&self) -> (Option<usize>, SeverityHistogram) {
         let mut hist = SeverityHistogram::default();
         for d in &self.loaded_drafts {
@@ -1851,7 +1858,7 @@ fn enter_tui() -> Result<(Terminal<CrosstermBackend<Stdout>>, TuiGuard)> {
 
 // ── entry point ───────────────────────────────────────────────────────────────
 
-pub(crate) fn run(pr: PrDetails) -> Result<()> {
+pub(crate) fn run(pr: PrDetails, stale_count: usize) -> Result<()> {
     let size = crossterm::terminal::size().map_err(|source| GgrError::Io { source })?;
     if size.0 < MIN_COLS {
         return Err(GgrError::TerminalTooNarrow { cols: size.0 });
@@ -1861,7 +1868,13 @@ pub(crate) fn run(pr: PrDetails) -> Result<()> {
     }
     let cursor_path = cursor::cursor_path(&pr);
     let initial_cursor = cursor_path.as_deref().and_then(cursor::load);
-    let surface = GgrSurface::new(pr, initial_cursor.as_ref());
+    let mut surface = GgrSurface::new(pr, initial_cursor.as_ref());
+    if stale_count > 0 {
+        surface.pending_stale_message = Some(format!(
+            "{stale_count} stale draft{} — press R to review",
+            if stale_count == 1 { "" } else { "s" }
+        ));
+    }
     let mut app = App::new(surface, vec![], TransitionMode::Auto);
     let (mut terminal, _guard) = enter_tui()?;
     core_run_app(&mut terminal, &mut app, |app| {
