@@ -81,9 +81,9 @@ Workspace lints (per `CLAUDE.md`): strict — `unwrap_used`, `expect_used`,
 
 ## Phase 2: Local drafts at three scopes
 
-| Status         | Started    | Completed |
-| -------------- | ---------- | --------- |
-| ✅ complete    | 2026-05-11 | 2026-05-16 |
+| Status      | Started    | Completed  |
+| ----------- | ---------- | ---------- |
+| ✅ complete | 2026-05-11 | 2026-05-16 |
 
 Build the comment data model in `local-review-core`, parameterized over the
 identifier type (jjr's `ChangeId` vs ggr's `CommitId`) and over the scope shape
@@ -160,9 +160,9 @@ seam that lets ggr have its own storage layout without changing jjr's behavior.
 
 ## Phase 3: Reply composer and batched submit to GitHub
 
-| Status         | Started | Completed |
-| -------------- | ------- | --------- |
-| ⬜ not-started |         |           |
+| Status      | Started    | Completed  |
+| ----------- | ---------- | ---------- |
+| ✅ complete | 2026-05-16 | 2026-05-17 |
 
 Ship the reply composer and the GitHub submit endpoint in one phase. They're
 combined because reply drafts that can't be submitted have no reviewer-visible

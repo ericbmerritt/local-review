@@ -14,6 +14,7 @@ mod error;
 mod gh;
 mod pr;
 mod pr_ref;
+mod submit;
 mod tui;
 mod util;
 
