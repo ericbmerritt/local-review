@@ -114,10 +114,10 @@ fn cmd_review(pr_str: &str, url: Option<&str>) -> error::Result<()> {
         return Err(GgrError::PrNotFound { pr: parsed.number });
     }
     // Re-anchor local drafts against the freshly fetched PR state.
-    if let Some(base) = util::data_home() {
-        reanchor::reanchor_all(&pr, &base);
-    }
-    tui::run(pr)
+    let stale_count = util::data_home()
+        .map(|base| reanchor::reanchor_all(&pr, &base))
+        .unwrap_or(0);
+    tui::run(pr, stale_count)
 }
 
 /// Resolve a PR reference string to `(host, owner, repo, pr_number)` for
