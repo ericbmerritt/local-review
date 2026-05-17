@@ -551,6 +551,91 @@ impl GgrSurface {
     }
 
     /// Route delete through the surface's `delete_comment`.
+    /// Delete the draft comment under the cursor without opening the composer.
+    /// Returns a status message action — either a confirmation or an error.
+    fn delete_at_cursor(
+        &mut self,
+        line_index: usize,
+        current_view: Option<&DiffView>,
+    ) -> ExtraKeyAction {
+        let Some(view) = current_view else {
+            return ExtraKeyAction::Ignored;
+        };
+        let Some(row) = view.lines.get(line_index) else {
+            return ExtraKeyAction::Ignored;
+        };
+        let RenderedLineKind::InlineCommentMeta { comment_index } = row.kind else {
+            return ExtraKeyAction::Ignored;
+        };
+
+        match comment_index {
+            CommentIndex::Local(draft_idx) => {
+                let Some(draft) = self.loaded_drafts.get(draft_idx) else {
+                    return ExtraKeyAction::StatusMessage(
+                        "draft not found — navigate away and back to refresh".to_owned(),
+                    );
+                };
+                // Use the stored created_at string directly as the key so
+                // there is no RFC 3339 round-trip that could change "Z" to
+                // "+00:00" and break the equality check in delete_draft.
+                let created_at = draft.created_at.clone();
+                let Some(base) = crate::util::data_home() else {
+                    return ExtraKeyAction::StatusMessage(
+                        "could not determine data directory".to_owned(),
+                    );
+                };
+                let path = crate::draft::draft_path_from_base(&base, draft);
+                match crate::draft::delete_draft(&path, |d| d.created_at == created_at) {
+                    Ok(true) => {
+                        self.reload_drafts();
+                        ExtraKeyAction::RefreshAndStatus("draft deleted".to_owned())
+                    }
+                    Ok(false) => {
+                        ExtraKeyAction::StatusMessage("draft not found on disk".to_owned())
+                    }
+                    Err(e) => ExtraKeyAction::StatusMessage(format!(
+                        "delete failed: {}",
+                        strip_controls(&e.to_string())
+                    )),
+                }
+            }
+            CommentIndex::LocalReply(reply_idx) => {
+                let Some(reply) = self.loaded_replies.get(reply_idx) else {
+                    return ExtraKeyAction::StatusMessage(
+                        "reply draft not found — navigate away and back to refresh".to_owned(),
+                    );
+                };
+                let created_at = reply.created_at.clone();
+                let Some(base) = crate::util::data_home() else {
+                    return ExtraKeyAction::StatusMessage(
+                        "could not determine data directory".to_owned(),
+                    );
+                };
+                let host = self.pr.hostname.as_deref().unwrap_or("github.com");
+                let slug = self.pr.repo_name.as_str();
+                let (owner, repo) = slug.split_once('/').unwrap_or(("_", "_"));
+                let path =
+                    crate::draft::replies_file_from_base(&base, host, owner, repo, self.pr.number);
+                match crate::draft::delete_reply(&path, |r| r.created_at == created_at) {
+                    Ok(true) => {
+                        self.reload_drafts();
+                        ExtraKeyAction::RefreshAndStatus("reply draft deleted".to_owned())
+                    }
+                    Ok(false) => {
+                        ExtraKeyAction::StatusMessage("reply draft not found on disk".to_owned())
+                    }
+                    Err(e) => ExtraKeyAction::StatusMessage(format!(
+                        "delete failed: {}",
+                        strip_controls(&e.to_string())
+                    )),
+                }
+            }
+            CommentIndex::GitHubThread(_) => ExtraKeyAction::StatusMessage(
+                "GitHub review threads cannot be deleted locally".to_owned(),
+            ),
+        }
+    }
+
     fn delete_via_composer(&mut self, composer: &Composer) -> std::result::Result<(), String> {
         let Some(edit_ctx) = composer.editing() else {
             return Err("nothing to delete — composer is not in edit mode".to_owned());
@@ -598,8 +683,19 @@ impl GgrSurface {
                     commit_sha: sha,
                     file: file_str,
                     side,
-                    old_line: line_target.source_line,
-                    new_line: line_target.target_line,
+                    // Only set the line number for the chosen side; the
+                    // validation in GgrDraft::new_line rejects anchors where
+                    // both are set (context lines have both source and target).
+                    old_line: if side == Side::Old {
+                        line_target.source_line
+                    } else {
+                        None
+                    },
+                    new_line: if side == Side::New {
+                        line_target.target_line
+                    } else {
+                        None
+                    },
                     hunk_header: line_target.hunk_header.clone(),
                     target_text: line_target.target_text.clone(),
                     context_before: line_target.context_before.clone(),
@@ -775,7 +871,8 @@ impl ReviewSurface for GgrSurface {
         if idx == 0 {
             self.state = State::Description;
             let desc = self.pr_description_text();
-            let views = vec![DiffView::from_description(&desc)];
+            let title = format!("PR #{} — description", self.pr.number);
+            let views = vec![DiffView::from_description(&desc).with_title(title)];
             self.loaded_drafts.clear();
             return Ok(views);
         }
@@ -799,6 +896,49 @@ impl ReviewSurface for GgrSurface {
         self.state = State::CommitDiff { index: idx, diff };
         self.reload_drafts();
         Ok(views)
+    }
+
+    fn appended_comments_for_view(
+        &self,
+        view_idx: usize,
+        severity_filter: Option<Severity>,
+    ) -> Vec<InlineComment> {
+        // view_idx=0 is the synthetic description/title sub-view for every
+        // entry (PR description page or commit title). Append PR-scope and
+        // commit-scope draft markers there so the reviewer can see them.
+        if view_idx != 0 {
+            return Vec::new();
+        }
+        let now = std::time::SystemTime::now();
+        let mut result = Vec::new();
+        for (draft_idx, draft) in self.loaded_drafts.iter().enumerate() {
+            if let Some(crate::draft::DraftStatus::Stale) = draft.status {
+                continue;
+            }
+            if let Some(f) = severity_filter {
+                if draft.severity != f {
+                    continue;
+                }
+            }
+            let age = local_review_core::util::format_age_from_iso_str(now, &draft.created_at);
+            let label = match &draft.anchor {
+                crate::draft::GgrAnchor::Pr => "[PR draft]".to_owned(),
+                crate::draft::GgrAnchor::Commit { .. } => "[commit draft]".to_owned(),
+                crate::draft::GgrAnchor::Line { .. } => continue,
+            };
+            result.push(InlineComment {
+                source_line: None,
+                target_line: None,
+                severity: draft.severity,
+                age: format!("{label} · {age}"),
+                body_lines: strip_controls_preserve_newlines(&draft.body)
+                    .lines()
+                    .map(str::to_owned)
+                    .collect(),
+                comment_index: CommentIndex::Local(draft_idx),
+            });
+        }
+        result
     }
 
     fn inline_comments_for_view(
@@ -879,8 +1019,12 @@ impl ReviewSurface for GgrSurface {
 
         let msg = match &draft.anchor {
             crate::draft::GgrAnchor::Line { .. } => "line draft saved",
-            crate::draft::GgrAnchor::Commit { .. } => "commit draft saved",
-            crate::draft::GgrAnchor::Pr => "PR draft saved",
+            crate::draft::GgrAnchor::Commit { .. } => {
+                "commit draft saved — visible at top of this commit"
+            }
+            crate::draft::GgrAnchor::Pr => {
+                "PR draft saved — visible on description page (f → PR description)"
+            }
         };
         Ok(SaveOutcome::Saved {
             status_message: msg.to_owned(),
@@ -1036,6 +1180,7 @@ impl ReviewSurface for GgrSurface {
             KeyCode::Char('m') => Ok(self.open_commit_scope_composer()),
             KeyCode::Char('P') => Ok(self.open_pr_scope_composer()),
             KeyCode::Char('e') => Ok(self.open_edit_composer(line_index, current_view)),
+            KeyCode::Char('d') => Ok(self.delete_at_cursor(line_index, current_view)),
             KeyCode::Char('r') => Ok(self.open_reply_composer(line_index, current_view)),
             KeyCode::Char('S') => Ok(ExtraKeyAction::OpenScreen(Box::new(VerdictScreen))),
             KeyCode::Char('R') => Ok(self.run_refresh()),
@@ -1141,20 +1286,109 @@ impl ReviewSurface for GgrSurface {
                         .count();
                     draft_count + thread_count
                 };
-                file_picker::build_entries(
+                let mut entries = file_picker::build_entries(
                     diff.files.as_slice(),
                     &comment_count,
                     &|_| false,
                     &|_| 0,
-                )
+                );
+                // Rename the description entry to clarify it's the PR
+                // description + comments, not a code file.
+                if let Some(e) = entries.first_mut() {
+                    e.display_path =
+                        std::path::PathBuf::from(format!("<PR #{} description>", self.pr.number));
+                }
+                entries
             }
         }
     }
 
     fn help_screen_title(&self) -> &'static str {
-        "ggr"
+        "ggr · keybindings"
+    }
+
+    fn help_screen_body(&self) -> &'static str {
+        GGR_HELP_BODY
+    }
+
+    fn footer_hint(
+        &self,
+        width: u16,
+        _has_stack: bool,
+        severity_filter: Option<Severity>,
+    ) -> String {
+        ggr_footer_text_for_width(width, severity_filter)
     }
 }
+
+fn ggr_footer_text_for_width(width: u16, severity_filter: Option<Severity>) -> String {
+    let badge = match severity_filter {
+        Some(Severity::Required) => "  [F:required]",
+        Some(Severity::Suggestion) => "  [F:suggestion]",
+        Some(Severity::Note) => "  [F:note]",
+        None => "",
+    };
+    // Build from widest to narrowest; drop optional segments to fit.
+    let full = format!(
+        " ↑↓ line  Tab file  n/p commit  c comment  e/d edit/delete  S submit  R refresh  ?{badge}"
+    );
+    let medium =
+        format!(" ↑↓ line  Tab file  n/p commit  c comment  S submit  R refresh  ?{badge}");
+    let narrow = format!(" ↑↓ Tab n/p  c comment  S submit  ?{badge}");
+    let w = usize::from(width);
+    if full.chars().count() <= w {
+        full
+    } else if medium.chars().count() <= w {
+        medium
+    } else {
+        narrow
+    }
+}
+
+const GGR_HELP_BODY: &str = "
+Movement
+    ↑ ↓     k j           line
+    PgUp PgDn             page
+    Home End  g G         top / bottom
+    Tab     S-Tab         next / previous file
+    n       p             next / previous commit (or description)
+
+Comments
+    Enter   c             new line-scoped comment
+    m                     new commit-scoped comment
+    P                     new PR-scoped comment
+    r                     reply to thread on current line
+    e                     edit draft (cursor must be on the draft line)
+    d                     delete draft (cursor must be on the draft line)
+    T                     toggle thread expand / collapse
+
+Views
+    f                     file picker
+    R                     refresh — re-fetch PR state and re-anchor drafts
+    S                     submit review (opens verdict modal)
+    |                     cycle diff layout: auto / unified / side-by-side
+                          (auto picks side-by-side at >=120 cols)
+    ?                     this help
+    q                     quit
+
+Verdict modal  (press S from main view)
+    a                     Approve
+    r                     Request changes
+    c   Enter             Comment (default)
+    Esc                   cancel
+
+Stale panel  (opens automatically when stale drafts exist)
+    ↑ ↓     k j           select entry
+    d                     delete focused stale draft
+    Esc                   dismiss
+
+In comment composer
+    M-l M-c M-k           scope:    line / commit / PR
+    M-r M-s M-n           severity: required / suggestion / note
+    ^X                    save
+    ^D                    delete (edit mode only)
+    Esc                   cancel
+";
 
 // ── ReviewSurfaceExt impl ─────────────────────────────────────────────────────
 
@@ -1822,6 +2056,15 @@ impl GgrSurface {
         };
         match crate::submit::submit(&self.pr, verdict, &base) {
             Ok(outcome) => {
+                // Re-fetch the PR so submitted comments appear as GitHub
+                // review threads immediately instead of disappearing.
+                if let Ok(fresh) = gh::fetch_pr_details(
+                    self.pr.number,
+                    Some(self.pr.repo_name.as_str()),
+                    self.pr.hostname.as_deref(),
+                ) {
+                    self.pr = fresh;
+                }
                 self.reload_drafts();
                 *ctx.status_message = Some(outcome.message);
             }
@@ -1902,6 +2145,41 @@ pub(crate) fn run(pr: PrDetails, stale_count: usize) -> Result<()> {
 mod tests {
     use super::*;
     use crate::pr::{CommitEntry, CommitSha, PrComment, RepoName, ReviewThread, ThreadComment};
+
+    #[test]
+    fn ggr_footer_text_full_width_contains_key_hints() {
+        let text = ggr_footer_text_for_width(200, None);
+        assert!(
+            text.contains("c comment"),
+            "full footer must mention c comment"
+        );
+        assert!(
+            text.contains("S submit"),
+            "full footer must mention S submit"
+        );
+        assert!(
+            text.contains("R refresh"),
+            "full footer must mention R refresh"
+        );
+    }
+
+    #[test]
+    fn ggr_footer_text_narrow_drops_to_minimal() {
+        let text = ggr_footer_text_for_width(40, None);
+        assert!(
+            text.contains("S submit"),
+            "narrow footer must still mention submit"
+        );
+    }
+
+    #[test]
+    fn ggr_footer_text_badge_appended_when_filter_active() {
+        let text = ggr_footer_text_for_width(200, Some(Severity::Required));
+        assert!(
+            text.contains("[F:required]"),
+            "badge must appear with active filter"
+        );
+    }
     use crossterm::event::{KeyCode, KeyModifiers};
     use local_review_core::change_id::ChangeId;
     use local_review_core::diff::{Diff, DiffFile};
@@ -2810,7 +3088,7 @@ mod tests {
     #[test]
     fn help_screen_title_is_ggr() {
         let surface = GgrSurface::new(make_pr(), None);
-        assert_eq!(surface.help_screen_title(), "ggr");
+        assert_eq!(surface.help_screen_title(), "ggr · keybindings");
     }
 
     #[test]
@@ -2912,6 +3190,60 @@ mod tests {
             text, "PR title",
             "empty body must not add trailing newlines"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn delete_at_cursor_returns_refresh_and_status_on_success() {
+        use local_review_core::tui::diff_view::{CommentIndex, RenderedLine, RenderedLineKind};
+        use local_review_core::tui::ExtraKeyAction;
+
+        let dir = tempfile::tempdir().unwrap();
+        let prev = std::env::var("XDG_DATA_HOME").ok();
+        std::env::set_var("XDG_DATA_HOME", dir.path());
+
+        let mut surface = GgrSurface::new(make_pr(), None);
+        set_commit_diff_state(&mut surface);
+
+        // Save a draft so there's something to delete.
+        let scope = ComposerScope::Change;
+        let req = SaveRequest {
+            scope: &scope,
+            severity: Severity::Note,
+            body: "to be deleted",
+            entry_idx: 0,
+        };
+        surface.save_comment(req).unwrap();
+        assert_eq!(surface.loaded_drafts.len(), 1);
+
+        // Build a fake view with an InlineCommentMeta pointing at draft 0.
+        let meta_line = RenderedLine {
+            kind: RenderedLineKind::InlineCommentMeta {
+                comment_index: CommentIndex::Local(0),
+            },
+            text: "┃ ● note".to_owned(),
+            source_line: None,
+            target_line: None,
+            hunk_header: None,
+            comment_severity: None,
+        };
+        let view = DiffView {
+            title: "test".to_owned(),
+            lines: vec![meta_line],
+            paired_rows: vec![],
+        };
+
+        let action = surface.delete_at_cursor(0, Some(&view));
+        assert!(
+            matches!(action, ExtraKeyAction::RefreshAndStatus(_)),
+            "delete_at_cursor must return RefreshAndStatus so the core rebuilds the view"
+        );
+
+        if let Some(p) = prev {
+            std::env::set_var("XDG_DATA_HOME", p);
+        } else {
+            std::env::remove_var("XDG_DATA_HOME");
+        }
     }
 
     #[test]

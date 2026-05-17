@@ -35,7 +35,7 @@ lint-nix:
 
 test:
     cargo llvm-cov nextest --fail-under-lines 90 \
-      --ignore-filename-regex '(^|/)(tui|jj|main|error)\.rs$|tui/(help_screen|composer|composer_overlay)\.rs$'
+      --ignore-filename-regex '(^|/)(tui|jj|main|error|gh)\.rs$|tui/(help_screen|composer|composer_overlay)\.rs$'
 
 [parallel]
 format: remove-trailing-whitespace format-rust format-nix format-md

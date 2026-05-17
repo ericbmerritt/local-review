@@ -848,7 +848,12 @@ pub(crate) fn render<S: ReviewSurfaceExt>(frame: &mut Frame<'_>, app: &mut App<S
     match &app.screen {
         Screen::Main => {}
         Screen::Help => {
-            help_screen::render(frame, app.surface.help_screen_title(), app.help_scroll);
+            help_screen::render(
+                frame,
+                app.surface.help_screen_title(),
+                app.surface.help_screen_body(),
+                app.help_scroll,
+            );
         }
         Screen::Transition(state) => {
             render_transition(frame, app, state);
@@ -1259,7 +1264,8 @@ fn render_footer<S: ReviewSurfaceExt>(frame: &mut Frame<'_>, area: Rect, app: &A
     } else {
         let has_stack = app.surface.entry_count() > 1;
         (
-            footer_text_for_width(area.width, has_stack, app.severity_filter),
+            app.surface
+                .footer_hint(area.width, has_stack, app.severity_filter),
             Style::default(),
         )
     };
@@ -1426,10 +1432,39 @@ fn handle_main_key<S: ReviewSurfaceExt>(app: &mut App<S>, key: KeyEvent) -> Resu
         KeyCode::Char('|') => app.cycle_diff_mode(),
         _ => {
             // Delegate to the surface for tool-specific keys.
-            let current_view = app.rendered_per_file.get(app.file_index);
-            let action =
-                app.surface
-                    .handle_extra_key(key, app.file_index, app.line_index, current_view)?;
+            // Pass the annotated view (not the base view) so surfaces can
+            // read injected InlineCommentMeta line kinds at the cursor.
+            // In side-by-side mode line_index is a paired_rows index; resolve
+            // it to the corresponding lines index so surfaces index correctly.
+            // Clone to release the immutable borrow before the mutable call.
+            let annotated_clone = app.current_view().cloned();
+            let lines_index = match app.effective_diff_mode() {
+                EffectiveDiffMode::Unified => app.line_index,
+                EffectiveDiffMode::SideBySide => annotated_clone
+                    .as_ref()
+                    .and_then(|v| v.paired_rows.get(app.line_index))
+                    .and_then(|row| match row {
+                        PairedRow::Spanning(idx)
+                        | PairedRow::Pair {
+                            right: Some(idx), ..
+                        }
+                        | PairedRow::Pair {
+                            left: Some(idx),
+                            right: None,
+                        } => Some(*idx),
+                        PairedRow::Pair {
+                            left: None,
+                            right: None,
+                        } => None,
+                    })
+                    .unwrap_or(app.line_index),
+            };
+            let action = app.surface.handle_extra_key(
+                key,
+                app.file_index,
+                lines_index,
+                annotated_clone.as_ref(),
+            )?;
             match action {
                 ExtraKeyAction::Ignored => {}
                 ExtraKeyAction::OpenScreen(state) => {
@@ -1437,6 +1472,10 @@ fn handle_main_key<S: ReviewSurfaceExt>(app: &mut App<S>, key: KeyEvent) -> Resu
                 }
                 ExtraKeyAction::StatusMessage(msg) => {
                     app.status_message = Some(msg);
+                }
+                ExtraKeyAction::RefreshAndStatus(msg) => {
+                    app.status_message = Some(msg);
+                    app.refresh_inline_comments();
                 }
                 ExtraKeyAction::Quit => {
                     app.should_quit = true;
@@ -1788,6 +1827,17 @@ mod app_tests {
         }
         fn help_screen_title(&self) -> &'static str {
             "test"
+        }
+        fn help_screen_body(&self) -> &'static str {
+            ""
+        }
+        fn footer_hint(
+            &self,
+            _width: u16,
+            _has_stack: bool,
+            _severity_filter: Option<Severity>,
+        ) -> String {
+            String::new()
         }
     }
 
