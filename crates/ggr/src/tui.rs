@@ -1113,12 +1113,38 @@ impl ReviewSurface for GgrSurface {
     fn file_picker_entries(&self) -> Vec<FilePickerEntry> {
         match &self.state {
             State::Description => file_picker::build_entries(&[], &|_| 0, &|_| false, &|_| 0),
-            State::CommitDiff { diff, .. } => file_picker::build_entries(
-                &diff.files,
-                &|_view_idx| 0,
-                &|_view_idx| false,
-                &|_view_idx| 0,
-            ),
+            State::CommitDiff { diff, .. } => {
+                let comment_count = |view_idx: usize| -> usize {
+                    let Some(file_idx) = view_idx.checked_sub(1) else {
+                        return 0;
+                    };
+                    let Some(file) = diff.files.get(file_idx) else {
+                        return 0;
+                    };
+                    let file_path = file.display_path().to_string_lossy();
+                    let draft_count = self
+                        .loaded_drafts
+                        .iter()
+                        .filter(|d| {
+                            d.status != Some(crate::draft::DraftStatus::Stale)
+                                && matches!(&d.anchor, crate::draft::GgrAnchor::Line { file, .. } if file.as_str() == file_path.as_ref())
+                        })
+                        .count();
+                    let thread_count = self
+                        .pr
+                        .review_threads
+                        .iter()
+                        .filter(|t| t.path == file_path.as_ref() && !t.is_outdated())
+                        .count();
+                    draft_count + thread_count
+                };
+                file_picker::build_entries(
+                    diff.files.as_slice(),
+                    &comment_count,
+                    &|_| false,
+                    &|_| 0,
+                )
+            }
         }
     }
 
@@ -1133,7 +1159,29 @@ impl ReviewSurfaceExt for GgrSurface {
     fn on_entry_loaded(&mut self, _idx: usize, _record_cursor: bool) {}
 
     fn severity_histogram_for_transition(&self) -> (Option<usize>, SeverityHistogram) {
-        (Some(0), SeverityHistogram::default())
+        let mut hist = SeverityHistogram::default();
+        for d in &self.loaded_drafts {
+            if d.status == Some(crate::draft::DraftStatus::Stale) {
+                continue;
+            }
+            match d.severity {
+                Severity::Required => hist.required += 1,
+                Severity::Suggestion => hist.suggestion += 1,
+                Severity::Note => hist.note += 1,
+            }
+        }
+        for r in &self.loaded_replies {
+            if r.status == Some(crate::draft::DraftStatus::Stale) {
+                continue;
+            }
+            match r.severity {
+                Severity::Required => hist.required += 1,
+                Severity::Suggestion => hist.suggestion += 1,
+                Severity::Note => hist.note += 1,
+            }
+        }
+        let total = hist.total();
+        (Some(total), hist)
     }
 
     fn initial_view_position(&mut self) -> (usize, usize) {
