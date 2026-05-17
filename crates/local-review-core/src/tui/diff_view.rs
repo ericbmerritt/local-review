@@ -204,6 +204,13 @@ impl DiffView {
         }
     }
 
+    /// Replace the title, returning the modified view.
+    #[must_use]
+    pub fn with_title(mut self, title: String) -> Self {
+        self.title = title;
+        self
+    }
+
     /// Return a new `DiffView` with `InlineComment` annotation lines injected
     /// immediately below each matched diff line.
     ///

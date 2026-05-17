@@ -83,20 +83,30 @@ pub(crate) fn fetch_pr_details(
     let mut args = vec!["pr", "view", &pr_str, "--json"];
     let fields = "number,title,body,comments,commits,headRepository";
     args.push(fields);
+    // When GH_HOST is set the --repo flag must be "owner/repo", not
+    // "host/owner/repo". Strip the host prefix if present so that GHE
+    // repos work correctly (the host prefix was added for the old
+    // --hostname flag approach and is now redundant).
+    let repo_stripped;
     if let Some(r) = repo {
+        repo_stripped = hostname
+            .map(|h| r.strip_prefix(&format!("{h}/")).unwrap_or(r))
+            .unwrap_or(r);
         args.push("--repo");
-        args.push(r);
+        args.push(repo_stripped);
     }
-    if let Some(host) = hostname {
-        args.push("--hostname");
-        args.push(host);
-    }
-
     // Inline subprocess rather than run_gh: only here can we inspect gh's exit
     // code and stderr to distinguish PrNotFound from RepoNotFound.  run_gh
     // collapses all non-zero exits to GhFailed, losing that discrimination.
-    let output = Command::new("gh")
-        .args(&args)
+    //
+    // GH_HOST is used instead of --hostname because older gh releases do not
+    // support --hostname on `gh pr view`.
+    let mut cmd = Command::new("gh");
+    cmd.args(&args);
+    if let Some(h) = hostname {
+        cmd.env("GH_HOST", h);
+    }
+    let output = cmd
         .output()
         .map_err(|source| GhMissingSnafu.into_error(source))?;
 
@@ -134,7 +144,7 @@ pub(crate) fn fetch_pr_details(
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let comments = parsed
+    let mut comments: Vec<PrComment> = parsed
         .comments
         .into_iter()
         .map(|c| PrComment {
@@ -144,6 +154,12 @@ pub(crate) fn fetch_pr_details(
         .collect();
 
     let repo_name = RepoName::try_from(parsed.head_repository.name_with_owner.as_str())?;
+
+    // Also fetch review-level bodies (submitted review summaries from other
+    // reviewers). These are separate from issue-thread comments and from
+    // inline review threads — they're the top-level text of a PR review.
+    let review_bodies = fetch_review_bodies(pr, &repo_name, hostname).unwrap_or_default();
+    comments.extend(review_bodies);
 
     let review_threads = fetch_review_threads(pr, &repo_name, hostname)?;
 
@@ -163,27 +179,32 @@ pub(crate) fn fetch_pr_details(
 
 /// Run `gh <args>` and return stdout as UTF-8.
 ///
-/// Returns `Err` if the binary is missing, the process exits non-zero, or the
-/// output is not valid UTF-8. stderr is stripped of control characters before
-/// inclusion in error values to prevent terminal injection via hostile server error messages.
-fn run_gh(args: &[&str]) -> Result<String> {
-    run_gh_with_stdin(args, &[])
+/// `hostname` is forwarded via `GH_HOST` so it works across all `gh` versions.
+/// The `--hostname` flag is not used because older `gh` releases do not support
+/// it on `gh pr view` (only on `gh api`).
+fn run_gh(args: &[&str], hostname: Option<&str>) -> Result<String> {
+    run_gh_with_stdin(args, &[], hostname)
 }
 
 /// Runs `gh` with the given args, feeding `body` to the process's stdin.
 ///
-/// Used for POST endpoints that expect a JSON body via `--input -`.
-fn run_gh_with_stdin(args: &[&str], body: &[u8]) -> Result<String> {
+/// `hostname` is forwarded via `GH_HOST`. Used for POST endpoints that expect
+/// a JSON body via `--input -`.
+fn run_gh_with_stdin(args: &[&str], body: &[u8], hostname: Option<&str>) -> Result<String> {
     use std::io::Write as _;
-    let mut child = Command::new("gh")
-        .args(args)
-        .stdin(if body.is_empty() {
-            std::process::Stdio::null()
-        } else {
-            std::process::Stdio::piped()
-        })
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+    let mut cmd = Command::new("gh");
+    cmd.args(args);
+    if let Some(h) = hostname {
+        cmd.env("GH_HOST", h);
+    }
+    cmd.stdin(if body.is_empty() {
+        std::process::Stdio::null()
+    } else {
+        std::process::Stdio::piped()
+    })
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped());
+    let mut child = cmd
         .spawn()
         .map_err(|source| GhMissingSnafu.into_error(source))?;
     if !body.is_empty() {
@@ -197,7 +218,15 @@ fn run_gh_with_stdin(args: &[&str], body: &[u8]) -> Result<String> {
         .wait_with_output()
         .map_err(|source| GgrError::Io { source })?;
     if !output.status.success() {
-        let message = strip_controls(&String::from_utf8_lossy(&output.stderr));
+        // gh api writes the status line to stderr and the response JSON body
+        // to stdout. Include both so callers can see the actual API error.
+        let stderr = strip_controls(&String::from_utf8_lossy(&output.stderr));
+        let stdout = strip_controls(&String::from_utf8_lossy(&output.stdout));
+        let message = if stdout.trim().is_empty() {
+            stderr
+        } else {
+            format!("{stderr}\n{stdout}")
+        };
         let exit_code = output.status.code();
         return GhFailedSnafu { message, exit_code }.fail();
     }
@@ -219,11 +248,12 @@ pub(crate) fn post_review(
         .comments
         .iter()
         .map(|c| {
+            // commit_id is NOT a valid field on DraftPullRequestReviewThread;
+            // it belongs at the top-level review, not per-comment.
             json!({
                 "path": c.path,
                 "line": c.line,
                 "side": c.side,
-                "commit_id": c.commit_id,
                 "body": c.body,
             })
         })
@@ -236,13 +266,8 @@ pub(crate) fn post_review(
     let json_bytes = serde_json::to_vec(&json_payload).map_err(|e| GgrError::Io {
         source: std::io::Error::other(e),
     })?;
-    let mut args = vec!["api", &endpoint, "-X", "POST", "--input", "-"];
-    let hostname_flag;
-    if let Some(h) = hostname {
-        hostname_flag = format!("--hostname={h}");
-        args.push(&hostname_flag);
-    }
-    run_gh_with_stdin(&args, &json_bytes)?;
+    let args = vec!["api", &endpoint, "-X", "POST", "--input", "-"];
+    run_gh_with_stdin(&args, &json_bytes, hostname)?;
     Ok(())
 }
 
@@ -272,13 +297,8 @@ pub(crate) fn post_reply(
     let json_bytes = serde_json::to_vec(&payload).map_err(|e| GgrError::Io {
         source: std::io::Error::other(e),
     })?;
-    let mut args = vec!["api", &endpoint, "-X", "POST", "--input", "-"];
-    let hostname_flag;
-    if let Some(h) = hostname {
-        hostname_flag = format!("--hostname={h}");
-        args.push(&hostname_flag);
-    }
-    run_gh_with_stdin(&args, &json_bytes)?;
+    let args = vec!["api", &endpoint, "-X", "POST", "--input", "-"];
+    run_gh_with_stdin(&args, &json_bytes, hostname)?;
     Ok(())
 }
 
@@ -295,17 +315,13 @@ pub(crate) fn fetch_commit_diff(
     hostname: Option<&str>,
 ) -> Result<Diff> {
     let endpoint = format!("repos/{}/commits/{}", repo_name.as_str(), sha.as_str());
-    let mut args = vec![
+    let args = vec![
         "api",
         &endpoint,
         "--header",
         "Accept: application/vnd.github.diff",
     ];
-    if let Some(host) = hostname {
-        args.push("--hostname");
-        args.push(host);
-    }
-    let raw = run_gh(&args)?;
+    let raw = run_gh(&args, hostname)?;
     local_review_core::diff::parse(&raw).map_err(GgrError::from)
 }
 
@@ -424,6 +440,60 @@ fn group_review_comments(raw: Vec<RawReviewComment>) -> Result<Vec<ReviewThread>
 
 /// Fetch and group inline review threads for a pull request via `gh`.
 ///
+/// Fetch the top-level body text of submitted PR reviews.
+///
+/// Each GitHub PR review can carry a summary body (the text a reviewer types
+/// in the review box before clicking Approve/Request Changes/Comment). These
+/// bodies are separate from issue-thread comments and from inline review
+/// threads; they live at `GET /repos/{repo}/pulls/{pr}/reviews`.
+///
+/// Returns `Vec<PrComment>` so review bodies can be shown alongside
+/// issue-thread comments on the description page. Soft-fails to empty on any
+/// error — missing review bodies are cosmetic, not load-bearing.
+fn fetch_review_bodies(
+    pr: u64,
+    repo_name: &RepoName,
+    hostname: Option<&str>,
+) -> Option<Vec<PrComment>> {
+    #[derive(Deserialize)]
+    struct ReviewJson {
+        user: ReviewUserJson,
+        body: String,
+        state: String,
+    }
+    #[derive(Deserialize)]
+    struct ReviewUserJson {
+        login: String,
+    }
+
+    let endpoint = format!("repos/{}/pulls/{pr}/reviews", repo_name.as_str());
+    let raw = run_gh(&["api", &endpoint, "--paginate"], hostname).ok()?;
+
+    let mut all: Vec<ReviewJson> = Vec::new();
+    let mut stream = serde_json::Deserializer::from_str(&raw).into_iter::<Vec<ReviewJson>>();
+    for page in &mut stream {
+        all.extend(page.ok()?);
+    }
+
+    let bodies: Vec<PrComment> = all
+        .into_iter()
+        .filter(|r| !r.body.trim().is_empty())
+        .map(|r| {
+            let label = match r.state.as_str() {
+                "APPROVED" => "approved",
+                "CHANGES_REQUESTED" => "requested changes",
+                _ => "commented",
+            };
+            PrComment {
+                author: format!("{} ({})", strip_controls(&r.user.login), label),
+                body: strip_controls(&r.body),
+            }
+        })
+        .collect();
+
+    Some(bodies)
+}
+
 /// Calls `gh api repos/{repo_name}/pulls/{pr}/comments`, which returns a flat
 /// JSON array of all inline review comments.  The flat list is grouped into
 /// [`ReviewThread`] values by [`group_review_comments`].
@@ -440,13 +510,8 @@ pub(crate) fn fetch_review_threads(
     hostname: Option<&str>,
 ) -> Result<Vec<ReviewThread>> {
     let endpoint = format!("repos/{}/pulls/{pr}/comments", repo_name.as_str());
-    let mut args = vec!["api", &endpoint, "--paginate"];
-    if let Some(host) = hostname {
-        args.push("--hostname");
-        args.push(host);
-    }
-
-    let raw = run_gh(&args)?;
+    let args = vec!["api", &endpoint, "--paginate"];
+    let raw = run_gh(&args, hostname)?;
 
     let comments: Vec<RawReviewComment> = {
         let mut all: Vec<RawReviewComment> = Vec::new();
@@ -478,13 +543,8 @@ pub(crate) fn fetch_commit_subject(
         repo_name.as_str(),
         strip_controls(sha)
     );
-    let mut args = vec!["api", &endpoint, "--jq", ".commit.message"];
-    let hostname_flag;
-    if let Some(h) = hostname {
-        hostname_flag = format!("--hostname={h}");
-        args.push(&hostname_flag);
-    }
-    let raw = run_gh(&args).ok()?;
+    let args = vec!["api", &endpoint, "--jq", ".commit.message"];
+    let raw = run_gh(&args, hostname).ok()?;
     // The jq expression returns the full commit message; subject is the first line.
     let subject = strip_controls(raw.lines().next()?.trim());
     if subject.is_empty() {

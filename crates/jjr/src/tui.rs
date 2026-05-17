@@ -39,6 +39,7 @@ mod composer_overlay;
 mod diff_view;
 mod file_picker;
 mod help_screen;
+use help_screen::JJR_HELP_BODY;
 mod overview_screen;
 mod send_to_claude;
 mod stale_screen;
@@ -1067,6 +1068,19 @@ impl ReviewSurface for JjrSurface {
 
     fn help_screen_title(&self) -> &'static str {
         "jjr · keybindings"
+    }
+
+    fn help_screen_body(&self) -> &'static str {
+        JJR_HELP_BODY
+    }
+
+    fn footer_hint(
+        &self,
+        width: u16,
+        has_stack: bool,
+        severity_filter: Option<Severity>,
+    ) -> String {
+        local_review_core::tui::footer_text_for_width(width, has_stack, severity_filter)
     }
 }
 
@@ -2900,7 +2914,9 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
     render_main(frame, app);
     match &app.screen {
         Screen::Main => {}
-        Screen::Help => help_screen::render(frame, "jjr · keybindings", app.help_scroll),
+        Screen::Help => {
+            help_screen::render(frame, "jjr · keybindings", JJR_HELP_BODY, app.help_scroll);
+        }
         Screen::Composer(composer) => {
             composer_overlay::render_composer_overlay(frame, composer, app.current_view());
         }

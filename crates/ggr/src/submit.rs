@@ -43,7 +43,6 @@ pub(crate) struct ReviewLineComment {
     pub(crate) line: u32,
     /// `"LEFT"` (old side) or `"RIGHT"` (new side).
     pub(crate) side: &'static str,
-    pub(crate) commit_id: String,
     pub(crate) body: String,
 }
 
@@ -119,7 +118,6 @@ pub(crate) fn build_review_body(
 /// anchor is missing a line number (should not happen for valid drafts).
 pub(crate) fn draft_to_line_comment(draft: &GgrDraft) -> Option<ReviewLineComment> {
     let GgrAnchor::Line {
-        commit_sha,
         file,
         side,
         old_line,
@@ -137,7 +135,6 @@ pub(crate) fn draft_to_line_comment(draft: &GgrDraft) -> Option<ReviewLineCommen
         path: file.clone(),
         line,
         side: api_side,
-        commit_id: commit_sha.as_str().to_owned(),
         body: format_comment_body(&draft.body, draft.severity),
     })
 }
@@ -245,7 +242,10 @@ fn post_review_from_drafts(
         .copied()
         .filter(|d| matches!(d.anchor, GgrAnchor::Line { .. }))
         .collect();
-    let review_body = build_review_body(&pr_scope, &commit_scope, &pr.commits);
+    let review_body = ensure_nonempty_body_for_verdict(
+        build_review_body(&pr_scope, &commit_scope, &pr.commits),
+        verdict,
+    );
     let comments: Vec<ReviewLineComment> = line_scope
         .iter()
         .filter_map(|d| draft_to_line_comment(d))
@@ -262,6 +262,22 @@ fn post_review_from_drafts(
     )
 }
 
+/// Ensure the review body is non-empty when the GitHub API requires it.
+///
+/// GitHub returns HTTP 422 when the body is empty for `REQUEST_CHANGES` or
+/// `COMMENT` (even when inline comments are present). `APPROVE` accepts an
+/// empty body.
+fn ensure_nonempty_body_for_verdict(body: String, verdict: Verdict) -> String {
+    if body.is_empty() && !matches!(verdict, Verdict::Approve) {
+        match verdict {
+            Verdict::RequestChanges => "Changes requested.".to_owned(),
+            Verdict::Comment => " ".to_owned(),
+            Verdict::Approve => body,
+        }
+    } else {
+        body
+    }
+}
 /// POST reply drafts serially. Stale replies are skipped.
 /// Returns `(posted, failed, first_error_message)`.
 fn fan_out_replies(pr: &PrDetails, replies: &[GgrReply]) -> (usize, usize, Option<String>) {
@@ -787,6 +803,34 @@ mod tests {
         assert!(
             err.to_string().contains("nothing to submit"),
             "wrong error: {err}"
+        );
+    }
+
+    #[test]
+    fn ensure_nonempty_body_request_changes_empty_uses_fallback() {
+        let result = ensure_nonempty_body_for_verdict(String::new(), Verdict::RequestChanges);
+        assert_eq!(result, "Changes requested.");
+    }
+
+    #[test]
+    fn ensure_nonempty_body_request_changes_with_content_unchanged() {
+        let result =
+            ensure_nonempty_body_for_verdict("my review".to_owned(), Verdict::RequestChanges);
+        assert_eq!(result, "my review");
+    }
+
+    #[test]
+    fn ensure_nonempty_body_approve_empty_stays_empty() {
+        let result = ensure_nonempty_body_for_verdict(String::new(), Verdict::Approve);
+        assert!(result.is_empty(), "APPROVE does not require a body");
+    }
+
+    #[test]
+    fn ensure_nonempty_body_comment_empty_uses_space_fallback() {
+        let result = ensure_nonempty_body_for_verdict(String::new(), Verdict::Comment);
+        assert!(
+            !result.is_empty(),
+            "COMMENT with empty body must use fallback to avoid 422"
         );
     }
 }

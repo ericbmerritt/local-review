@@ -18,8 +18,8 @@ pub mod help_screen;
 pub mod textarea;
 
 pub use app::{
-    run_app, App, AppError, BaseViews, DiffMode, Edge, EffectiveDiffMode, ExtraScreenContext,
-    ReviewSurfaceExt, TransitionMode, TransitionState, MIN_COLS, MIN_ROWS,
+    footer_text_for_width, run_app, App, AppError, BaseViews, DiffMode, Edge, EffectiveDiffMode,
+    ExtraScreenContext, ReviewSurfaceExt, TransitionMode, TransitionState, MIN_COLS, MIN_ROWS,
     SIDE_BY_SIDE_GUTTER_WIDTH, SIDE_BY_SIDE_MIN_WIDTH,
 };
 pub use diff_view::{
@@ -388,6 +388,16 @@ pub trait ReviewSurface: Sized {
     /// Title shown in the `?` help screen. Each surface supplies its own
     /// tool name so the generic core does not hard-code "jjr".
     fn help_screen_title(&self) -> &'static str;
+
+    /// Body text shown in the `?` help screen. Each surface supplies its own
+    /// keybinding reference so the help is accurate for the tool in use.
+    fn help_screen_body(&self) -> &'static str;
+
+    /// One-line keybinding hint shown in the main-view footer when no status
+    /// message is active. Each surface supplies its own hint so the footer
+    /// reflects the tool's actual keys.
+    fn footer_hint(&self, width: u16, has_stack: bool, severity_filter: Option<Severity>)
+        -> String;
 }
 
 /// Opaque extra-screen state owned by the core `App` but whose type is only
@@ -434,6 +444,10 @@ pub enum ExtraKeyAction {
     OpenScreen(Box<dyn ExtraScreen>),
     /// Surface a status message on the main screen.
     StatusMessage(String),
+    /// Refresh inline comment views (rebuild `annotated_per_file`) and show a
+    /// status message. Used after in-place mutations like direct comment delete
+    /// that update the surface's data without going through the composer flow.
+    RefreshAndStatus(String),
     /// Quit the application.
     Quit,
 }
