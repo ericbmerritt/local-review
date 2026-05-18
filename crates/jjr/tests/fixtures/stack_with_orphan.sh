@@ -27,6 +27,11 @@ export JJ_CONFIG="$config"
 cd "$repo"
 jj git init --quiet
 
+# Match the runtime: jjr writes /.jj-review to .gitignore before creating any
+# state files. Without this, jj snapshots the .jj-review/ files below and the
+# startup precheck (`store::check_review_files_untracked`) rejects them.
+echo '/.jj-review' >.gitignore
+
 echo "one" >file.txt
 jj describe -m "first" --quiet
 change_id=$(jj log -r @ --no-graph -T 'change_id ++ "\n"' | head -1 | tr -d '[:space:]')

@@ -184,6 +184,7 @@ fn detect_metadata_only_section(section: &str) -> Option<DiffFile> {
     let mut rename_to: Option<PathBuf> = None;
     let mut new_file = false;
     let mut deleted_file = false;
+    let mut is_binary = false;
     let mut diff_target: Option<PathBuf> = None;
 
     for line in section.lines() {
@@ -199,6 +200,8 @@ fn detect_metadata_only_section(section: &str) -> Option<DiffFile> {
             new_file = true;
         } else if line.starts_with("deleted file mode ") {
             deleted_file = true;
+        } else if line.starts_with("Binary files ") {
+            is_binary = true;
         }
     }
 
@@ -223,6 +226,12 @@ fn detect_metadata_only_section(section: &str) -> Option<DiffFile> {
             path,
             hunks: vec![],
         });
+    }
+    if is_binary {
+        // Binary files have no hunk content and cannot carry inline comments;
+        // emit a Modified entry with empty hunks so the file appears in the
+        // file picker without blocking the rest of the diff parse.
+        return Some(DiffFile::Binary { path });
     }
 
     None
