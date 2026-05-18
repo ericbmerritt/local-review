@@ -6,10 +6,12 @@ share a common core:
 - `crates/jjr/` — review surface for local jj stacks, pre-PR. Functional and
   shipping. No database, no network I/O, no async.
 - `crates/ggr/` — review surface for GitHub pull requests, walked
-  commit-by-commit. Scaffold only; not yet implemented. Will introduce network
-  I/O at the gh-CLI shell boundary.
-- `crates/local-review-core/` — shared library. Stub today; logic migrates from
-  `jjr` over follow-up commits.
+  commit-by-commit. Functional and shipping. Introduces network I/O exclusively
+  at the `gh`-CLI shell boundary (`src/gh.rs`); no direct HTTP.
+- `crates/local-review-core/` — shared library: diff parser, fuzzy anchoring,
+  severity/comment/change-id data types, revset hashing, and the `ratatui`-based
+  TUI framework parameterised by a `ReviewSurface` trait that each binary
+  implements.
 
 Default to working in `crates/jjr/` unless the task specifies otherwise.
 

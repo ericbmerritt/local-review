@@ -1,14 +1,26 @@
 # local-review
 
-Two terminal tools for reviewing code without leaving your editor context. Both
-follow the same model: walk through changes one at a time, draft comments
-locally, submit in one shot. What differs is where the code lives and where the
-comments go.
+Two terminal tools for batched, commit-by-commit code review. They share the
+same TUI, anchoring engine, and severity vocabulary — but they sit at different
+points in the agentic-development loop.
 
-| Tool  | Reviews                             | Comments go to          | Status  |
-| ----- | ----------------------------------- | ----------------------- | ------- |
-| `jjr` | Your local jj stack, before pushing | Claude (edits the code) | Shipped |
-| `ggr` | A GitHub pull request, by commit    | GitHub PR review API    | Shipped |
+`jjr` is the load-bearing idea: **review the agent's stack before it leaves your
+workstation.** When an agent writes commits on your behalf, your name goes on
+them. `jjr` walks the local `trunk()..@` stack, captures line / change /
+description / stack-scoped comments, and hands them back to Claude. The agent
+edits the changes in place; the codebase change is the reply. You re-review and
+push when you're satisfied.
+
+`ggr` extends the same loop to GitHub PRs you didn't author. Open a PR by
+number, walk each commit oldest-to-newest, draft inline comments, submit one
+review. Same TUI, same anchoring, same batched discipline — different source of
+truth (`gh` instead of `jj`) and different submission target (the GitHub PR
+review API instead of Claude).
+
+| Tool  | Reviews                             | Comments go to          | Install                                  |
+| ----- | ----------------------------------- | ----------------------- | ---------------------------------------- |
+| `jjr` | Your local jj stack, before pushing | Claude (edits the code) | `cargo install jjr` or Homebrew          |
+| `ggr` | A GitHub pull request, by commit    | GitHub PR review API    | Homebrew (crates.io publication pending) |
 
 ## The assumption these tools make
 
@@ -84,13 +96,12 @@ writing a thin shell around a data source.
 ## Install
 
 ```sh
-# jjr
+# jjr — crates.io or Homebrew tap
 cargo install jjr
-# or: brew install ericbmerritt/jjr/jjr
+brew install ericbmerritt/jjr/jjr
 
-# ggr
-cargo install ggr
-# or: brew install ericbmerritt/jjr/ggr
+# ggr — Homebrew tap (crates.io publication pending)
+brew install ericbmerritt/jjr/ggr
 ```
 
 Both require their respective CLI dependencies at runtime: `jj` for `jjr`, `gh`
