@@ -15,13 +15,14 @@ and the submission target (GitHub PR review API instead of Claude).
 ## Install
 
 ```sh
-cargo install ggr
+brew install ericbmerritt/jjr/ggr
 ```
 
-Or via Homebrew:
+`cargo install ggr` will work once the crate is published to crates.io; the
+binary is not on crates.io yet. To install from source meanwhile:
 
 ```sh
-brew install ericbmerritt/jjr/ggr
+cargo install --path crates/ggr --locked
 ```
 
 Requires [`gh`](https://cli.github.com) authenticated to GitHub (or GitHub
