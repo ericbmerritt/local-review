@@ -1,12 +1,20 @@
 [package]
 name = "local-review-core"
-version = "0.0.0"
+version = "0.1.0"
 description = "Shared core for local-first batched code review (diff parsing, anchoring, comment storage, TUI render)"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 authors.workspace = true
-publish = false
+readme = "README.md"
+keywords = ["review", "tui", "diff", "anchoring", "jj"]
+categories = ["command-line-interface", "development-tools"]
+include = [
+    "/src/**/*",
+    "/Cargo.toml",
+    "/README.md",
+]
 
 [lints]
 workspace = true
