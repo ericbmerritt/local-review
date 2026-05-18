@@ -1,0 +1,53 @@
+name: Publish local-review-core to crates.io
+
+# Triggered by pushing a tag like `core-v0.1.0`. Uses the Nix dev shell so
+# the Rust toolchain matches what the rest of CI builds with.
+#
+# local-review-core must be published before any new jjr/ggr release that
+# depends on it, because `cargo publish` requires all path-and-version deps
+# to be resolvable on crates.io.
+#
+# Required secret: CARGO_REGISTRY_TOKEN
+#   Same token used by release-crates.yml.
+#
+# Manual run: `gh workflow run release-crates-core.yml --ref core-v0.1.0`
+
+on:
+  push:
+    tags:
+      - "core-v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-crates-core-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: cachix/install-nix-action@8aa03977d8d733052d78f4e008a241fd1dbf36b3 # v31.10.6
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Verify tag matches local-review-core Cargo.toml version
+        run: |
+          manifest=crates/local-review-core/Cargo.toml
+          tag="${GITHUB_REF#refs/tags/core-v}"
+          cargo_version=$(grep -E '^version = ' "$manifest" | head -1 | sed -E 's/version = "(.+)"/\1/')
+          if [ "$tag" != "$cargo_version" ]; then
+            echo "::error::Tag core-v${tag} does not match $manifest version ${cargo_version}" >&2
+            exit 1
+          fi
+          echo "Tag core-v${tag} matches $manifest"
+
+      - name: Publish local-review-core
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: nix develop --command cargo publish -p local-review-core

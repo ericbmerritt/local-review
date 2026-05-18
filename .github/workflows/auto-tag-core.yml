@@ -1,0 +1,73 @@
+name: Auto-tag from local-review-core Cargo.toml version
+
+# Triggered when `crates/local-review-core/Cargo.toml` changes on `main`.
+# Reads the local-review-core package version, checks whether
+# `core-v$version` already exists as a tag, and if not, creates and pushes
+# it. The tag push then triggers `release-crates-core.yml`.
+#
+# Tags are prefixed `core-v` so local-review-core releases independently of
+# jjr (`v*`) and ggr (`ggr-v*`). local-review-core must be published before
+# any new jjr/ggr release that depends on it, because cargo publish requires
+# all path-and-version deps to be resolvable on crates.io.
+#
+# Required secret: RELEASE_TAG_TOKEN
+#   Same PAT used by auto-tag.yml — fine-grained, Contents: Read and write.
+#
+# Manual run: `gh workflow run auto-tag-core.yml --ref main`
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/local-review-core/Cargo.toml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: auto-tag-core
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_TAG_TOKEN }}
+
+      - name: Read local-review-core Cargo.toml version
+        id: version
+        run: |
+          manifest=crates/local-review-core/Cargo.toml
+          version=$(grep -E '^version = ' "$manifest" | head -1 | sed -E 's/version = "(.+)"/\1/')
+          if [ -z "$version" ]; then
+            echo "::error::Could not parse version from $manifest" >&2
+            exit 1
+          fi
+          echo "value=$version" >> "$GITHUB_OUTPUT"
+          echo "$manifest version: $version"
+
+      - name: Check if tag already exists
+        id: check
+        run: |
+          tag="core-v${{ steps.version.outputs.value }}"
+          if git rev-parse --verify --quiet "refs/tags/$tag" >/dev/null; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Tag $tag already exists; nothing to do."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "Tag $tag does not exist; will create."
+          fi
+
+      - name: Create and push tag
+        if: steps.check.outputs.exists == 'false'
+        run: |
+          tag="core-v${{ steps.version.outputs.value }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "$tag" -m "Release $tag"
+          git push origin "$tag"
+          echo "Pushed $tag"

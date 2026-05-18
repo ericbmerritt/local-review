@@ -43,6 +43,27 @@ jobs:
           fi
           echo "Tag ggr-v${tag} matches $manifest"
 
+      - name: Wait for local-review-core on crates.io
+        # `ggr` depends on `local-review-core` via path+version. cargo publish
+        # requires the version to be resolvable on crates.io. When both crates
+        # are bumped in the same merge their tag workflows fire in parallel;
+        # this poll lets ggr's publish wait for core's publish to land.
+        run: |
+          core_version=$(grep -E '^local-review-core' Cargo.toml | sed -E 's/.*version = "=([^"]+)".*/\1/')
+          url="https://crates.io/api/v1/crates/local-review-core/${core_version}"
+          echo "Waiting for local-review-core ${core_version} on crates.io..."
+          for attempt in $(seq 1 60); do
+            status=$(curl -s -o /dev/null -w '%{http_code}' "$url")
+            if [ "$status" = "200" ]; then
+              echo "local-review-core ${core_version} is available (attempt ${attempt})."
+              exit 0
+            fi
+            echo "Attempt ${attempt}: HTTP ${status}; retrying in 15s."
+            sleep 15
+          done
+          echo "::error::Timed out waiting for local-review-core ${core_version} on crates.io" >&2
+          exit 1
+
       - name: Publish ggr
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

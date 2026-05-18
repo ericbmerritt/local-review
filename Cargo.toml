@@ -76,7 +76,7 @@ trivial_numeric_casts = "deny"
 variant_size_differences = "deny"
 
 [workspace.dependencies]
-local-review-core = { path = "crates/local-review-core", version = "=0.0.0" }
+local-review-core = { path = "crates/local-review-core", version = "=0.1.0" }
 blake3 = "1"
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.29"
