@@ -29,6 +29,11 @@ export JJ_CONFIG="$config"
 cd "$repo"
 jj git init --quiet
 
+# Match the runtime: jjr writes /.jj-review to .gitignore before creating any
+# state files. Tests that hand-create .jj-review/ rely on this so the startup
+# precheck (`store::check_review_files_untracked`) does not reject them.
+echo '/.jj-review' >.gitignore
+
 # First change.
 echo "one" >file.txt
 jj describe -m "first" --quiet

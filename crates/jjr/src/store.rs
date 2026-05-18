@@ -36,8 +36,14 @@ fn anchor_file(repo_root: &Path, comment: &Comment) -> PathBuf {
 }
 
 /// Creates `.jj-review/comments/` under `repo_root` if it does not already exist. Idempotent.
+///
+/// Also ensures `/.jj-review` is in `.gitignore` so jj does not track the
+/// review state files. Previously this only happened on `save_comment`, which
+/// meant a fresh repo where the user opens jjr but saves no comments would
+/// have `.jj-review/` files appear in `jj diff`.
 pub(crate) fn ensure_review_dir(repo_root: &Path) -> Result<()> {
-    std::fs::create_dir_all(comments_dir(repo_root)).map_err(|source| JjrError::Io { source })
+    std::fs::create_dir_all(comments_dir(repo_root)).map_err(|source| JjrError::Io { source })?;
+    ensure_ignored(repo_root)
 }
 
 /// Idempotently append `/.jj-review` to `.gitignore`.
@@ -46,6 +52,47 @@ pub(crate) fn ensure_review_dir(repo_root: &Path) -> Result<()> {
 /// The file is created if absent; the entry is not duplicated.
 pub(crate) fn ensure_ignored(repo_root: &Path) -> Result<()> {
     ensure_entry_in_file(repo_root, ".gitignore", "/.jj-review")
+}
+
+/// Detect whether jj is currently tracking files inside `.jj-review/`.
+///
+/// This can happen when an earlier jjr run created state files before the
+/// `/.jj-review` line existed in `.gitignore`: jj snapshots those files into
+/// its working copy, then continues to surface them in `jj diff` / `jj show`
+/// even after `.gitignore` is updated, which trips the diff parser and clutters
+/// the user's view of their own changes.
+///
+/// On detection, returns `JjrError::JjReviewTracked` with a recovery hint
+/// (`jj file untrack .jj-review`). We deliberately do not auto-fix: the repo
+/// belongs to the user, and silently rewriting their working-copy state is the
+/// kind of "helpfulness" that surprises people.
+///
+/// Best-effort: if `jj file list` cannot run (jj missing, not a repo, etc.),
+/// this returns `Ok(())`. The downstream jj operations will surface a clearer
+/// error in that case.
+pub fn check_review_files_untracked(repo_root: &Path) -> Result<()> {
+    let output = std::process::Command::new("jj")
+        .arg("file")
+        .arg("list")
+        .arg(".jj-review")
+        .current_dir(repo_root)
+        .output();
+
+    let Ok(out) = output else { return Ok(()) };
+    if !out.status.success() {
+        return Ok(());
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let tracked: Vec<String> = stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect();
+    if tracked.is_empty() {
+        return Ok(());
+    }
+    Err(JjrError::JjReviewTracked { tracked })
 }
 
 fn ensure_entry_in_file(repo_root: &Path, filename: &str, entry: &str) -> Result<()> {
@@ -120,7 +167,6 @@ pub fn load_stack_comments(repo_root: &Path, revset_hash: &RevsetHash) -> Result
 /// still operate on by `created_at` alone.
 pub fn save_comment(repo_root: &Path, comment: &Comment) -> Result<()> {
     ensure_review_dir(repo_root)?;
-    ensure_ignored(repo_root)?;
 
     let path = anchor_file(repo_root, comment);
     let key = format_rfc3339(comment.created_at)?;
