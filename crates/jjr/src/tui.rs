@@ -203,19 +203,21 @@ pub(super) fn resolve_diff_mode(
 pub(super) use local_review_core::tui::diff_view::severity_label;
 pub(super) use local_review_core::tui::severity_color;
 
-pub fn run(change_id: &ChangeId, repo_root: &std::path::Path) -> Result<()> {
+pub fn run(
+    change_id: &ChangeId,
+    repo_root: &std::path::Path,
+    data_home: &std::path::Path,
+) -> Result<()> {
     let details = jj::show(change_id)?;
     let revset = change_id.as_str().to_owned();
 
     let (mut terminal, guard) = enter_tui_session(repo_root)?;
-    let outcome = run_jjr_app(
-        &mut terminal,
-        details,
-        repo_root.to_owned(),
+    let ctx = JjrContext {
+        data_home: data_home.to_owned(),
+        repo_root: repo_root.to_owned(),
         revset,
-        None,
-        Some(guard),
-    );
+    };
+    let outcome = run_jjr_app(&mut terminal, details, ctx, None, Some(guard));
     teardown_terminal(&mut terminal)?;
     outcome
 }
@@ -224,6 +226,7 @@ pub fn run_stack(
     repo_root: &std::path::Path,
     resolved: &ResolvedStack,
     restart: bool,
+    data_home: &std::path::Path,
 ) -> Result<()> {
     if resolved.entries.is_empty() {
         return Err(JjrError::RevsetNoMatch {
@@ -236,7 +239,7 @@ pub fn run_stack(
     }
 
     let has_comments = |id: &ChangeId| {
-        crate::store::load_change_comments(repo_root, id)
+        crate::store::load_change_comments(data_home, repo_root, id)
             .map(|v| !v.is_empty())
             .unwrap_or(false)
     };
@@ -308,14 +311,12 @@ pub fn run_stack(
     };
 
     let (mut terminal, guard) = enter_tui_session(repo_root)?;
-    let outcome = run_jjr_app(
-        &mut terminal,
-        details,
-        repo_root.to_owned(),
-        resolved.revset.clone(),
-        Some(stack_ctx),
-        Some(guard),
-    );
+    let ctx = JjrContext {
+        data_home: data_home.to_owned(),
+        repo_root: repo_root.to_owned(),
+        revset: resolved.revset.clone(),
+    };
+    let outcome = run_jjr_app(&mut terminal, details, ctx, Some(stack_ctx), Some(guard));
     teardown_terminal(&mut terminal)?;
     outcome
 }
@@ -433,12 +434,25 @@ struct StackContext {
 // JjrSurface — the ReviewSurface implementation for jjr
 // ---------------------------------------------------------------------------
 
+/// Location context for a review session: where to find the repo on disk and
+/// where to read/write comment state.
+///
+/// Bundled as a single argument to keep `JjrSurface::new` within the five-arg
+/// limit that the workspace enforces.
+pub(crate) struct JjrContext {
+    pub(crate) data_home: PathBuf,
+    pub(crate) repo_root: PathBuf,
+    pub(crate) revset: String,
+}
+
 /// jjr-specific TUI surface state. Holds the data that differs between jjr
 /// and other future tools (ggr). Plugged into the generic
 /// `local_review_core::tui::App<JjrSurface>` via the `ReviewSurface` and
 /// `ReviewSurfaceExt` traits.
 pub(crate) struct JjrSurface {
     details: ChangeDetails,
+    /// Data home for comment storage (XDG-based path).
+    data_home: PathBuf,
     /// Repo root for comment storage.
     repo_root: PathBuf,
     /// The revset string used to open this view.
@@ -469,17 +483,17 @@ pub(crate) struct JjrSurface {
 impl JjrSurface {
     fn new(
         details: ChangeDetails,
-        repo_root: PathBuf,
-        revset: String,
+        ctx: JjrContext,
         stack: Option<StackContext>,
         stderr_guard: Option<StderrLogGuard>,
     ) -> Self {
-        let reviewed = ReviewedState::load(&repo_root).unwrap_or_default();
+        let reviewed = ReviewedState::load(&ctx.repo_root).unwrap_or_default();
         let rendered_views = build_rendered_views(&details);
         Self {
             details,
-            repo_root,
-            revset,
+            data_home: ctx.data_home,
+            repo_root: ctx.repo_root,
+            revset: ctx.revset,
             loaded_comments: Vec::new(),
             stack,
             comments_loaded_ok: false,
@@ -514,7 +528,11 @@ impl JjrSurface {
     /// failure. The caller may surface `msg` as a status message.
     fn reload_comments(&mut self) -> Option<String> {
         self.overview_cache = None;
-        match crate::store::load_change_comments(&self.repo_root, &self.details.change_id) {
+        match crate::store::load_change_comments(
+            &self.data_home,
+            &self.repo_root,
+            &self.details.change_id,
+        ) {
             Ok(comments) => {
                 self.loaded_comments = self.reconcile_and_persist(comments);
                 self.comments_loaded_ok = true;
@@ -533,6 +551,7 @@ impl JjrSurface {
             comments,
             &self.details.diff,
             &self.details.description,
+            &self.data_home,
             &self.repo_root,
         );
         if let Some(msg) = first_error {
@@ -548,15 +567,17 @@ impl JjrSurface {
         };
         let revset_hash = ctx.revset_hash;
         let entries = ctx.entries.clone();
+        let data_home = self.data_home.clone();
         let repo_root = self.repo_root.clone();
 
-        let stack_level = crate::store::load_stack_comments(&repo_root, &revset_hash)
+        let stack_level = crate::store::load_stack_comments(&data_home, &repo_root, &revset_hash)
             .unwrap_or_else(|_| Vec::new());
 
         let per_change: Vec<Vec<Comment>> = entries
             .iter()
             .map(|entry| {
-                crate::store::load_change_comments(&repo_root, &entry.change_id).unwrap_or_default()
+                crate::store::load_change_comments(&data_home, &repo_root, &entry.change_id)
+                    .unwrap_or_default()
             })
             .collect();
 
@@ -572,7 +593,7 @@ impl JjrSurface {
             })
             .collect();
 
-        let orphaned = collect_orphaned_comments(&repo_root, &entries);
+        let orphaned = collect_orphaned_comments(&data_home, &repo_root, &entries);
 
         self.overview_cache = Some(OverviewCommentSet {
             stack_level,
@@ -818,7 +839,7 @@ impl ReviewSurface for JjrSurface {
             mismatch_reason: None,
         };
 
-        match crate::store::save_comment(&self.repo_root, &comment) {
+        match crate::store::save_comment(&self.data_home, &self.repo_root, &comment) {
             Ok(()) => {
                 let _ = self.reload_comments();
                 let status_message = if oversized {
@@ -863,7 +884,7 @@ impl ReviewSurface for JjrSurface {
         updated.severity = req.severity;
         updated.updated_at = Some(time::OffsetDateTime::now_utc());
 
-        match crate::store::update_comment(&self.repo_root, &updated) {
+        match crate::store::update_comment(&self.data_home, &self.repo_root, &updated) {
             Ok(()) => {
                 let _ = self.reload_comments();
                 let msg = if req.oversized {
@@ -895,7 +916,7 @@ impl ReviewSurface for JjrSurface {
                 reason: "comment not found in loaded set".to_owned(),
             });
         };
-        crate::store::delete_comment(&self.repo_root, &comment)?;
+        crate::store::delete_comment(&self.data_home, &self.repo_root, &comment)?;
         let _ = self.reload_comments();
         Ok(CoreDeleteOutcome::Deleted)
     }
@@ -1140,8 +1161,8 @@ impl JjrSurface {
         };
 
         let packet = match crate::packet::build_packet(
+            &self.data_home,
             &self.repo_root,
-            &self.revset,
             &resolved,
             false,
             jj::diff_for_change,
@@ -1158,8 +1179,12 @@ impl JjrSurface {
             }
         };
 
-        let stale_count =
-            send_to_claude::stale_count_for_change(&self.repo_root, &change_id, revset_hash);
+        let stale_count = send_to_claude::stale_count_for_change(
+            &self.data_home,
+            &self.repo_root,
+            &change_id,
+            revset_hash,
+        );
         let scope_severity_grid = send_to_claude::compute_scope_severity_grid(&packet);
         let files_affected = send_to_claude::compute_files_affected(&packet);
 
@@ -1230,7 +1255,7 @@ impl JjrSurface {
             .and_then(|&idx| self.loaded_comments.get(idx))
             .cloned();
         if let Some(comment) = focused {
-            match crate::store::delete_comment(&self.repo_root, &comment) {
+            match crate::store::delete_comment(&self.data_home, &self.repo_root, &comment) {
                 Ok(()) => {
                     let _ = self.reload_comments();
                     let new_indices = stale_screen::stale_comment_indices(&self.loaded_comments);
@@ -1779,8 +1804,11 @@ impl JjrSurface {
                     ComposerSaveOutcome::Saved { status } => {
                         *ctx.status_message = Some(status);
                         if let Some(reanchor) = self.pending_reanchor.take() {
-                            match crate::store::delete_comment(&self.repo_root, &reanchor.original)
-                            {
+                            match crate::store::delete_comment(
+                                &self.data_home,
+                                &self.repo_root,
+                                &reanchor.original,
+                            ) {
                                 Ok(()) => {}
                                 Err(e) => {
                                     *ctx.status_message = Some(format!(
@@ -1850,7 +1878,7 @@ impl JjrSurface {
                 updated_at: Some(now),
                 ..source
             };
-            return match crate::store::update_comment(&self.repo_root, &updated) {
+            return match crate::store::update_comment(&self.data_home, &self.repo_root, &updated) {
                 Ok(()) => ComposerSaveOutcome::Saved {
                     status: if oversized {
                         "body truncated to 64 KB on save".to_owned()
@@ -1888,7 +1916,13 @@ impl JjrSurface {
 
     /// Delete a comment via the composer (edit-mode `^D`).
     fn delete_via_composer(&mut self, composer: &Composer) -> ComposerSaveOutcome {
-        delete_via_composer_impl(&self.repo_root, &self.revset, &self.details, composer)
+        delete_via_composer_impl(
+            &self.data_home,
+            &self.repo_root,
+            &self.revset,
+            &self.details,
+            composer,
+        )
     }
 }
 
@@ -1937,6 +1971,7 @@ fn build_anchor_from_scope(
 
 /// Delete a comment via the composer (edit-mode `^D`).
 fn delete_via_composer_impl(
+    data_home: &std::path::Path,
     repo_root: &std::path::Path,
     revset: &str,
     details: &ChangeDetails,
@@ -1961,7 +1996,7 @@ fn delete_via_composer_impl(
             mismatch_reason: None,
         },
     };
-    match crate::store::delete_comment(repo_root, &comment) {
+    match crate::store::delete_comment(data_home, repo_root, &comment) {
         Ok(()) => ComposerSaveOutcome::Saved {
             status: "comment deleted".to_owned(),
         },
@@ -2281,7 +2316,11 @@ impl App {
         // gets a fresh load.
         self.overview_cache = None;
 
-        match crate::store::load_change_comments(&self.repo_root, &self.details.change_id) {
+        match crate::store::load_change_comments(
+            &self.repo_root,
+            &self.repo_root,
+            &self.details.change_id,
+        ) {
             Ok(comments) => {
                 self.loaded_comments = self.reconcile_and_persist(comments);
                 self.comments_loaded_ok = true;
@@ -2303,6 +2342,7 @@ impl App {
             comments,
             &self.details.diff,
             &self.details.description,
+            &self.repo_root,
             &self.repo_root,
         );
         if let Some(msg) = first_error {
@@ -2570,7 +2610,7 @@ impl App {
         let entries = ctx.entries.clone();
         let repo_root = self.repo_root.clone();
 
-        let stack_level = crate::store::load_stack_comments(&repo_root, &revset_hash)
+        let stack_level = crate::store::load_stack_comments(&repo_root, &repo_root, &revset_hash)
             .unwrap_or_else(|e| {
                 let _ = e; // best-effort; ignore load failures for overview
                 Vec::new()
@@ -2579,7 +2619,8 @@ impl App {
         let per_change: Vec<Vec<Comment>> = entries
             .iter()
             .map(|entry| {
-                crate::store::load_change_comments(&repo_root, &entry.change_id).unwrap_or_default()
+                crate::store::load_change_comments(&repo_root, &repo_root, &entry.change_id)
+                    .unwrap_or_default()
             })
             .collect();
 
@@ -2599,7 +2640,7 @@ impl App {
             })
             .collect();
 
-        let orphaned = collect_orphaned_comments(&repo_root, &entries);
+        let orphaned = collect_orphaned_comments(&repo_root, &repo_root, &entries);
 
         self.overview_cache = Some(OverviewCommentSet {
             stack_level,
@@ -2695,6 +2736,7 @@ fn reconcile_comments_with_diff(
     comments: Vec<Comment>,
     diff: &crate::diff::Diff,
     description: &str,
+    data_home: &std::path::Path,
     repo_root: &std::path::Path,
 ) -> (Vec<Comment>, Option<String>) {
     let mut errors: Vec<String> = Vec::new();
@@ -2703,13 +2745,15 @@ fn reconcile_comments_with_diff(
         .map(
             |comment| match crate::anchoring::reanchor_comment(&comment, diff, description) {
                 None => comment,
-                Some(updated) => match crate::store::update_comment(repo_root, &updated) {
-                    Ok(()) => updated,
-                    Err(e) => {
-                        errors.push(format_persist_error(&updated, &e));
-                        comment
+                Some(updated) => {
+                    match crate::store::update_comment(data_home, repo_root, &updated) {
+                        Ok(()) => updated,
+                        Err(e) => {
+                            errors.push(format_persist_error(&updated, &e));
+                            comment
+                        }
                     }
-                },
+                }
             },
         )
         .collect();
@@ -2760,13 +2804,14 @@ fn format_persist_error(comment: &Comment, err: &JjrError) -> String {
 /// this is a self-DoS only. If `jjr` ever runs in a shared workspace,
 /// add a hard cap on files and lines processed per session.
 fn collect_orphaned_comments(
+    data_home: &std::path::Path,
     repo_root: &std::path::Path,
     stack_entries: &[StackEntry],
 ) -> Vec<Comment> {
     let in_stack: std::collections::HashSet<&ChangeId> =
         stack_entries.iter().map(|e| &e.change_id).collect();
 
-    let Ok(all_on_disk) = crate::store::list_change_ids_with_comments(repo_root) else {
+    let Ok(all_on_disk) = crate::store::list_change_ids_with_comments(data_home, repo_root) else {
         return Vec::new();
     };
 
@@ -2775,7 +2820,8 @@ fn collect_orphaned_comments(
         if in_stack.contains(&change_id) {
             continue;
         }
-        let Ok(comments) = crate::store::load_change_comments(repo_root, &change_id) else {
+        let Ok(comments) = crate::store::load_change_comments(data_home, repo_root, &change_id)
+        else {
             continue;
         };
         for mut comment in comments {
@@ -2789,15 +2835,10 @@ fn collect_orphaned_comments(
 /// Production entry point: construct a `JjrApp` and run the generic core event
 /// loop. The on-exit closure persists the cursor so subsequent runs resume at
 /// the last-reviewed change.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "all parameters are distinct surface fields; no natural grouping avoids the count"
-)]
 fn run_jjr_app(
     terminal: &mut Term,
     details: ChangeDetails,
-    repo_root: PathBuf,
-    revset: String,
+    ctx: JjrContext,
     stack: Option<StackContext>,
     stderr_guard: Option<StderrLogGuard>,
 ) -> Result<()> {
@@ -2810,7 +2851,7 @@ fn run_jjr_app(
         TransitionMode::Always => CoreTransitionMode::Always,
     };
     let rendered = build_rendered_views(&details);
-    let surface = JjrSurface::new(details, repo_root, revset, stack, stderr_guard);
+    let surface = JjrSurface::new(details, ctx, stack, stderr_guard);
     let mut app = JjrApp::new(surface, rendered, core_transition_mode);
     core_run_app(terminal, &mut app, |app| {
         persist_cursor_on_jjr_app_exit(app);
@@ -3669,7 +3710,7 @@ fn focused_stale(app: &App) -> Option<&Comment> {
 
 #[cfg(test)]
 fn delete_focused_stale(app: &mut App, comment: &Comment) {
-    match crate::store::delete_comment(&app.repo_root, comment) {
+    match crate::store::delete_comment(&app.repo_root, &app.repo_root, comment) {
         Ok(()) => {
             app.refresh_inline_comments();
             let new_indices = stale_screen::stale_comment_indices(&app.loaded_comments);
@@ -3836,7 +3877,7 @@ fn open_send_to_claude(app: &mut App) {
 
     let packet = match crate::packet::build_packet(
         &app.repo_root,
-        &app.revset,
+        &app.repo_root,
         &resolved,
         false,
         jj::diff_for_change,
@@ -3855,8 +3896,12 @@ fn open_send_to_claude(app: &mut App) {
         }
     };
 
-    let stale_count =
-        send_to_claude::stale_count_for_change(&app.repo_root, &change_id, revset_hash);
+    let stale_count = send_to_claude::stale_count_for_change(
+        &app.repo_root,
+        &app.repo_root,
+        &change_id,
+        revset_hash,
+    );
     let scope_severity_grid = send_to_claude::compute_scope_severity_grid(&packet);
     let files_affected = send_to_claude::compute_files_affected(&packet);
 
@@ -4454,7 +4499,11 @@ fn handle_composer_event(app: &mut App, key: KeyEvent) {
             match save_composer(app, &composer, time::OffsetDateTime::now_utc()) {
                 SaveOutcome::Saved => {
                     if let Some(reanchor) = app.pending_reanchor.take() {
-                        match crate::store::delete_comment(&app.repo_root, &reanchor.original) {
+                        match crate::store::delete_comment(
+                            &app.repo_root,
+                            &app.repo_root,
+                            &reanchor.original,
+                        ) {
                             Ok(()) => {
                                 app.refresh_inline_comments();
                             }
@@ -4665,7 +4714,7 @@ fn delete_focused_comment(app: &mut App) {
 
     let target_index = anchor_line_index(app, &comment);
 
-    match crate::store::delete_comment(&app.repo_root, &comment) {
+    match crate::store::delete_comment(&app.repo_root, &app.repo_root, &comment) {
         Ok(()) => {
             app.refresh_inline_comments();
             app.status_message = Some("comment deleted".to_owned());
@@ -4838,7 +4887,7 @@ fn save_composer(app: &mut App, composer: &Composer, now: time::OffsetDateTime) 
 
     let comment = build_comment_from_composer(app, composer, body, now);
 
-    match crate::store::save_comment(&app.repo_root, &comment) {
+    match crate::store::save_comment(&app.repo_root, &app.repo_root, &comment) {
         Ok(()) => {
             app.last_severity = Some(composer.severity);
             app.refresh_inline_comments();
@@ -4978,7 +5027,7 @@ fn persist_update_from_composer(
         ..source
     };
 
-    match crate::store::update_comment(&app.repo_root, &updated) {
+    match crate::store::update_comment(&app.repo_root, &app.repo_root, &updated) {
         Ok(()) => {
             app.last_severity = Some(composer.severity);
             app.refresh_inline_comments();
@@ -5022,7 +5071,7 @@ fn delete_via_composer(app: &mut App, composer: &Composer) -> SaveOutcome {
         },
     };
 
-    match crate::store::delete_comment(&app.repo_root, &comment) {
+    match crate::store::delete_comment(&app.repo_root, &app.repo_root, &comment) {
         Ok(()) => {
             app.refresh_inline_comments();
             app.status_message = Some("comment deleted".to_owned());
@@ -5568,7 +5617,12 @@ mod tests {
             time::OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1),
         );
 
-        let mut surface = JjrSurface::new(details, repo_root.clone(), "@".to_owned(), None, None);
+        let ctx = JjrContext {
+            data_home: dir.path().to_path_buf(),
+            repo_root: repo_root.clone(),
+            revset: "@".to_owned(),
+        };
+        let mut surface = JjrSurface::new(details, ctx, None, None);
         surface.loaded_comments = vec![c1.clone(), c2.clone()];
         let _ = surface.reconcile_and_persist(vec![c1, c2]);
 
@@ -5593,13 +5647,12 @@ mod tests {
             description: String::new(),
             diff: make_single_hunk_diff(),
         };
-        let mut surface = JjrSurface::new(
-            details,
-            dir.path().to_path_buf(),
-            "@".to_owned(),
-            None,
-            None,
-        );
+        let ctx = JjrContext {
+            data_home: dir.path().to_path_buf(),
+            repo_root: dir.path().to_path_buf(),
+            revset: "@".to_owned(),
+        };
+        let mut surface = JjrSurface::new(details, ctx, None, None);
         // loaded_comments is empty — any CommentId will be absent.
         let absent_id = local_review_core::tui::CommentId::new(time::OffsetDateTime::UNIX_EPOCH);
         let req = DeleteRequest::new(absent_id, None);
@@ -5950,8 +6003,12 @@ mod tests {
             "expected Saved; got {outcome:?}"
         );
 
-        let loaded =
-            crate::store::load_change_comments(&app.repo_root, &app.details.change_id).unwrap();
+        let loaded = crate::store::load_change_comments(
+            &app.repo_root,
+            &app.repo_root,
+            &app.details.change_id,
+        )
+        .unwrap();
         assert_eq!(loaded.len(), 1);
         assert!(
             matches!(loaded[0].anchor, Anchor::Change { .. }),
@@ -6003,7 +6060,9 @@ mod tests {
             "expected Saved; got {outcome:?}"
         );
 
-        let loaded = crate::store::load_stack_comments(&app.repo_root, &revset_hash).unwrap();
+        let loaded =
+            crate::store::load_stack_comments(&app.repo_root, &app.repo_root, &revset_hash)
+                .unwrap();
         assert_eq!(loaded.len(), 1);
         match &loaded[0].anchor {
             Anchor::Stack {
@@ -6018,11 +6077,7 @@ mod tests {
         assert_eq!(loaded[0].body, "stack-level concern");
 
         // Confirm the record landed in `_stack.jsonl`, not the change file.
-        let stack_path = dir
-            .path()
-            .join(".jj-review")
-            .join("comments")
-            .join("_stack.jsonl");
+        let stack_path = crate::store::stack_file(dir.path(), dir.path());
         assert!(stack_path.exists(), "_stack.jsonl should exist");
     }
 
@@ -6199,8 +6254,12 @@ mod tests {
         assert!(matches!(outcome, SaveOutcome::Saved), "expected Saved");
 
         // After update, the comment should still carry the original created_at.
-        let loaded =
-            crate::store::load_change_comments(&app.repo_root, &app.details.change_id).unwrap();
+        let loaded = crate::store::load_change_comments(
+            &app.repo_root,
+            &app.repo_root,
+            &app.details.change_id,
+        )
+        .unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].created_at, created_at);
         assert_eq!(loaded[0].updated_at, Some(save_time));
@@ -6319,7 +6378,11 @@ mod tests {
         // Wipe the on-disk record. update_comment will see an empty file
         // (load_file_for_rewrite returns Ok(empty) for missing files) and
         // then `replace_by_timestamp` errors with CommentNotFound.
-        let comments_dir = dir.path().join(".jj-review").join("comments");
+        let comments_dir =
+            crate::store::change_file(dir.path(), dir.path(), &app.details.change_id)
+                .parent()
+                .expect("change_file has parent")
+                .to_path_buf();
         for entry in std::fs::read_dir(&comments_dir).expect("comments dir") {
             let entry = entry.expect("entry");
             std::fs::remove_file(entry.path()).expect("remove jsonl");
@@ -6388,15 +6451,19 @@ mod tests {
         }
         // Persist the in-memory mutation to disk so update_comment finds the
         // correct timestamp.
-        crate::store::update_comment(&app.repo_root, &app.loaded_comments[0])
+        crate::store::update_comment(&app.repo_root, &app.repo_root, &app.loaded_comments[0])
             .expect("seed disk with moved anchor");
 
         let save_time = time::OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(60);
         let outcome = save_composer(&mut app, &composer_snapshot, save_time);
         assert!(matches!(outcome, SaveOutcome::Saved), "expected Saved");
 
-        let loaded = crate::store::load_change_comments(&app.repo_root, &app.details.change_id)
-            .expect("load");
+        let loaded = crate::store::load_change_comments(
+            &app.repo_root,
+            &app.repo_root,
+            &app.details.change_id,
+        )
+        .expect("load");
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].created_at, created_at);
         let Anchor::Line { location, .. } = &loaded[0].anchor else {
@@ -6486,7 +6553,11 @@ mod tests {
         };
 
         // Wipe the on-disk record.
-        let comments_dir = dir.path().join(".jj-review").join("comments");
+        let comments_dir =
+            crate::store::change_file(dir.path(), dir.path(), &app.details.change_id)
+                .parent()
+                .expect("change_file has parent")
+                .to_path_buf();
         for entry in std::fs::read_dir(&comments_dir).expect("comments dir") {
             let entry = entry.expect("entry");
             std::fs::remove_file(entry.path()).expect("remove jsonl");
@@ -6561,14 +6632,20 @@ mod tests {
             "composer closes on successful delete"
         );
         // The original line-anchored comment is gone from disk.
-        let loaded =
-            crate::store::load_change_comments(&app.repo_root, &app.details.change_id).unwrap();
+        let loaded = crate::store::load_change_comments(
+            &app.repo_root,
+            &app.repo_root,
+            &app.details.change_id,
+        )
+        .unwrap();
         assert!(
             loaded.is_empty(),
             "original line comment should be deleted from disk; got {loaded:?}"
         );
         // No stack comment was created (delete must not write the swapped scope).
-        let stack_loaded = crate::store::load_stack_comments(&app.repo_root, &revset_hash).unwrap();
+        let stack_loaded =
+            crate::store::load_stack_comments(&app.repo_root, &app.repo_root, &revset_hash)
+                .unwrap();
         assert!(
             stack_loaded.is_empty(),
             "no stack comment should exist after delete; got {stack_loaded:?}"
@@ -6613,7 +6690,7 @@ mod tests {
             status: None,
             mismatch_reason: None,
         };
-        crate::store::save_comment(dir.path(), &original).unwrap();
+        crate::store::save_comment(dir.path(), dir.path(), &original).unwrap();
 
         open_meta_comment_editor(&mut app, &original);
         if let Screen::Composer(ref c) = app.screen {
@@ -6807,7 +6884,7 @@ mod tests {
             status: None,
             mismatch_reason: None,
         };
-        crate::store::save_comment(dir.path(), &original).unwrap();
+        crate::store::save_comment(dir.path(), dir.path(), &original).unwrap();
 
         open_meta_comment_editor(&mut app, &original);
         let Screen::Composer(ref c) = app.screen else {
@@ -6849,7 +6926,7 @@ mod tests {
             status: Some(Status::Pending),
             mismatch_reason: None,
         };
-        crate::store::save_comment(dir.path(), &original).unwrap();
+        crate::store::save_comment(dir.path(), dir.path(), &original).unwrap();
 
         open_meta_comment_editor(&mut app, &original);
         let Screen::Composer(ref c) = app.screen else {
@@ -6887,7 +6964,11 @@ mod tests {
         // Wipe the JSONL but leave `loaded_comments` and the annotated view
         // alone — the meta line is still rendered and the cursor still
         // resolves to a Comment, but the store has nothing to delete.
-        let comments_dir = dir.path().join(".jj-review").join("comments");
+        let comments_dir =
+            crate::store::change_file(dir.path(), dir.path(), &app.details.change_id)
+                .parent()
+                .expect("change_file has parent")
+                .to_path_buf();
         for entry in std::fs::read_dir(&comments_dir).expect("comments dir") {
             let entry = entry.expect("entry");
             std::fs::remove_file(entry.path()).expect("remove jsonl");
@@ -6954,7 +7035,7 @@ mod tests {
             status: Some(Status::Pending),
             mismatch_reason: None,
         };
-        crate::store::save_comment(dir, &comment).unwrap();
+        crate::store::save_comment(dir, dir, &comment).unwrap();
         app.refresh_inline_comments();
         app.file_index = 0;
         let view = app.current_view().expect("description view");
@@ -7043,7 +7124,7 @@ mod tests {
             status: Some(Status::Pending),
             mismatch_reason: None,
         };
-        crate::store::save_comment(dir.path(), &comment).unwrap();
+        crate::store::save_comment(dir.path(), dir.path(), &comment).unwrap();
         app.refresh_inline_comments();
         app.file_index = 0;
         let view = app.current_view().expect("description view");
@@ -7131,7 +7212,7 @@ mod tests {
                 status: Some(Status::Pending),
                 mismatch_reason: None,
             };
-            crate::store::save_comment(dir.path(), &comment).unwrap();
+            crate::store::save_comment(dir.path(), dir.path(), &comment).unwrap();
         }
         app.refresh_inline_comments();
 
@@ -7330,8 +7411,12 @@ mod tests {
         let mut app = make_app_with_comment_on_disk(dir.path());
 
         // Snapshot the on-disk record before we open the composer.
-        let before =
-            crate::store::load_change_comments(&app.repo_root, &app.details.change_id).unwrap();
+        let before = crate::store::load_change_comments(
+            &app.repo_root,
+            &app.repo_root,
+            &app.details.change_id,
+        )
+        .unwrap();
         assert_eq!(before.len(), 1);
         let original = before[0].clone();
 
@@ -7355,8 +7440,12 @@ mod tests {
         );
 
         // On-disk record is unchanged.
-        let after =
-            crate::store::load_change_comments(&app.repo_root, &app.details.change_id).unwrap();
+        let after = crate::store::load_change_comments(
+            &app.repo_root,
+            &app.repo_root,
+            &app.details.change_id,
+        )
+        .unwrap();
         assert_eq!(after.len(), 1);
         let preserved = &after[0];
         assert_eq!(preserved.body, original.body);
@@ -7878,7 +7967,7 @@ mod tests {
             "stale body",
             time::OffsetDateTime::UNIX_EPOCH,
         );
-        crate::store::save_comment(dir, &comment).unwrap();
+        crate::store::save_comment(dir, dir, &comment).unwrap();
         app.refresh_inline_comments();
         app
     }
@@ -7917,7 +8006,7 @@ mod tests {
             "second stale",
             time::OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1),
         );
-        crate::store::save_comment(dir.path(), &comment2).unwrap();
+        crate::store::save_comment(dir.path(), dir.path(), &comment2).unwrap();
         app.refresh_inline_comments();
         open_stale_screen(&mut app);
 
@@ -7967,7 +8056,8 @@ mod tests {
         );
 
         let loaded =
-            crate::store::load_change_comments(dir.path(), &app.details.change_id).unwrap();
+            crate::store::load_change_comments(dir.path(), dir.path(), &app.details.change_id)
+                .unwrap();
         assert!(
             loaded.iter().all(|c| c.status != Some(Status::Stale)),
             "stale comment should be deleted from disk"
@@ -8082,12 +8172,14 @@ mod tests {
         assert!(matches!(outcome, SaveOutcome::Saved), "expected Saved");
 
         if let Some(reanchor) = app.pending_reanchor.take() {
-            crate::store::delete_comment(&app.repo_root, &reanchor.original).unwrap();
+            crate::store::delete_comment(&app.repo_root, &app.repo_root, &reanchor.original)
+                .unwrap();
             app.refresh_inline_comments();
         }
 
         let loaded =
-            crate::store::load_change_comments(dir.path(), &app.details.change_id).unwrap();
+            crate::store::load_change_comments(dir.path(), dir.path(), &app.details.change_id)
+                .unwrap();
         assert_eq!(
             loaded.len(),
             1,
@@ -8148,7 +8240,7 @@ mod tests {
             "stale on missing file",
             time::OffsetDateTime::UNIX_EPOCH,
         );
-        crate::store::save_comment(dir.path(), &comment).unwrap();
+        crate::store::save_comment(dir.path(), dir.path(), &comment).unwrap();
         app.refresh_inline_comments();
 
         open_stale_screen(&mut app);
@@ -8181,7 +8273,7 @@ mod tests {
             "stale on absent line",
             time::OffsetDateTime::UNIX_EPOCH,
         );
-        crate::store::save_comment(dir.path(), &comment).unwrap();
+        crate::store::save_comment(dir.path(), dir.path(), &comment).unwrap();
         app.refresh_inline_comments();
 
         open_stale_screen(&mut app);
@@ -8210,7 +8302,7 @@ mod tests {
                 time::OffsetDateTime::UNIX_EPOCH
                     + time::Duration::seconds(i64::try_from(i + 1).unwrap_or(1)),
             );
-            crate::store::save_comment(dir.path(), &comment).unwrap();
+            crate::store::save_comment(dir.path(), dir.path(), &comment).unwrap();
         }
         app.refresh_inline_comments();
         open_stale_screen(&mut app);
@@ -8379,7 +8471,7 @@ mod tests {
             status: None,
             mismatch_reason: None,
         };
-        crate::store::save_comment(dir.path(), &original).unwrap();
+        crate::store::save_comment(dir.path(), dir.path(), &original).unwrap();
 
         // Open the editor via the overview path (simulates Enter on the row).
         open_meta_comment_editor(&mut app, &original);
@@ -8400,7 +8492,8 @@ mod tests {
         // After save, screen should be back to Main.
         assert!(matches!(app.screen, Screen::Main));
 
-        let loaded = crate::store::load_stack_comments(dir.path(), &revset_hash).unwrap();
+        let loaded =
+            crate::store::load_stack_comments(dir.path(), dir.path(), &revset_hash).unwrap();
         assert_eq!(loaded.len(), 1, "stack file should still hold one comment");
         assert_eq!(loaded[0].body, "edited body text");
         assert_eq!(loaded[0].severity, Severity::Required);
@@ -8430,7 +8523,7 @@ mod tests {
             status: Some(Status::Pending),
             mismatch_reason: None,
         };
-        crate::store::save_comment(dir.path(), &original).unwrap();
+        crate::store::save_comment(dir.path(), dir.path(), &original).unwrap();
 
         open_meta_comment_editor(&mut app, &original);
         let Screen::Composer(ref mut composer) = app.screen else {
@@ -8446,7 +8539,7 @@ mod tests {
 
         dispatch_ctrl_x(&mut app);
 
-        let loaded_b = crate::store::load_change_comments(dir.path(), &id_b).unwrap();
+        let loaded_b = crate::store::load_change_comments(dir.path(), dir.path(), &id_b).unwrap();
         assert_eq!(loaded_b.len(), 1, "B should still hold one comment");
         assert_eq!(loaded_b[0].body, "B-edited");
         assert_eq!(loaded_b[0].severity, Severity::Suggestion);
@@ -8553,7 +8646,7 @@ mod tests {
             status: Some(Status::Pending),
             mismatch_reason: None,
         };
-        crate::store::save_comment(dir.path(), &orphan_comment).unwrap();
+        crate::store::save_comment(dir.path(), dir.path(), &orphan_comment).unwrap();
 
         // Also save a comment for A (in stack) — should NOT appear in orphaned.
         let active_comment = Comment {
@@ -8571,7 +8664,7 @@ mod tests {
             status: Some(Status::Pending),
             mismatch_reason: None,
         };
-        crate::store::save_comment(dir.path(), &active_comment).unwrap();
+        crate::store::save_comment(dir.path(), dir.path(), &active_comment).unwrap();
 
         let stack_entries = vec![
             StackEntry {
@@ -8586,7 +8679,7 @@ mod tests {
             },
         ];
 
-        let orphaned = collect_orphaned_comments(dir.path(), &stack_entries);
+        let orphaned = collect_orphaned_comments(dir.path(), dir.path(), &stack_entries);
         assert_eq!(orphaned.len(), 1, "only X's comment should be orphaned");
         assert_eq!(
             orphaned[0].status,
@@ -8600,7 +8693,7 @@ mod tests {
     fn collect_orphaned_comments_empty_dir_returns_empty() {
         let dir = tempfile::tempdir().unwrap();
         let stack_entries: Vec<StackEntry> = vec![];
-        let orphaned = collect_orphaned_comments(dir.path(), &stack_entries);
+        let orphaned = collect_orphaned_comments(dir.path(), dir.path(), &stack_entries);
         assert!(orphaned.is_empty());
     }
 
@@ -8624,7 +8717,7 @@ mod tests {
             status: Some(Status::Pending),
             mismatch_reason: None,
         };
-        crate::store::save_comment(dir.path(), &comment).unwrap();
+        crate::store::save_comment(dir.path(), dir.path(), &comment).unwrap();
 
         let stack_entries = vec![StackEntry {
             change_id: id_a.clone(),
@@ -8632,7 +8725,7 @@ mod tests {
             description: "first".to_owned(),
         }];
 
-        let orphaned = collect_orphaned_comments(dir.path(), &stack_entries);
+        let orphaned = collect_orphaned_comments(dir.path(), dir.path(), &stack_entries);
         assert!(orphaned.is_empty(), "in-stack change must not be orphaned");
     }
 
@@ -8657,7 +8750,7 @@ mod tests {
             status: None,
             mismatch_reason: None,
         };
-        crate::store::save_comment(dir.path(), &original).unwrap();
+        crate::store::save_comment(dir.path(), dir.path(), &original).unwrap();
 
         open_meta_comment_editor(&mut app, &original);
         assert!(matches!(app.screen, Screen::Composer(_)));
@@ -8665,7 +8758,8 @@ mod tests {
         dispatch_ctrl_d(&mut app);
 
         assert!(matches!(app.screen, Screen::Main));
-        let loaded = crate::store::load_stack_comments(dir.path(), &revset_hash).unwrap();
+        let loaded =
+            crate::store::load_stack_comments(dir.path(), dir.path(), &revset_hash).unwrap();
         assert!(
             loaded.is_empty(),
             "stack file should be empty after delete; got {loaded:?}"
@@ -8708,8 +8802,8 @@ mod tests {
 
         dispatch_ctrl_x(&mut app);
 
-        let loaded_a = crate::store::load_change_comments(dir.path(), &id_a).unwrap();
-        let loaded_b = crate::store::load_change_comments(dir.path(), &id_b).unwrap();
+        let loaded_a = crate::store::load_change_comments(dir.path(), dir.path(), &id_a).unwrap();
+        let loaded_b = crate::store::load_change_comments(dir.path(), dir.path(), &id_b).unwrap();
         assert!(
             loaded_a.is_empty(),
             "A's file must be untouched; got {loaded_a:?}"
@@ -8750,7 +8844,7 @@ mod tests {
             status: Some(Status::Pending),
             mismatch_reason: None,
         };
-        crate::store::save_comment(dir.path(), &on_b).unwrap();
+        crate::store::save_comment(dir.path(), dir.path(), &on_b).unwrap();
 
         open_send_to_claude(&mut app);
 
@@ -8819,7 +8913,7 @@ mod tests {
             status: Some(Status::Pending),
             mismatch_reason: None,
         };
-        crate::store::save_comment(dir.path(), &on_current).unwrap();
+        crate::store::save_comment(dir.path(), dir.path(), &on_current).unwrap();
 
         // Save a comment on an unrelated change_id; in single-change mode it
         // must NOT be loaded into the packet.
@@ -8839,7 +8933,7 @@ mod tests {
             status: Some(Status::Pending),
             mismatch_reason: None,
         };
-        crate::store::save_comment(dir.path(), &on_unrelated).unwrap();
+        crate::store::save_comment(dir.path(), dir.path(), &on_unrelated).unwrap();
 
         open_send_to_claude(&mut app);
 
@@ -8904,7 +8998,7 @@ mod tests {
             status: Some(Status::Pending),
             mismatch_reason: None,
         };
-        crate::store::save_comment(dir.path(), &on_current).unwrap();
+        crate::store::save_comment(dir.path(), dir.path(), &on_current).unwrap();
 
         open_send_to_claude(&mut app);
 
@@ -9919,7 +10013,7 @@ mod tests {
                 &format!("stale {i}"),
                 time::OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(i64::from(i)),
             );
-            crate::store::save_comment(dir, &comment).unwrap();
+            crate::store::save_comment(dir, dir, &comment).unwrap();
         }
         app.refresh_inline_comments();
         open_stale_screen(&mut app);
@@ -10001,7 +10095,7 @@ mod tests {
                 status: Some(Status::Pending),
                 mismatch_reason: None,
             };
-            crate::store::save_comment(dir, &comment).unwrap();
+            crate::store::save_comment(dir, dir, &comment).unwrap();
         }
         open_overview_screen(&mut app);
         app

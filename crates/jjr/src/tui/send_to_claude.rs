@@ -292,19 +292,20 @@ fn render_prompt_view(frame: &mut Frame<'_>, prompt: &str, scroll_offset: u16) {
 }
 
 pub(super) fn stale_count_for_change(
+    data_home: &std::path::Path,
     repo_root: &std::path::Path,
     change_id: &crate::change_id::ChangeId,
     revset_hash: Option<crate::stack::RevsetHash>,
 ) -> usize {
     let mut count = 0;
-    if let Ok(comments) = crate::store::load_change_comments(repo_root, change_id) {
+    if let Ok(comments) = crate::store::load_change_comments(data_home, repo_root, change_id) {
         count += comments
             .iter()
             .filter(|c| c.status == Some(Status::Stale))
             .count();
     }
     if let Some(hash) = revset_hash {
-        if let Ok(stack_comments) = crate::store::load_stack_comments(repo_root, &hash) {
+        if let Ok(stack_comments) = crate::store::load_stack_comments(data_home, repo_root, &hash) {
             count += stack_comments
                 .iter()
                 .filter(|c| c.status == Some(Status::Stale))
@@ -398,6 +399,7 @@ mod tests {
 
     fn empty_packet() -> Packet {
         Packet {
+            data_home: PathBuf::from("/data"),
             repo_root: PathBuf::from("/repo"),
             revset: "@".to_owned(),
             stack_comments: vec![],
@@ -407,6 +409,7 @@ mod tests {
 
     fn packet_with_all_scopes() -> Packet {
         Packet {
+            data_home: PathBuf::from("/data"),
             repo_root: PathBuf::from("/repo"),
             revset: "@".to_owned(),
             stack_comments: vec![make_stack_comment(Severity::Suggestion)],

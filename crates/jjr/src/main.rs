@@ -161,9 +161,17 @@ fn main() -> ExitCode {
 fn run_export(revset: &str, format: ExportFormat) -> ExitCode {
     let result = (|| -> Result<(), JjrError> {
         let repo_root = find_repo_root()?;
-        store::check_review_files_untracked(&repo_root)?;
+        let data_home = store::jjr_data_home().ok_or(JjrError::NoDataHome)?;
+        if store::old_review_dir_exists(&repo_root) {
+            let mut stderr = std::io::stderr().lock();
+            let _ = writeln!(
+                stderr,
+                "note: .jj-review/ is no longer used; review state is now stored in\n      {}\n      Delete .jj-review/ from your repo when ready.",
+                data_home.display()
+            );
+        }
         let resolved = jj::resolve_stack(revset)?;
-        let data = export::collect_export_data(&repo_root, &resolved)?;
+        let data = export::collect_export_data(&data_home, &repo_root, &resolved)?;
         if export::is_empty(&data) {
             return Err(JjrError::NoCommentsToExport {
                 revset: revset.to_owned(),
@@ -196,11 +204,19 @@ fn run_export(revset: &str, format: ExportFormat) -> ExitCode {
 fn run_packet(revset: &str, output: Option<&std::path::Path>, include_stale: bool) -> ExitCode {
     let result = (|| -> Result<(), JjrError> {
         let repo_root = find_repo_root()?;
-        store::check_review_files_untracked(&repo_root)?;
+        let data_home = store::jjr_data_home().ok_or(JjrError::NoDataHome)?;
+        if store::old_review_dir_exists(&repo_root) {
+            let mut stderr = std::io::stderr().lock();
+            let _ = writeln!(
+                stderr,
+                "note: .jj-review/ is no longer used; review state is now stored in\n      {}\n      Delete .jj-review/ from your repo when ready.",
+                data_home.display()
+            );
+        }
         let resolved = jj::resolve_stack(revset)?;
         let pkt = packet::build_packet(
+            &data_home,
             &repo_root,
-            revset,
             &resolved,
             include_stale,
             jj::diff_for_change,
@@ -233,7 +249,15 @@ fn run_packet(revset: &str, output: Option<&std::path::Path>, include_stale: boo
 fn run_claude(revset: &str, include_stale: bool) -> ExitCode {
     let result = (|| -> Result<String, JjrError> {
         let repo_root = find_repo_root()?;
-        store::check_review_files_untracked(&repo_root)?;
+        let data_home = store::jjr_data_home().ok_or(JjrError::NoDataHome)?;
+        if store::old_review_dir_exists(&repo_root) {
+            let mut stderr = std::io::stderr().lock();
+            let _ = writeln!(
+                stderr,
+                "note: .jj-review/ is no longer used; review state is now stored in\n      {}\n      Delete .jj-review/ from your repo when ready.",
+                data_home.display()
+            );
+        }
         let change_id = jj::resolve_revset(revset)?;
         let details = jj::show(&change_id)?;
 
@@ -248,8 +272,8 @@ fn run_claude(revset: &str, include_stale: bool) -> ExitCode {
         };
 
         let pkt = packet::build_packet(
+            &data_home,
             &repo_root,
-            revset,
             &resolved,
             include_stale,
             jj::diff_for_change,
@@ -288,31 +312,55 @@ fn run_claude(revset: &str, include_stale: bool) -> ExitCode {
 
 fn run_single(revset: &str) -> Result<(), JjrError> {
     let repo_root = find_repo_root()?;
-    store::check_review_files_untracked(&repo_root)?;
+    let data_home = store::jjr_data_home().ok_or(JjrError::NoDataHome)?;
+    if store::old_review_dir_exists(&repo_root) {
+        let mut stderr = std::io::stderr().lock();
+        let _ = writeln!(
+            stderr,
+            "note: .jj-review/ is no longer used; review state is now stored in\n      {}\n      Delete .jj-review/ from your repo when ready.",
+            data_home.display()
+        );
+    }
     let change_id = jj::resolve_revset(revset)?;
-    tui::run(&change_id, &repo_root)
+    tui::run(&change_id, &repo_root, &data_home)
 }
 
 fn run_stack(revset: &str, restart: bool) -> Result<(), JjrError> {
     let repo_root = find_repo_root()?;
-    store::check_review_files_untracked(&repo_root)?;
+    let data_home = store::jjr_data_home().ok_or(JjrError::NoDataHome)?;
+    if store::old_review_dir_exists(&repo_root) {
+        let mut stderr = std::io::stderr().lock();
+        let _ = writeln!(
+            stderr,
+            "note: .jj-review/ is no longer used; review state is now stored in\n      {}\n      Delete .jj-review/ from your repo when ready.",
+            data_home.display()
+        );
+    }
     let resolved = jj::resolve_stack(revset)?;
-    tui::run_stack(&repo_root, &resolved, restart)
+    tui::run_stack(&repo_root, &resolved, restart, &data_home)
 }
 
 fn run_clear(revset: &str, stale: bool, orphaned: bool, yes: bool) -> Result<(), JjrError> {
     let repo_root = find_repo_root()?;
-    store::check_review_files_untracked(&repo_root)?;
+    let data_home = store::jjr_data_home().ok_or(JjrError::NoDataHome)?;
+    if store::old_review_dir_exists(&repo_root) {
+        let mut stderr = std::io::stderr().lock();
+        let _ = writeln!(
+            stderr,
+            "note: .jj-review/ is no longer used; review state is now stored in\n      {}\n      Delete .jj-review/ from your repo when ready.",
+            data_home.display()
+        );
+    }
     let resolved = jj::resolve_stack(revset)?;
 
     if stale {
-        let stats = store::clear_stale_for_stack(&repo_root, &resolved)?;
+        let stats = store::clear_stale_for_stack(&data_home, &repo_root, &resolved)?;
         print_clear_summary(stats.comments_removed, Some("stale"), stats.changes_touched);
         return Ok(());
     }
 
     if orphaned {
-        let stats = store::clear_orphaned_for_revset(&repo_root, &resolved)?;
+        let stats = store::clear_orphaned_for_revset(&data_home, &repo_root, &resolved)?;
         print_clear_summary(
             stats.comments_removed,
             Some("orphaned"),
@@ -322,7 +370,7 @@ fn run_clear(revset: &str, stale: bool, orphaned: bool, yes: bool) -> Result<(),
     }
 
     // Bare clear — confirm unless --yes.
-    let total = store::count_all_for_stack(&repo_root, &resolved)?;
+    let total = store::count_all_for_stack(&data_home, &repo_root, &resolved)?;
     if total == 0 {
         let mut stderr = std::io::stderr().lock();
         let _ = writeln!(stderr, "no comments to clear");
@@ -347,7 +395,7 @@ fn run_clear(revset: &str, stale: bool, orphaned: bool, yes: bool) -> Result<(),
         }
     }
 
-    let stats = store::clear_all_for_stack(&repo_root, &resolved)?;
+    let stats = store::clear_all_for_stack(&data_home, &repo_root, &resolved)?;
     print_clear_summary(stats.comments_removed, None, stats.changes_touched);
     Ok(())
 }

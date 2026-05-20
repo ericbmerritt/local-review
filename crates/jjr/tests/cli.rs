@@ -133,6 +133,11 @@ fn build_fixture(tmp: &tempfile::TempDir) -> std::path::PathBuf {
 
 /// Build a fresh fixture repo by running the named script under
 /// `tests/fixtures/`. Returns the repo path inside the given tempdir.
+///
+/// `XDG_DATA_HOME` is set to `tmp.path()` so the fixture script and `jjr`
+/// both read/write comments under `tmp.path()/jjr/repos/...` rather than
+/// `~/.local/share/jjr/...`. Use `jjr_comments_dir(tmp.path(), &repo)` to
+/// locate the comments directory in test assertions.
 #[cfg(test)]
 fn build_fixture_named(tmp: &tempfile::TempDir, script_name: &str) -> std::path::PathBuf {
     let repo = tmp.path().join("repo");
@@ -145,10 +150,28 @@ fn build_fixture_named(tmp: &tempfile::TempDir, script_name: &str) -> std::path:
     let status = StdCommand::new("bash")
         .arg(&script)
         .arg(&repo)
+        // Point comments storage at the test tmpdir so tests don't touch
+        // the developer's real ~/.local/share/jjr/ and can locate files
+        // predictably via jjr_comments_dir(tmp.path(), &repo).
+        .env("XDG_DATA_HOME", tmp.path())
         .status()
         .expect("bash should be on PATH");
     assert!(status.success(), "fixture script {script_name} failed");
     repo
+}
+
+/// Compute the comments directory path that `jjr` uses when `XDG_DATA_HOME`
+/// is set to `xdg`. Mirrors `store::comments_dir(data_home, repo_root)`.
+///
+/// Used by integration tests to locate JSONL files after running `jjr`.
+#[cfg(test)]
+fn jjr_comments_dir(xdg: &Path, repo: &Path) -> std::path::PathBuf {
+    let canonical = repo.canonicalize().unwrap_or_else(|_| repo.to_owned());
+    let relative = canonical.strip_prefix("/").unwrap_or(&canonical);
+    xdg.join("jjr")
+        .join("repos")
+        .join(relative)
+        .join("comments")
 }
 
 #[test]
@@ -322,12 +345,13 @@ fn clear_stale_removes_stale_comment_and_emits_summary() {
     Command::cargo_bin("jjr")
         .unwrap()
         .current_dir(&repo)
+        .env("XDG_DATA_HOME", tmp.path())
         .args(["clear", "--stale", "@"])
         .assert()
         .success()
         .stderr(predicate::str::contains("cleared 1 stale comment"));
 
-    let comments_dir = repo.join(".jj-review").join("comments");
+    let comments_dir = jjr_comments_dir(tmp.path(), &repo);
     let jsonl: Vec<_> = std::fs::read_dir(&comments_dir)
         .unwrap()
         .filter_map(|e| {
@@ -365,6 +389,7 @@ fn clear_bare_with_n_stdin_aborts() {
     Command::cargo_bin("jjr")
         .unwrap()
         .current_dir(&repo)
+        .env("XDG_DATA_HOME", tmp.path())
         .args(["clear", "@"])
         .write_stdin("n\n")
         .assert()
@@ -388,13 +413,14 @@ fn clear_bare_with_y_stdin_clears_all() {
     Command::cargo_bin("jjr")
         .unwrap()
         .current_dir(&repo)
+        .env("XDG_DATA_HOME", tmp.path())
         .args(["clear", "@"])
         .write_stdin("y\n")
         .assert()
         .success()
         .stderr(predicate::str::contains("cleared"));
 
-    let comments_dir = repo.join(".jj-review").join("comments");
+    let comments_dir = jjr_comments_dir(tmp.path(), &repo);
     for id in &ids {
         let path = comments_dir.join(format!("{id}.jsonl"));
         if path.exists() {
@@ -531,7 +557,7 @@ fn clear_stale_across_three_change_stack() {
     let ids = resolve_stack_change_ids(&repo);
     assert_eq!(ids.len(), 3, "expected three changes; got: {ids:?}");
 
-    let comments_dir = repo.join(".jj-review").join("comments");
+    let comments_dir = jjr_comments_dir(tmp.path(), &repo);
     std::fs::create_dir_all(&comments_dir).unwrap();
 
     // id[0]: stale only; id[1]: stale + pending; id[2]: pending only.
@@ -543,6 +569,7 @@ fn clear_stale_across_three_change_stack() {
     Command::cargo_bin("jjr")
         .unwrap()
         .current_dir(&repo)
+        .env("XDG_DATA_HOME", tmp.path())
         .args(["clear", "--stale", "trunk()..@"])
         .assert()
         .success()
@@ -640,6 +667,7 @@ fn packet_with_pending_comment_writes_to_stdout() {
     Command::cargo_bin("jjr")
         .unwrap()
         .current_dir(&repo)
+        .env("XDG_DATA_HOME", tmp.path())
         .args(["packet", "@"])
         .assert()
         .success()
@@ -664,6 +692,7 @@ fn packet_output_flag_writes_to_file() {
     Command::cargo_bin("jjr")
         .unwrap()
         .current_dir(&repo)
+        .env("XDG_DATA_HOME", tmp.path())
         .args(["packet", "@", "-o", out_path.to_str().unwrap()])
         .assert()
         .success()
@@ -695,6 +724,7 @@ fn packet_include_stale_flag_includes_stale_comments() {
     Command::cargo_bin("jjr")
         .unwrap()
         .current_dir(&repo)
+        .env("XDG_DATA_HOME", tmp.path())
         .args(["packet", "--include-stale", "@"])
         .assert()
         .success()
@@ -761,12 +791,13 @@ fn clear_yes_flag_skips_prompt_and_clears_all() {
     Command::cargo_bin("jjr")
         .unwrap()
         .current_dir(&repo)
+        .env("XDG_DATA_HOME", tmp.path())
         .args(["clear", "@", "--yes"])
         .assert()
         .success()
         .stderr(predicate::str::contains("cleared"));
 
-    let comments_dir = repo.join(".jj-review").join("comments");
+    let comments_dir = jjr_comments_dir(tmp.path(), &repo);
     for id in &ids {
         let path = comments_dir.join(format!("{id}.jsonl"));
         if path.exists() {
@@ -791,13 +822,14 @@ fn clear_orphaned_removes_orphan_file_leaves_in_stack() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = build_fixture_named(&tmp, "stack_with_orphan.sh");
 
-    let comments_dir = repo.join(".jj-review").join("comments");
+    let comments_dir = jjr_comments_dir(tmp.path(), &repo);
     let orphan_path = comments_dir.join("aabbccddeeff0011.jsonl");
     assert!(orphan_path.exists(), "orphan file must exist before clear");
 
     Command::cargo_bin("jjr")
         .unwrap()
         .current_dir(&repo)
+        .env("XDG_DATA_HOME", tmp.path())
         .args(["clear", "trunk()..@", "--orphaned"])
         .assert()
         .success()
@@ -835,6 +867,7 @@ fn export_jsonl_pending_comment_produces_parseable_output() {
     let output = Command::cargo_bin("jjr")
         .unwrap()
         .current_dir(&repo)
+        .env("XDG_DATA_HOME", tmp.path())
         .args(["export", "@"])
         .output()
         .unwrap();
@@ -880,6 +913,7 @@ fn export_markdown_pending_comment_produces_markdown_output() {
     let output = Command::cargo_bin("jjr")
         .unwrap()
         .current_dir(&repo)
+        .env("XDG_DATA_HOME", tmp.path())
         .args(["export", "@", "--format", "markdown"])
         .output()
         .unwrap();
@@ -946,6 +980,7 @@ fn claude_missing_binary_exits_nonzero_with_clear_message() {
     Command::cargo_bin("jjr")
         .unwrap()
         .current_dir(&repo)
+        .env("XDG_DATA_HOME", tmp.path())
         .env("PATH", empty_dir.to_str().unwrap())
         .args(["claude", "@"])
         .assert()
@@ -966,7 +1001,7 @@ fn clear_bare_removes_stack_scoped_and_per_change() {
 
     let tmp = tempfile::tempdir().unwrap();
     let repo = build_fixture_named(&tmp, "single_change_with_pending.sh");
-    let comments_dir = repo.join(".jj-review").join("comments");
+    let comments_dir = jjr_comments_dir(tmp.path(), &repo);
 
     // Inject a stack-scoped comment for the `@` revset.
     let revset = "@";
@@ -986,6 +1021,7 @@ fn clear_bare_removes_stack_scoped_and_per_change() {
     Command::cargo_bin("jjr")
         .unwrap()
         .current_dir(&repo)
+        .env("XDG_DATA_HOME", tmp.path())
         .args(["clear", "@", "--yes"])
         .assert()
         .success()

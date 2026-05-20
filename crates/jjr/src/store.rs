@@ -11,120 +11,72 @@ use crate::util::log_warning;
 /// `_`, so there is no collision risk.
 pub(crate) const STACK_FILENAME: &str = "_stack.jsonl";
 
-fn comments_dir(repo_root: &Path) -> PathBuf {
-    repo_root.join(".jj-review").join("comments")
+/// Resolve the jjr data home:
+/// 1. `$XDG_DATA_HOME/jjr` if `XDG_DATA_HOME` is set and non-empty
+/// 2. `$HOME/.local/share/jjr` as the XDG default
+///
+/// Returns `None` when neither env var is set.
+pub fn jjr_data_home() -> Option<PathBuf> {
+    if let Some(xdg) = std::env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(xdg).join("jjr"));
+    }
+    std::env::var_os("HOME")
+        .filter(|v| !v.is_empty())
+        .map(|home| PathBuf::from(home).join(".local").join("share").join("jjr"))
+}
+
+fn comments_dir(data_home: &Path, repo_root: &Path) -> PathBuf {
+    // Canonicalize the repo root so symlinks and `.` segments are resolved,
+    // giving a stable storage key. Fall back to the raw path if canonicalize
+    // fails (e.g. the path doesn't exist yet in tests).
+    let canonical = repo_root
+        .canonicalize()
+        .unwrap_or_else(|_| repo_root.to_owned());
+    // Strip the leading `/` so the path can be used as a relative directory
+    // component under `data_home/repos/`.
+    let relative = canonical.strip_prefix("/").unwrap_or(&canonical);
+    data_home.join("repos").join(relative).join("comments")
 }
 
 /// Canonical on-disk path for a per-change comments file.
-pub fn change_file(repo_root: &Path, change_id: &ChangeId) -> PathBuf {
-    comments_dir(repo_root).join(format!("{}.jsonl", change_id.to_filename()))
+pub fn change_file(data_home: &Path, repo_root: &Path, change_id: &ChangeId) -> PathBuf {
+    comments_dir(data_home, repo_root).join(format!("{}.jsonl", change_id.to_filename()))
 }
 
-/// Canonical on-disk path for the shared stack-scoped comments file. Records
-/// across multiple stacks share the file; each carries its own `revset_hash`.
-pub fn stack_file(repo_root: &Path) -> PathBuf {
-    comments_dir(repo_root).join(STACK_FILENAME)
+/// Canonical on-disk path for the shared stack-scoped comments file.
+pub fn stack_file(data_home: &Path, repo_root: &Path) -> PathBuf {
+    comments_dir(data_home, repo_root).join(STACK_FILENAME)
 }
 
-fn anchor_file(repo_root: &Path, comment: &Comment) -> PathBuf {
+fn anchor_file(data_home: &Path, repo_root: &Path, comment: &Comment) -> PathBuf {
     match &comment.anchor {
         Anchor::Line { change_id, .. }
         | Anchor::Change { change_id }
-        | Anchor::Description { change_id, .. } => change_file(repo_root, change_id),
-        Anchor::Stack { .. } => stack_file(repo_root),
+        | Anchor::Description { change_id, .. } => change_file(data_home, repo_root, change_id),
+        Anchor::Stack { .. } => stack_file(data_home, repo_root),
     }
 }
 
-/// Creates `.jj-review/comments/` under `repo_root` if it does not already exist. Idempotent.
-///
-/// Also ensures `/.jj-review` is in `.gitignore` so jj does not track the
-/// review state files. Previously this only happened on `save_comment`, which
-/// meant a fresh repo where the user opens jjr but saves no comments would
-/// have `.jj-review/` files appear in `jj diff`.
-pub(crate) fn ensure_review_dir(repo_root: &Path) -> Result<()> {
-    std::fs::create_dir_all(comments_dir(repo_root)).map_err(|source| JjrError::Io { source })?;
-    ensure_ignored(repo_root)
+/// Creates the comments directory under `data_home` for `repo_root`. Idempotent.
+pub(crate) fn ensure_review_dir(data_home: &Path, repo_root: &Path) -> Result<()> {
+    std::fs::create_dir_all(comments_dir(data_home, repo_root))
+        .map_err(|source| JjrError::Io { source })
 }
 
-/// Idempotently append `/.jj-review` to `.gitignore`.
-///
-/// `jj` reads `.gitignore` natively, so a separate `.jjignore` is unnecessary.
-/// The file is created if absent; the entry is not duplicated.
-pub(crate) fn ensure_ignored(repo_root: &Path) -> Result<()> {
-    ensure_entry_in_file(repo_root, ".gitignore", "/.jj-review")
-}
-
-/// Detect whether jj is currently tracking files inside `.jj-review/`.
-///
-/// This can happen when an earlier jjr run created state files before the
-/// `/.jj-review` line existed in `.gitignore`: jj snapshots those files into
-/// its working copy, then continues to surface them in `jj diff` / `jj show`
-/// even after `.gitignore` is updated, which trips the diff parser and clutters
-/// the user's view of their own changes.
-///
-/// On detection, returns `JjrError::JjReviewTracked` with a recovery hint
-/// (`jj file untrack .jj-review`). We deliberately do not auto-fix: the repo
-/// belongs to the user, and silently rewriting their working-copy state is the
-/// kind of "helpfulness" that surprises people.
-///
-/// Best-effort: if `jj file list` cannot run (jj missing, not a repo, etc.),
-/// this returns `Ok(())`. The downstream jj operations will surface a clearer
-/// error in that case.
-pub fn check_review_files_untracked(repo_root: &Path) -> Result<()> {
-    let output = std::process::Command::new("jj")
-        .arg("file")
-        .arg("list")
-        .arg(".jj-review")
-        .current_dir(repo_root)
-        .output();
-
-    let Ok(out) = output else { return Ok(()) };
-    if !out.status.success() {
-        return Ok(());
-    }
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let tracked: Vec<String> = stdout
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(ToOwned::to_owned)
-        .collect();
-    if tracked.is_empty() {
-        return Ok(());
-    }
-    Err(JjrError::JjReviewTracked { tracked })
-}
-
-fn ensure_entry_in_file(repo_root: &Path, filename: &str, entry: &str) -> Result<()> {
-    let path = repo_root.join(filename);
-
-    let existing = if path.exists() {
-        std::fs::read_to_string(&path).map_err(|source| JjrError::Io { source })?
-    } else {
-        String::new()
-    };
-
-    if existing.lines().any(|line| line.trim() == entry) {
-        return Ok(());
-    }
-
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .map_err(|source| JjrError::Io { source })?;
-
-    if !existing.is_empty() && !existing.ends_with('\n') {
-        writeln!(file).map_err(|source| JjrError::Io { source })?;
-    }
-    writeln!(file, "{entry}").map_err(|source| JjrError::Io { source })?;
-    Ok(())
+/// Returns `true` when the old in-repo `.jj-review/` directory still exists.
+/// Used to emit a one-time migration notice.
+pub fn old_review_dir_exists(repo_root: &Path) -> bool {
+    repo_root.join(".jj-review").exists()
 }
 
 /// Malformed lines are written to stderr and skipped; valid records are
 /// returned. A schema-version mismatch on any parseable record is a hard error.
-pub fn load_change_comments(repo_root: &Path, change_id: &ChangeId) -> Result<Vec<Comment>> {
-    let path = change_file(repo_root, change_id);
+pub fn load_change_comments(
+    data_home: &Path,
+    repo_root: &Path,
+    change_id: &ChangeId,
+) -> Result<Vec<Comment>> {
+    let path = change_file(data_home, repo_root, change_id);
     if !path.exists() {
         return Ok(Vec::new());
     }
@@ -136,8 +88,12 @@ pub fn load_change_comments(repo_root: &Path, change_id: &ChangeId) -> Result<Ve
 /// Returns an empty `Vec` when the file does not exist. Any record in
 /// `_stack.jsonl` whose anchor is not `Anchor::Stack` is a corruption indicator
 /// and causes this function to return `JjrError::StackFileCorruption`.
-pub fn load_stack_comments(repo_root: &Path, revset_hash: &RevsetHash) -> Result<Vec<Comment>> {
-    let path = comments_dir(repo_root).join(STACK_FILENAME);
+pub fn load_stack_comments(
+    data_home: &Path,
+    repo_root: &Path,
+    revset_hash: &RevsetHash,
+) -> Result<Vec<Comment>> {
+    let path = comments_dir(data_home, repo_root).join(STACK_FILENAME);
     if !path.exists() {
         return Ok(Vec::new());
     }
@@ -165,10 +121,10 @@ pub fn load_stack_comments(repo_root: &Path, revset_hash: &RevsetHash) -> Result
 /// `DuplicateCommentTimestamp` is returned and nothing is written. Catching
 /// this at save time keeps the file in a state that `update`/`delete` can
 /// still operate on by `created_at` alone.
-pub fn save_comment(repo_root: &Path, comment: &Comment) -> Result<()> {
-    ensure_review_dir(repo_root)?;
+pub fn save_comment(data_home: &Path, repo_root: &Path, comment: &Comment) -> Result<()> {
+    ensure_review_dir(data_home, repo_root)?;
 
-    let path = anchor_file(repo_root, comment);
+    let path = anchor_file(data_home, repo_root, comment);
     let key = format_rfc3339(comment.created_at)?;
 
     let existing = load_file_for_rewrite(&path)?;
@@ -194,8 +150,8 @@ pub fn save_comment(repo_root: &Path, comment: &Comment) -> Result<()> {
 }
 
 /// Errors if the timestamp is not found or if two records share the same timestamp.
-pub fn update_comment(repo_root: &Path, comment: &Comment) -> Result<()> {
-    let path = anchor_file(repo_root, comment);
+pub fn update_comment(data_home: &Path, repo_root: &Path, comment: &Comment) -> Result<()> {
+    let path = anchor_file(data_home, repo_root, comment);
     let key = format_rfc3339(comment.created_at)?;
     let existing = load_file_for_rewrite(&path)?;
     let updated = replace_by_timestamp(existing, &key, comment, &path)?;
@@ -204,8 +160,8 @@ pub fn update_comment(repo_root: &Path, comment: &Comment) -> Result<()> {
 
 /// Taking `&Comment` rather than `&ChangeId` ensures stack-scoped comments —
 /// which have no `change_id` — can be deleted via the same entry point.
-pub fn delete_comment(repo_root: &Path, comment: &Comment) -> Result<()> {
-    let path = anchor_file(repo_root, comment);
+pub fn delete_comment(data_home: &Path, repo_root: &Path, comment: &Comment) -> Result<()> {
+    let path = anchor_file(data_home, repo_root, comment);
     let key = format_rfc3339(comment.created_at)?;
     let existing = load_file_for_rewrite(&path)?;
     let updated = delete_by_timestamp(existing, &key, &path)?;
@@ -365,7 +321,7 @@ fn write_file(path: &Path, comments: &[Comment]) -> Result<()> {
     crate::util::atomic_write_bytes(path, &buf)
 }
 
-/// Walk `.jj-review/comments/` and return the `ChangeId` for every
+/// Walk the comments directory and return the `ChangeId` for every
 /// `<change-id>.jsonl` file found there.
 ///
 /// `_stack.jsonl` is excluded — it is not a per-change file. Files whose
@@ -374,8 +330,8 @@ fn write_file(path: &Path, comments: &[Comment]) -> Result<()> {
 /// prevent the rest of the orphan detection pass from running).
 ///
 /// Returns an empty `Vec` when the comments directory does not exist.
-pub fn list_change_ids_with_comments(repo_root: &Path) -> Result<Vec<ChangeId>> {
-    let dir = comments_dir(repo_root);
+pub fn list_change_ids_with_comments(data_home: &Path, repo_root: &Path) -> Result<Vec<ChangeId>> {
+    let dir = comments_dir(data_home, repo_root);
     if !dir.exists() {
         return Ok(Vec::new());
     }
@@ -423,8 +379,12 @@ pub struct ClearStats {
 }
 
 /// `_stack.jsonl` is not touched.
-pub fn clear_stale_for_change(repo_root: &Path, change_id: &ChangeId) -> Result<usize> {
-    let path = change_file(repo_root, change_id);
+pub fn clear_stale_for_change(
+    data_home: &Path,
+    repo_root: &Path,
+    change_id: &ChangeId,
+) -> Result<usize> {
+    let path = change_file(data_home, repo_root, change_id);
     let all = load_file_for_rewrite(&path)?;
     let total = all.len();
     let kept: Vec<Comment> = all
@@ -442,8 +402,12 @@ pub fn clear_stale_for_change(repo_root: &Path, change_id: &ChangeId) -> Result<
 /// Remove all comments for `change_id` regardless of status.
 ///
 /// Returns the number of records removed. Zero when the file does not exist.
-pub fn clear_all_for_change(repo_root: &Path, change_id: &ChangeId) -> Result<usize> {
-    let path = change_file(repo_root, change_id);
+pub fn clear_all_for_change(
+    data_home: &Path,
+    repo_root: &Path,
+    change_id: &ChangeId,
+) -> Result<usize> {
+    let path = change_file(data_home, repo_root, change_id);
     let all = load_file_for_rewrite(&path)?;
     let total = all.len();
     if total == 0 {
@@ -453,11 +417,15 @@ pub fn clear_all_for_change(repo_root: &Path, change_id: &ChangeId) -> Result<us
     Ok(total)
 }
 
-pub fn clear_stale_for_stack(repo_root: &Path, stack: &ResolvedStack) -> Result<ClearStats> {
+pub fn clear_stale_for_stack(
+    data_home: &Path,
+    repo_root: &Path,
+    stack: &ResolvedStack,
+) -> Result<ClearStats> {
     let mut changes_touched = 0;
     let mut comments_removed = 0;
     for entry in &stack.entries {
-        let removed = clear_stale_for_change(repo_root, &entry.change_id)?;
+        let removed = clear_stale_for_change(data_home, repo_root, &entry.change_id)?;
         if removed > 0 {
             changes_touched += 1;
             comments_removed += removed;
@@ -477,11 +445,15 @@ pub fn clear_stale_for_stack(repo_root: &Path, stack: &ResolvedStack) -> Result<
 /// and `_stack.jsonl`. Stack-scoped comments for OTHER revsets in the same
 /// `_stack.jsonl` file are preserved — only records matching the stack's hash
 /// are deleted.
-pub fn clear_all_for_stack(repo_root: &Path, stack: &ResolvedStack) -> Result<ClearStats> {
+pub fn clear_all_for_stack(
+    data_home: &Path,
+    repo_root: &Path,
+    stack: &ResolvedStack,
+) -> Result<ClearStats> {
     let mut changes_touched = 0;
     let mut comments_removed = 0;
     for entry in &stack.entries {
-        let removed = clear_all_for_change(repo_root, &entry.change_id)?;
+        let removed = clear_all_for_change(data_home, repo_root, &entry.change_id)?;
         if removed > 0 {
             changes_touched += 1;
             comments_removed += removed;
@@ -491,7 +463,7 @@ pub fn clear_all_for_stack(repo_root: &Path, stack: &ResolvedStack) -> Result<Cl
     // Stack-scoped: rewrite `_stack.jsonl` keeping only records whose
     // revset_hash differs from the current stack. Same-hash records are
     // dropped. The file is left intact even if no records are removed.
-    let stack_path = comments_dir(repo_root).join(STACK_FILENAME);
+    let stack_path = comments_dir(data_home, repo_root).join(STACK_FILENAME);
     if stack_path.exists() {
         let all = load_file_for_rewrite(&stack_path)?;
         let total = all.len();
@@ -523,17 +495,21 @@ pub fn clear_all_for_stack(repo_root: &Path, stack: &ResolvedStack) -> Result<Cl
 ///
 /// Returns stats over the orphaned-file set only; the in-stack changes are
 /// not touched.
-pub fn clear_orphaned_for_revset(repo_root: &Path, stack: &ResolvedStack) -> Result<ClearStats> {
+pub fn clear_orphaned_for_revset(
+    data_home: &Path,
+    repo_root: &Path,
+    stack: &ResolvedStack,
+) -> Result<ClearStats> {
     use std::collections::HashSet;
 
     let in_stack: HashSet<_> = stack.entries.iter().map(|e| &e.change_id).collect();
-    let on_disk = list_change_ids_with_comments(repo_root)?;
+    let on_disk = list_change_ids_with_comments(data_home, repo_root)?;
 
     let mut changes_touched = 0;
     let mut comments_removed = 0;
 
     for orphan_id in on_disk.iter().filter(|id| !in_stack.contains(id)) {
-        let path = change_file(repo_root, orphan_id);
+        let path = change_file(data_home, repo_root, orphan_id);
         let count = load_file_for_rewrite(&path)?.len();
         std::fs::remove_file(&path).map_err(|source| JjrError::Io { source })?;
         changes_touched += 1;
@@ -550,14 +526,18 @@ pub fn clear_orphaned_for_revset(repo_root: &Path, stack: &ResolvedStack) -> Res
 /// stack-scoped comments for the current `revset_hash`.
 ///
 /// Used to populate the confirmation prompt for bare `jjr clear <revset>`.
-pub fn count_all_for_stack(repo_root: &Path, stack: &ResolvedStack) -> Result<usize> {
+pub fn count_all_for_stack(
+    data_home: &Path,
+    repo_root: &Path,
+    stack: &ResolvedStack,
+) -> Result<usize> {
     let mut total = 0;
     for entry in &stack.entries {
-        let path = change_file(repo_root, &entry.change_id);
+        let path = change_file(data_home, repo_root, &entry.change_id);
         let comments = load_file_for_rewrite(&path)?;
         total += comments.len();
     }
-    total += load_stack_comments(repo_root, &stack.revset_hash)?.len();
+    total += load_stack_comments(data_home, repo_root, &stack.revset_hash)?.len();
     Ok(total)
 }
 
@@ -625,8 +605,8 @@ mod tests {
             dir.path(),
         );
 
-        save_comment(dir.path(), &comment).unwrap();
-        let loaded = load_change_comments(dir.path(), &id).unwrap();
+        save_comment(dir.path(), dir.path(), &comment).unwrap();
+        let loaded = load_change_comments(dir.path(), dir.path(), &id).unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].body, "body");
     }
@@ -644,10 +624,10 @@ mod tests {
             dir.path(),
         );
 
-        save_comment(dir.path(), &c1).unwrap();
-        save_comment(dir.path(), &c2).unwrap();
+        save_comment(dir.path(), dir.path(), &c1).unwrap();
+        save_comment(dir.path(), dir.path(), &c2).unwrap();
 
-        let loaded = load_change_comments(dir.path(), &id).unwrap();
+        let loaded = load_change_comments(dir.path(), dir.path(), &id).unwrap();
         assert_eq!(loaded.len(), 2);
         let bodies: Vec<&str> = loaded.iter().map(|c| c.body.as_str()).collect();
         assert!(bodies.contains(&"first"));
@@ -658,7 +638,7 @@ mod tests {
     fn load_nonexistent_file_returns_empty_vec() {
         let dir = tmp();
         let id = cid("abc12345");
-        let loaded = load_change_comments(dir.path(), &id).unwrap();
+        let loaded = load_change_comments(dir.path(), dir.path(), &id).unwrap();
         assert!(loaded.is_empty());
     }
 
@@ -668,16 +648,16 @@ mod tests {
         let id = cid("abc12345");
         let ts = datetime!(2026-04-29 14:00:00 UTC);
         let original = rooted(make_line_comment(id.clone(), ts, "original"), dir.path());
-        save_comment(dir.path(), &original).unwrap();
+        save_comment(dir.path(), dir.path(), &original).unwrap();
 
         let updated = Comment {
             body: "updated body".to_owned(),
             severity: Severity::Required,
             ..original
         };
-        update_comment(dir.path(), &updated).unwrap();
+        update_comment(dir.path(), dir.path(), &updated).unwrap();
 
-        let loaded = load_change_comments(dir.path(), &id).unwrap();
+        let loaded = load_change_comments(dir.path(), dir.path(), &id).unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].body, "updated body");
         assert_eq!(loaded[0].severity, Severity::Required);
@@ -691,7 +671,7 @@ mod tests {
         let ts = datetime!(2026-04-29 14:00:00 UTC);
         let comment = rooted(make_line_comment(id, ts, "body"), dir.path());
 
-        let result = update_comment(dir.path(), &comment);
+        let result = update_comment(dir.path(), dir.path(), &comment);
         assert!(
             result.is_err(),
             "expected error updating non-existent comment"
@@ -707,12 +687,12 @@ mod tests {
         let ts2 = datetime!(2026-04-29 14:01:00 UTC);
         let c1 = rooted(make_line_comment(id.clone(), ts1, "first"), dir.path());
         let c2 = rooted(make_line_comment(id.clone(), ts2, "second"), dir.path());
-        save_comment(dir.path(), &c1).unwrap();
-        save_comment(dir.path(), &c2).unwrap();
+        save_comment(dir.path(), dir.path(), &c1).unwrap();
+        save_comment(dir.path(), dir.path(), &c2).unwrap();
 
-        delete_comment(dir.path(), &c1).unwrap();
+        delete_comment(dir.path(), dir.path(), &c1).unwrap();
 
-        let loaded = load_change_comments(dir.path(), &id).unwrap();
+        let loaded = load_change_comments(dir.path(), dir.path(), &id).unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].body, "second");
     }
@@ -723,7 +703,7 @@ mod tests {
         let id = cid("abc12345");
         let ts = datetime!(2026-04-29 14:00:00 UTC);
         let comment = rooted(make_line_comment(id, ts, "body"), dir.path());
-        save_comment(dir.path(), &comment).unwrap();
+        save_comment(dir.path(), dir.path(), &comment).unwrap();
 
         let other_ts = datetime!(2026-04-29 15:00:00 UTC);
         // Build a sibling comment whose anchor routes to the same file but
@@ -732,7 +712,7 @@ mod tests {
             created_at: other_ts,
             ..comment
         };
-        let result = delete_comment(dir.path(), &phantom);
+        let result = delete_comment(dir.path(), dir.path(), &phantom);
         assert!(
             result.is_err(),
             "expected error deleting non-existent comment"
@@ -769,18 +749,14 @@ mod tests {
         let mut comment = make_stack_comment(ts, "rename retry_wrapper to retry_policy");
         comment.repo_root = dir.path().to_owned();
 
-        save_comment(dir.path(), &comment).unwrap();
+        save_comment(dir.path(), dir.path(), &comment).unwrap();
 
-        let stack_path = dir
-            .path()
-            .join(".jj-review")
-            .join("comments")
-            .join(STACK_FILENAME);
+        let stack_path = stack_file(dir.path(), dir.path());
         assert!(stack_path.exists(), "stack jsonl should be created");
         let raw_before = std::fs::read_to_string(&stack_path).unwrap();
         assert!(raw_before.contains("rename retry_wrapper"));
 
-        delete_comment(dir.path(), &comment).unwrap();
+        delete_comment(dir.path(), dir.path(), &comment).unwrap();
 
         let raw_after = std::fs::read_to_string(&stack_path).unwrap();
         assert!(
@@ -796,12 +772,12 @@ mod tests {
         let ts = datetime!(2026-04-29 14:00:00 UTC);
         let comment = rooted(make_line_comment(id.clone(), ts, "good"), dir.path());
 
-        ensure_review_dir(dir.path()).unwrap();
-        let path = change_file(dir.path(), &id);
+        ensure_review_dir(dir.path(), dir.path()).unwrap();
+        let path = change_file(dir.path(), dir.path(), &id);
         let good_line = serde_json::to_string(&comment).unwrap();
         std::fs::write(&path, format!("{{not valid json}}\n{good_line}\n")).unwrap();
 
-        let loaded = load_change_comments(dir.path(), &id).unwrap();
+        let loaded = load_change_comments(dir.path(), dir.path(), &id).unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].body, "good");
     }
@@ -810,11 +786,11 @@ mod tests {
     fn schema_version_mismatch_returns_error() {
         let dir = tmp();
         let id = cid("abc12345");
-        ensure_review_dir(dir.path()).unwrap();
-        let path = change_file(dir.path(), &id);
+        ensure_review_dir(dir.path(), dir.path()).unwrap();
+        let path = change_file(dir.path(), dir.path(), &id);
         std::fs::write(&path, format!("{BAD_V1_FIXTURE}\n")).unwrap();
 
-        let result = load_change_comments(dir.path(), &id);
+        let result = load_change_comments(dir.path(), dir.path(), &id);
         assert!(matches!(
             result,
             Err(JjrError::SchemaVersionMismatch { .. })
@@ -825,13 +801,13 @@ mod tests {
     fn missing_schema_version_returns_hard_error() {
         let dir = tmp();
         let id = cid("abc12345");
-        ensure_review_dir(dir.path()).unwrap();
-        let path = change_file(dir.path(), &id);
+        ensure_review_dir(dir.path(), dir.path()).unwrap();
+        let path = change_file(dir.path(), dir.path(), &id);
         // No `schema_version` field at all.
         let bad = r#"{"scope":"line","change_id":"abc12345","repo_root":"/w","revset":"@","file":"f.rs","side":"new","new_line":1,"hunk_header":"@@","target_text":"x","comment":"b","severity":"note","created_at":"2026-04-29T14:22:01Z"}"#;
         std::fs::write(&path, format!("{bad}\n")).unwrap();
 
-        let result = load_change_comments(dir.path(), &id);
+        let result = load_change_comments(dir.path(), dir.path(), &id);
         match result {
             Err(JjrError::SchemaVersionMismatch { found, .. }) => {
                 assert_eq!(found, "(missing)");
@@ -844,12 +820,12 @@ mod tests {
     fn v1_record_without_scope_loads_via_store() {
         let dir = tmp();
         let id = cid("abc12345");
-        ensure_review_dir(dir.path()).unwrap();
-        let path = change_file(dir.path(), &id);
+        ensure_review_dir(dir.path(), dir.path()).unwrap();
+        let path = change_file(dir.path(), dir.path(), &id);
         let v1 = r#"{"schema_version":"diff-comment/v2","change_id":"abc12345","repo_root":"/w","revset":"@","file":"src/foo.rs","side":"new","new_line":42,"hunk_header":"@@","target_text":"t","comment":"v1 body","severity":"note","created_at":"2026-04-29T14:22:01Z"}"#;
         std::fs::write(&path, format!("{v1}\n")).unwrap();
 
-        let loaded = load_change_comments(dir.path(), &id).unwrap();
+        let loaded = load_change_comments(dir.path(), dir.path(), &id).unwrap();
         assert_eq!(loaded.len(), 1);
         assert!(matches!(loaded[0].anchor, Anchor::Line { .. }));
         assert_eq!(loaded[0].body, "v1 body");
@@ -864,8 +840,8 @@ mod tests {
         // `save_comment`'s uniqueness guard) so we can exercise the error
         // arm in `replace_by_timestamp`.
         let c = rooted(make_line_comment(id.clone(), ts, "first"), dir.path());
-        ensure_review_dir(dir.path()).unwrap();
-        let path = change_file(dir.path(), &id);
+        ensure_review_dir(dir.path(), dir.path()).unwrap();
+        let path = change_file(dir.path(), dir.path(), &id);
         let line = serde_json::to_string(&c).unwrap();
         std::fs::write(&path, format!("{line}\n{line}\n")).unwrap();
 
@@ -873,7 +849,7 @@ mod tests {
             body: "updated".to_owned(),
             ..c
         };
-        let result = update_comment(dir.path(), &updated);
+        let result = update_comment(dir.path(), dir.path(), &updated);
         assert!(matches!(
             result,
             Err(JjrError::DuplicateCommentTimestamp { .. })
@@ -886,12 +862,12 @@ mod tests {
         let id = cid("abc12345");
         let ts = datetime!(2026-04-29 14:00:00 UTC);
         let c = rooted(make_line_comment(id.clone(), ts, "dup"), dir.path());
-        ensure_review_dir(dir.path()).unwrap();
-        let path = change_file(dir.path(), &id);
+        ensure_review_dir(dir.path(), dir.path()).unwrap();
+        let path = change_file(dir.path(), dir.path(), &id);
         let line = serde_json::to_string(&c).unwrap();
         std::fs::write(&path, format!("{line}\n{line}\n")).unwrap();
 
-        let result = delete_comment(dir.path(), &c);
+        let result = delete_comment(dir.path(), dir.path(), &c);
         assert!(matches!(
             result,
             Err(JjrError::DuplicateCommentTimestamp { .. })
@@ -904,17 +880,17 @@ mod tests {
         let id = cid("abc12345");
         let ts = datetime!(2026-04-29 14:00:00 UTC);
         let c1 = rooted(make_line_comment(id.clone(), ts, "first"), dir.path());
-        save_comment(dir.path(), &c1).unwrap();
+        save_comment(dir.path(), dir.path(), &c1).unwrap();
 
         let c2 = rooted(make_line_comment(id.clone(), ts, "second"), dir.path());
-        let result = save_comment(dir.path(), &c2);
+        let result = save_comment(dir.path(), dir.path(), &c2);
         assert!(matches!(
             result,
             Err(JjrError::DuplicateCommentTimestamp { .. })
         ));
 
         // First record is the only one; second was rejected before writing.
-        let loaded = load_change_comments(dir.path(), &id).unwrap();
+        let loaded = load_change_comments(dir.path(), dir.path(), &id).unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].body, "first");
     }
@@ -922,82 +898,19 @@ mod tests {
     #[test]
     fn ensure_review_dir_creates_directory() {
         let dir = tmp();
-        let expected = dir.path().join(".jj-review").join("comments");
+        let expected = comments_dir(dir.path(), dir.path());
         assert!(!expected.exists());
 
-        ensure_review_dir(dir.path()).unwrap();
+        ensure_review_dir(dir.path(), dir.path()).unwrap();
         assert!(expected.is_dir());
     }
 
     #[test]
     fn ensure_review_dir_is_idempotent() {
         let dir = tmp();
-        ensure_review_dir(dir.path()).unwrap();
-        ensure_review_dir(dir.path()).unwrap();
-        assert!(dir.path().join(".jj-review").join("comments").is_dir());
-    }
-
-    #[test]
-    fn ensure_ignored_adds_entry_to_gitignore() {
-        let dir = tmp();
-        ensure_ignored(dir.path()).unwrap();
-
-        let content = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
-        assert!(content.contains("/.jj-review"));
-    }
-
-    #[test]
-    fn ensure_ignored_does_not_create_jjignore() {
-        let dir = tmp();
-        ensure_ignored(dir.path()).unwrap();
-
-        assert!(!dir.path().join(".jjignore").exists());
-    }
-
-    #[test]
-    fn ensure_ignored_does_not_duplicate_entries() {
-        let dir = tmp();
-        ensure_ignored(dir.path()).unwrap();
-        ensure_ignored(dir.path()).unwrap();
-
-        let gitignore = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
-        let count = gitignore.lines().filter(|l| *l == "/.jj-review").count();
-        assert_eq!(count, 1);
-    }
-
-    #[test]
-    fn ensure_ignored_appends_to_existing_file_with_content() {
-        let dir = tmp();
-        let gitignore_path = dir.path().join(".gitignore");
-        std::fs::write(&gitignore_path, "*.log\n/target\n").unwrap();
-
-        ensure_ignored(dir.path()).unwrap();
-
-        let content = std::fs::read_to_string(&gitignore_path).unwrap();
-        assert!(content.contains("*.log"));
-        assert!(content.contains("/target"));
-        assert!(content.contains("/.jj-review"));
-    }
-
-    #[test]
-    fn ensure_ignored_inserts_separator_when_file_lacks_trailing_newline() {
-        let dir = tmp();
-        let gitignore_path = dir.path().join(".gitignore");
-        // No trailing newline — should trigger the writeln! guard.
-        std::fs::write(&gitignore_path, "*.log").unwrap();
-
-        ensure_ignored(dir.path()).unwrap();
-
-        let content = std::fs::read_to_string(&gitignore_path).unwrap();
-        let lines: Vec<&str> = content.lines().collect();
-        assert!(
-            lines.contains(&"*.log"),
-            "original content preserved on its own line; got: {content:?}"
-        );
-        assert!(
-            lines.contains(&"/.jj-review"),
-            "new entry on its own line; got: {content:?}"
-        );
+        ensure_review_dir(dir.path(), dir.path()).unwrap();
+        ensure_review_dir(dir.path(), dir.path()).unwrap();
+        assert!(comments_dir(dir.path(), dir.path()).is_dir());
     }
 
     #[test]
@@ -1007,20 +920,16 @@ mod tests {
         let ts = datetime!(2026-04-29 14:00:00 UTC);
         let comment = rooted(make_line_comment(id.clone(), ts, "divergent"), dir.path());
 
-        save_comment(dir.path(), &comment).unwrap();
+        save_comment(dir.path(), dir.path(), &comment).unwrap();
 
-        let expected_path = dir
-            .path()
-            .join(".jj-review")
-            .join("comments")
-            .join("abc11111_1.jsonl");
+        let expected_path = change_file(dir.path(), dir.path(), &id);
         assert!(
             expected_path.exists(),
             "expected file at {}",
             expected_path.display()
         );
 
-        let loaded = load_change_comments(dir.path(), &id).unwrap();
+        let loaded = load_change_comments(dir.path(), dir.path(), &id).unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].body, "divergent");
 
@@ -1076,7 +985,7 @@ mod tests {
     fn clear_stale_no_jsonl_returns_zero() {
         let dir = tmp();
         let id = cid("abc12345");
-        let removed = clear_stale_for_change(dir.path(), &id).unwrap();
+        let removed = clear_stale_for_change(dir.path(), dir.path(), &id).unwrap();
         assert_eq!(removed, 0);
     }
 
@@ -1086,12 +995,12 @@ mod tests {
         let id = cid("abc12345");
         let ts = datetime!(2026-04-29 14:00:00 UTC);
         let comment = rooted(make_line_comment(id.clone(), ts, "pending"), dir.path());
-        save_comment(dir.path(), &comment).unwrap();
+        save_comment(dir.path(), dir.path(), &comment).unwrap();
 
-        let removed = clear_stale_for_change(dir.path(), &id).unwrap();
+        let removed = clear_stale_for_change(dir.path(), dir.path(), &id).unwrap();
         assert_eq!(removed, 0);
 
-        let remaining = load_change_comments(dir.path(), &id).unwrap();
+        let remaining = load_change_comments(dir.path(), dir.path(), &id).unwrap();
         assert_eq!(remaining.len(), 1);
     }
 
@@ -1103,13 +1012,13 @@ mod tests {
         let ts2 = datetime!(2026-04-29 14:01:00 UTC);
         let c1 = rooted(make_stale_comment(id.clone(), ts1, "stale1"), dir.path());
         let c2 = rooted(make_stale_comment(id.clone(), ts2, "stale2"), dir.path());
-        save_comment(dir.path(), &c1).unwrap();
-        save_comment(dir.path(), &c2).unwrap();
+        save_comment(dir.path(), dir.path(), &c1).unwrap();
+        save_comment(dir.path(), dir.path(), &c2).unwrap();
 
-        let removed = clear_stale_for_change(dir.path(), &id).unwrap();
+        let removed = clear_stale_for_change(dir.path(), dir.path(), &id).unwrap();
         assert_eq!(removed, 2);
 
-        let remaining = load_change_comments(dir.path(), &id).unwrap();
+        let remaining = load_change_comments(dir.path(), dir.path(), &id).unwrap();
         assert!(remaining.is_empty());
     }
 
@@ -1123,14 +1032,14 @@ mod tests {
         let pending = rooted(make_line_comment(id.clone(), ts1, "pending"), dir.path());
         let stale = rooted(make_stale_comment(id.clone(), ts2, "stale"), dir.path());
         let pending2 = rooted(make_line_comment(id.clone(), ts3, "pending2"), dir.path());
-        save_comment(dir.path(), &pending).unwrap();
-        save_comment(dir.path(), &stale).unwrap();
-        save_comment(dir.path(), &pending2).unwrap();
+        save_comment(dir.path(), dir.path(), &pending).unwrap();
+        save_comment(dir.path(), dir.path(), &stale).unwrap();
+        save_comment(dir.path(), dir.path(), &pending2).unwrap();
 
-        let removed = clear_stale_for_change(dir.path(), &id).unwrap();
+        let removed = clear_stale_for_change(dir.path(), dir.path(), &id).unwrap();
         assert_eq!(removed, 1);
 
-        let remaining = load_change_comments(dir.path(), &id).unwrap();
+        let remaining = load_change_comments(dir.path(), dir.path(), &id).unwrap();
         assert_eq!(remaining.len(), 2);
         assert_eq!(remaining[0].body, "pending");
         assert_eq!(remaining[1].body, "pending2");
@@ -1152,14 +1061,14 @@ mod tests {
             make_change_scoped_comment(&id, ts3, "change-level"),
             dir.path(),
         );
-        save_comment(dir.path(), &stale).unwrap();
-        save_comment(dir.path(), &orphaned).unwrap();
-        save_comment(dir.path(), &change_scoped).unwrap();
+        save_comment(dir.path(), dir.path(), &stale).unwrap();
+        save_comment(dir.path(), dir.path(), &orphaned).unwrap();
+        save_comment(dir.path(), dir.path(), &change_scoped).unwrap();
 
-        let removed = clear_stale_for_change(dir.path(), &id).unwrap();
+        let removed = clear_stale_for_change(dir.path(), dir.path(), &id).unwrap();
         assert_eq!(removed, 1);
 
-        let remaining = load_change_comments(dir.path(), &id).unwrap();
+        let remaining = load_change_comments(dir.path(), dir.path(), &id).unwrap();
         assert_eq!(remaining.len(), 2);
         let bodies: Vec<&str> = remaining.iter().map(|c| c.body.as_str()).collect();
         assert!(bodies.contains(&"orphaned"));
@@ -1187,7 +1096,7 @@ mod tests {
     fn clear_stale_for_stack_empty_stack_returns_zero_stats() {
         let dir = tmp();
         let stack = make_resolved_stack(vec![]);
-        let stats = clear_stale_for_stack(dir.path(), &stack).unwrap();
+        let stats = clear_stale_for_stack(dir.path(), dir.path(), &stack).unwrap();
         assert_eq!(stats.changes_touched, 0);
         assert_eq!(stats.comments_removed, 0);
     }
@@ -1198,14 +1107,16 @@ mod tests {
         let id = cid("abc12345");
         let ts = datetime!(2026-04-29 14:00:00 UTC);
         let stale = rooted(make_stale_comment(id.clone(), ts, "stale"), dir.path());
-        save_comment(dir.path(), &stale).unwrap();
+        save_comment(dir.path(), dir.path(), &stale).unwrap();
 
         let stack = make_resolved_stack(vec![("abc12345", "first")]);
-        let stats = clear_stale_for_stack(dir.path(), &stack).unwrap();
+        let stats = clear_stale_for_stack(dir.path(), dir.path(), &stack).unwrap();
         assert_eq!(stats.changes_touched, 1);
         assert_eq!(stats.comments_removed, 1);
 
-        assert!(load_change_comments(dir.path(), &id).unwrap().is_empty());
+        assert!(load_change_comments(dir.path(), dir.path(), &id)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -1219,10 +1130,10 @@ mod tests {
         let ts3 = datetime!(2026-04-29 14:02:00 UTC);
 
         let pending1 = rooted(make_line_comment(id1.clone(), ts1, "pending"), dir.path());
-        save_comment(dir.path(), &pending1).unwrap();
+        save_comment(dir.path(), dir.path(), &pending1).unwrap();
 
         let stale2 = rooted(make_stale_comment(id2.clone(), ts2, "stale"), dir.path());
-        save_comment(dir.path(), &stale2).unwrap();
+        save_comment(dir.path(), dir.path(), &stale2).unwrap();
 
         let stale3a = rooted(make_stale_comment(id3.clone(), ts3, "stale3a"), dir.path());
         let ts3b = datetime!(2026-04-29 14:03:00 UTC);
@@ -1230,28 +1141,32 @@ mod tests {
             make_line_comment(id3.clone(), ts3b, "pending3b"),
             dir.path(),
         );
-        save_comment(dir.path(), &stale3a).unwrap();
-        save_comment(dir.path(), &pending3b).unwrap();
+        save_comment(dir.path(), dir.path(), &stale3a).unwrap();
+        save_comment(dir.path(), dir.path(), &pending3b).unwrap();
 
         let stack = make_resolved_stack(vec![
             ("abc11111", "first"),
             ("abc22222", "second"),
             ("abc33333", "third"),
         ]);
-        let stats = clear_stale_for_stack(dir.path(), &stack).unwrap();
+        let stats = clear_stale_for_stack(dir.path(), dir.path(), &stack).unwrap();
         assert_eq!(stats.changes_touched, 2);
         assert_eq!(stats.comments_removed, 2);
 
         assert_eq!(
-            load_change_comments(dir.path(), &id1).unwrap().len(),
+            load_change_comments(dir.path(), dir.path(), &id1)
+                .unwrap()
+                .len(),
             1,
             "pending on id1 preserved"
         );
         assert!(
-            load_change_comments(dir.path(), &id2).unwrap().is_empty(),
+            load_change_comments(dir.path(), dir.path(), &id2)
+                .unwrap()
+                .is_empty(),
             "id2 stale removed"
         );
-        let id3_remaining = load_change_comments(dir.path(), &id3).unwrap();
+        let id3_remaining = load_change_comments(dir.path(), dir.path(), &id3).unwrap();
         assert_eq!(id3_remaining.len(), 1);
         assert_eq!(id3_remaining[0].body, "pending3b");
     }
@@ -1270,19 +1185,19 @@ mod tests {
         let ts2 = datetime!(2026-04-29 14:01:00 UTC);
         let stale = rooted(make_stale_comment(id.clone(), ts1, "stale"), dir.path());
         let pending = rooted(make_line_comment(id.clone(), ts2, "pending"), dir.path());
-        save_comment(dir.path(), &stale).unwrap();
-        save_comment(dir.path(), &pending).unwrap();
+        save_comment(dir.path(), dir.path(), &stale).unwrap();
+        save_comment(dir.path(), dir.path(), &pending).unwrap();
 
         // Exercise all three write_file callers.
         let updated = Comment {
             body: "updated".to_owned(),
             ..pending.clone()
         };
-        update_comment(dir.path(), &updated).unwrap();
-        clear_stale_for_change(dir.path(), &id).unwrap();
-        delete_comment(dir.path(), &updated).unwrap();
+        update_comment(dir.path(), dir.path(), &updated).unwrap();
+        clear_stale_for_change(dir.path(), dir.path(), &id).unwrap();
+        delete_comment(dir.path(), dir.path(), &updated).unwrap();
 
-        let comments_dir = dir.path().join(".jj-review").join("comments");
+        let comments_dir = comments_dir(dir.path(), dir.path());
         let leftovers: Vec<_> = std::fs::read_dir(&comments_dir)
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -1307,8 +1222,8 @@ mod tests {
         let id = cid("abc12345");
         let ts = datetime!(2026-04-29 14:00:00 UTC);
         let comment = rooted(make_line_comment(id.clone(), ts, "original"), dir.path());
-        save_comment(dir.path(), &comment).unwrap();
-        let path = change_file(dir.path(), &id);
+        save_comment(dir.path(), dir.path(), &comment).unwrap();
+        let path = change_file(dir.path(), dir.path(), &id);
         let before = std::fs::read_to_string(&path).unwrap();
 
         // Force write_file to fail by pointing at a path whose "parent"
@@ -1332,7 +1247,7 @@ mod tests {
     fn load_stack_comments_returns_empty_when_file_absent() {
         let dir = tmp();
         let hash = sample_revset_hash();
-        let loaded = load_stack_comments(dir.path(), &hash).unwrap();
+        let loaded = load_stack_comments(dir.path(), dir.path(), &hash).unwrap();
         assert!(loaded.is_empty());
     }
 
@@ -1353,17 +1268,17 @@ mod tests {
         let mut c_b = make_stack_comment_with_hash(hash_b, ts3, "stack-b comment");
         c_b.repo_root = dir.path().to_owned();
 
-        save_comment(dir.path(), &c_a1).unwrap();
-        save_comment(dir.path(), &c_a2).unwrap();
-        save_comment(dir.path(), &c_b).unwrap();
+        save_comment(dir.path(), dir.path(), &c_a1).unwrap();
+        save_comment(dir.path(), dir.path(), &c_a2).unwrap();
+        save_comment(dir.path(), dir.path(), &c_b).unwrap();
 
-        let loaded_a = load_stack_comments(dir.path(), &hash_a).unwrap();
+        let loaded_a = load_stack_comments(dir.path(), dir.path(), &hash_a).unwrap();
         assert_eq!(loaded_a.len(), 2);
         let bodies: Vec<&str> = loaded_a.iter().map(|c| c.body.as_str()).collect();
         assert!(bodies.contains(&"stack-a first"));
         assert!(bodies.contains(&"stack-a second"));
 
-        let loaded_b = load_stack_comments(dir.path(), &hash_b).unwrap();
+        let loaded_b = load_stack_comments(dir.path(), dir.path(), &hash_b).unwrap();
         assert_eq!(loaded_b.len(), 1);
         assert_eq!(loaded_b[0].body, "stack-b comment");
     }
@@ -1394,17 +1309,13 @@ mod tests {
         let id = cid("abc12345");
         let ts = datetime!(2026-04-29 14:00:00 UTC);
         let line_comment = rooted(make_line_comment(id, ts, "wrong scope"), dir.path());
-        ensure_review_dir(dir.path()).unwrap();
-        let stack_path = dir
-            .path()
-            .join(".jj-review")
-            .join("comments")
-            .join(STACK_FILENAME);
+        ensure_review_dir(dir.path(), dir.path()).unwrap();
+        let stack_path = stack_file(dir.path(), dir.path());
         let line = serde_json::to_string(&line_comment).unwrap();
         std::fs::write(&stack_path, format!("{line}\n")).unwrap();
 
         let hash = sample_revset_hash();
-        let result = load_stack_comments(dir.path(), &hash);
+        let result = load_stack_comments(dir.path(), dir.path(), &hash);
         assert!(
             matches!(result, Err(JjrError::StackFileCorruption { .. })),
             "expected StackFileCorruption; got: {result:?}"
@@ -1420,29 +1331,21 @@ mod tests {
             make_change_scoped_comment(&id, ts, "change-level concern"),
             dir.path(),
         );
-        save_comment(dir.path(), &comment).unwrap();
+        save_comment(dir.path(), dir.path(), &comment).unwrap();
 
-        let change_path = dir
-            .path()
-            .join(".jj-review")
-            .join("comments")
-            .join("abc12345.jsonl");
+        let change_path = change_file(dir.path(), dir.path(), &id);
         assert!(
             change_path.exists(),
             "change-scoped comment must go to <change-id>.jsonl"
         );
 
-        let stack_path = dir
-            .path()
-            .join(".jj-review")
-            .join("comments")
-            .join(STACK_FILENAME);
+        let stack_path = stack_file(dir.path(), dir.path());
         assert!(
             !stack_path.exists(),
             "_stack.jsonl must not be created for change-scope"
         );
 
-        let loaded = load_change_comments(dir.path(), &id).unwrap();
+        let loaded = load_change_comments(dir.path(), dir.path(), &id).unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].body, "change-level concern");
     }
@@ -1454,19 +1357,15 @@ mod tests {
         let ts = datetime!(2026-04-29 14:00:00 UTC);
         let mut c = make_stack_comment_with_hash(hash, ts, "cross-cutting concern");
         c.repo_root = dir.path().to_owned();
-        save_comment(dir.path(), &c).unwrap();
+        save_comment(dir.path(), dir.path(), &c).unwrap();
 
-        let stack_path = dir
-            .path()
-            .join(".jj-review")
-            .join("comments")
-            .join(STACK_FILENAME);
+        let stack_path = stack_file(dir.path(), dir.path());
         assert!(
             stack_path.exists(),
             "stack-scoped comment must go to _stack.jsonl"
         );
 
-        let loaded = load_stack_comments(dir.path(), &hash).unwrap();
+        let loaded = load_stack_comments(dir.path(), dir.path(), &hash).unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].body, "cross-cutting concern");
     }
@@ -1474,15 +1373,15 @@ mod tests {
     #[test]
     fn list_change_ids_empty_dir_returns_empty() {
         let dir = tmp();
-        ensure_review_dir(dir.path()).unwrap();
-        let ids = list_change_ids_with_comments(dir.path()).unwrap();
+        ensure_review_dir(dir.path(), dir.path()).unwrap();
+        let ids = list_change_ids_with_comments(dir.path(), dir.path()).unwrap();
         assert!(ids.is_empty());
     }
 
     #[test]
     fn list_change_ids_missing_dir_returns_empty() {
         let dir = tmp();
-        let ids = list_change_ids_with_comments(dir.path()).unwrap();
+        let ids = list_change_ids_with_comments(dir.path(), dir.path()).unwrap();
         assert!(ids.is_empty());
     }
 
@@ -1492,9 +1391,9 @@ mod tests {
         let id = cid("abc12345");
         let ts = datetime!(2026-04-29 14:00:00 UTC);
         let comment = rooted(make_line_comment(id.clone(), ts, "body"), dir.path());
-        save_comment(dir.path(), &comment).unwrap();
+        save_comment(dir.path(), dir.path(), &comment).unwrap();
 
-        let ids = list_change_ids_with_comments(dir.path()).unwrap();
+        let ids = list_change_ids_with_comments(dir.path(), dir.path()).unwrap();
         assert_eq!(ids.len(), 1);
         assert_eq!(ids[0], id);
     }
@@ -1507,10 +1406,10 @@ mod tests {
         let ts2 = datetime!(2026-04-29 14:01:00 UTC);
         let change_comment = rooted(make_line_comment(id, ts1, "change"), dir.path());
         let stack_comment = rooted(make_stack_comment(ts2, "stack"), dir.path());
-        save_comment(dir.path(), &change_comment).unwrap();
-        save_comment(dir.path(), &stack_comment).unwrap();
+        save_comment(dir.path(), dir.path(), &change_comment).unwrap();
+        save_comment(dir.path(), dir.path(), &stack_comment).unwrap();
 
-        let ids = list_change_ids_with_comments(dir.path()).unwrap();
+        let ids = list_change_ids_with_comments(dir.path(), dir.path()).unwrap();
         assert_eq!(ids.len(), 1, "stack file must not appear in returned ids");
     }
 
@@ -1523,10 +1422,10 @@ mod tests {
         let ts2 = datetime!(2026-04-29 14:01:00 UTC);
         let c1 = rooted(make_line_comment(id1.clone(), ts1, "first"), dir.path());
         let c2 = rooted(make_line_comment(id2.clone(), ts2, "second"), dir.path());
-        save_comment(dir.path(), &c1).unwrap();
-        save_comment(dir.path(), &c2).unwrap();
+        save_comment(dir.path(), dir.path(), &c1).unwrap();
+        save_comment(dir.path(), dir.path(), &c2).unwrap();
 
-        let mut ids = list_change_ids_with_comments(dir.path()).unwrap();
+        let mut ids = list_change_ids_with_comments(dir.path(), dir.path()).unwrap();
         ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
         assert_eq!(ids.len(), 2);
         assert_eq!(ids[0], id1);
@@ -1536,15 +1435,11 @@ mod tests {
     #[test]
     fn list_change_ids_malformed_filename_skipped_silently() {
         let dir = tmp();
-        ensure_review_dir(dir.path()).unwrap();
-        let bad_path = dir
-            .path()
-            .join(".jj-review")
-            .join("comments")
-            .join("bogus.jsonl");
+        ensure_review_dir(dir.path(), dir.path()).unwrap();
+        let bad_path = comments_dir(dir.path(), dir.path()).join("bogus.jsonl");
         std::fs::write(&bad_path, "").unwrap();
 
-        let ids = list_change_ids_with_comments(dir.path()).unwrap();
+        let ids = list_change_ids_with_comments(dir.path(), dir.path()).unwrap();
         assert!(
             ids.is_empty(),
             "malformed filename must be skipped silently"
@@ -1557,9 +1452,9 @@ mod tests {
         let id = cid("abc11111/1");
         let ts = datetime!(2026-04-29 14:00:00 UTC);
         let comment = rooted(make_line_comment(id.clone(), ts, "divergent"), dir.path());
-        save_comment(dir.path(), &comment).unwrap();
+        save_comment(dir.path(), dir.path(), &comment).unwrap();
 
-        let ids = list_change_ids_with_comments(dir.path()).unwrap();
+        let ids = list_change_ids_with_comments(dir.path(), dir.path()).unwrap();
         assert_eq!(ids.len(), 1);
         assert_eq!(
             ids[0], id,
@@ -1577,15 +1472,11 @@ mod tests {
         // in heads would silently start matching such files — this test
         // surfaces the breakage.
         let dir = tmp();
-        ensure_review_dir(dir.path()).unwrap();
-        let crafted = dir
-            .path()
-            .join(".jj-review")
-            .join("comments")
-            .join("abcdef12_34_5.jsonl");
+        ensure_review_dir(dir.path(), dir.path()).unwrap();
+        let crafted = comments_dir(dir.path(), dir.path()).join("abcdef12_34_5.jsonl");
         std::fs::write(&crafted, "").unwrap();
 
-        let ids = list_change_ids_with_comments(dir.path()).unwrap();
+        let ids = list_change_ids_with_comments(dir.path(), dir.path()).unwrap();
         assert!(
             ids.is_empty(),
             "ambiguous-decode filename must be skipped silently, got {ids:?}"
@@ -1600,12 +1491,12 @@ mod tests {
         let ts2 = datetime!(2026-04-29 14:01:00 UTC);
 
         let pending = rooted(make_line_comment(id.clone(), ts1, "pending"), dir.path());
-        save_comment(dir.path(), &pending).unwrap();
+        save_comment(dir.path(), dir.path(), &pending).unwrap();
 
         let hash = sample_revset_hash();
         let mut stack_c = make_stack_comment_with_hash(hash, ts2, "stack note");
         stack_c.repo_root = dir.path().to_owned();
-        save_comment(dir.path(), &stack_c).unwrap();
+        save_comment(dir.path(), dir.path(), &stack_c).unwrap();
 
         let stack = ResolvedStack {
             revset: "main..@".to_owned(),
@@ -1616,7 +1507,7 @@ mod tests {
                 description: "first".to_owned(),
             }],
         };
-        let total = count_all_for_stack(dir.path(), &stack).unwrap();
+        let total = count_all_for_stack(dir.path(), dir.path(), &stack).unwrap();
         assert_eq!(total, 2, "must include both per-change and stack-scoped");
     }
 
@@ -1629,14 +1520,14 @@ mod tests {
 
         let mut other = make_stack_comment_with_hash(other_hash, ts, "other-revset stack note");
         other.repo_root = dir.path().to_owned();
-        save_comment(dir.path(), &other).unwrap();
+        save_comment(dir.path(), dir.path(), &other).unwrap();
 
         let stack = ResolvedStack {
             revset: "main..@".to_owned(),
             revset_hash: stack_hash,
             entries: vec![],
         };
-        let total = count_all_for_stack(dir.path(), &stack).unwrap();
+        let total = count_all_for_stack(dir.path(), dir.path(), &stack).unwrap();
         assert_eq!(
             total, 0,
             "stack-scoped comment for a different revset_hash must not count"
@@ -1651,12 +1542,12 @@ mod tests {
         let ts2 = datetime!(2026-04-29 14:01:00 UTC);
 
         let pending = rooted(make_line_comment(id.clone(), ts1, "pending"), dir.path());
-        save_comment(dir.path(), &pending).unwrap();
+        save_comment(dir.path(), dir.path(), &pending).unwrap();
 
         let hash = sample_revset_hash();
         let mut stack_c = make_stack_comment_with_hash(hash, ts2, "stack note");
         stack_c.repo_root = dir.path().to_owned();
-        save_comment(dir.path(), &stack_c).unwrap();
+        save_comment(dir.path(), dir.path(), &stack_c).unwrap();
 
         let stack = ResolvedStack {
             revset: "main..@".to_owned(),
@@ -1667,7 +1558,7 @@ mod tests {
                 description: "first".to_owned(),
             }],
         };
-        let stats = clear_all_for_stack(dir.path(), &stack).unwrap();
+        let stats = clear_all_for_stack(dir.path(), dir.path(), &stack).unwrap();
         assert_eq!(
             stats.comments_removed, 2,
             "removed count must include per-change and stack-scoped"
@@ -1676,8 +1567,12 @@ mod tests {
             stats.changes_touched, 1,
             "changes_touched counts per-change files only"
         );
-        assert!(load_change_comments(dir.path(), &id).unwrap().is_empty());
-        assert!(load_stack_comments(dir.path(), &hash).unwrap().is_empty());
+        assert!(load_change_comments(dir.path(), dir.path(), &id)
+            .unwrap()
+            .is_empty());
+        assert!(load_stack_comments(dir.path(), dir.path(), &hash)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -1690,26 +1585,26 @@ mod tests {
 
         let mut other = make_stack_comment_with_hash(other_hash, ts1, "preserved");
         other.repo_root = dir.path().to_owned();
-        save_comment(dir.path(), &other).unwrap();
+        save_comment(dir.path(), dir.path(), &other).unwrap();
 
         let mut current = make_stack_comment_with_hash(stack_hash, ts2, "removed");
         current.repo_root = dir.path().to_owned();
-        save_comment(dir.path(), &current).unwrap();
+        save_comment(dir.path(), dir.path(), &current).unwrap();
 
         let stack = ResolvedStack {
             revset: "main..@".to_owned(),
             revset_hash: stack_hash,
             entries: vec![],
         };
-        let stats = clear_all_for_stack(dir.path(), &stack).unwrap();
+        let stats = clear_all_for_stack(dir.path(), dir.path(), &stack).unwrap();
         assert_eq!(stats.comments_removed, 1);
 
         // The other-hash stack comment must remain.
-        let remaining = load_stack_comments(dir.path(), &other_hash).unwrap();
+        let remaining = load_stack_comments(dir.path(), dir.path(), &other_hash).unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].body, "preserved");
         // Current-hash stack comments are gone.
-        assert!(load_stack_comments(dir.path(), &stack_hash)
+        assert!(load_stack_comments(dir.path(), dir.path(), &stack_hash)
             .unwrap()
             .is_empty());
     }
@@ -1751,8 +1646,8 @@ mod tests {
             make_description_comment(id.clone(), datetime!(2026-04-29 15:00:00 UTC), "desc body"),
             dir.path(),
         );
-        save_comment(dir.path(), &comment).unwrap();
-        let loaded = load_change_comments(dir.path(), &id).unwrap();
+        save_comment(dir.path(), dir.path(), &comment).unwrap();
+        let loaded = load_change_comments(dir.path(), dir.path(), &id).unwrap();
         assert_eq!(loaded.len(), 1);
         assert!(matches!(loaded[0].anchor, Anchor::Description { .. }));
         assert_eq!(loaded[0].body, "desc body");
@@ -1770,9 +1665,9 @@ mod tests {
             make_description_comment(id.clone(), datetime!(2026-04-29 15:01:00 UTC), "desc body"),
             dir.path(),
         );
-        save_comment(dir.path(), &line_c).unwrap();
-        save_comment(dir.path(), &desc_c).unwrap();
-        let loaded = load_change_comments(dir.path(), &id).unwrap();
+        save_comment(dir.path(), dir.path(), &line_c).unwrap();
+        save_comment(dir.path(), dir.path(), &desc_c).unwrap();
+        let loaded = load_change_comments(dir.path(), dir.path(), &id).unwrap();
         assert_eq!(loaded.len(), 2);
     }
 
@@ -1785,15 +1680,15 @@ mod tests {
             make_description_comment(id.clone(), ts, "original"),
             dir.path(),
         );
-        save_comment(dir.path(), &original).unwrap();
+        save_comment(dir.path(), dir.path(), &original).unwrap();
 
         let updated = Comment {
             body: "updated".to_owned(),
             ..original
         };
-        update_comment(dir.path(), &updated).unwrap();
+        update_comment(dir.path(), dir.path(), &updated).unwrap();
 
-        let loaded = load_change_comments(dir.path(), &id).unwrap();
+        let loaded = load_change_comments(dir.path(), dir.path(), &id).unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].body, "updated");
     }
@@ -1806,9 +1701,9 @@ mod tests {
             make_description_comment(id.clone(), datetime!(2026-04-29 15:00:00 UTC), "to delete"),
             dir.path(),
         );
-        save_comment(dir.path(), &comment).unwrap();
-        delete_comment(dir.path(), &comment).unwrap();
-        let loaded = load_change_comments(dir.path(), &id).unwrap();
+        save_comment(dir.path(), dir.path(), &comment).unwrap();
+        delete_comment(dir.path(), dir.path(), &comment).unwrap();
+        let loaded = load_change_comments(dir.path(), dir.path(), &id).unwrap();
         assert!(loaded.is_empty());
     }
 }
