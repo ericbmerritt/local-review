@@ -93,6 +93,9 @@ pub(crate) struct GgrSurface {
     last_severity: Option<Severity>,
     /// Shown once on the first entry load if stale drafts were found on open.
     pending_stale_message: Option<String>,
+    /// Verdict chosen in the verdict modal; executed by `poll_immediate_action`
+    /// on the first draw tick after the submitting overlay is visible.
+    pending_submit: Option<crate::submit::Verdict>,
 }
 
 impl GgrSurface {
@@ -116,6 +119,7 @@ impl GgrSurface {
             loaded_replies: Vec::new(),
             last_severity: None,
             pending_stale_message: None,
+            pending_submit: None,
         }
     }
 
@@ -666,10 +670,7 @@ impl GgrSurface {
                     }
                 };
                 let file_str = line_target.file.to_string_lossy().into_owned();
-                if file_str
-                    .split('/')
-                    .any(|seg| !crate::pr::valid_segment(seg))
-                {
+                if !crate::pr::valid_file_path(&file_str) {
                     return Err(SaveOutcome::Refused {
                         reason: "file path contains invalid segment".to_owned(),
                     });
@@ -787,15 +788,29 @@ impl GgrSurface {
             if severity_filter.is_some_and(|f| thread.severity != f) {
                 continue;
             }
+            let mut body_lines: Vec<String> = strip_controls_preserve_newlines(&thread.root.body)
+                .lines()
+                .map(str::to_owned)
+                .collect();
+            // Append each reply as `── @<author> · <age>` header followed by
+            // the reply body. Without this, replies-by-other-reviewers in a
+            // GitHub PR thread silently disappear from the diff view.
+            for reply in &thread.replies {
+                body_lines.push(String::new());
+                let age = local_review_core::util::format_age_from_iso_str(now, &reply.created_at);
+                body_lines.push(format!("── @{} · {}", strip_controls(&reply.author), age));
+                body_lines.extend(
+                    strip_controls_preserve_newlines(&reply.body)
+                        .lines()
+                        .map(str::to_owned),
+                );
+            }
             out.push(InlineComment {
                 source_line: thread.original_line,
                 target_line: thread.line,
                 severity: thread.severity,
                 age: local_review_core::util::format_age_from_iso_str(now, &thread.root.created_at),
-                body_lines: strip_controls_preserve_newlines(&thread.root.body)
-                    .lines()
-                    .map(str::to_owned)
-                    .collect(),
+                body_lines,
                 comment_index: CommentIndex::GitHubThread(enumerate_idx),
             });
         }
@@ -1195,6 +1210,8 @@ impl ReviewSurface for GgrSurface {
             composer_overlay::render_composer_overlay(frame, &s.composer, None);
         } else if state.as_any().downcast_ref::<VerdictScreen>().is_some() {
             render_verdict_screen(frame);
+        } else if state.as_any().downcast_ref::<SubmittingOverlay>().is_some() {
+            render_submitting_overlay(frame);
         } else if let Some(panel) = state.as_any().downcast_ref::<StalePanel>() {
             render_stale_panel(frame, panel);
         }
@@ -1251,8 +1268,14 @@ impl ReviewSurface for GgrSurface {
                 return Ok(ExtraScreenAction::Close);
             }
             if let Some(v) = verdict_from_key(key.code) {
-                return Ok(self.run_submit(v, ctx));
+                self.pending_submit = Some(v);
+                return Ok(ExtraScreenAction::OpenScreen(Box::new(SubmittingOverlay)));
             }
+            return Ok(ExtraScreenAction::StayOpen);
+        }
+        if try_downcast_mut::<SubmittingOverlay>(state).is_some() {
+            // Key presses during submit are ignored; poll_immediate_action
+            // drives the transition once the overlay frame is visible.
             return Ok(ExtraScreenAction::StayOpen);
         }
         Ok(ExtraScreenAction::StayOpen)
@@ -1439,6 +1462,16 @@ impl ReviewSurfaceExt for GgrSurface {
             .map(|pos| pos + 1)
             .unwrap_or(0);
         (file_idx, line)
+    }
+
+    fn poll_immediate_action(
+        &mut self,
+        ctx: &mut ExtraScreenContext<'_>,
+    ) -> std::result::Result<Option<ExtraScreenAction>, GgrError> {
+        let Some(verdict) = self.pending_submit.take() else {
+            return Ok(None);
+        };
+        Ok(Some(self.run_submit(verdict, ctx)))
     }
 }
 
@@ -1967,6 +2000,58 @@ fn verdict_from_key(code: KeyCode) -> Option<crate::submit::Verdict> {
         KeyCode::Char('c' | 'C') | KeyCode::Enter => Some(Verdict::Comment),
         _ => None,
     }
+}
+
+// ── SubmittingOverlay ─────────────────────────────────────────────────────────
+
+/// Overlay rendered while a submit is in flight.
+///
+/// One frame of this is drawn by `run_app` before `poll_immediate_action`
+/// fires and executes the actual blocking network call.
+struct SubmittingOverlay;
+
+impl ExtraScreen for SubmittingOverlay {
+    fn is_overlay(&self) -> bool {
+        true
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+
+fn render_submitting_overlay(frame: &mut Frame<'_>) {
+    let area = frame.area();
+    let [_, center, _] = Layout::horizontal([
+        Constraint::Fill(1),
+        Constraint::Length(36),
+        Constraint::Fill(1),
+    ])
+    .flex(Flex::Center)
+    .areas(area);
+    let [_, modal, _] = Layout::vertical([
+        Constraint::Fill(1),
+        Constraint::Length(4),
+        Constraint::Fill(1),
+    ])
+    .flex(Flex::Center)
+    .areas(center);
+
+    frame.render_widget(Clear, modal);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(" Submit Review ");
+    let inner = block.inner(modal);
+    frame.render_widget(block, modal);
+    frame.render_widget(
+        Paragraph::new(TuiLine::raw("  Submitting…")).alignment(Alignment::Left),
+        inner,
+    );
 }
 
 // ── GgrSurface submit helpers ─────────────────────────────────────────────────
@@ -2548,6 +2633,93 @@ mod tests {
                 .inline_comments_for_view(std::time::SystemTime::UNIX_EPOCH, 1, None)
                 .is_empty(),
             "outdated thread (position: None) must be skipped"
+        );
+    }
+
+    #[test]
+    fn inline_comments_for_view_renders_thread_replies_in_body() {
+        // A GitHub PR thread with replies from other reviewers must surface
+        // the reply bodies inline below the root, not silently drop them.
+        let mut thread = make_thread(
+            "src/foo.rs",
+            Some(10),
+            Some(1),
+            "fix this typo",
+            "2024-01-15T10:30:00Z",
+        );
+        thread.replies.push(ThreadComment {
+            id: 2,
+            author: "octocat".to_owned(),
+            created_at: "2024-01-15T11:00:00Z".to_owned(),
+            body: "good catch".to_owned(),
+        });
+        thread.replies.push(ThreadComment {
+            id: 3,
+            author: "hubot".to_owned(),
+            created_at: "2024-01-15T12:00:00Z".to_owned(),
+            body: "fixed in next commit".to_owned(),
+        });
+        let surface = make_surface_with_thread(thread);
+        let comments = surface.inline_comments_for_view(std::time::SystemTime::UNIX_EPOCH, 1, None);
+        assert_eq!(comments.len(), 1, "one InlineComment per thread");
+        let body = comments[0].body_lines.join("\n");
+        assert!(
+            body.contains("fix this typo"),
+            "root body present: {body:?}"
+        );
+        assert!(
+            body.contains("good catch"),
+            "reply 1 body present: {body:?}"
+        );
+        assert!(
+            body.contains("fixed in next commit"),
+            "reply 2 body present: {body:?}"
+        );
+        assert!(
+            body.contains("@octocat"),
+            "reply 1 author present: {body:?}"
+        );
+        assert!(body.contains("@hubot"), "reply 2 author present: {body:?}");
+    }
+
+    #[test]
+    fn inline_comments_for_view_includes_pending_reply_for_matching_thread() {
+        // A locally-drafted reply to an existing GitHub thread must surface
+        // in the inline view alongside the thread itself, anchored to the
+        // same diff line.
+        let thread = make_thread(
+            "src/foo.rs",
+            Some(10),
+            Some(1),
+            "review note",
+            "2024-01-15T10:30:00Z",
+        );
+        let thread_id = thread.root.id;
+        let mut surface = make_surface_with_thread(thread);
+
+        let reply = crate::draft::GgrReply::new(&crate::draft::ReplyParams {
+            host: "github.com".to_owned(),
+            owner: "acme".to_owned(),
+            repo: "widget".to_owned(),
+            pr_number: 1,
+            parent_comment_id: thread_id.to_string(),
+            body: "thanks, fixed".to_owned(),
+            severity: Severity::Note,
+            created_at: "2024-01-16T09:00:00Z".to_owned(),
+        })
+        .unwrap();
+        surface.loaded_replies.push(reply);
+
+        let comments = surface.inline_comments_for_view(std::time::SystemTime::UNIX_EPOCH, 1, None);
+        assert!(
+            comments
+                .iter()
+                .any(|c| matches!(c.comment_index, CommentIndex::LocalReply(_))),
+            "pending reply must appear in the inline view: {:?}",
+            comments
+                .iter()
+                .map(|c| (c.comment_index, &c.body_lines))
+                .collect::<Vec<_>>()
         );
     }
 

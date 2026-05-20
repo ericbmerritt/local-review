@@ -658,6 +658,23 @@ pub trait ReviewSurfaceExt: ReviewSurface {
     fn initial_view_position(&mut self) -> (usize, usize) {
         (0, 0)
     }
+
+    /// Called by the event loop immediately after drawing each frame while an
+    /// extra screen is open. If this returns `Some(action)`, the action is
+    /// applied and the loop redraws without waiting for a key event.
+    ///
+    /// Surfaces use this to power loading overlays: the surface opens an
+    /// overlay and stores deferred work (e.g. a blocking network call).
+    /// On the first post-draw tick this method executes the work and returns
+    /// an action so the user sees the overlay before the call blocks.
+    ///
+    /// The default implementation always returns `None`.
+    fn poll_immediate_action(
+        &mut self,
+        _ctx: &mut ExtraScreenContext<'_>,
+    ) -> Result<Option<ExtraScreenAction>, Self::Error> {
+        Ok(None)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -778,6 +795,47 @@ where
         terminal
             .draw(|frame| render(frame, app))
             .map_err(|e| AppError::Io(std::io::Error::other(e)))?;
+
+        // After drawing, give the surface a chance to run deferred work while
+        // an extra screen is open (e.g. execute a blocking submit after the
+        // "Submitting…" overlay is visible). If it returns an action, apply it
+        // and loop back to redraw immediately without blocking on a key event.
+        if matches!(app.screen, Screen::Extra(_)) {
+            let mut navigate_to_entry: Option<usize> = None;
+            let maybe_action = app
+                .surface
+                .poll_immediate_action(&mut ExtraScreenContext {
+                    file_index: &mut app.file_index,
+                    line_index: &mut app.line_index,
+                    scroll: &mut app.scroll,
+                    rendered_per_file: &mut app.rendered_per_file,
+                    base_per_file: &mut app.annotated_per_file,
+                    should_quit: &mut app.should_quit,
+                    status_message: &mut app.status_message,
+                    last_severity: &mut app.last_severity,
+                    needs_full_redraw: &mut app.needs_full_redraw,
+                    severity_filter: app.severity_filter,
+                    navigate_to_entry: &mut navigate_to_entry,
+                })
+                .map_err(AppError::Surface)?;
+            if let Some(action) = maybe_action {
+                match action {
+                    ExtraScreenAction::StayOpen => {}
+                    ExtraScreenAction::Close => {
+                        app.screen = Screen::Main;
+                        if let Some(idx) = navigate_to_entry {
+                            app.load_entry(idx, true).map_err(AppError::Surface)?;
+                        }
+                    }
+                    ExtraScreenAction::OpenScreen(new_state) => {
+                        app.screen = Screen::Extra(new_state);
+                    }
+                }
+                app.refresh_inline_comments();
+                continue;
+            }
+        }
+
         handle_event(app)?;
     }
 
