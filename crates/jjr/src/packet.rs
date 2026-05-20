@@ -11,6 +11,7 @@ use crate::store;
 
 /// A fully-resolved, inclusion-filtered set of comments ready to render.
 pub struct Packet {
+    pub data_home: PathBuf,
     pub repo_root: PathBuf,
     pub revset: String,
     /// Stack-scoped comments in created-at order.
@@ -39,20 +40,20 @@ pub struct ChangePacket {
 /// `diff_fn` fetches the diff for a single change. Separated from the rest so
 /// callers in tests can inject a stub rather than spawning jj.
 pub fn build_packet(
+    data_home: &Path,
     repo_root: &Path,
-    revset: &str,
     resolved: &ResolvedStack,
     include_stale: bool,
     diff_fn: impl Fn(&ChangeId) -> Result<Diff>,
 ) -> Result<Packet> {
     let stack_comments = {
-        let raw = store::load_stack_comments(repo_root, &resolved.revset_hash)?;
+        let raw = store::load_stack_comments(data_home, repo_root, &resolved.revset_hash)?;
         filter_comments(raw, include_stale)
     };
 
     let mut changes = Vec::new();
     for entry in &resolved.entries {
-        let raw = store::load_change_comments(repo_root, &entry.change_id)?;
+        let raw = store::load_change_comments(data_home, repo_root, &entry.change_id)?;
         let filtered = filter_comments(raw, include_stale);
 
         let (change_comments, line_comments, description_comments) = partition_by_scope(filtered);
@@ -83,13 +84,14 @@ pub fn build_packet(
 
     if stack_comments.is_empty() && changes.is_empty() {
         return Err(JjrError::EmptyPacket {
-            revset: revset.to_owned(),
+            revset: resolved.revset.clone(),
         });
     }
 
     Ok(Packet {
+        data_home: data_home.to_owned(),
         repo_root: repo_root.to_owned(),
-        revset: revset.to_owned(),
+        revset: resolved.revset.clone(),
         stack_comments,
         changes,
     })
@@ -215,7 +217,7 @@ fn render_jsonl_paths_section(packet: &Packet) -> String {
         .map(|cp| {
             (
                 cp.change_id.as_str().to_owned(),
-                store::change_file(&packet.repo_root, &cp.change_id),
+                store::change_file(&packet.data_home, &packet.repo_root, &cp.change_id),
             )
         })
         .collect();
@@ -250,7 +252,7 @@ fn render_jsonl_paths_section(packet: &Packet) -> String {
         let _ = writeln!(out, "- Per-change ({change_id}): `{}`", path.display());
     }
     if include_stack {
-        let stack_path = store::stack_file(&packet.repo_root);
+        let stack_path = store::stack_file(&packet.data_home, &packet.repo_root);
         let _ = writeln!(
             out,
             "- Stack-scope: `{}` (filter records by revset_hash)",
@@ -903,6 +905,7 @@ mod tests {
     #[test]
     fn render_stack_only_has_no_changes_section() {
         let packet = Packet {
+            data_home: PathBuf::from("/data"),
             repo_root: PathBuf::from("/repo"),
             revset: "trunk()..@".to_owned(),
             stack_comments: vec![make_stack_comment("rename everything", Severity::Required)],
@@ -919,6 +922,7 @@ mod tests {
     fn render_change_only_no_line_level_section() {
         let id = cid("abc11111");
         let packet = Packet {
+            data_home: PathBuf::from("/data"),
             repo_root: PathBuf::from("/repo"),
             revset: "@".to_owned(),
             stack_comments: vec![],
@@ -954,6 +958,7 @@ mod tests {
             Severity::Required,
         );
         let packet = Packet {
+            data_home: PathBuf::from("/data"),
             repo_root: PathBuf::from("/repo"),
             revset: "@".to_owned(),
             stack_comments: vec![],
@@ -976,6 +981,7 @@ mod tests {
     #[test]
     fn render_all_severity_labels() {
         let packet = Packet {
+            data_home: PathBuf::from("/data"),
             repo_root: PathBuf::from("/repo"),
             revset: "@".to_owned(),
             stack_comments: vec![
@@ -995,6 +1001,7 @@ mod tests {
     fn render_preserves_body_newlines() {
         let body = "line one\nline two\nline three";
         let packet = Packet {
+            data_home: PathBuf::from("/data"),
             repo_root: PathBuf::from("/repo"),
             revset: "@".to_owned(),
             stack_comments: vec![make_stack_comment(body, Severity::Note)],
@@ -1008,6 +1015,7 @@ mod tests {
     fn render_is_deterministic() {
         let id = cid("abc11111");
         let packet = Packet {
+            data_home: PathBuf::from("/data"),
             repo_root: PathBuf::from("/repo"),
             revset: "trunk()..@".to_owned(),
             stack_comments: vec![make_stack_comment("stack note", Severity::Note)],
@@ -1091,6 +1099,7 @@ mod tests {
     #[test]
     fn render_prompt_contains_repo_and_revision() {
         let packet = Packet {
+            data_home: PathBuf::from("/data"),
             repo_root: PathBuf::from("/workspace/project"),
             revset: "trunk()..@".to_owned(),
             stack_comments: vec![make_stack_comment("note", Severity::Note)],
@@ -1104,6 +1113,7 @@ mod tests {
     #[test]
     fn render_prompt_contains_prelude() {
         let packet = Packet {
+            data_home: PathBuf::from("/data"),
             repo_root: PathBuf::from("/repo"),
             revset: "@".to_owned(),
             stack_comments: vec![make_stack_comment("x", Severity::Note)],
@@ -1122,7 +1132,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let stack = make_resolved_stack(&[("abc11111", "first")]);
 
-        let result = build_packet(dir.path(), "trunk()..@", &stack, false, no_diff);
+        let result = build_packet(dir.path(), dir.path(), &stack, false, no_diff);
         assert!(
             matches!(result, Err(JjrError::EmptyPacket { .. })),
             "expected EmptyPacket"
@@ -1139,9 +1149,9 @@ mod tests {
             repo_root: dir.path().to_owned(),
             ..make_stale_line_comment(&id, "stale")
         };
-        store::save_comment(dir.path(), &stale).unwrap();
+        store::save_comment(dir.path(), dir.path(), &stale).unwrap();
 
-        let result = build_packet(dir.path(), "trunk()..@", &stack, false, no_diff);
+        let result = build_packet(dir.path(), dir.path(), &stack, false, no_diff);
         assert!(
             matches!(result, Err(JjrError::EmptyPacket { .. })),
             "stale comment should be excluded by default"
@@ -1158,9 +1168,9 @@ mod tests {
             repo_root: dir.path().to_owned(),
             ..make_stale_line_comment(&id, "stale body")
         };
-        store::save_comment(dir.path(), &stale).unwrap();
+        store::save_comment(dir.path(), dir.path(), &stale).unwrap();
 
-        let packet = build_packet(dir.path(), "trunk()..@", &stack, true, no_diff).unwrap();
+        let packet = build_packet(dir.path(), dir.path(), &stack, true, no_diff).unwrap();
         assert_eq!(packet.changes.len(), 1);
         assert_eq!(packet.changes[0].line_comments.len(), 1);
         assert_eq!(packet.changes[0].line_comments[0].body, "stale body");
@@ -1176,9 +1186,9 @@ mod tests {
             repo_root: dir.path().to_owned(),
             ..make_orphaned_line_comment(&id, "orphaned")
         };
-        store::save_comment(dir.path(), &orphaned).unwrap();
+        store::save_comment(dir.path(), dir.path(), &orphaned).unwrap();
 
-        let result = build_packet(dir.path(), "trunk()..@", &stack, true, no_diff);
+        let result = build_packet(dir.path(), dir.path(), &stack, true, no_diff);
         assert!(
             matches!(result, Err(JjrError::EmptyPacket { .. })),
             "orphaned comment must never be included even with include_stale"
@@ -1201,13 +1211,13 @@ mod tests {
 
         let mut stack_comment = make_stack_comment("cross-cutting", Severity::Note);
         stack_comment.repo_root = dir.path().to_owned();
-        store::save_comment(dir.path(), &stack_comment).unwrap();
+        store::save_comment(dir.path(), dir.path(), &stack_comment).unwrap();
 
         let mut change_comment = make_change_comment(&id, "change body", Severity::Suggestion);
         change_comment.repo_root = dir.path().to_owned();
-        store::save_comment(dir.path(), &change_comment).unwrap();
+        store::save_comment(dir.path(), dir.path(), &change_comment).unwrap();
 
-        let packet = build_packet(dir.path(), "trunk()..@", &stack, false, no_diff).unwrap();
+        let packet = build_packet(dir.path(), dir.path(), &stack, false, no_diff).unwrap();
         assert_eq!(packet.stack_comments.len(), 1);
         assert_eq!(packet.stack_comments[0].body, "cross-cutting");
         assert_eq!(packet.changes.len(), 1);
@@ -1223,9 +1233,9 @@ mod tests {
 
         let mut comment = make_change_comment(&id1, "first change note", Severity::Note);
         comment.repo_root = dir.path().to_owned();
-        store::save_comment(dir.path(), &comment).unwrap();
+        store::save_comment(dir.path(), dir.path(), &comment).unwrap();
 
-        let packet = build_packet(dir.path(), "trunk()..@", &stack, false, no_diff).unwrap();
+        let packet = build_packet(dir.path(), dir.path(), &stack, false, no_diff).unwrap();
         assert_eq!(packet.changes.len(), 1);
         assert_eq!(packet.changes[0].change_id, id1);
 
@@ -1386,10 +1396,10 @@ mod tests {
             created_at: datetime!(2026-04-29 11:00:00 UTC),
             ..make_stale_line_comment(&id, "later stale")
         };
-        store::save_comment(dir.path(), &pending).unwrap();
-        store::save_comment(dir.path(), &stale).unwrap();
+        store::save_comment(dir.path(), dir.path(), &pending).unwrap();
+        store::save_comment(dir.path(), dir.path(), &stale).unwrap();
 
-        let packet = build_packet(dir.path(), "trunk()..@", &stack, true, no_diff).unwrap();
+        let packet = build_packet(dir.path(), dir.path(), &stack, true, no_diff).unwrap();
         assert_eq!(packet.changes.len(), 1);
         let bodies: Vec<&str> = packet.changes[0]
             .line_comments
@@ -1412,6 +1422,7 @@ mod tests {
     fn render_preserves_structural_markers_in_body_verbatim() {
         let body = "My note about ### [REQUIRED] in the code, also >>> arrows.";
         let packet = Packet {
+            data_home: PathBuf::from("/data"),
             repo_root: PathBuf::from("/repo"),
             revset: "@".to_owned(),
             stack_comments: vec![make_stack_comment(body, Severity::Note)],
@@ -1471,6 +1482,7 @@ mod tests {
             Some(1),
         );
         let packet = Packet {
+            data_home: PathBuf::from("/data"),
             repo_root: PathBuf::from("/repo"),
             revset: "@".to_owned(),
             stack_comments: vec![],
@@ -1518,6 +1530,7 @@ mod tests {
             Some(1),
         );
         let packet = Packet {
+            data_home: PathBuf::from("/data"),
             repo_root: PathBuf::from("/repo"),
             revset: "@".to_owned(),
             stack_comments: vec![],
@@ -1556,6 +1569,7 @@ mod tests {
     fn render_description_section_omitted_when_no_comments() {
         let id = cid("abc11111");
         let packet = Packet {
+            data_home: PathBuf::from("/data"),
             repo_root: PathBuf::from("/repo"),
             revset: "@".to_owned(),
             stack_comments: vec![],
@@ -1673,6 +1687,7 @@ mod tests {
             Some(2),
         );
         let packet = Packet {
+            data_home: PathBuf::from("/data"),
             repo_root: PathBuf::from("/repo"),
             revset: "@".to_owned(),
             stack_comments: vec![],
@@ -1740,6 +1755,7 @@ mod tests {
             mismatch_reason: None,
         };
         let packet = Packet {
+            data_home: PathBuf::from("/data"),
             repo_root: PathBuf::from("/repo"),
             revset: "@".to_owned(),
             stack_comments: vec![],
@@ -1847,6 +1863,7 @@ mod tests {
             mismatch_reason: None,
         };
         let packet = Packet {
+            data_home: PathBuf::from("/data"),
             repo_root: PathBuf::from("/repo"),
             revset: "@".to_owned(),
             stack_comments: vec![],
@@ -1893,9 +1910,9 @@ mod tests {
 
         let mut comment = make_change_comment(&id, "secret body text", Severity::Required);
         comment.repo_root = dir.path().to_owned();
-        store::save_comment(dir.path(), &comment).unwrap();
+        store::save_comment(dir.path(), dir.path(), &comment).unwrap();
 
-        let packet = build_packet(dir.path(), "@", &stack, false, no_diff).unwrap();
+        let packet = build_packet(dir.path(), dir.path(), &stack, false, no_diff).unwrap();
         let out = render_prompt_with_mode(&packet, PromptMode::JsonlPaths);
 
         assert!(
@@ -1907,7 +1924,7 @@ mod tests {
         assert!(out.contains("\"line\""));
         assert!(out.contains("\"description\""));
 
-        let expected_path = store::change_file(dir.path(), &id);
+        let expected_path = store::change_file(dir.path(), dir.path(), &id);
         assert!(expected_path.is_absolute());
         assert!(
             out.contains(&expected_path.display().to_string()),
@@ -1938,15 +1955,15 @@ mod tests {
 
         let mut stack_comment = make_stack_comment("cross-cutting", Severity::Required);
         stack_comment.repo_root = dir.path().to_owned();
-        store::save_comment(dir.path(), &stack_comment).unwrap();
+        store::save_comment(dir.path(), dir.path(), &stack_comment).unwrap();
 
         let mut change_comment = make_change_comment(&id, "change body", Severity::Note);
         change_comment.repo_root = dir.path().to_owned();
-        store::save_comment(dir.path(), &change_comment).unwrap();
+        store::save_comment(dir.path(), dir.path(), &change_comment).unwrap();
 
         let stack = make_resolved_stack(&[("abc11111", "first")]);
-        let with_stack = build_packet(dir.path(), "trunk()..@", &stack, false, no_diff).unwrap();
-        let stack_path = store::stack_file(dir.path());
+        let with_stack = build_packet(dir.path(), dir.path(), &stack, false, no_diff).unwrap();
+        let stack_path = store::stack_file(dir.path(), dir.path());
 
         let stacked_out = render_prompt_with_mode(&with_stack, PromptMode::JsonlPaths);
         assert!(
@@ -1985,10 +2002,11 @@ mod tests {
             Severity::Required,
         );
         line_comment.repo_root = dir.path().to_owned();
-        store::save_comment(dir.path(), &line_comment).unwrap();
+        store::save_comment(dir.path(), dir.path(), &line_comment).unwrap();
 
         let stack = make_resolved_stack(&[("abc11111", "first")]);
-        let packet = build_packet(dir.path(), "@", &stack, false, |_| Ok(simple_diff())).unwrap();
+        let packet =
+            build_packet(dir.path(), dir.path(), &stack, false, |_| Ok(simple_diff())).unwrap();
 
         let out = render_prompt_with_mode(&packet, PromptMode::JsonlPaths);
 
@@ -2020,9 +2038,9 @@ mod tests {
         let id = cid("abc11111");
         let mut comment = make_change_comment(&id, "body", Severity::Note);
         comment.repo_root = dir.path().to_owned();
-        store::save_comment(dir.path(), &comment).unwrap();
+        store::save_comment(dir.path(), dir.path(), &comment).unwrap();
         let stack = make_resolved_stack(&[("abc11111", "first")]);
-        let packet = build_packet(dir.path(), "@", &stack, false, no_diff).unwrap();
+        let packet = build_packet(dir.path(), dir.path(), &stack, false, no_diff).unwrap();
 
         let out = render_prompt_with_mode(&packet, PromptMode::JsonlPaths);
         assert!(
@@ -2043,17 +2061,17 @@ mod tests {
         let id = cid("abc11111");
         let mut sc = make_stack_comment("cross", Severity::Note);
         sc.repo_root = dir.path().to_owned();
-        store::save_comment(dir.path(), &sc).unwrap();
+        store::save_comment(dir.path(), dir.path(), &sc).unwrap();
         let mut cc = make_change_comment(&id, "body", Severity::Note);
         cc.repo_root = dir.path().to_owned();
-        store::save_comment(dir.path(), &cc).unwrap();
+        store::save_comment(dir.path(), dir.path(), &cc).unwrap();
         let stack = make_resolved_stack(&[("abc11111", "first")]);
-        let packet = build_packet(dir.path(), "trunk()..@", &stack, false, no_diff).unwrap();
+        let packet = build_packet(dir.path(), dir.path(), &stack, false, no_diff).unwrap();
 
         let out = render_prompt_with_mode(&packet, PromptMode::JsonlPaths);
 
-        let change_path = store::change_file(dir.path(), &id);
-        let stack_path = store::stack_file(dir.path());
+        let change_path = store::change_file(dir.path(), dir.path(), &id);
+        let stack_path = store::stack_file(dir.path(), dir.path());
         assert!(
             out.contains(&format!("`{}`", change_path.display())),
             "per-change path must be wrapped in backticks; got:\n{out}"
@@ -2080,17 +2098,17 @@ mod tests {
             Some(1),
         );
         comment.repo_root = dir.path().to_owned();
-        store::save_comment(dir.path(), &comment).unwrap();
+        store::save_comment(dir.path(), dir.path(), &comment).unwrap();
 
         let stack = make_resolved_stack(&[("abc11111", "first")]);
-        let packet = build_packet(dir.path(), "@", &stack, false, no_diff).unwrap();
+        let packet = build_packet(dir.path(), dir.path(), &stack, false, no_diff).unwrap();
         // Sanity: the change's only comment lives in description_comments.
         assert!(packet.changes[0].line_comments.is_empty());
         assert!(packet.changes[0].change_comments.is_empty());
         assert!(!packet.changes[0].description_comments.is_empty());
 
         let out = render_prompt_with_mode(&packet, PromptMode::JsonlPaths);
-        let change_path = store::change_file(dir.path(), &id);
+        let change_path = store::change_file(dir.path(), dir.path(), &id);
         assert!(
             out.contains(&format!("`{}`", change_path.display())),
             "description-only change must still get a per-change bullet; got:\n{out}"
@@ -2103,10 +2121,10 @@ mod tests {
         let id = cid("abc11111");
         let mut comment = make_change_comment(&id, "inline body text", Severity::Suggestion);
         comment.repo_root = dir.path().to_owned();
-        store::save_comment(dir.path(), &comment).unwrap();
+        store::save_comment(dir.path(), dir.path(), &comment).unwrap();
 
         let stack = make_resolved_stack(&[("abc11111", "first")]);
-        let packet = build_packet(dir.path(), "@", &stack, false, no_diff).unwrap();
+        let packet = build_packet(dir.path(), dir.path(), &stack, false, no_diff).unwrap();
         let out = render_prompt_with_mode(&packet, PromptMode::Inline);
 
         assert!(out.contains("### Change-Level Review Comments"));
@@ -2122,10 +2140,10 @@ mod tests {
         let id = cid("abc11111");
         let mut comment = make_change_comment(&id, "body", Severity::Note);
         comment.repo_root = dir.path().to_owned();
-        store::save_comment(dir.path(), &comment).unwrap();
+        store::save_comment(dir.path(), dir.path(), &comment).unwrap();
 
         let stack = make_resolved_stack(&[("abc11111", "first")]);
-        let packet = build_packet(dir.path(), "@", &stack, false, no_diff).unwrap();
+        let packet = build_packet(dir.path(), dir.path(), &stack, false, no_diff).unwrap();
 
         assert_eq!(
             render_prompt(&packet),

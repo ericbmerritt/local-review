@@ -116,14 +116,8 @@ pub enum JjrError {
     ))]
     PromptTooLarge { size: usize, limit: usize },
 
-    #[snafu(display(
-        "jj is tracking jjr state files under .jj-review/:\n  {}\n\n\
-         /.jj-review is now in .gitignore, but jj already snapshotted these files \
-         in a prior run. Run `jj file untrack .jj-review` to stop tracking them, \
-         then retry.",
-        tracked.join("\n  ")
-    ))]
-    JjReviewTracked { tracked: Vec<String> },
+    #[snafu(display("cannot resolve data directory; set XDG_DATA_HOME or HOME"))]
+    NoDataHome,
 }
 
 impl From<local_review_core::Error> for JjrError {

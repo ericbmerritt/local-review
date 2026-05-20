@@ -52,14 +52,18 @@ pub struct ChangeExport {
 /// Note: comment files for change IDs that are NOT in the resolved stack
 /// (orphan files left behind after abandon/rebase) are NOT loaded by this
 /// function. Use `jjr clear --orphaned` to manage those separately.
-pub fn collect_export_data(repo_root: &Path, resolved: &ResolvedStack) -> Result<ExportData> {
-    let stack_comments = store::load_stack_comments(repo_root, &resolved.revset_hash)?;
+pub fn collect_export_data(
+    data_home: &Path,
+    repo_root: &Path,
+    resolved: &ResolvedStack,
+) -> Result<ExportData> {
+    let stack_comments = store::load_stack_comments(data_home, repo_root, &resolved.revset_hash)?;
 
     let per_change = resolved
         .entries
         .iter()
         .map(|entry| {
-            let comments = store::load_change_comments(repo_root, &entry.change_id)?;
+            let comments = store::load_change_comments(data_home, repo_root, &entry.change_id)?;
             Ok(ChangeExport {
                 entry: entry.clone(),
                 comments,
@@ -768,9 +772,9 @@ mod tests {
             status: Some(Status::Stale),
             mismatch_reason: Some(MismatchReason::AnchorNotFound),
         };
-        store::save_comment(dir.path(), &stale).unwrap();
+        store::save_comment(dir.path(), dir.path(), &stale).unwrap();
 
-        let data = collect_export_data(dir.path(), &resolved).unwrap();
+        let data = collect_export_data(dir.path(), dir.path(), &resolved).unwrap();
         assert_eq!(data.per_change.len(), 1);
         assert_eq!(
             data.per_change[0].comments.len(),
@@ -824,9 +828,9 @@ mod tests {
             status: Some(Status::Orphaned),
             mismatch_reason: None,
         };
-        store::save_comment(dir.path(), &orphaned).unwrap();
+        store::save_comment(dir.path(), dir.path(), &orphaned).unwrap();
 
-        let data = collect_export_data(dir.path(), &resolved).unwrap();
+        let data = collect_export_data(dir.path(), dir.path(), &resolved).unwrap();
         assert_eq!(data.per_change.len(), 1);
         assert_eq!(
             data.per_change[0].comments.len(),
