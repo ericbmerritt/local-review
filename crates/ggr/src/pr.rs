@@ -27,6 +27,20 @@ pub(crate) fn valid_segment(seg: &str) -> bool {
         && seg.chars().any(|c| c.is_ascii_alphanumeric())
 }
 
+/// Validate a forward-slash–delimited file path from a PR diff.
+///
+/// The path is stored as a JSON field, not used directly as a filesystem path,
+/// so only path-traversal patterns need rejection: empty segments, bare `.`,
+/// and `..` components. Leading dots are allowed for hidden files and
+/// directories (`.gitignore`, `.github/`, etc.).
+pub(crate) fn valid_file_path(path: &str) -> bool {
+    !path.is_empty()
+        && !path.starts_with('/')
+        && path
+            .split('/')
+            .all(|seg| !seg.is_empty() && seg != "." && seg != "..")
+}
+
 // ── RepoName ──────────────────────────────────────────────────────────────────
 
 /// A validated `owner/repo` slug.
@@ -134,7 +148,6 @@ pub(crate) struct ThreadComment {
     /// GitHub's numeric review comment ID.
     pub(crate) id: u64,
     /// Comment author login as returned by the GitHub API.
-    #[expect(dead_code, reason = "consumed by thread rendering TUI (not yet built)")]
     pub(crate) author: String,
     /// ISO 8601 creation timestamp (e.g. `"2024-01-15T10:30:00Z"`).
     pub(crate) created_at: String,
@@ -390,5 +403,62 @@ mod tests {
                 "control characters must be stripped from error repo_name: {repo_name:?}"
             );
         }
+    }
+
+    // ── valid_file_path ────────────────────────────────────────────────────────
+
+    #[test]
+    fn valid_file_path_accepts_normal_path() {
+        assert!(super::valid_file_path("src/main.rs"));
+    }
+
+    #[test]
+    fn valid_file_path_accepts_hidden_file_at_root() {
+        assert!(super::valid_file_path(".gitignore"));
+    }
+
+    #[test]
+    fn valid_file_path_accepts_hidden_directory() {
+        assert!(super::valid_file_path(".github/workflows/ci.yml"));
+    }
+
+    #[test]
+    fn valid_file_path_accepts_dotfile_in_subdir() {
+        assert!(super::valid_file_path("config/.env.example"));
+    }
+
+    #[test]
+    fn valid_file_path_rejects_dotdot_segment() {
+        assert!(!super::valid_file_path("foo/../bar"));
+    }
+
+    #[test]
+    fn valid_file_path_rejects_bare_dotdot() {
+        assert!(!super::valid_file_path(".."));
+    }
+
+    #[test]
+    fn valid_file_path_rejects_dot_segment() {
+        assert!(!super::valid_file_path("foo/./bar"));
+    }
+
+    #[test]
+    fn valid_file_path_rejects_absolute_path() {
+        assert!(!super::valid_file_path("/etc/passwd"));
+    }
+
+    #[test]
+    fn valid_file_path_rejects_empty_string() {
+        assert!(!super::valid_file_path(""));
+    }
+
+    #[test]
+    fn valid_file_path_rejects_trailing_slash() {
+        assert!(!super::valid_file_path("src/"));
+    }
+
+    #[test]
+    fn valid_file_path_rejects_double_slash() {
+        assert!(!super::valid_file_path("src//main.rs"));
     }
 }
