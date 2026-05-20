@@ -73,6 +73,8 @@ at line / change / description / stack scope. When you're done, `C` hands the
 comments to Claude; the agent edits the stack in place. You re-review. Repeat
 until you push.
 
+![jjr reviewing a three-change stack: stack progress bar at top, side-by-side diff of src/client.rs showing a retry-policy edit](docs/screenshots/jjr.gif)
+
 → See [`crates/jjr/README.md`](crates/jjr/README.md) for full docs.
 
 ## `ggr` — review a GitHub PR commit-by-commit
@@ -82,6 +84,8 @@ each commit's diff, and draft inline comments. When you're satisfied, `S` opens
 a verdict modal — approve, request changes, or comment — and posts everything as
 a single GitHub review. Replies to existing threads, partial failure recovery,
 and stale-draft detection on force-push are all handled.
+
+![ggr reviewing a GitHub PR: commit context at top, side-by-side workflow YAML diff in the body](docs/screenshots/ggr.gif)
 
 → See [`crates/ggr/README.md`](crates/ggr/README.md) for full docs.
 

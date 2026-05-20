@@ -93,6 +93,10 @@
           cargo-nextest
           ripgrep
           prettier
+          # README screenshot recorder. VHS drives a headless terminal
+          # emulator (ttyd) and renders GIF/SVG via ffmpeg.
+          vhs
+          ttyd
         ];
       };
     });
