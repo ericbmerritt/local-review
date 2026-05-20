@@ -49,17 +49,22 @@ jobs:
         # requires the version to be resolvable on crates.io. When both crates
         # are bumped in the same merge their tag workflows fire in parallel;
         # this poll lets jjr's publish wait for core's publish to land.
+        #
+        # Polls the sparse-registry index (`index.crates.io`) rather than the
+        # public API: the API returns HTTP 403 to unauthenticated runners,
+        # but the sparse index is what cargo itself reads to resolve deps,
+        # so a 200 here means cargo publish will resolve.
         run: |
           core_version=$(grep -E '^local-review-core' Cargo.toml | sed -E 's/.*version = "=([^"]+)".*/\1/')
-          url="https://crates.io/api/v1/crates/local-review-core/${core_version}"
-          echo "Waiting for local-review-core ${core_version} on crates.io..."
+          url="https://index.crates.io/lo/ca/local-review-core"
+          echo "Waiting for local-review-core ${core_version} on crates.io sparse index..."
           for attempt in $(seq 1 60); do
-            status=$(curl -s -o /dev/null -w '%{http_code}' "$url")
-            if [ "$status" = "200" ]; then
+            if curl -s --fail -H "User-Agent: ${GITHUB_REPOSITORY}-publish-poll" "$url" \
+              | grep -F "\"vers\":\"${core_version}\"" >/dev/null 2>&1; then
               echo "local-review-core ${core_version} is available (attempt ${attempt})."
               exit 0
             fi
-            echo "Attempt ${attempt}: HTTP ${status}; retrying in 15s."
+            echo "Attempt ${attempt}: not available yet; retrying in 15s."
             sleep 15
           done
           echo "::error::Timed out waiting for local-review-core ${core_version} on crates.io" >&2
