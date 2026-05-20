@@ -6,7 +6,7 @@
 use std::path::Path;
 
 use local_review_core::comment::Side;
-use local_review_core::util::strip_controls;
+use local_review_core::util::{strip_controls, strip_controls_preserve_newlines};
 use local_review_core::Severity;
 
 use crate::draft::{
@@ -70,7 +70,11 @@ fn severity_marker(severity: Severity) -> &'static str {
 }
 
 fn format_comment_body(body: &str, severity: Severity) -> String {
-    format!("{}\n\n{}", severity_marker(severity), strip_controls(body))
+    format!(
+        "{}\n\n{}",
+        severity_marker(severity),
+        strip_controls_preserve_newlines(body)
+    )
 }
 
 /// Build the review `body` field from PR-scoped and commit-scoped drafts.
@@ -100,7 +104,7 @@ pub(crate) fn build_review_body(
             .map(|c| c.title.as_str())
             .unwrap_or("unknown commit");
         let attribution = format!("> Commit {short_sha} — \"{title}\"");
-        let body_quoted = strip_controls(&draft.body)
+        let body_quoted = strip_controls_preserve_newlines(&draft.body)
             .lines()
             .map(|l| format!("> {l}"))
             .collect::<Vec<_>>()
@@ -500,6 +504,32 @@ mod tests {
             "ANSI escape must be stripped: {body:?}"
         );
         assert!(body.contains("evil"), "visible text must survive stripping");
+    }
+
+    #[test]
+    fn format_comment_body_preserves_newlines_in_body() {
+        // GitHub review comments render multi-line bodies; the formatter must
+        // not collapse user newlines into a single line.
+        let body = format_comment_body("foo\nbar\nbaz", Severity::Note);
+        assert!(
+            body.ends_with("foo\nbar\nbaz"),
+            "body newlines must survive formatting: {body:?}"
+        );
+    }
+
+    #[test]
+    fn build_review_body_commit_scope_preserves_newlines_in_quote() {
+        // Multi-line bodies on commit-scoped drafts must render each line as
+        // its own `> ` quote line, not be smashed into one.
+        let mut draft =
+            GgrDraft::new_commit(&common("ignored", Severity::Note), &"a".repeat(40)).unwrap();
+        draft.body = "line one\nline two".to_owned();
+        let commits = [make_commit('a', "T")];
+        let body = build_review_body(&[], &[&draft], &commits);
+        assert!(
+            body.contains("> line one\n> line two"),
+            "each body line must be quoted on its own row: {body:?}"
+        );
     }
 
     #[test]
