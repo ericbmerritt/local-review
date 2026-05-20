@@ -17,7 +17,9 @@ use serde::{Deserialize, Serialize};
 use crate::error::{GgrError, Result};
 use crate::pr::{valid_segment, CommitSha};
 use local_review_core::comment::{Side, CONTEXT_MAX, TARGET_TEXT_MAX};
-use local_review_core::util::{atomic_write_bytes, strip_controls};
+use local_review_core::util::{
+    atomic_write_bytes, strip_controls, strip_controls_preserve_newlines,
+};
 use local_review_core::Severity;
 
 const SCHEMA_VERSION: &str = "ggr-comment/v1";
@@ -159,7 +161,7 @@ impl GgrDraft {
             owner: strip_controls(&common.owner),
             repo: strip_controls(&common.repo),
             pr_number: common.pr_number,
-            body: strip_controls(&common.body),
+            body: strip_controls_preserve_newlines(&common.body),
             severity: common.severity,
             created_at: strip_controls(&common.created_at),
             updated_at: None,
@@ -197,7 +199,7 @@ impl GgrDraft {
             owner: strip_controls(&common.owner),
             repo: strip_controls(&common.repo),
             pr_number: common.pr_number,
-            body: strip_controls(&common.body),
+            body: strip_controls_preserve_newlines(&common.body),
             severity: common.severity,
             created_at: strip_controls(&common.created_at),
             updated_at: None,
@@ -214,7 +216,7 @@ impl GgrDraft {
             owner: strip_controls(&common.owner),
             repo: strip_controls(&common.repo),
             pr_number: common.pr_number,
-            body: strip_controls(&common.body),
+            body: strip_controls_preserve_newlines(&common.body),
             severity: common.severity,
             created_at: strip_controls(&common.created_at),
             updated_at: None,
@@ -642,7 +644,7 @@ pub(crate) fn update_draft(
     let Some(idx) = pos else {
         return Ok(false);
     };
-    drafts[idx].body = strip_controls(new_body);
+    drafts[idx].body = strip_controls_preserve_newlines(new_body);
     drafts[idx].severity = new_severity;
     drafts[idx].updated_at = Some(strip_controls(new_updated_at));
     write_all(path, &drafts)?;
@@ -735,7 +737,7 @@ impl GgrReply {
             repo: strip_controls(&params.repo),
             pr_number: params.pr_number,
             parent_comment_id: strip_controls(&params.parent_comment_id),
-            body: strip_controls(&params.body),
+            body: strip_controls_preserve_newlines(&params.body),
             severity: params.severity,
             created_at: strip_controls(&params.created_at),
             updated_at: None,
@@ -919,7 +921,7 @@ pub(crate) fn update_reply(
     let Some(idx) = pos else {
         return Ok(false);
     };
-    replies[idx].body = strip_controls(new_body);
+    replies[idx].body = strip_controls_preserve_newlines(new_body);
     replies[idx].severity = new_severity;
     replies[idx].updated_at = Some(strip_controls(new_updated_at));
     write_all_replies(path, &replies)?;
@@ -1451,6 +1453,18 @@ mod tests {
     }
 
     #[test]
+    fn newlines_preserved_in_body_on_save() {
+        // GitHub review comments render multi-line bodies. The composer's
+        // textarea inserts `\n` on Enter, and the storage layer must keep
+        // those bytes — otherwise the submit pipeline ends up sending
+        // `foobar` to GitHub for what the user typed as `foo\nbar`.
+        let mut c = common("placeholder");
+        c.body = "first line\nsecond line".to_owned();
+        let draft = GgrDraft::new_pr(&c).unwrap();
+        assert_eq!(draft.body, "first line\nsecond line");
+    }
+
+    #[test]
     fn control_characters_stripped_from_line_anchor_fields() {
         let mut a = line_anchor();
         a.target_text = "\x1b[32mgreen\x1b[0m".to_owned();
@@ -1886,6 +1900,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn update_draft_preserves_newlines_in_new_body() {
+        let path = unique_path("update_preserve_newlines");
+        let draft = GgrDraft::new_pr(&common("original")).unwrap();
+        let ts = draft.created_at.clone();
+        append_draft(&path, &draft).unwrap();
+
+        update_draft(
+            &path,
+            &ts,
+            "line one\nline two",
+            Severity::Note,
+            "2024-01-15T10:31:00Z",
+        )
+        .unwrap();
+        let loaded = list_drafts(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(loaded[0].body, "line one\nline two");
+    }
+
     // ── GgrReply tests ────────────────────────────────────────────────────────
 
     fn reply_params(body: &str) -> ReplyParams {
@@ -1924,6 +1959,13 @@ mod tests {
         let p = reply_params("\x1b[31mevil\x1b[0m");
         let reply = GgrReply::new(&p).unwrap();
         assert!(!reply.body.chars().any(char::is_control));
+    }
+
+    #[test]
+    fn new_reply_preserves_newlines_in_body() {
+        let p = reply_params("line one\nline two");
+        let reply = GgrReply::new(&p).unwrap();
+        assert_eq!(reply.body, "line one\nline two");
     }
 
     #[test]
@@ -2042,6 +2084,29 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn update_reply_preserves_newlines_in_new_body() {
+        let path = unique_reply_path("update_newlines");
+        let _ = std::fs::remove_file(&path);
+
+        let reply = GgrReply::new(&reply_params("original")).unwrap();
+        let created_at = reply.created_at.clone();
+        append_reply(&path, &reply).unwrap();
+
+        update_reply(
+            &path,
+            &created_at,
+            "line one\nline two",
+            Severity::Note,
+            "2026-02-01T00:00:00Z",
+        )
+        .unwrap();
+        let loaded = list_replies(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(loaded[0].body, "line one\nline two");
     }
 
     #[test]
