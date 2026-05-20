@@ -1,13 +1,14 @@
 name: Bump Homebrew formula for ggr
 
-# Triggered by pushing a tag like `ggr-v0.1.0`. Opens a PR against the
-# `ericbmerritt/homebrew-jjr` tap that updates `Formula/ggr.rb`.
+# Triggered by pushing a tag like `ggr-v0.1.0`. Computes the tarball's
+# sha256 and commits the updated `Formula/ggr.rb` directly to the
+# `ericbmerritt/homebrew-jjr` tap's main branch. No PR step, no manual
+# merge required — earlier dawidd6/action-homebrew-bump-formula runs piled
+# up unmerged bump PRs on the tap because no one was reviewing them.
 #
-# Prerequisites (one-time):
-#   1. Add `Formula/ggr.rb` to the `ericbmerritt/homebrew-jjr` tap repo
-#      (build-from-source recipe targeting this repo + the ggr-v* tag format).
-#   2. Repository secret `HOMEBREW_TAP_TOKEN` holds a PAT with `repo` scope
-#      on the tap repo (same token used by release-brew.yml).
+# Required secret: HOMEBREW_TAP_TOKEN
+#   PAT with `repo` scope on the tap repo (same token used by
+#   release-brew.yml).
 #
 # Manual run: `gh workflow run release-brew-ggr.yml --ref ggr-v0.1.0`
 
@@ -28,17 +29,70 @@ jobs:
   bump:
     runs-on: ubuntu-latest
     steps:
-      - name: Extract version from tag
-        id: version
+      - name: Resolve tarball and sha256
+        id: src
+        env:
+          TAG: ${{ github.ref_name }}
         run: |
-          tag="${GITHUB_REF_NAME}"
-          echo "value=${tag#ggr-v}" >> "$GITHUB_OUTPUT"
+          version="${TAG#ggr-v}"
+          tarball="https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/${TAG}.tar.gz"
+          # GitHub may take a moment after tag push before the archive is
+          # served. Poll briefly rather than failing on a 1-second race.
+          sha=""
+          for attempt in $(seq 1 12); do
+            if sha=$(curl -sL --fail "$tarball" | shasum -a 256 | cut -d' ' -f1) && [ -n "$sha" ]; then
+              break
+            fi
+            sha=""
+            echo "Attempt ${attempt}: tarball not ready; retrying in 10s."
+            sleep 10
+          done
+          if [ -z "$sha" ]; then
+            echo "::error::Could not fetch ${tarball}" >&2
+            exit 1
+          fi
+          {
+            echo "version=${version}"
+            echo "tarball=${tarball}"
+            echo "sha=${sha}"
+            echo "homepage=https://github.com/${GITHUB_REPOSITORY}"
+          } >> "$GITHUB_OUTPUT"
+          echo "tarball: ${tarball}"
+          echo "sha256:  ${sha}"
 
-      - name: Bump tap formula
-        uses: dawidd6/action-homebrew-bump-formula@v7
-        with:
-          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-          tap: ericbmerritt/homebrew-jjr
-          formula: ggr
-          tag: ${{ github.ref_name }}
-          revision: ${{ github.sha }}
+      - name: Bump formula in tap (direct commit)
+        env:
+          TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          VERSION: ${{ steps.src.outputs.version }}
+          TARBALL: ${{ steps.src.outputs.tarball }}
+          SHA: ${{ steps.src.outputs.sha }}
+          HOMEPAGE: ${{ steps.src.outputs.homepage }}
+        run: |
+          git clone --depth 1 \
+            "https://x-access-token:${TOKEN}@github.com/ericbmerritt/homebrew-jjr.git" \
+            tap
+          cd tap
+          python3 - "Formula/ggr.rb" "$TARBALL" "$SHA" "$HOMEPAGE" <<'PY'
+          import re, sys, pathlib
+          path = pathlib.Path(sys.argv[1])
+          tarball, sha, homepage = sys.argv[2:]
+          text = path.read_text()
+          def replace_first(pattern, new_quoted, text):
+              return re.sub(
+                  pattern,
+                  lambda m: m.group(1) + new_quoted,
+                  text, count=1, flags=re.M)
+          text = replace_first(r'^(\s*url\s+)".*?"', f'"{tarball}"', text)
+          text = replace_first(r'^(\s*sha256\s+)".*?"', f'"{sha}"', text)
+          text = replace_first(r'^(\s*homepage\s+)".*?"', f'"{homepage}"', text)
+          path.write_text(text)
+          PY
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet; then
+            echo "Formula already at version ${VERSION}; nothing to commit."
+            exit 0
+          fi
+          git add Formula/ggr.rb
+          git commit -m "ggr ${VERSION}"
+          git push origin HEAD:main

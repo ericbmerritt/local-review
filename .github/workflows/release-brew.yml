@@ -1,18 +1,12 @@
 name: Bump Homebrew formula
 
-# Triggered by pushing a tag like `v0.1.0`. Opens a PR against the
-# `ericbmerritt/homebrew-jjr` tap that updates the `url` + `sha256` in
-# `Formula/jjr.rb` to point at the new tag's source tarball.
+# Triggered by pushing a tag like `v0.1.0`. Computes the tarball's sha256
+# and commits the updated `Formula/jjr.rb` directly to the
+# `ericbmerritt/homebrew-jjr` tap's main branch. No PR step, no manual
+# merge required.
 #
-# Prerequisites (one-time):
-#   1. The tap repo `ericbmerritt/homebrew-jjr` exists with an initial
-#      `Formula/jjr.rb` (build-from-source recipe).
-#   2. Repository secret `HOMEBREW_TAP_TOKEN` holds a Personal Access Token
-#      with `repo` scope on the tap repo (the default `GITHUB_TOKEN` cannot
-#      push to a different repository).
-#
-# Until both are in place this workflow runs but the bump step fails — that's
-# fine, it doesn't block the crates.io publish (separate workflow).
+# Required secret: HOMEBREW_TAP_TOKEN
+#   PAT with `repo` scope on the tap repo.
 #
 # Manual run: `gh workflow run release-brew.yml --ref v0.1.0`
 
@@ -33,11 +27,68 @@ jobs:
   bump:
     runs-on: ubuntu-latest
     steps:
-      - name: Bump tap formula
-        uses: dawidd6/action-homebrew-bump-formula@v7
-        with:
-          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-          tap: ericbmerritt/homebrew-jjr
-          formula: jjr
-          tag: ${{ github.ref_name }}
-          revision: ${{ github.sha }}
+      - name: Resolve tarball and sha256
+        id: src
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="${TAG#v}"
+          tarball="https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/${TAG}.tar.gz"
+          sha=""
+          for attempt in $(seq 1 12); do
+            if sha=$(curl -sL --fail "$tarball" | shasum -a 256 | cut -d' ' -f1) && [ -n "$sha" ]; then
+              break
+            fi
+            sha=""
+            echo "Attempt ${attempt}: tarball not ready; retrying in 10s."
+            sleep 10
+          done
+          if [ -z "$sha" ]; then
+            echo "::error::Could not fetch ${tarball}" >&2
+            exit 1
+          fi
+          {
+            echo "version=${version}"
+            echo "tarball=${tarball}"
+            echo "sha=${sha}"
+            echo "homepage=https://github.com/${GITHUB_REPOSITORY}"
+          } >> "$GITHUB_OUTPUT"
+          echo "tarball: ${tarball}"
+          echo "sha256:  ${sha}"
+
+      - name: Bump formula in tap (direct commit)
+        env:
+          TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          VERSION: ${{ steps.src.outputs.version }}
+          TARBALL: ${{ steps.src.outputs.tarball }}
+          SHA: ${{ steps.src.outputs.sha }}
+          HOMEPAGE: ${{ steps.src.outputs.homepage }}
+        run: |
+          git clone --depth 1 \
+            "https://x-access-token:${TOKEN}@github.com/ericbmerritt/homebrew-jjr.git" \
+            tap
+          cd tap
+          python3 - "Formula/jjr.rb" "$TARBALL" "$SHA" "$HOMEPAGE" <<'PY'
+          import re, sys, pathlib
+          path = pathlib.Path(sys.argv[1])
+          tarball, sha, homepage = sys.argv[2:]
+          text = path.read_text()
+          def replace_first(pattern, new_quoted, text):
+              return re.sub(
+                  pattern,
+                  lambda m: m.group(1) + new_quoted,
+                  text, count=1, flags=re.M)
+          text = replace_first(r'^(\s*url\s+)".*?"', f'"{tarball}"', text)
+          text = replace_first(r'^(\s*sha256\s+)".*?"', f'"{sha}"', text)
+          text = replace_first(r'^(\s*homepage\s+)".*?"', f'"{homepage}"', text)
+          path.write_text(text)
+          PY
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet; then
+            echo "Formula already at version ${VERSION}; nothing to commit."
+            exit 0
+          fi
+          git add Formula/jjr.rb
+          git commit -m "jjr ${VERSION}"
+          git push origin HEAD:main
