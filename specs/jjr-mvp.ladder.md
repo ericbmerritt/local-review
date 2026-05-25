@@ -260,29 +260,28 @@ Composer's scope picker fully active: ^L line (default when cursor on a diff
 line), ^C change (default when cursor on a change row in stack overview), ^K
 stack (default on the stack-level header). Picker swaps the chrome context block
 per specs/jjr-tui-design.md Screen 2: scope=line shows three lines of diff
-context with ▶ marker; scope=change shows change ID and description;
-scope=stack shows the revset. Screen 4 (stack overview) accessed via s from main
-view. Renders stack-level comments at top with severity dot + one-line body
-preview, then ─── separator, then change rows. Change-level comments inset under
-their change row prefixed with ◆; right-edge dot count aggregates across all
-scopes; severity dots denote hot spots regardless of scope. Done indicator ✓ for
-changes with no comments at any scope (NOT 'approved' — jjr does not model
-approval per spec principle 'tool does not model done'). Column budget at 80
-cols: idx(2) sp(2) cid(8) sp(2) desc(filled) sp(2) dots(3) sp(2) count(2).
-Truncate descriptions with `…` at the column where the dot column begins. Strip
-`│` and other box-drawing characters and ANSI escapes from preview rows.
-First-body-line only — multi-line bodies get the first line, truncated. Resize
-ladder for Screen 4: 120+ as specified; 100-119 description truncates and
-previews truncate; 80-99 drop the idx column (cursor ▶ already conveys
-position); <80 drop change-level inset preview text entirely, keep just ◆ change
-· severity prefix (body is one keystroke away on Enter). Orphan detection: when
-a change is no longer in the resolved revset (jj abandon / jj undo / jj rebase),
-its comment files persist on disk but are loaded with status=orphaned and not
-surfaced in the UI. Stack-scoped comments are NEVER stale (no anchoring to
-content) — they reappear in every cycle until cleared. From Screen 4, c opens
-the composer with default scope from cursor row. NOT in scope: orphaned-comment
-surfacing UI (deferred to Later Enhancements: jjr orphans), packet generation
-(Phase 6).
+context with ▶ marker; scope=change shows change ID and description; scope=stack
+shows the revset. Screen 4 (stack overview) accessed via s from main view.
+Renders stack-level comments at top with severity dot + one-line body preview,
+then ─── separator, then change rows. Change-level comments inset under their
+change row prefixed with ◆; right-edge dot count aggregates across all scopes;
+severity dots denote hot spots regardless of scope. Done indicator ✓ for changes
+with no comments at any scope (NOT 'approved' — jjr does not model approval per
+spec principle 'tool does not model done'). Column budget at 80 cols: idx(2)
+sp(2) cid(8) sp(2) desc(filled) sp(2) dots(3) sp(2) count(2). Truncate
+descriptions with `…` at the column where the dot column begins. Strip `│` and
+other box-drawing characters and ANSI escapes from preview rows. First-body-line
+only — multi-line bodies get the first line, truncated. Resize ladder for Screen
+4: 120+ as specified; 100-119 description truncates and previews truncate; 80-99
+drop the idx column (cursor ▶ already conveys position); <80 drop change-level
+inset preview text entirely, keep just ◆ change · severity prefix (body is one
+keystroke away on Enter). Orphan detection: when a change is no longer in the
+resolved revset (jj abandon / jj undo / jj rebase), its comment files persist on
+disk but are loaded with status=orphaned and not surfaced in the UI.
+Stack-scoped comments are NEVER stale (no anchoring to content) — they reappear
+in every cycle until cleared. From Screen 4, c opens the composer with default
+scope from cursor row. NOT in scope: orphaned-comment surfacing UI (deferred to
+Later Enhancements: jjr orphans), packet generation (Phase 6).
 
 #### Delivers
 
