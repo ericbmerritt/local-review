@@ -20,10 +20,9 @@ use ratatui::widgets::{Scrollbar, ScrollbarOrientation};
 use ratatui::{Frame, Terminal};
 
 use crate::change_id::ChangeId;
-#[cfg(test)]
-use crate::comment::CONTEXT_MAX;
 use crate::comment::{
     Anchor, Comment, DescriptionAnchor, LineAnchor, SchemaVersion, Severity, Side, Status,
+    CONTEXT_MAX,
 };
 use crate::cursor;
 use crate::error::{JjrError, Result};
@@ -49,13 +48,12 @@ use composer::{
     default_severity, Composer, ComposerAction, ComposerInit, ComposerScope, DescriptionContext,
     EditedComment, LineTarget, StackContextSnapshot,
 };
-use diff_view::RenderedLineKind;
-use diff_view::{
-    change_comment_to_inline, comment_to_inline, description_comment_to_inline, DiffView,
-    InlineComment,
-};
 #[cfg(test)]
-use diff_view::{PairedRow, RenderedLine};
+use diff_view::PairedRow;
+use diff_view::{
+    change_comment_to_inline, comment_to_inline, description_comment_to_inline, CommentIndex,
+    DiffView, InlineComment, RenderedLine, RenderedLineKind,
+};
 
 use file_picker::build_entries as build_file_picker_entries;
 #[cfg(test)]
@@ -65,8 +63,6 @@ use local_review_core::tui::composer::{
     STATUS_DESCRIPTION_UNAVAILABLE, STATUS_LINE_UNAVAILABLE, STATUS_STACK_UNAVAILABLE,
 };
 use local_review_core::tui::try_downcast_mut;
-#[cfg(test)]
-use local_review_core::tui::CommentIndex;
 use local_review_core::tui::{
     BaseViews, DeleteOutcome as CoreDeleteOutcome, DeleteRequest, ExtraKeyAction, ExtraScreen,
     ExtraScreenAction, ExtraScreenContext, FilePickerEntry, MarkReviewedOutcome, ReviewSurface,
@@ -465,6 +461,9 @@ pub(crate) struct JjrSurface {
     comments_loaded_ok: bool,
     /// Active when the user is picking a new anchor for a stale comment.
     pending_reanchor: Option<PendingReanchor>,
+    /// Severity used for the most recently saved comment; seeds the default
+    /// for the next composer open so the reviewer doesn't have to re-select.
+    last_severity: Option<Severity>,
     /// Cached comments for the stack overview.
     overview_cache: Option<OverviewCommentSet>,
     /// Persistent reviewed-bits.
@@ -498,6 +497,7 @@ impl JjrSurface {
             stack,
             comments_loaded_ok: false,
             pending_reanchor: None,
+            last_severity: None,
             overview_cache: None,
             reviewed,
             stderr_guard,
@@ -841,6 +841,7 @@ impl ReviewSurface for JjrSurface {
 
         match crate::store::save_comment(&self.data_home, &self.repo_root, &comment) {
             Ok(()) => {
+                self.last_severity = Some(severity);
                 let _ = self.reload_comments();
                 let status_message = if oversized {
                     "body truncated to 64 KB on save".to_owned()
@@ -973,11 +974,11 @@ impl ReviewSurface for JjrSurface {
     fn handle_extra_key(
         &mut self,
         key: KeyEvent,
-        _file_index: usize,
-        _line_index: usize,
-        _current_view: Option<&DiffView>,
+        file_index: usize,
+        line_index: usize,
+        current_view: Option<&DiffView>,
     ) -> std::result::Result<ExtraKeyAction, JjrError> {
-        // Handle reanchor mode first (pending_reanchor intercepts some keys).
+        // Esc cancels reanchor mode.
         if key.code == KeyCode::Esc {
             if let Some(reanchor) = self.pending_reanchor.take() {
                 let label = match reanchor.severity {
@@ -992,7 +993,19 @@ impl ReviewSurface for JjrSurface {
             }
         }
 
+        // In reanchor mode Enter/c opens the composer pre-filled with the stale body.
+        if self.pending_reanchor.is_some()
+            && matches!(key.code, KeyCode::Char('c') | KeyCode::Enter)
+        {
+            return Ok(self.open_new_comment_composer(file_index, line_index, current_view));
+        }
+
         match key.code {
+            KeyCode::Char('c') | KeyCode::Enter => {
+                Ok(self.open_new_comment_composer(file_index, line_index, current_view))
+            }
+            KeyCode::Char('e') => Ok(self.open_edit_comment_composer(line_index, current_view)),
+            KeyCode::Char('d') => Ok(self.delete_focused_comment_action(line_index, current_view)),
             KeyCode::Char('S') => {
                 let stale_indices = stale_screen::stale_comment_indices(&self.loaded_comments);
                 let state = StaleScreen(StaleScreenState {
@@ -1021,15 +1034,12 @@ impl ReviewSurface for JjrSurface {
                     OverviewScreenState::new(),
                 ))))
             }
-            KeyCode::Char('C') => {
-                // Build the send-to-claude confirmation screen.
-                match self.build_send_to_claude() {
-                    Ok(state) => Ok(ExtraKeyAction::OpenScreen(Box::new(
-                        SendToClaudeScreen::new(state),
-                    ))),
-                    Err(msg) => Ok(ExtraKeyAction::StatusMessage(msg)),
-                }
-            }
+            KeyCode::Char('C') => match self.build_send_to_claude() {
+                Ok(state) => Ok(ExtraKeyAction::OpenScreen(Box::new(
+                    SendToClaudeScreen::new(state),
+                ))),
+                Err(msg) => Ok(ExtraKeyAction::StatusMessage(msg)),
+            },
             _ => Ok(ExtraKeyAction::Ignored),
         }
     }
@@ -1205,6 +1215,294 @@ impl JjrSurface {
             revset: s.revset.clone(),
             revset_hash: s.revset_hash,
         })
+    }
+
+    /// Return the comment the cursor is sitting on, if any.
+    fn focused_comment_from_view(
+        &self,
+        line_index: usize,
+        view: Option<&DiffView>,
+    ) -> Option<&Comment> {
+        let line = view?.lines.get(line_index)?;
+        let RenderedLineKind::InlineCommentMeta { comment_index } = line.kind else {
+            return None;
+        };
+        let CommentIndex::Local(idx) = comment_index else {
+            return None;
+        };
+        self.loaded_comments.get(idx)
+    }
+
+    /// Classify the line at the cursor into a `BuildTargetResult` using the
+    /// parameters already available inside `handle_extra_key`.
+    fn build_line_target_from_view(
+        &self,
+        file_index: usize,
+        line_index: usize,
+        view: Option<&DiffView>,
+    ) -> BuildTargetResult {
+        let Some(view) = view else {
+            return BuildTargetResult::NoView;
+        };
+        let Some(line) = view.lines.get(line_index) else {
+            return BuildTargetResult::NoView;
+        };
+
+        match line.kind {
+            RenderedLineKind::Added | RenderedLineKind::Removed | RenderedLineKind::Context => {}
+            RenderedLineKind::DescriptionLine => {
+                return BuildTargetResult::DescriptionLine {
+                    target_line: line.target_line,
+                };
+            }
+            RenderedLineKind::HunkHeader
+            | RenderedLineKind::HunkSeparator
+            | RenderedLineKind::Notice
+            | RenderedLineKind::InlineCommentMeta { .. }
+            | RenderedLineKind::InlineCommentBody => return BuildTargetResult::NonCommentable,
+        }
+
+        // file_index 0 is the description view; DescriptionLine returns early above.
+        let Some(diff_file_idx) = file_index.checked_sub(1) else {
+            return BuildTargetResult::NoView;
+        };
+        let Some(file) = self.details.diff.files.get(diff_file_idx) else {
+            return BuildTargetResult::NoView;
+        };
+        let file = file.display_path().to_owned();
+        let hunk_header = line.hunk_header.clone().unwrap_or_default();
+        let is_content = |k: RenderedLineKind| {
+            matches!(
+                k,
+                RenderedLineKind::Added | RenderedLineKind::Removed | RenderedLineKind::Context
+            )
+        };
+        let (context_before, context_after) =
+            collect_context_with(&view.lines, line_index, is_content);
+
+        BuildTargetResult::Ready(LineTarget {
+            file,
+            rendered_index: line_index,
+            source_line: line.source_line,
+            target_line: line.target_line,
+            target_text: line.text.clone(),
+            hunk_header,
+            context_before,
+            context_after,
+        })
+    }
+
+    /// Build a description-scope `DescriptionContext` from view parameters.
+    fn description_context_from_view(
+        &self,
+        target_line: Option<u32>,
+        line_index: usize,
+        view: Option<&DiffView>,
+    ) -> DescriptionContext {
+        let (context_before, context_after) = view
+            .map(|v| {
+                let is_desc = |k: RenderedLineKind| matches!(k, RenderedLineKind::DescriptionLine);
+                collect_context_with(&v.lines, line_index, is_desc)
+            })
+            .unwrap_or_default();
+        let target_text = view
+            .and_then(|v| v.lines.get(line_index))
+            .map(|l| l.text.clone())
+            .unwrap_or_default();
+        DescriptionContext {
+            change_id: self.details.change_id.clone(),
+            target_line,
+            target_text,
+            context_before,
+            context_after,
+        }
+    }
+
+    /// Build and return an `ExtraKeyAction` that opens the new-comment composer.
+    fn open_new_comment_composer(
+        &mut self,
+        file_index: usize,
+        line_index: usize,
+        current_view: Option<&DiffView>,
+    ) -> ExtraKeyAction {
+        // On a Change-anchored comment row, default to Change scope for the new comment.
+        if self
+            .focused_comment_from_view(line_index, current_view)
+            .is_some_and(|c| matches!(c.anchor, Anchor::Change { .. }))
+        {
+            let target_change_id = self.details.change_id.clone();
+            let init = ComposerInit {
+                scope: ComposerScope::Change,
+                severity: default_severity(self.last_severity),
+                change_id: target_change_id,
+                change_description: self.details.description.clone(),
+                line_available: None,
+                stack_available: self.stack_context_snapshot(),
+                description_available: None,
+            };
+            return ExtraKeyAction::OpenScreen(Box::new(ComposerScreen(Box::new(Composer::new(
+                init,
+            )))));
+        }
+
+        let reanchor_severity = self.pending_reanchor.as_ref().map(|r| r.severity);
+        let reanchor_body = self.pending_reanchor.take().map(|r| r.body);
+
+        match self.build_line_target_from_view(file_index, line_index, current_view) {
+            BuildTargetResult::Ready(target) => {
+                let init = ComposerInit {
+                    scope: ComposerScope::Line(target.clone()),
+                    severity: reanchor_severity
+                        .unwrap_or_else(|| default_severity(self.last_severity)),
+                    change_id: self.details.change_id.clone(),
+                    change_description: self.details.description.clone(),
+                    line_available: Some(target),
+                    stack_available: self.stack_context_snapshot(),
+                    description_available: None,
+                };
+                let mut composer = Composer::new(init);
+                if let Some(body) = reanchor_body {
+                    for (i, line) in body.lines().enumerate() {
+                        if i > 0 {
+                            composer.body.insert_newline();
+                        }
+                        composer.body.insert_str(line);
+                    }
+                }
+                ExtraKeyAction::OpenScreen(Box::new(ComposerScreen(Box::new(composer))))
+            }
+            BuildTargetResult::DescriptionLine { target_line } => {
+                let desc_ctx =
+                    self.description_context_from_view(target_line, line_index, current_view);
+                let init = ComposerInit {
+                    scope: ComposerScope::Description(desc_ctx.clone()),
+                    severity: default_severity(self.last_severity),
+                    change_id: self.details.change_id.clone(),
+                    change_description: self.details.description.clone(),
+                    line_available: None,
+                    stack_available: self.stack_context_snapshot(),
+                    description_available: Some(desc_ctx),
+                };
+                ExtraKeyAction::OpenScreen(Box::new(ComposerScreen(Box::new(Composer::new(init)))))
+            }
+            BuildTargetResult::NonCommentable => {
+                ExtraKeyAction::StatusMessage("cannot comment on this line".to_owned())
+            }
+            BuildTargetResult::NoView => ExtraKeyAction::Ignored,
+        }
+    }
+
+    /// Build and return an `ExtraKeyAction` that opens the edit-comment composer.
+    fn open_edit_comment_composer(
+        &self,
+        line_index: usize,
+        current_view: Option<&DiffView>,
+    ) -> ExtraKeyAction {
+        let Some(comment) = self.focused_comment_from_view(line_index, current_view) else {
+            return ExtraKeyAction::StatusMessage(
+                "cursor is not on a comment — move to a comment marker to edit".to_owned(),
+            );
+        };
+
+        let target_change_id = match &comment.anchor {
+            Anchor::Change { change_id }
+            | Anchor::Line { change_id, .. }
+            | Anchor::Description { change_id, .. } => change_id.clone(),
+            Anchor::Stack { .. } => self.details.change_id.clone(),
+        };
+
+        let stack_available = self.stack_context_snapshot();
+
+        let (scope, description_available) = match &comment.anchor {
+            Anchor::Line { location, .. } => {
+                let line_target = LineTarget {
+                    file: location.file.clone(),
+                    rendered_index: line_index,
+                    source_line: location.old_line,
+                    target_line: location.new_line,
+                    target_text: location.target_text.clone(),
+                    hunk_header: location.hunk_header.clone(),
+                    context_before: location.context_before.clone(),
+                    context_after: location.context_after.clone(),
+                };
+                (ComposerScope::Line(line_target), None)
+            }
+            Anchor::Change { .. } => (ComposerScope::Change, None),
+            Anchor::Stack { revset_hash } => {
+                let snapshot = stack_available
+                    .clone()
+                    .unwrap_or_else(|| StackContextSnapshot {
+                        revset: format!("revset_hash:{}", revset_hash.hex()),
+                        revset_hash: *revset_hash,
+                    });
+                (ComposerScope::Stack(snapshot), None)
+            }
+            Anchor::Description {
+                change_id: anchor_change_id,
+                location,
+            } => {
+                let ctx = DescriptionContext {
+                    change_id: anchor_change_id.clone(),
+                    target_line: location.display_line,
+                    target_text: location.target_text.clone(),
+                    context_before: location.context_before.clone(),
+                    context_after: location.context_after.clone(),
+                };
+                (ComposerScope::Description(ctx.clone()), Some(ctx))
+            }
+        };
+
+        let change_description = if target_change_id == self.details.change_id {
+            self.details.description.clone()
+        } else {
+            String::new()
+        };
+
+        let init = ComposerInit {
+            scope,
+            severity: comment.severity,
+            change_id: target_change_id,
+            change_description,
+            line_available: None,
+            stack_available,
+            description_available,
+        };
+        let edited = EditedComment {
+            init,
+            body: comment.body.clone(),
+            identity: comment.created_at,
+            original: None,
+            original_anchor: comment.anchor.clone(),
+        };
+        ExtraKeyAction::OpenScreen(Box::new(ComposerScreen(Box::new(Composer::for_edit(
+            edited,
+        )))))
+    }
+
+    /// Delete the comment the cursor is on and return the appropriate action.
+    fn delete_focused_comment_action(
+        &mut self,
+        line_index: usize,
+        current_view: Option<&DiffView>,
+    ) -> ExtraKeyAction {
+        let Some(comment) = self
+            .focused_comment_from_view(line_index, current_view)
+            .cloned()
+        else {
+            return ExtraKeyAction::StatusMessage(
+                "cursor is not on a comment — move to a comment marker to delete".to_owned(),
+            );
+        };
+        match crate::store::delete_comment(&self.data_home, &self.repo_root, &comment) {
+            Ok(()) => {
+                let _ = self.reload_comments();
+                ExtraKeyAction::RefreshAndStatus("comment deleted".to_owned())
+            }
+            Err(e) => ExtraKeyAction::StatusMessage(format!(
+                "delete failed: {}",
+                sanitize_for_status(&e.to_string())
+            )),
+        }
     }
 
     /// Handle a key event while the stale-comments screen is open.
@@ -4731,7 +5029,6 @@ fn delete_focused_comment(app: &mut App) {
     }
 }
 
-#[cfg(test)]
 enum BuildTargetResult {
     Ready(LineTarget),
     /// Cursor is on a description line; use description scope.
@@ -4814,7 +5111,6 @@ fn collect_description_context(lines: &[RenderedLine], idx: usize) -> (Vec<Strin
     collect_context_with(lines, idx, is_content)
 }
 
-#[cfg(test)]
 fn collect_context_with(
     lines: &[RenderedLine],
     idx: usize,
