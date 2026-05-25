@@ -37,8 +37,6 @@ data and return data — no IO, no subprocess, no clock. Each `.rs` file in
 `crates/jjr/src/` carries a module-level doc comment summarising its role; read
 those rather than relying on a list here.
 
-See `specs/jjr-mvp.ladder.md` for current scope and what is still planned.
-
 Layout is flat (`mod_module_files = "deny"`). `tui.rs` is the only module with a
 same-named subdirectory (`tui/`) because the TUI is genuinely multi-file.
 
@@ -60,14 +58,10 @@ Tests are exempted from `unwrap`/`expect`/`dbg`/`print` denies (see
 
 ## Specs
 
-The `specs/` directory contains the engineering design document, the TUI design,
-and the milestone ladder. Read the EDD and TUI design before implementing
-anything non-trivial.
+The `specs/` directory contains the engineering design document and the TUI
+design. Read the EDD and TUI design before implementing anything non-trivial.
 
 ## Workflow
-
-`pgc` is the ladder management tool used in this monorepo. If `pgc` is not on
-PATH, refer to `specs/jjr-mvp.ladder.md` directly for milestone progress.
 
 ## Design defaults
 

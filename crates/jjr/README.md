@@ -62,14 +62,13 @@ The default revset is `trunk()..@`.
 
 ## Status
 
-MVP complete and stable. The whole [milestone ladder](specs/jjr-mvp.ladder.md)
-has landed: read-only diff view, line / change / description / stack-scoped
-comments with severity, stack walking with cursor resume, side-by-side diff at
-wide widths, line re-anchoring with stale view, packet generation, single-change
-Claude handoff via the CLI (`jjr claude`) and stack-wide handoff via the in-TUI
-`C` key in stack mode (both with working-copy guard), per-file reviewed
-tracking, file picker, severity filters, refresh, JSONL/markdown export,
-configurable agent CLI.
+MVP complete and stable. Shipped: read-only diff view, line / change /
+description / stack-scoped comments with severity, stack walking with cursor
+resume, side-by-side diff at wide widths, line re-anchoring with stale view,
+packet generation, single-change Claude handoff via the CLI (`jjr claude`) and
+stack-wide handoff via the in-TUI `C` key in stack mode (both with working-copy
+guard), per-file reviewed tracking, file picker, severity filters, refresh,
+JSONL/markdown export, configurable agent CLI.
 
 Not yet implemented (deferred): inter-cycle diff feature, full `jjr orphans`
 view (the `--orphaned` flag on `jjr clear` covers cleanup), syntax highlighting,
