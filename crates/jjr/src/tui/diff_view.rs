@@ -4,9 +4,11 @@
 //! and adds jjr-specific conversion functions that map `Comment` records (with
 //! their `Anchor` variants) to `InlineComment` values ready for injection.
 
-pub(crate) use local_review_core::tui::diff_view::{DiffView, InlineComment, RenderedLineKind};
 #[cfg(test)]
-pub(super) use local_review_core::tui::diff_view::{PairedRow, RenderedLine};
+pub(super) use local_review_core::tui::diff_view::PairedRow;
+pub(crate) use local_review_core::tui::diff_view::{
+    DiffView, InlineComment, RenderedLine, RenderedLineKind,
+};
 pub(crate) use local_review_core::tui::CommentIndex;
 
 use crate::comment::{Anchor, Comment, Side, Status};
