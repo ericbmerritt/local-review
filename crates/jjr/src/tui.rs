@@ -2132,10 +2132,14 @@ impl JjrSurface {
     /// Save a new or edited comment from the composer.
     ///
     /// New-comment path delegates to [`JjrSurface::save_comment`] so the
-    /// persistence logic lives in one place. Edit path invokes the store
-    /// directly because it works from a captured `original` snapshot (which
-    /// may belong to a different change and is therefore absent from
-    /// `loaded_comments`).
+    /// persistence logic lives in one place. Edit path has two sub-paths:
+    ///
+    /// - Main-view edits: `edit_ctx.original` is `None`; source the anchor
+    ///   from `loaded_comments` keyed by `identity` so a re-anchor that
+    ///   happened after open is preserved.
+    /// - Stack-overview edits: `edit_ctx.original` is `Some`; the comment
+    ///   may belong to a different change and be absent from `loaded_comments`,
+    ///   so use the captured snapshot directly.
     fn save_via_composer(
         &mut self,
         composer: &Composer,
@@ -2148,14 +2152,20 @@ impl JjrSurface {
         let oversized = body.chars().count() > crate::comment::BODY_MAX;
 
         if let Some(edit_ctx) = composer.editing.as_ref() {
-            // Edit path: use the captured `original` snapshot so the anchor is
-            // authoritative regardless of whether this change is current.
             let source = if let Some(orig) = edit_ctx.original.as_ref() {
                 orig.clone()
             } else {
-                return ComposerSaveOutcome::Errored(
-                    "comment was removed between open and save; edit not saved".to_owned(),
-                );
+                let Some(latest) = self
+                    .loaded_comments
+                    .iter()
+                    .find(|c| c.created_at == edit_ctx.identity)
+                    .cloned()
+                else {
+                    return ComposerSaveOutcome::Errored(
+                        "comment was removed between open and save; edit not saved".to_owned(),
+                    );
+                };
+                latest
             };
             let updated = Comment {
                 body,
