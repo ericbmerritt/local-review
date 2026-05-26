@@ -1190,15 +1190,20 @@ impl ReviewSurface for GgrSurface {
                 Ok(ExtraKeyAction::StatusMessage(msg.to_owned()))
             }
             KeyCode::Char('c') | KeyCode::Enter => {
-                let on_comment = current_view
+                let comment_at_cursor = current_view
                     .and_then(|v| v.lines.get(line_index))
-                    .is_some_and(|row| {
-                        matches!(row.kind, RenderedLineKind::InlineCommentMeta { .. })
+                    .and_then(|row| match row.kind {
+                        RenderedLineKind::InlineCommentMeta { comment_index } => {
+                            Some(comment_index)
+                        }
+                        _ => None,
                     });
-                if on_comment {
-                    Ok(self.open_edit_composer(line_index, current_view))
-                } else {
-                    Ok(self.open_composer_at(file_index, line_index, current_view))
+                match comment_at_cursor {
+                    Some(CommentIndex::GitHubThread(_)) => {
+                        Ok(self.open_reply_composer(line_index, current_view))
+                    }
+                    Some(_) => Ok(self.open_edit_composer(line_index, current_view)),
+                    None => Ok(self.open_composer_at(file_index, line_index, current_view)),
                 }
             }
             KeyCode::Char('m') => Ok(self.open_commit_scope_composer()),
@@ -3425,6 +3430,176 @@ mod tests {
         } else {
             std::env::remove_var("XDG_DATA_HOME");
         }
+    }
+
+    #[test]
+    #[serial]
+    fn enter_on_inline_comment_meta_opens_edit_composer_with_draft_body() {
+        use local_review_core::tui::diff_view::{CommentIndex, RenderedLine, RenderedLineKind};
+        use local_review_core::tui::ComposerScreen;
+
+        let dir = tempfile::tempdir().unwrap();
+        let prev = std::env::var("XDG_DATA_HOME").ok();
+        std::env::set_var("XDG_DATA_HOME", dir.path());
+
+        let mut surface = GgrSurface::new(make_pr(), None);
+        set_commit_diff_state(&mut surface);
+
+        let scope = ComposerScope::Change;
+        let req = SaveRequest {
+            scope: &scope,
+            severity: Severity::Note,
+            body: "this is my review note",
+            entry_idx: 0,
+        };
+        surface.save_comment(req).unwrap();
+        assert_eq!(
+            surface.loaded_drafts.len(),
+            1,
+            "draft must be in loaded_drafts"
+        );
+
+        let meta_line = RenderedLine {
+            kind: RenderedLineKind::InlineCommentMeta {
+                comment_index: CommentIndex::Local(0),
+            },
+            text: "┃ ● note  this is my review note".to_owned(),
+            source_line: None,
+            target_line: None,
+            hunk_header: None,
+            comment_severity: None,
+        };
+        let view = DiffView {
+            title: "test".to_owned(),
+            lines: vec![meta_line],
+            paired_rows: vec![],
+        };
+
+        let action = surface
+            .handle_extra_key(make_key(KeyCode::Enter), 0, 0, Some(&view))
+            .unwrap();
+
+        let ExtraKeyAction::OpenScreen(mut state) = action else {
+            panic!("expected ExtraKeyAction::OpenScreen from Enter on InlineCommentMeta");
+        };
+        let screen = state
+            .as_any_mut()
+            .downcast_mut::<ComposerScreen>()
+            .expect("opened screen must be a ComposerScreen");
+        assert_eq!(
+            screen.0.body_text(),
+            "this is my review note",
+            "edit composer must pre-populate body from the saved draft"
+        );
+
+        if let Some(p) = prev {
+            std::env::set_var("XDG_DATA_HOME", p);
+        } else {
+            std::env::remove_var("XDG_DATA_HOME");
+        }
+    }
+
+    #[test]
+    fn enter_on_github_thread_meta_opens_reply_composer() {
+        use local_review_core::tui::diff_view::{CommentIndex, RenderedLine, RenderedLineKind};
+
+        let thread = make_thread(
+            "src/foo.rs",
+            Some(10),
+            Some(1),
+            "upstream review comment",
+            "2024-01-15T10:30:00Z",
+        );
+        let mut surface = make_surface_with_thread(thread);
+
+        let meta_line = RenderedLine {
+            kind: RenderedLineKind::InlineCommentMeta {
+                comment_index: CommentIndex::GitHubThread(0),
+            },
+            text: "┃ ● note  upstream review comment".to_owned(),
+            source_line: None,
+            target_line: None,
+            hunk_header: None,
+            comment_severity: None,
+        };
+        let view = DiffView {
+            title: "test".to_owned(),
+            lines: vec![meta_line],
+            paired_rows: vec![],
+        };
+
+        let action_enter = surface
+            .handle_extra_key(make_key(KeyCode::Enter), 0, 0, Some(&view))
+            .unwrap();
+        let ExtraKeyAction::OpenScreen(mut state) = action_enter else {
+            panic!("Enter on GitHubThread must open a ReplyComposerScreen, not edit / error");
+        };
+        assert!(
+            state
+                .as_any_mut()
+                .downcast_mut::<ReplyComposerScreen>()
+                .is_some(),
+            "Enter on GitHubThread must open a ReplyComposerScreen (not a ComposerScreen)"
+        );
+
+        let action_c = surface
+            .handle_extra_key(make_key(KeyCode::Char('c')), 0, 0, Some(&view))
+            .unwrap();
+        let ExtraKeyAction::OpenScreen(mut state) = action_c else {
+            panic!("c on GitHubThread must open a ReplyComposerScreen");
+        };
+        assert!(
+            state
+                .as_any_mut()
+                .downcast_mut::<ReplyComposerScreen>()
+                .is_some(),
+            "c on GitHubThread must open a ReplyComposerScreen"
+        );
+    }
+
+    #[test]
+    fn e_on_github_thread_meta_returns_edit_not_allowed_status() {
+        use local_review_core::tui::diff_view::{CommentIndex, RenderedLine, RenderedLineKind};
+
+        let thread = make_thread(
+            "src/foo.rs",
+            Some(10),
+            Some(1),
+            "upstream review comment",
+            "2024-01-15T10:30:00Z",
+        );
+        let mut surface = make_surface_with_thread(thread);
+
+        let meta_line = RenderedLine {
+            kind: RenderedLineKind::InlineCommentMeta {
+                comment_index: CommentIndex::GitHubThread(0),
+            },
+            text: "┃ ● note  upstream review comment".to_owned(),
+            source_line: None,
+            target_line: None,
+            hunk_header: None,
+            comment_severity: None,
+        };
+        let view = DiffView {
+            title: "test".to_owned(),
+            lines: vec![meta_line],
+            paired_rows: vec![],
+        };
+
+        // e is "edit local draft" — must NOT open the reply composer on a GitHub
+        // thread row. It must surface the status message instead. This pins the
+        // semantic split between Enter/c (which route Local→edit, GitHub→reply)
+        // and e (which is edit-only and refuses GitHub threads).
+        let action = surface
+            .handle_extra_key(make_key(KeyCode::Char('e')), 0, 0, Some(&view))
+            .unwrap();
+        let ExtraKeyAction::StatusMessage(msg) = action else {
+            panic!("e on GitHubThread must return StatusMessage, not OpenScreen");
+        };
+        assert!(
+            msg.contains("cannot be edited"),
+            "e on GitHubThread must surface the 'cannot be edited locally' status, got: {msg}"
+        );
     }
 
     #[test]
