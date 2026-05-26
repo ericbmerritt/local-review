@@ -11,9 +11,10 @@ use crate::util::atomic_write_bytes;
 
 /// Persistent cursor tracking the last-viewed change per revset.
 ///
-/// Stored at `.jj-review/cursor.json`. The key is a lowercase hex encoding of
-/// the BLAKE3 hash of the canonicalized revset string so the file is human-
-/// readable without requiring the reviewer to know the hash algorithm.
+/// Stored under `data_home` at `repos/<repo>/cursor.json`. The key is a
+/// lowercase hex encoding of the BLAKE3 hash of the canonicalized revset
+/// string so the file is human-readable without requiring the reviewer to
+/// know the hash algorithm.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Cursor {
     pub revsets: BTreeMap<String, RevsetCursor>,
@@ -30,15 +31,15 @@ pub struct RevsetCursor {
     pub updated_at: OffsetDateTime,
 }
 
-fn cursor_path(repo_root: &Path) -> PathBuf {
-    repo_root.join(".jj-review").join("cursor.json")
+fn cursor_path(data_home: &Path, repo_root: &Path) -> PathBuf {
+    crate::store::repo_data_dir(data_home, repo_root).join("cursor.json")
 }
 
-/// Load the cursor file from `repo_root/.jj-review/cursor.json`.
+/// Load the cursor file from the XDG data home.
 ///
 /// Returns an empty `Cursor` if the file does not exist.
-pub fn load(repo_root: &Path) -> Result<Cursor> {
-    let path = cursor_path(repo_root);
+pub fn load(data_home: &Path, repo_root: &Path) -> Result<Cursor> {
+    let path = cursor_path(data_home, repo_root);
     if !path.exists() {
         return Ok(Cursor::default());
     }
@@ -48,9 +49,9 @@ pub fn load(repo_root: &Path) -> Result<Cursor> {
     })
 }
 
-/// Save the cursor to `repo_root/.jj-review/cursor.json` atomically.
-pub fn save(repo_root: &Path, cursor: &Cursor) -> Result<()> {
-    let path = cursor_path(repo_root);
+/// Save the cursor to the XDG data home atomically.
+pub fn save(data_home: &Path, repo_root: &Path, cursor: &Cursor) -> Result<()> {
+    let path = cursor_path(data_home, repo_root);
     let json = serde_json::to_string_pretty(cursor).map_err(|e| JjrError::Io {
         source: std::io::Error::other(e),
     })?;
@@ -61,12 +62,13 @@ pub fn save(repo_root: &Path, cursor: &Cursor) -> Result<()> {
 ///
 /// Convenience wrapper around `load` + mutate + `save`.
 pub(crate) fn record(
+    data_home: &Path,
     repo_root: &Path,
     hash: RevsetHash,
     revset: &str,
     last_change_id: &ChangeId,
 ) -> Result<()> {
-    let mut cursor = load(repo_root)?;
+    let mut cursor = load(data_home, repo_root)?;
     cursor.revsets.insert(
         hash.hex(),
         RevsetCursor {
@@ -75,14 +77,14 @@ pub(crate) fn record(
             updated_at: OffsetDateTime::now_utc(),
         },
     );
-    save(repo_root, &cursor)
+    save(data_home, repo_root, &cursor)
 }
 
 /// Remove the cursor entry for a revset hash. Used by `--restart`.
-pub(crate) fn clear(repo_root: &Path, hash: RevsetHash) -> Result<()> {
-    let mut cursor = load(repo_root)?;
+pub(crate) fn clear(data_home: &Path, repo_root: &Path, hash: RevsetHash) -> Result<()> {
+    let mut cursor = load(data_home, repo_root)?;
     cursor.revsets.remove(&hash.hex());
-    save(repo_root, &cursor)
+    save(data_home, repo_root, &cursor)
 }
 
 /// Whether the current stack carries any persisted reviewed-state.
@@ -133,8 +135,13 @@ pub(crate) struct ResumeInputs<'a> {
 /// [`resume_index_from_cursor`]. On any load error, falls through to the
 /// `is_fully_reviewed`-driven fallback so the reviewer still lands on
 /// something useful.
-pub(crate) fn resume_index(repo_root: &Path, hash: RevsetHash, inputs: &ResumeInputs<'_>) -> usize {
-    let cursor = load(repo_root).unwrap_or_default();
+pub(crate) fn resume_index(
+    data_home: &Path,
+    repo_root: &Path,
+    hash: RevsetHash,
+    inputs: &ResumeInputs<'_>,
+) -> usize {
+    let cursor = load(data_home, repo_root).unwrap_or_default();
     resume_index_from_cursor(&cursor, hash, inputs)
 }
 
@@ -267,17 +274,17 @@ mod tests {
     #[test]
     fn load_missing_file_returns_empty_cursor() {
         let dir = tmp();
-        let cursor = load(dir.path()).unwrap();
+        let cursor = load(dir.path(), dir.path()).unwrap();
         assert!(cursor.revsets.is_empty());
     }
 
     #[test]
     fn load_corrupt_json_returns_err() {
         let dir = tmp();
-        let path = dir.path().join(".jj-review");
-        std::fs::create_dir_all(&path).unwrap();
-        std::fs::write(path.join("cursor.json"), b"{not json").unwrap();
-        assert!(load(dir.path()).is_err());
+        let cursor_file = crate::store::repo_data_dir(dir.path(), dir.path()).join("cursor.json");
+        std::fs::create_dir_all(cursor_file.parent().unwrap()).unwrap();
+        std::fs::write(&cursor_file, b"{not json").unwrap();
+        assert!(load(dir.path(), dir.path()).is_err());
     }
 
     #[test]
@@ -287,12 +294,13 @@ mod tests {
         // OLDEST and lands on the most-recent unreviewed change (LATEST when
         // nothing is reviewed).
         let dir = tmp();
-        let path = dir.path().join(".jj-review");
-        std::fs::create_dir_all(&path).unwrap();
-        std::fs::write(path.join("cursor.json"), b"{not json").unwrap();
+        let cursor_file = crate::store::repo_data_dir(dir.path(), dir.path()).join("cursor.json");
+        std::fs::create_dir_all(cursor_file.parent().unwrap()).unwrap();
+        std::fs::write(&cursor_file, b"{not json").unwrap();
         let hash = RevsetHash::from_revset("@");
         let ids = vec![cid("abc11111"), cid("abc22222")];
         let idx = resume_index(
+            dir.path(),
             dir.path(),
             hash,
             &inputs(&ids, &|_| false, &|_| false, StackReviewState::Partial),
@@ -313,8 +321,8 @@ mod tests {
                 updated_at: datetime!(2026-04-29 14:00:00 UTC),
             },
         );
-        save(dir.path(), &cursor).unwrap();
-        let loaded = load(dir.path()).unwrap();
+        save(dir.path(), dir.path(), &cursor).unwrap();
+        let loaded = load(dir.path(), dir.path()).unwrap();
         assert_eq!(loaded.revsets.len(), 1);
         let entry = &loaded.revsets[&hash.hex()];
         assert_eq!(entry.revset, "@");
@@ -325,15 +333,15 @@ mod tests {
     fn record_creates_and_updates_entry() {
         let dir = tmp();
         let hash = RevsetHash::from_revset("@");
-        record(dir.path(), hash, "@", &cid("abc12345")).unwrap();
+        record(dir.path(), dir.path(), hash, "@", &cid("abc12345")).unwrap();
 
-        let loaded = load(dir.path()).unwrap();
+        let loaded = load(dir.path(), dir.path()).unwrap();
         let entry = &loaded.revsets[&hash.hex()];
         assert_eq!(entry.last_change_id, cid("abc12345"));
 
         // Update to a different change.
-        record(dir.path(), hash, "@", &cid("def99999")).unwrap();
-        let loaded2 = load(dir.path()).unwrap();
+        record(dir.path(), dir.path(), hash, "@", &cid("def99999")).unwrap();
+        let loaded2 = load(dir.path(), dir.path()).unwrap();
         let entry2 = &loaded2.revsets[&hash.hex()];
         assert_eq!(entry2.last_change_id, cid("def99999"));
     }
@@ -342,9 +350,9 @@ mod tests {
     fn clear_removes_entry() {
         let dir = tmp();
         let hash = RevsetHash::from_revset("@");
-        record(dir.path(), hash, "@", &cid("abc12345")).unwrap();
-        clear(dir.path(), hash).unwrap();
-        let loaded = load(dir.path()).unwrap();
+        record(dir.path(), dir.path(), hash, "@", &cid("abc12345")).unwrap();
+        clear(dir.path(), dir.path(), hash).unwrap();
+        let loaded = load(dir.path(), dir.path()).unwrap();
         assert!(loaded.revsets.is_empty());
     }
 
@@ -352,7 +360,7 @@ mod tests {
     fn clear_on_missing_file_is_ok() {
         let dir = tmp();
         let hash = RevsetHash::from_revset("@");
-        clear(dir.path(), hash).unwrap();
+        clear(dir.path(), dir.path(), hash).unwrap();
     }
 
     #[test]
@@ -364,6 +372,7 @@ mod tests {
         // LATEST→OLDEST. `is_fully_reviewed` = false everywhere, so LATEST
         // (index 2) wins.
         let idx = resume_index(
+            dir.path(),
             dir.path(),
             hash,
             &inputs(&ids, &|_| false, &|_| false, StackReviewState::Partial),
@@ -386,6 +395,7 @@ mod tests {
         let reviewed_id = ids[3].clone();
         let idx = resume_index(
             dir.path(),
+            dir.path(),
             hash,
             &inputs(
                 &ids,
@@ -404,6 +414,7 @@ mod tests {
         let ids = vec![cid("abc11111"), cid("abc22222"), cid("abc33333")];
         let idx = resume_index(
             dir.path(),
+            dir.path(),
             hash,
             &inputs(&ids, &|_| false, &|_| true, StackReviewState::Partial),
         );
@@ -420,11 +431,12 @@ mod tests {
         let hash = RevsetHash::from_revset("@");
         // Cursor's last_change_id `ffffffff` is gone (rebased / abandoned).
         let cursor = make_cursor_with_entry("@", cid("ffffffff"));
-        save(dir.path(), &cursor).unwrap();
+        save(dir.path(), dir.path(), &cursor).unwrap();
         let ids = vec![cid("abc11111"), cid("abc22222"), cid("abc33333")];
         // Index 2 is reviewed → smart fallback picks index 1 (latest unreviewed).
         let reviewed_id = ids[2].clone();
         let idx = resume_index(
+            dir.path(),
             dir.path(),
             hash,
             &inputs(
@@ -443,12 +455,13 @@ mod tests {
         let hash = RevsetHash::from_revset("@");
         let ids = vec![cid("abc11111"), cid("abc22222"), cid("abc33333")];
         let cursor = make_cursor_with_entry("@", ids[1].clone());
-        save(dir.path(), &cursor).unwrap();
+        save(dir.path(), dir.path(), &cursor).unwrap();
         // All changes have comments — the cursor change qualifies under the
         // first rule (its own check) only if it has no comments. With every
         // change carrying comments, the resume rule falls through to the
         // last-resort and returns last_pos=1.
         let idx = resume_index(
+            dir.path(),
             dir.path(),
             hash,
             &inputs(&ids, &|_| true, &|_| false, StackReviewState::Partial),
@@ -467,10 +480,11 @@ mod tests {
             cid("abc44444"),
         ];
         let cursor = make_cursor_with_entry("@", ids[1].clone());
-        save(dir.path(), &cursor).unwrap();
+        save(dir.path(), dir.path(), &cursor).unwrap();
         // ids[1] has comments, ids[2] does not → next unreviewed is index 2.
         let no_comment_id = ids[2].clone();
         let idx = resume_index(
+            dir.path(),
             dir.path(),
             hash,
             &inputs(
@@ -489,11 +503,12 @@ mod tests {
         let hash = RevsetHash::from_revset("@");
         let ids = vec![cid("abc11111"), cid("abc22222"), cid("abc33333")];
         let cursor = make_cursor_with_entry("@", ids[2].clone());
-        save(dir.path(), &cursor).unwrap();
+        save(dir.path(), dir.path(), &cursor).unwrap();
         // has_comments=false everywhere → resume at the cursor change itself
         // (per the corrected resume rule: cursor change qualifies if it has
         // no comments yet).
         let idx = resume_index(
+            dir.path(),
             dir.path(),
             hash,
             &inputs(&ids, &|_| false, &|_| false, StackReviewState::Partial),
@@ -509,9 +524,10 @@ mod tests {
         let hash = RevsetHash::from_revset("@");
         let ids = vec![cid("abc11111"), cid("abc22222"), cid("abc33333")];
         let cursor = make_cursor_with_entry("@", ids[1].clone());
-        save(dir.path(), &cursor).unwrap();
+        save(dir.path(), dir.path(), &cursor).unwrap();
         let cursor_id = ids[1].clone();
         let idx = resume_index(
+            dir.path(),
             dir.path(),
             hash,
             &inputs(
@@ -555,6 +571,7 @@ mod tests {
         let ids = vec![cid("abc11111"), cid("abc22222"), cid("abc33333")];
         let idx = resume_index(
             dir.path(),
+            dir.path(),
             hash,
             &inputs(&ids, &|_| false, &|_| false, StackReviewState::Fresh),
         );
@@ -578,6 +595,7 @@ mod tests {
         let reviewed_id = ids[3].clone();
         let idx = resume_index(
             dir.path(),
+            dir.path(),
             hash,
             &inputs(
                 &ids,
@@ -598,8 +616,9 @@ mod tests {
         let hash = RevsetHash::from_revset("@");
         let ids = vec![cid("abc11111"), cid("abc22222"), cid("abc33333")];
         let cursor = make_cursor_with_entry("@", ids[1].clone());
-        save(dir.path(), &cursor).unwrap();
+        save(dir.path(), dir.path(), &cursor).unwrap();
         let idx = resume_index(
+            dir.path(),
             dir.path(),
             hash,
             &inputs(&ids, &|_| false, &|_| false, StackReviewState::Fresh),
@@ -652,6 +671,7 @@ mod tests {
         let ids = vec![cid("abc11111")];
         let idx = resume_index(
             dir.path(),
+            dir.path(),
             hash,
             &inputs(&ids, &|_| false, &|_| false, StackReviewState::Fresh),
         );
@@ -664,6 +684,7 @@ mod tests {
         let hash = RevsetHash::from_revset("@");
         let ids = vec![cid("abc11111")];
         let idx = resume_index(
+            dir.path(),
             dir.path(),
             hash,
             &inputs(&ids, &|_| false, &|_| false, StackReviewState::Partial),
@@ -684,9 +705,10 @@ mod tests {
         let dir = tmp();
         let hash = RevsetHash::from_revset("@");
         let cursor = make_cursor_with_entry("@", cid("ffffffff"));
-        save(dir.path(), &cursor).unwrap();
+        save(dir.path(), dir.path(), &cursor).unwrap();
         let ids = vec![cid("abc11111"), cid("abc22222"), cid("abc33333")];
         let idx = resume_index(
+            dir.path(),
             dir.path(),
             hash,
             &inputs(&ids, &|_| false, &|_| false, StackReviewState::Fresh),
@@ -701,10 +723,11 @@ mod tests {
         let dir = tmp();
         let hash = RevsetHash::from_revset("@");
         let cursor = make_cursor_with_entry("@", cid("ffffffff"));
-        save(dir.path(), &cursor).unwrap();
+        save(dir.path(), dir.path(), &cursor).unwrap();
         let ids = vec![cid("abc11111"), cid("abc22222"), cid("abc33333")];
         let reviewed_id = ids[2].clone();
         let idx = resume_index(
+            dir.path(),
             dir.path(),
             hash,
             &inputs(
