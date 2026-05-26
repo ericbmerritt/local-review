@@ -1190,7 +1190,16 @@ impl ReviewSurface for GgrSurface {
                 Ok(ExtraKeyAction::StatusMessage(msg.to_owned()))
             }
             KeyCode::Char('c') | KeyCode::Enter => {
-                Ok(self.open_composer_at(file_index, line_index, current_view))
+                let on_comment = current_view
+                    .and_then(|v| v.lines.get(line_index))
+                    .is_some_and(|row| {
+                        matches!(row.kind, RenderedLineKind::InlineCommentMeta { .. })
+                    });
+                if on_comment {
+                    Ok(self.open_edit_composer(line_index, current_view))
+                } else {
+                    Ok(self.open_composer_at(file_index, line_index, current_view))
+                }
             }
             KeyCode::Char('m') => Ok(self.open_commit_scope_composer()),
             KeyCode::Char('P') => Ok(self.open_pr_scope_composer()),
