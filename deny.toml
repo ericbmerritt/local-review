@@ -7,7 +7,6 @@ allow = [
   "MIT",
   "MIT-0",
   "BSD-2-Clause",
-  "BSD-3-Clause",
   "Unicode-3.0",
   "Unlicense",
   "Zlib",

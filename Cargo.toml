@@ -88,6 +88,5 @@ snafu = "0.9"
 tempfile = "3"
 time = { version = "0.3", features = ["serde", "formatting", "parsing", "macros"] }
 toml = "1.1"
-unidiff = "0.4"
 assert_cmd = "2"
 predicates = "3"

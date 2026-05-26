@@ -1,7 +1,5 @@
 use std::path::{Path, PathBuf};
 
-use unidiff::{PatchSet, PatchedFile};
-
 use crate::error::{Error, Result};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,19 +88,12 @@ pub fn parse(input: &str) -> Result<Diff> {
             continue;
         }
 
-        let mut patch = PatchSet::new();
-        patch.parse(&section).map_err(|e| Error::DiffParse {
-            file: section_file_hint(&section),
-            message: format!("unidiff: {e}"),
-        })?;
+        let hint = section_file_hint(&section);
+        let (source_file, target_file, hunks) = parse_hunk_content(&section, &hint)?;
 
-        let pf_list: Vec<_> = patch.files().iter().collect();
-
-        if pf_list.is_empty() {
-            // unidiff produces no PatchedFile for sections that have no hunk
-            // content: pure renames with similarity 100%, and empty file
-            // creates/deletes (no `---`/`+++` headers because there is no
-            // textual content to diff). Detect and emit those manually;
+        if source_file.is_none() && target_file.is_none() && hunks.is_empty() {
+            // No --- / +++ headers and no @@ hunks: pure rename, empty
+            // add/delete, or mode-only change. Detect and emit those manually;
             // everything else is a parse failure we surface rather than
             // silently drop.
             if let Some(file) = detect_metadata_only_section(&section) {
@@ -110,16 +101,14 @@ pub fn parse(input: &str) -> Result<Diff> {
                 continue;
             }
             return Err(Error::DiffParse {
-                file: section_file_hint(&section),
+                file: hint,
                 message: "section produced no patched files and has no recognised metadata-only \
                           shape (rename, empty add, empty delete)"
                     .to_owned(),
             });
         }
 
-        for pf in pf_list {
-            files.push(convert_patched_file(pf)?);
-        }
+        files.push(classify_diff_file(source_file, target_file, hunks, &hint)?);
     }
 
     Ok(Diff { files })
@@ -174,11 +163,10 @@ fn detect_binary(section: &str) -> Option<PathBuf> {
 /// Detect a section with no hunk content but a recognisable metadata-only
 /// shape: pure rename, empty file create, or empty file delete.
 ///
-/// `unidiff` returns no `PatchedFile` for these because there are no
-/// `---`/`+++` headers (no textual content to diff). We synthesise a
-/// `DiffFile` with empty hunks from the header lines instead. Rename takes
-/// priority over add/delete because a pure rename can carry both `similarity
-/// index 100%` and a file mode header.
+/// These sections have no `---`/`+++` headers and no `@@` hunks. We
+/// synthesise a `DiffFile` with empty hunks from the header lines instead.
+/// Rename takes priority over add/delete because a pure rename can carry both
+/// `similarity index 100%` and a file mode header.
 fn detect_metadata_only_section(section: &str) -> Option<DiffFile> {
     let mut rename_from: Option<PathBuf> = None;
     let mut rename_to: Option<PathBuf> = None;
@@ -267,56 +255,6 @@ fn section_file_hint(section: &str) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("<unknown>"))
 }
 
-fn convert_patched_file(pf: &PatchedFile) -> Result<DiffFile> {
-    let file_path = PathBuf::from(pf.path());
-
-    let hunks = pf
-        .hunks()
-        .iter()
-        .map(|h| convert_hunk(h, &file_path))
-        .collect::<Result<Vec<_>>>()?;
-
-    if pf.is_added_file() {
-        debug_assert!(
-            hunks
-                .iter()
-                .all(|h| h.lines.iter().all(|l| l.kind == LineKind::Added)),
-            "Added file must only contain Added lines; type-level enforcement is a planned refactor"
-        );
-        return Ok(DiffFile::Added {
-            path: file_path,
-            hunks,
-        });
-    }
-
-    if pf.is_removed_file() {
-        debug_assert!(
-            hunks.iter().all(|h| h.lines.iter().all(|l| l.kind == LineKind::Removed)),
-            "Removed file must only contain Removed lines; type-level enforcement is a planned refactor"
-        );
-        return Ok(DiffFile::Removed {
-            path: file_path,
-            hunks,
-        });
-    }
-
-    let source = strip_a_prefix(&pf.source_file);
-    let target = strip_b_prefix(&pf.target_file);
-
-    if source == target {
-        Ok(DiffFile::Modified {
-            path: PathBuf::from(target),
-            hunks,
-        })
-    } else {
-        Ok(DiffFile::Renamed {
-            from: PathBuf::from(source),
-            to: PathBuf::from(target),
-            hunks,
-        })
-    }
-}
-
 fn strip_a_prefix(raw: &str) -> &str {
     raw.strip_prefix("a/").unwrap_or(raw)
 }
@@ -325,53 +263,258 @@ fn strip_b_prefix(raw: &str) -> &str {
     raw.strip_prefix("b/").unwrap_or(raw)
 }
 
-fn convert_hunk(h: &unidiff::Hunk, file: &Path) -> Result<Hunk> {
-    let function_context = if h.section_header.is_empty() {
+/// Parse the hunk content of a diff section.
+///
+/// Only `---`/`+++` lines in the file-header zone (before the first `@@`) are
+/// treated as file-name headers. Once the first `@@` is seen, the parser
+/// enters hunk-body mode and treats every line as `+`/`-`/` ` content,
+/// regardless of what it starts with. This prevents body lines like
+/// `--- old heading` from being misclassified as a new file header.
+fn parse_hunk_content(
+    section: &str,
+    file_path: &Path,
+) -> Result<(Option<String>, Option<String>, Vec<Hunk>)> {
+    let (source_file, target_file) = parse_file_headers(section);
+    let hunks = parse_hunks(section, file_path)?;
+    Ok((source_file, target_file, hunks))
+}
+
+fn parse_file_headers(section: &str) -> (Option<String>, Option<String>) {
+    let mut source_file: Option<String> = None;
+    let mut target_file: Option<String> = None;
+    for line in section.lines() {
+        if line.starts_with("@@ ") {
+            break;
+        }
+        if let Some(rest) = line.strip_prefix("--- ") {
+            source_file = Some(rest.to_owned());
+        } else if let Some(rest) = line.strip_prefix("+++ ") {
+            target_file = Some(rest.to_owned());
+        }
+    }
+    (source_file, target_file)
+}
+
+fn parse_hunks(section: &str, file_path: &Path) -> Result<Vec<Hunk>> {
+    let mut hunks: Vec<Hunk> = Vec::new();
+    let mut builder: Option<HunkBuilder> = None;
+
+    for raw_line in section.lines() {
+        if raw_line.starts_with("@@ ") {
+            if let Some(b) = builder.take() {
+                hunks.push(b.finish());
+            }
+            let (ss, sl, ts, tl, ctx) = parse_hunk_header(raw_line, file_path)?;
+            builder = Some(HunkBuilder::new(ss, sl, ts, tl, ctx));
+        } else if let Some(b) = builder.as_mut() {
+            if let Some(line) = classify_body_line(raw_line, b.src_cursor, b.tgt_cursor) {
+                match line.kind {
+                    LineKind::Added => b.tgt_cursor += 1,
+                    LineKind::Removed => b.src_cursor += 1,
+                    LineKind::Context => {
+                        b.src_cursor += 1;
+                        b.tgt_cursor += 1;
+                    }
+                }
+                b.lines.push(line);
+            }
+        }
+    }
+
+    if let Some(b) = builder {
+        hunks.push(b.finish());
+    }
+
+    Ok(hunks)
+}
+
+struct HunkBuilder {
+    src_start: u32,
+    src_len: u32,
+    tgt_start: u32,
+    tgt_len: u32,
+    ctx: Option<String>,
+    lines: Vec<Line>,
+    src_cursor: u32,
+    tgt_cursor: u32,
+}
+
+impl HunkBuilder {
+    fn new(ss: u32, sl: u32, ts: u32, tl: u32, ctx: Option<String>) -> Self {
+        Self {
+            src_start: ss,
+            src_len: sl,
+            tgt_start: ts,
+            tgt_len: tl,
+            ctx,
+            lines: Vec::new(),
+            src_cursor: ss,
+            tgt_cursor: ts,
+        }
+    }
+
+    fn finish(self) -> Hunk {
+        let header = render_hunk_header(
+            self.src_start,
+            self.src_len,
+            self.tgt_start,
+            self.tgt_len,
+            self.ctx.as_deref(),
+        );
+        Hunk {
+            header,
+            function_context: self.ctx,
+            source_start: self.src_start,
+            source_length: self.src_len,
+            target_start: self.tgt_start,
+            target_length: self.tgt_len,
+            lines: self.lines,
+        }
+    }
+}
+
+fn classify_body_line(raw_line: &str, src_cursor: u32, tgt_cursor: u32) -> Option<Line> {
+    if let Some(text) = raw_line.strip_prefix('+') {
+        Some(Line {
+            kind: LineKind::Added,
+            text: text.to_owned(),
+            source_line: None,
+            target_line: Some(tgt_cursor),
+        })
+    } else if let Some(text) = raw_line.strip_prefix('-') {
+        Some(Line {
+            kind: LineKind::Removed,
+            text: text.to_owned(),
+            source_line: Some(src_cursor),
+            target_line: None,
+        })
+    } else if let Some(text) = raw_line.strip_prefix(' ') {
+        Some(Line {
+            kind: LineKind::Context,
+            text: text.to_owned(),
+            source_line: Some(src_cursor),
+            target_line: Some(tgt_cursor),
+        })
+    } else if !raw_line.starts_with('\\') {
+        // Unified diff context lines MUST start with a space, but some test
+        // fixtures and a few real diffs omit it. Treat unrecognised hunk body
+        // lines that are not "no newline" markers as context, matching
+        // the behaviour of the previous unidiff-based parser.
+        Some(Line {
+            kind: LineKind::Context,
+            text: raw_line.to_owned(),
+            source_line: Some(src_cursor),
+            target_line: Some(tgt_cursor),
+        })
+    } else {
+        None
+    }
+}
+
+fn parse_hunk_header(line: &str, file: &Path) -> Result<(u32, u32, u32, u32, Option<String>)> {
+    let inner = line.strip_prefix("@@ ").ok_or_else(|| Error::DiffParse {
+        file: file.to_owned(),
+        message: format!("invalid hunk header: {line}"),
+    })?;
+
+    // Format: `-start[,len] +start[,len] @@ [function context]`
+    let sep = inner.find(" @@").ok_or_else(|| Error::DiffParse {
+        file: file.to_owned(),
+        message: format!("hunk header missing closing @@: {line}"),
+    })?;
+
+    let ranges = &inner[..sep];
+    let ctx_raw = inner[sep + 3..].trim();
+    let function_context = if ctx_raw.is_empty() {
         None
     } else {
-        Some(h.section_header.clone())
+        Some(ctx_raw.to_owned())
     };
 
-    let source_start = u32::try_from(h.source_start).map_err(|_| Error::DiffParse {
+    let mut parts = ranges.splitn(2, ' ');
+    let src_part = parts.next().ok_or_else(|| Error::DiffParse {
         file: file.to_owned(),
-        message: format!("source_start {} exceeds u32::MAX", h.source_start),
+        message: format!("hunk header missing source range: {line}"),
     })?;
-    let source_length = u32::try_from(h.source_length).map_err(|_| Error::DiffParse {
+    let tgt_part = parts.next().ok_or_else(|| Error::DiffParse {
         file: file.to_owned(),
-        message: format!("source_length {} exceeds u32::MAX", h.source_length),
-    })?;
-    let target_start = u32::try_from(h.target_start).map_err(|_| Error::DiffParse {
-        file: file.to_owned(),
-        message: format!("target_start {} exceeds u32::MAX", h.target_start),
-    })?;
-    let target_length = u32::try_from(h.target_length).map_err(|_| Error::DiffParse {
-        file: file.to_owned(),
-        message: format!("target_length {} exceeds u32::MAX", h.target_length),
+        message: format!("hunk header missing target range: {line}"),
     })?;
 
-    let header = render_hunk_header(
-        source_start,
-        source_length,
-        target_start,
-        target_length,
-        function_context.as_deref(),
-    );
+    let src_range_str = src_part.strip_prefix('-').ok_or_else(|| Error::DiffParse {
+        file: file.to_owned(),
+        message: format!("hunk header source range missing '-': {line}"),
+    })?;
+    let tgt_range_str = tgt_part.strip_prefix('+').ok_or_else(|| Error::DiffParse {
+        file: file.to_owned(),
+        message: format!("hunk header target range missing '+': {line}"),
+    })?;
 
-    let lines = h
-        .lines()
-        .iter()
-        .map(|l| convert_line(l, file))
-        .collect::<Result<Vec<_>>>()?;
+    let (src_start, src_len) = parse_range(src_range_str, file)?;
+    let (tgt_start, tgt_len) = parse_range(tgt_range_str, file)?;
 
-    Ok(Hunk {
-        header,
-        function_context,
-        source_start,
-        source_length,
-        target_start,
-        target_length,
-        lines,
-    })
+    Ok((src_start, src_len, tgt_start, tgt_len, function_context))
+}
+
+fn parse_range(s: &str, file: &Path) -> Result<(u32, u32)> {
+    if let Some((start_s, len_s)) = s.split_once(',') {
+        let start = start_s.parse::<u32>().map_err(|_| Error::DiffParse {
+            file: file.to_owned(),
+            message: format!("invalid hunk range start: {start_s:?}"),
+        })?;
+        let len = len_s.parse::<u32>().map_err(|_| Error::DiffParse {
+            file: file.to_owned(),
+            message: format!("invalid hunk range length: {len_s:?}"),
+        })?;
+        Ok((start, len))
+    } else {
+        let start = s.parse::<u32>().map_err(|_| Error::DiffParse {
+            file: file.to_owned(),
+            message: format!("invalid hunk range: {s:?}"),
+        })?;
+        Ok((start, 1))
+    }
+}
+
+fn classify_diff_file(
+    source_file: Option<String>,
+    target_file: Option<String>,
+    hunks: Vec<Hunk>,
+    file_path: &Path,
+) -> Result<DiffFile> {
+    let Some(source) = source_file else {
+        return Err(Error::DiffParse {
+            file: file_path.to_owned(),
+            message: "section has hunks but no source file header (---)".to_owned(),
+        });
+    };
+    let target = target_file.unwrap_or_default();
+
+    let source_norm = strip_a_prefix(&source);
+    let target_norm = strip_b_prefix(&target);
+
+    if source == "/dev/null" {
+        Ok(DiffFile::Added {
+            path: PathBuf::from(target_norm),
+            hunks,
+        })
+    } else if target == "/dev/null" {
+        Ok(DiffFile::Removed {
+            path: PathBuf::from(source_norm),
+            hunks,
+        })
+    } else if source_norm == target_norm {
+        Ok(DiffFile::Modified {
+            path: PathBuf::from(target_norm),
+            hunks,
+        })
+    } else {
+        Ok(DiffFile::Renamed {
+            from: PathBuf::from(source_norm),
+            to: PathBuf::from(target_norm),
+            hunks,
+        })
+    }
 }
 
 fn render_hunk_header(
@@ -395,45 +538,6 @@ fn format_range(start: u32, length: u32) -> String {
     } else {
         format!("{start},{length}")
     }
-}
-
-fn convert_line(l: &unidiff::Line, file: &Path) -> Result<Line> {
-    let kind = if l.is_added() {
-        LineKind::Added
-    } else if l.is_removed() {
-        LineKind::Removed
-    } else if l.is_context() {
-        LineKind::Context
-    } else {
-        return Err(Error::DiffParse {
-            file: file.to_owned(),
-            message: format!("unrecognized line type: {:?}", l.line_type),
-        });
-    };
-
-    let source_line = l
-        .source_line_no
-        .map(u32::try_from)
-        .transpose()
-        .map_err(|_| Error::DiffParse {
-            file: file.to_owned(),
-            message: "source_line_no exceeds u32::MAX".to_owned(),
-        })?;
-    let target_line = l
-        .target_line_no
-        .map(u32::try_from)
-        .transpose()
-        .map_err(|_| Error::DiffParse {
-            file: file.to_owned(),
-            message: "target_line_no exceeds u32::MAX".to_owned(),
-        })?;
-
-    Ok(Line {
-        kind,
-        text: l.value.clone(),
-        source_line,
-        target_line,
-    })
 }
 
 #[cfg(test)]
@@ -825,5 +929,51 @@ new file mode 100644
         let input = "this text has no diff markers at all\nsecond line\n";
         let diff = parse(input).unwrap();
         assert!(diff.files.is_empty());
+    }
+
+    #[test]
+    fn hunk_body_lines_starting_with_double_dash_parse_correctly() {
+        // Regression: the previous unidiff-based parser re-processed hunk
+        // body lines at the file-header level. A removed line starting with
+        // "-- " (e.g. Markdown YAML front matter or a heading that begins
+        // with dashes) matched the `--- ` source-file regex, clearing
+        // current_file and causing "Unexpected hunk" on the next @@ line.
+        let input = "diff --git a/spec.md b/spec.md\n\
+index abc..def 100644\n\
+--- a/spec.md\n\
++++ b/spec.md\n\
+@@ -1,4 +1,4 @@\n\
+ context\n\
+--- dashes in content\n\
++-- dashes revised\n\
+ more context\n\
+@@ -10,3 +10,3 @@\n\
+ second hunk\n\
+-old\n\
++new\n";
+        let diff = parse(input).unwrap();
+        assert_eq!(diff.files.len(), 1);
+        let DiffFile::Modified { hunks, .. } = &diff.files[0] else {
+            panic!("expected Modified");
+        };
+        assert_eq!(
+            hunks.len(),
+            2,
+            "both hunks must parse — second @@ must not trigger UnexpectedHunk"
+        );
+        let removed = hunks[0]
+            .lines
+            .iter()
+            .find(|l| l.kind == LineKind::Removed)
+            .unwrap();
+        assert_eq!(removed.text, "-- dashes in content");
+        let added = hunks[0]
+            .lines
+            .iter()
+            .find(|l| l.kind == LineKind::Added)
+            .unwrap();
+        assert_eq!(added.text, "-- dashes revised");
+        assert_eq!(hunks[1].source_start, 10);
+        assert_eq!(hunks[1].target_start, 10);
     }
 }
