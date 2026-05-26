@@ -19,11 +19,11 @@ pub(crate) enum ReviewTarget {
 
 /// Persistent reviewed-state for one revset run.
 ///
-/// Stored at `.jj-review/reviewed.json`. Keyed by `ChangeId` so a fresh
-/// `cargo run --stack` against the same change picks up what was already
-/// marked. The stored `commit_id` is the invalidation token: when the change
-/// gets amended or rebased the `commit_id` flips, and on next load the stale
-/// reviewed bits for that change are dropped.
+/// Stored under `data_home` at `repos/<repo>/reviewed.json`. Keyed by
+/// `ChangeId` so a fresh `jjr --stack` against the same change picks up
+/// what was already marked. The stored `commit_id` is the invalidation
+/// token: when the change gets amended or rebased the `commit_id` flips,
+/// and on next load the stale reviewed bits for that change are dropped.
 ///
 /// `HashMap` (not `BTreeMap`) because `ChangeId` does not derive `Ord` and
 /// the on-disk format does not depend on iteration order.
@@ -63,16 +63,16 @@ impl ReviewedEntry {
     }
 }
 
-fn reviewed_path(repo_root: &Path) -> PathBuf {
-    repo_root.join(".jj-review").join("reviewed.json")
+fn reviewed_path(data_home: &Path, repo_root: &Path) -> PathBuf {
+    crate::store::repo_data_dir(data_home, repo_root).join("reviewed.json")
 }
 
 impl ReviewedState {
-    /// Load `.jj-review/reviewed.json`, returning an empty state if the file
-    /// does not exist. Custom Deserialize at the trust boundary rejects records
-    /// missing required fields with a named error.
-    pub(crate) fn load(repo_root: &Path) -> Result<Self> {
-        let path = reviewed_path(repo_root);
+    /// Load `reviewed.json` from the XDG data home, returning an empty state
+    /// if the file does not exist. Custom Deserialize at the trust boundary
+    /// rejects records missing required fields with a named error.
+    pub(crate) fn load(data_home: &Path, repo_root: &Path) -> Result<Self> {
+        let path = reviewed_path(data_home, repo_root);
         if !path.exists() {
             return Ok(Self::default());
         }
@@ -85,8 +85,8 @@ impl ReviewedState {
 
     /// Atomic save via `util::atomic_write_bytes` — crash-safe rename, same
     /// pattern as cursor.json and the comment store.
-    pub(crate) fn save(&self, repo_root: &Path) -> Result<()> {
-        let path = reviewed_path(repo_root);
+    pub(crate) fn save(&self, data_home: &Path, repo_root: &Path) -> Result<()> {
+        let path = reviewed_path(data_home, repo_root);
         let dto = ReviewedStateDto::from_state(self);
         let json = serde_json::to_string_pretty(&dto).map_err(|e| JjrError::Io {
             source: std::io::Error::other(e),
@@ -348,7 +348,7 @@ mod tests {
     #[test]
     fn load_missing_file_returns_empty_state() {
         let dir = tmp();
-        let state = ReviewedState::load(dir.path()).unwrap();
+        let state = ReviewedState::load(dir.path(), dir.path()).unwrap();
         assert!(state.entries.is_empty());
     }
 
@@ -362,9 +362,9 @@ mod tests {
             coid("deadbeef"),
             ReviewTarget::File(PathBuf::from("src/foo.rs")),
         );
-        state.save(dir.path()).unwrap();
+        state.save(dir.path(), dir.path()).unwrap();
 
-        let loaded = ReviewedState::load(dir.path()).unwrap();
+        let loaded = ReviewedState::load(dir.path(), dir.path()).unwrap();
         let entry = loaded.entries.get(&cid("abc12345")).unwrap();
         assert_eq!(entry.commit_id, coid("deadbeef"));
         assert!(entry.description_reviewed);
@@ -385,32 +385,34 @@ mod tests {
 
     #[test]
     fn load_skips_entry_with_invalid_change_id() {
-        // Hand-edited JSONL must not be able to smuggle malformed change IDs
+        // Hand-edited JSON must not be able to smuggle malformed change IDs
         // past the trust boundary. `ChangeId::parse` rejects "bad", so the
         // entry is silently dropped on load.
         let dir = tmp();
-        let review_dir = dir.path().join(".jj-review");
-        std::fs::create_dir_all(&review_dir).unwrap();
+        let reviewed_file =
+            crate::store::repo_data_dir(dir.path(), dir.path()).join("reviewed.json");
+        std::fs::create_dir_all(reviewed_file.parent().unwrap()).unwrap();
         std::fs::write(
-            review_dir.join("reviewed.json"),
+            &reviewed_file,
             r#"{"entries": {"bad": {"commit_id": "deadbeef"}}}"#,
         )
         .unwrap();
-        let state = ReviewedState::load(dir.path()).unwrap();
+        let state = ReviewedState::load(dir.path(), dir.path()).unwrap();
         assert!(state.entries.is_empty());
     }
 
     #[test]
     fn load_skips_entry_with_invalid_commit_id() {
         let dir = tmp();
-        let review_dir = dir.path().join(".jj-review");
-        std::fs::create_dir_all(&review_dir).unwrap();
+        let reviewed_file =
+            crate::store::repo_data_dir(dir.path(), dir.path()).join("reviewed.json");
+        std::fs::create_dir_all(reviewed_file.parent().unwrap()).unwrap();
         std::fs::write(
-            review_dir.join("reviewed.json"),
+            &reviewed_file,
             r#"{"entries": {"abc12345": {"commit_id": "not-hex!"}}}"#,
         )
         .unwrap();
-        let state = ReviewedState::load(dir.path()).unwrap();
+        let state = ReviewedState::load(dir.path(), dir.path()).unwrap();
         assert!(state.entries.is_empty());
     }
 
@@ -720,8 +722,8 @@ mod tests {
         let dir = tmp();
         let mut state = ReviewedState::default();
         state.mark(cid("abc12345"), coid("deadbeef"), ReviewTarget::Description);
-        state.save(dir.path()).unwrap();
-        let loaded = ReviewedState::load(dir.path()).unwrap();
+        state.save(dir.path(), dir.path()).unwrap();
+        let loaded = ReviewedState::load(dir.path(), dir.path()).unwrap();
         let entry = loaded.entries.get(&cid("abc12345")).unwrap();
         assert!(entry.description_reviewed);
         assert!(entry.reviewed_files.is_empty());
@@ -741,8 +743,8 @@ mod tests {
             coid("deadbeef"),
             ReviewTarget::File(PathBuf::from("b.rs")),
         );
-        state.save(dir.path()).unwrap();
-        let loaded = ReviewedState::load(dir.path()).unwrap();
+        state.save(dir.path(), dir.path()).unwrap();
+        let loaded = ReviewedState::load(dir.path(), dir.path()).unwrap();
         let entry = loaded.entries.get(&cid("abc12345")).unwrap();
         assert!(!entry.description_reviewed);
         assert_eq!(entry.reviewed_files.len(), 2);
@@ -756,8 +758,8 @@ mod tests {
         // shell but no per-change records. Reloading produces an empty map.
         let dir = tmp();
         let state = ReviewedState::default();
-        state.save(dir.path()).unwrap();
-        let loaded = ReviewedState::load(dir.path()).unwrap();
+        state.save(dir.path(), dir.path()).unwrap();
+        let loaded = ReviewedState::load(dir.path(), dir.path()).unwrap();
         assert!(loaded.entries.is_empty());
     }
 
@@ -823,8 +825,8 @@ mod tests {
             coid("55667788"),
             ReviewTarget::File(PathBuf::from("both.rs")),
         );
-        state.save(dir.path()).unwrap();
-        let loaded = ReviewedState::load(dir.path()).unwrap();
+        state.save(dir.path(), dir.path()).unwrap();
+        let loaded = ReviewedState::load(dir.path(), dir.path()).unwrap();
 
         let e1 = loaded.entries.get(&cid("abc11111")).unwrap();
         assert!(e1.description_reviewed);

@@ -1,5 +1,5 @@
-//! Redirect process stderr (fd 2) to `<repo_root>/.jj-review/jjr.log` for the
-//! duration of a TUI session.
+//! Redirect process stderr (fd 2) to `<data_home>/repos/<repo>/jjr.log` for
+//! the duration of a TUI session.
 //!
 //! Background: synchronous `log_warning` calls (from `store::load_*_comments`,
 //! `reviewed::ReviewedState::load`, `WorkingCopyGuard::drop`) write to stderr
@@ -19,20 +19,19 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{JjrError, Result};
 
-const STATE_DIR: &str = ".jj-review";
 const LOG_FILE_NAME: &str = "jjr.log";
 
-pub fn log_path(repo_root: &Path) -> PathBuf {
-    repo_root.join(STATE_DIR).join(LOG_FILE_NAME)
+pub fn log_path(data_home: &Path, repo_root: &Path) -> PathBuf {
+    crate::store::repo_data_dir(data_home, repo_root).join(LOG_FILE_NAME)
 }
 
-fn open_log_file(repo_root: &Path) -> Result<File> {
-    let dir = repo_root.join(STATE_DIR);
+fn open_log_file(data_home: &Path, repo_root: &Path) -> Result<File> {
+    let dir = crate::store::repo_data_dir(data_home, repo_root);
     std::fs::create_dir_all(&dir).map_err(|source| JjrError::Io { source })?;
     OpenOptions::new()
         .create(true)
         .append(true)
-        .open(log_path(repo_root))
+        .open(log_path(data_home, repo_root))
         .map_err(|source| JjrError::Io { source })
 }
 
@@ -80,8 +79,8 @@ impl StderrLogGuard {
         unsafe_code,
         reason = "libc::dup/dup2/close manage fd 2 directly; std has no safe equivalent"
     )]
-    pub fn install(repo_root: &Path) -> Result<Self> {
-        let log = open_log_file(repo_root)?;
+    pub fn install(data_home: &Path, repo_root: &Path) -> Result<Self> {
+        let log = open_log_file(data_home, repo_root)?;
 
         // SAFETY: `libc::STDERR_FILENO` is the integer constant 2, which is
         // a valid open file descriptor in any standard process started by a
@@ -164,12 +163,13 @@ mod tests {
     }
 
     #[test]
-    fn log_path_resolves_to_dot_jj_review_jjr_log() {
-        let root = Path::new("/tmp/example");
-        assert_eq!(
-            log_path(root),
-            PathBuf::from("/tmp/example/.jj-review/jjr.log")
-        );
+    fn log_path_is_under_data_home_not_repo_root() {
+        let data_home = Path::new("/tmp/data");
+        let repo_root = Path::new("/tmp/repo");
+        let p = log_path(data_home, repo_root);
+        assert!(p.starts_with(data_home), "log must be under data_home");
+        assert!(!p.starts_with(repo_root), "log must not be under repo_root");
+        assert_eq!(p.file_name().unwrap(), "jjr.log");
     }
 
     /// End-to-end fd test using a child subprocess. The child's
@@ -182,14 +182,14 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let dir = tempfile::tempdir().unwrap();
-        let guard = StderrLogGuard::install(dir.path()).unwrap();
+        let guard = StderrLogGuard::install(dir.path(), dir.path()).unwrap();
 
         let status = spawn_marker_writer("NOT_SUSPENDED_MARKER");
         assert!(status.success());
 
         drop(guard);
 
-        let contents = std::fs::read_to_string(log_path(dir.path())).unwrap();
+        let contents = std::fs::read_to_string(log_path(dir.path(), dir.path())).unwrap();
         assert!(
             contents.contains("NOT_SUSPENDED_MARKER"),
             "expected marker in log, got: {contents:?}"
@@ -207,7 +207,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let dir = tempfile::tempdir().unwrap();
-        let guard = StderrLogGuard::install(dir.path()).unwrap();
+        let guard = StderrLogGuard::install(dir.path(), dir.path()).unwrap();
 
         guard.suspend().unwrap();
         let status = spawn_marker_writer("SUSPENDED_MARKER");
@@ -216,7 +216,7 @@ mod tests {
 
         drop(guard);
 
-        let contents = std::fs::read_to_string(log_path(dir.path())).unwrap();
+        let contents = std::fs::read_to_string(log_path(dir.path(), dir.path())).unwrap();
         assert!(
             !contents.contains("SUSPENDED_MARKER"),
             "log unexpectedly captured SUSPENDED_MARKER: {contents:?}"

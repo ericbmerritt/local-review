@@ -25,17 +25,21 @@ pub fn jjr_data_home() -> Option<PathBuf> {
         .map(|home| PathBuf::from(home).join(".local").join("share").join("jjr"))
 }
 
-fn comments_dir(data_home: &Path, repo_root: &Path) -> PathBuf {
-    // Canonicalize the repo root so symlinks and `.` segments are resolved,
-    // giving a stable storage key. Fall back to the raw path if canonicalize
-    // fails (e.g. the path doesn't exist yet in tests).
+/// Per-repo data directory under `data_home`.
+///
+/// Canonicalizes `repo_root` so symlinks and `.` segments produce a stable
+/// storage key. Cursor, reviewed-state, and log files live here alongside the
+/// `comments/` sub-directory.
+pub fn repo_data_dir(data_home: &Path, repo_root: &Path) -> PathBuf {
     let canonical = repo_root
         .canonicalize()
         .unwrap_or_else(|_| repo_root.to_owned());
-    // Strip the leading `/` so the path can be used as a relative directory
-    // component under `data_home/repos/`.
     let relative = canonical.strip_prefix("/").unwrap_or(&canonical);
-    data_home.join("repos").join(relative).join("comments")
+    data_home.join("repos").join(relative)
+}
+
+fn comments_dir(data_home: &Path, repo_root: &Path) -> PathBuf {
+    repo_data_dir(data_home, repo_root).join("comments")
 }
 
 /// Canonical on-disk path for a per-change comments file.

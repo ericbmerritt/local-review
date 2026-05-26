@@ -207,7 +207,7 @@ pub fn run(
     let details = jj::show(change_id)?;
     let revset = change_id.as_str().to_owned();
 
-    let (mut terminal, guard) = enter_tui_session(repo_root)?;
+    let (mut terminal, guard) = enter_tui_session(data_home, repo_root)?;
     let ctx = JjrContext {
         data_home: data_home.to_owned(),
         repo_root: repo_root.to_owned(),
@@ -231,7 +231,7 @@ pub fn run_stack(
     }
 
     if restart {
-        cursor::clear(repo_root, resolved.revset_hash)?;
+        cursor::clear(data_home, repo_root, resolved.revset_hash)?;
     }
 
     let has_comments = |id: &ChangeId| {
@@ -243,10 +243,9 @@ pub fn run_stack(
     // Smart-resume rule: when the stored cursor change is missing from the
     // current stack (or the cursor file is absent / corrupt), walk LATEST→
     // OLDEST and pick the most-recent change that is NOT fully reviewed.
-    // The reviewed-state needed to answer that question lives in
-    // `.jj-review/reviewed.json`; load it once for the resume decision and
-    // hand the entry IDs to a closure that asks the store about each.
-    let reviewed_state = ReviewedState::load(repo_root).unwrap_or_default();
+    // Load reviewed-state once for the resume decision and hand the entry
+    // IDs to a closure that asks the store about each.
+    let reviewed_state = ReviewedState::load(data_home, repo_root).unwrap_or_default();
     let entries_by_id: std::collections::HashMap<ChangeId, &StackEntry> = resolved
         .entries
         .iter()
@@ -286,6 +285,7 @@ pub fn run_stack(
         .map(|e| e.change_id.clone())
         .collect::<Vec<_>>();
     let start_index = cursor::resume_index(
+        data_home,
         repo_root,
         resolved.revset_hash,
         &cursor::ResumeInputs {
@@ -306,7 +306,7 @@ pub fn run_stack(
         revset_hash: resolved.revset_hash,
     };
 
-    let (mut terminal, guard) = enter_tui_session(repo_root)?;
+    let (mut terminal, guard) = enter_tui_session(data_home, repo_root)?;
     let ctx = JjrContext {
         data_home: data_home.to_owned(),
         repo_root: repo_root.to_owned(),
@@ -321,8 +321,11 @@ type Term = Terminal<CrosstermBackend<Stdout>>;
 
 /// Install the stderr-redirect guard before the alt screen so its Drop
 /// runs after `teardown_terminal` at the call site (via App).
-fn enter_tui_session(repo_root: &std::path::Path) -> Result<(Term, StderrLogGuard)> {
-    let guard = StderrLogGuard::install(repo_root)?;
+fn enter_tui_session(
+    data_home: &std::path::Path,
+    repo_root: &std::path::Path,
+) -> Result<(Term, StderrLogGuard)> {
+    let guard = StderrLogGuard::install(data_home, repo_root)?;
     let term = setup_terminal()?;
     Ok((term, guard))
 }
@@ -486,7 +489,7 @@ impl JjrSurface {
         stack: Option<StackContext>,
         stderr_guard: Option<StderrLogGuard>,
     ) -> Self {
-        let reviewed = ReviewedState::load(&ctx.repo_root).unwrap_or_default();
+        let reviewed = ReviewedState::load(&ctx.data_home, &ctx.repo_root).unwrap_or_default();
         let rendered_views = build_rendered_views(&details);
         Self {
             details,
@@ -614,7 +617,7 @@ impl JjrSurface {
             MarkOutcome::ResetDueToCommitMismatch => MarkReviewedOutcome::ResetDueToCommitMismatch,
             MarkOutcome::NoReset => MarkReviewedOutcome::NoReset,
         };
-        let _ = self.reviewed.save(&self.repo_root); // best-effort
+        let _ = self.reviewed.save(&self.data_home, &self.repo_root); // best-effort
         outcome
     }
 }
@@ -951,11 +954,11 @@ impl ReviewSurface for JjrSurface {
         let was_reviewed = self.is_view_reviewed(view_idx);
         if was_reviewed {
             self.reviewed.unmark(&change_id, &commit_id, &target);
-            let _ = self.reviewed.save(&self.repo_root);
+            let _ = self.reviewed.save(&self.data_home, &self.repo_root);
             ReviewedOutcome::Unmarked
         } else {
             let outcome = self.reviewed.mark(change_id, commit_id, target);
-            let _ = self.reviewed.save(&self.repo_root);
+            let _ = self.reviewed.save(&self.data_home, &self.repo_root);
             match outcome {
                 MarkOutcome::ResetDueToCommitMismatch => ReviewedOutcome::ResetAndMarked,
                 MarkOutcome::NoReset => ReviewedOutcome::Marked,
@@ -1128,8 +1131,13 @@ impl ReviewSurfaceExt for JjrSurface {
             if let Some(ctx) = self.stack.as_ref() {
                 let change_id = ctx.entries.get(idx).map(|e| &e.change_id);
                 if let Some(change_id) = change_id {
-                    let _ =
-                        cursor::record(&self.repo_root, ctx.revset_hash, &ctx.revset, change_id);
+                    let _ = cursor::record(
+                        &self.data_home,
+                        &self.repo_root,
+                        ctx.revset_hash,
+                        &ctx.revset,
+                        change_id,
+                    );
                 }
             }
         }
@@ -2360,6 +2368,8 @@ pub(super) const MIN_USEFUL_SIDE_BY_SIDE_WIDTH: u16 =
 #[cfg(test)]
 struct App {
     details: ChangeDetails,
+    /// XDG data home for cursor/reviewed/log storage; equals `repo_root` in tests.
+    data_home: PathBuf,
     /// Repo root for comment storage; passed from the CLI.
     repo_root: PathBuf,
     /// The revset string used to open this view.
@@ -2426,14 +2436,14 @@ impl App {
     ) -> Self {
         let rendered_per_file = build_rendered_views(&details);
         let annotated_per_file = rendered_per_file.clone();
-        // A load failure on `.jj-review/reviewed.json` should not block the
-        // TUI — fall back to an empty state so the reviewer still gets a
-        // working session, and any subsequent mark + save will overwrite the
-        // bad file. The atomic-rename save can't preserve corruption, so the
-        // file self-heals on the next mark.
-        let reviewed = ReviewedState::load(&repo_root).unwrap_or_default();
+        // A load failure on reviewed.json should not block the TUI — fall back
+        // to an empty state. The atomic-rename save self-heals the file on
+        // the next mark. In tests, data_home equals repo_root.
+        let reviewed = ReviewedState::load(&repo_root, &repo_root).unwrap_or_default();
+        let data_home = repo_root.clone();
         Self {
             details,
+            data_home,
             repo_root,
             revset,
             rendered_per_file,
@@ -2547,7 +2557,7 @@ impl App {
             }
             MarkOutcome::ResetDueToCommitMismatch | MarkOutcome::NoReset => {}
         }
-        if let Err(e) = self.reviewed.save(&self.repo_root) {
+        if let Err(e) = self.reviewed.save(&self.data_home, &self.repo_root) {
             if self.status_message.is_none() {
                 self.status_message = Some(format!(
                     "warning: could not save reviewed state: {}",
@@ -2577,7 +2587,7 @@ impl App {
             self.reviewed.mark(change_id, commit_id, target);
             self.status_message = Some(STATUS_MARKED_REVIEWED.to_owned());
         }
-        if let Err(e) = self.reviewed.save(&self.repo_root) {
+        if let Err(e) = self.reviewed.save(&self.data_home, &self.repo_root) {
             // The toggle's own status message conveys the user-facing
             // outcome; a save failure is a secondary warning. Override
             // (not ignore) the toggle message so the user sees the
@@ -2987,7 +2997,13 @@ impl App {
         self.mark_current_file_reviewed();
 
         if advance {
-            let _ = cursor::record(&self.repo_root, revset_hash, &revset, &change_id);
+            let _ = cursor::record(
+                &self.data_home,
+                &self.repo_root,
+                revset_hash,
+                &revset,
+                &change_id,
+            );
         }
 
         Ok(())
@@ -3165,7 +3181,13 @@ fn persist_cursor_on_jjr_app_exit(app: &JjrApp) {
         return;
     };
     let change_id = &ctx.entries[ctx.current_index].change_id;
-    let _ = cursor::record(&surface.repo_root, ctx.revset_hash, &ctx.revset, change_id);
+    let _ = cursor::record(
+        &surface.data_home,
+        &surface.repo_root,
+        ctx.revset_hash,
+        &ctx.revset,
+        change_id,
+    );
 }
 
 /// Invalidate ratatui's previous-frame buffer cache when the screen has been
@@ -3196,7 +3218,13 @@ fn persist_cursor_on_exit(app: &App) {
         return;
     };
     let change_id = &ctx.entries[ctx.current_index].change_id;
-    let _ = cursor::record(&app.repo_root, ctx.revset_hash, &ctx.revset, change_id);
+    let _ = cursor::record(
+        &app.data_home,
+        &app.repo_root,
+        ctx.revset_hash,
+        &ctx.revset,
+        change_id,
+    );
 }
 
 fn load_transition_mode() -> TransitionMode {
@@ -7985,7 +8013,7 @@ mod tests {
 
         persist_cursor_on_exit(&app);
 
-        let cursor = cursor::load(dir.path()).unwrap();
+        let cursor = cursor::load(dir.path(), dir.path()).unwrap();
         let entry = &cursor.revsets[&revset_hash.hex()];
         assert_eq!(entry.last_change_id, entries[1].change_id);
         assert_eq!(entry.revset, revset);
@@ -7998,7 +8026,8 @@ mod tests {
         app.repo_root = dir.path().to_owned();
         persist_cursor_on_exit(&app);
         // No cursor file should exist (single-change mode).
-        assert!(!dir.path().join(".jj-review").join("cursor.json").exists());
+        let cursor_file = crate::store::repo_data_dir(dir.path(), dir.path()).join("cursor.json");
+        assert!(!cursor_file.exists());
     }
 
     // The pure `pick_retreat_index` helper carries the navigation contract for
