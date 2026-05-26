@@ -1002,7 +1002,14 @@ impl ReviewSurface for JjrSurface {
 
         match key.code {
             KeyCode::Char('c') | KeyCode::Enter => {
-                Ok(self.open_new_comment_composer(file_index, line_index, current_view))
+                if self
+                    .focused_comment_from_view(line_index, current_view)
+                    .is_some()
+                {
+                    Ok(self.open_edit_comment_composer(line_index, current_view))
+                } else {
+                    Ok(self.open_new_comment_composer(file_index, line_index, current_view))
+                }
             }
             KeyCode::Char('e') => Ok(self.open_edit_comment_composer(line_index, current_view)),
             KeyCode::Char('d') => Ok(self.delete_focused_comment_action(line_index, current_view)),
@@ -1325,26 +1332,6 @@ impl JjrSurface {
         line_index: usize,
         current_view: Option<&DiffView>,
     ) -> ExtraKeyAction {
-        // On a Change-anchored comment row, default to Change scope for the new comment.
-        if self
-            .focused_comment_from_view(line_index, current_view)
-            .is_some_and(|c| matches!(c.anchor, Anchor::Change { .. }))
-        {
-            let target_change_id = self.details.change_id.clone();
-            let init = ComposerInit {
-                scope: ComposerScope::Change,
-                severity: default_severity(self.last_severity),
-                change_id: target_change_id,
-                change_description: self.details.description.clone(),
-                line_available: None,
-                stack_available: self.stack_context_snapshot(),
-                description_available: None,
-            };
-            return ExtraKeyAction::OpenScreen(Box::new(ComposerScreen(Box::new(Composer::new(
-                init,
-            )))));
-        }
-
         let reanchor_severity = self.pending_reanchor.as_ref().map(|r| r.severity);
         let reanchor_body = self.pending_reanchor.take().map(|r| r.body);
 
