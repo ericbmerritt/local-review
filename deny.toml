@@ -20,6 +20,7 @@ wildcards = "deny"
 highlight = "all"
 skip = [
   { crate = "wit-bindgen@0.51.0", reason = "two wit-bindgen versions reach us via tempfile's wasip2/wasip3 deps; cannot collapse without forking. Pinned so the skip fails when 0.51 drops out and we can re-evaluate." },
+  { crate = "hashbrown@0.16.1", reason = "ratatui 0.30.x pulls in two hashbrown versions transitively: kasuari (its constraint solver) uses 0.16, lru uses 0.17. Cannot collapse without upstream coordination. Pinned so the skip fails when 0.16 drops out and we can re-evaluate." },
 ]
 
 [sources]
