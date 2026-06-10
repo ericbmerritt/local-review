@@ -913,6 +913,72 @@ impl ReviewSurface for GgrSurface {
         Ok(views)
     }
 
+    fn fetch_entity_list(
+        &self,
+        entry_idx: usize,
+    ) -> std::result::Result<Vec<local_review_core::semantic::EntitySummary>, GgrError> {
+        if entry_idx == 0 {
+            return Ok(Vec::new()); // description page has no entities
+        }
+        let commit_idx = entry_idx - 1;
+        let Some(commit) = self.pr.commits.get(commit_idx) else {
+            return Ok(Vec::new());
+        };
+        let sha = commit.sha.as_str();
+        let owner_repo = self.pr.repo_name.as_str();
+        let cache_path =
+            ggr_entity_cache_base(owner_repo, self.pr.number, self.pr.hostname.as_deref())
+                .map(|base| local_review_core::semantic::cache::ggr_cache_path(&base, sha));
+
+        if let Some(ref p) = cache_path {
+            if let Ok(Some(entry)) = local_review_core::semantic::cache::read(p) {
+                return Ok(ggr_build_entity_summaries(entry));
+            }
+        }
+
+        let diff =
+            gh::fetch_commit_diff(&self.pr.repo_name, &commit.sha, self.pr.hostname.as_deref())?;
+
+        let file_paths: Vec<String> = diff
+            .files
+            .iter()
+            .map(|f| f.display_path().to_string_lossy().into_owned())
+            .collect();
+
+        let pairs = gh::fetch_commit_file_contents(
+            &self.pr.repo_name,
+            &commit.sha,
+            &file_paths,
+            self.pr.hostname.as_deref(),
+        );
+
+        let registry = local_review_core::semantic::create_default_registry();
+        let mut entities = Vec::new();
+        let mut failed_files = Vec::new();
+
+        for pair in &pairs {
+            let before_raw = registry.extract(&pair.before, &pair.path);
+            let after_raw = registry.extract(&pair.after, &pair.path);
+            match (before_raw, after_raw) {
+                (Ok(b), Ok(a)) => {
+                    entities.extend(local_review_core::semantic::diff_entities(&b, &a));
+                }
+                _ => failed_files.push(pair.path.clone()),
+            }
+        }
+
+        let cache_entry = local_review_core::semantic::cache::CacheEntry {
+            schema_version: local_review_core::semantic::cache::SCHEMA_VERSION,
+            entities,
+            graph: None,
+            failed_files,
+        };
+        if let Some(ref p) = cache_path {
+            let _ = local_review_core::semantic::cache::write(p, &cache_entry);
+        }
+        Ok(ggr_build_entity_summaries(cache_entry))
+    }
+
     fn appended_comments_for_view(
         &self,
         view_idx: usize,
@@ -1356,6 +1422,62 @@ impl ReviewSurface for GgrSurface {
     ) -> String {
         ggr_footer_text_for_width(width, severity_filter)
     }
+}
+
+/// Return the XDG-style cache base path for ggr entity extraction.
+///
+/// `owner_repo` is `"owner/repo"`. Creates a path like:
+/// Returns `None` when no suitable data home can be determined (both
+/// `XDG_DATA_HOME` and `HOME` are unset). The caller should treat `None` as
+/// "no cache available" and skip the cache for this session.
+fn ggr_entity_cache_base(
+    owner_repo: &str,
+    pr_number: u64,
+    hostname: Option<&str>,
+) -> Option<std::path::PathBuf> {
+    let base = crate::util::data_home()?
+        .join("ggr")
+        .join("cache")
+        .join("entities");
+    // Include the hostname so the same PR reviewed on github.com vs a GHE
+    // instance uses separate cache directories.
+    let host_segment = hostname.unwrap_or("github.com");
+    let (owner, repo) = owner_repo.split_once('/').unwrap_or((owner_repo, "repo"));
+    Some(
+        base.join(host_segment)
+            .join(owner)
+            .join(repo)
+            .join(pr_number.to_string()),
+    )
+}
+
+/// Convert a `CacheEntry` into renderable `EntitySummary` values.
+fn ggr_build_entity_summaries(
+    entry: local_review_core::semantic::cache::CacheEntry,
+) -> Vec<local_review_core::semantic::EntitySummary> {
+    entry
+        .entities
+        .into_iter()
+        .map(|e| {
+            let display_name = e.id.display_name();
+            let file_path = e.id.file_path.clone();
+            let source_file = e.source_file.clone();
+            local_review_core::semantic::EntitySummary {
+                id: e.id,
+                display_name,
+                kind: e.kind,
+                change: e.change,
+                annotation: e.annotation,
+                file_path,
+                source_file,
+                target_line: e.target_line,
+                line_range: e.line_range,
+                structural_change: e.structural_change,
+                content_hash: e.content_hash,
+                comment_count: 0,
+            }
+        })
+        .collect()
 }
 
 fn ggr_footer_text_for_width(width: u16, severity_filter: Option<Severity>) -> String {

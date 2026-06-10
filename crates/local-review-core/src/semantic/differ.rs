@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 
 use crate::semantic::entity::{
-    ChangeAnnotation, ChangeType, EntityCoreData, EntityKind, PlaceholderEntityId, RawEntity,
+    ChangeAnnotation, ChangeType, EntityCoreData, EntityId, EntityKind, RawEntity,
 };
 use crate::semantic::identity::{annotation, is_structural_change, match_entities};
 
@@ -30,7 +30,7 @@ fn is_container(kind: EntityKind) -> bool {
 
 fn make_added(e: &RawEntity) -> EntityCoreData {
     EntityCoreData {
-        id: PlaceholderEntityId(e.id_str.clone()),
+        id: e.id.clone(),
         kind: e.kind,
         change: ChangeType::Added,
         annotation: ChangeAnnotation::None,
@@ -44,7 +44,7 @@ fn make_added(e: &RawEntity) -> EntityCoreData {
 
 fn make_deleted(e: &RawEntity) -> EntityCoreData {
     EntityCoreData {
-        id: PlaceholderEntityId(e.id_str.clone()),
+        id: e.id.clone(),
         kind: e.kind,
         change: ChangeType::Deleted,
         annotation: ChangeAnnotation::None,
@@ -58,7 +58,7 @@ fn make_deleted(e: &RawEntity) -> EntityCoreData {
 
 fn make_modified(be: &RawEntity, ae: &RawEntity) -> EntityCoreData {
     EntityCoreData {
-        id: PlaceholderEntityId(ae.id_str.clone()),
+        id: ae.id.clone(),
         kind: ae.kind,
         change: ChangeType::Modified,
         annotation: annotation(be, ae),
@@ -72,7 +72,7 @@ fn make_modified(be: &RawEntity, ae: &RawEntity) -> EntityCoreData {
 
 fn make_moved(be: &RawEntity, ae: &RawEntity) -> EntityCoreData {
     EntityCoreData {
-        id: PlaceholderEntityId(ae.id_str.clone()),
+        id: ae.id.clone(),
         kind: ae.kind,
         change: ChangeType::Moved,
         annotation: ChangeAnnotation::None,
@@ -86,29 +86,19 @@ fn make_moved(be: &RawEntity, ae: &RawEntity) -> EntityCoreData {
 
 // ── Container Rule suppression ────────────────────────────────────────────────
 
-/// True when an entity whose result id-string uses `child_scope` within
-/// `container_file` is a direct or transitive child of the given container.
+/// True when `child` is a direct or transitive child of `container`.
 ///
-/// The scope comparison uses `RawEntity::scope` (just the `::` -separated
-/// name chain, e.g., `Session::refresh`) rather than the full `id_str`.
-/// This correctly handles containers and children having different `<kind>`
-/// segments in their `id_str`.
-fn scope_is_child(child_scope: &str, child_file: &str, container: &RawEntity) -> bool {
-    child_file == container.file_path
-        && child_scope.starts_with(&container.scope)
-        && child_scope.len() > container.scope.len()
-        && child_scope.as_bytes().get(container.scope.len()).copied() == Some(b':')
-}
-
-/// Extract the scope and file from a result entity's `PlaceholderEntityId`.
-///
-/// Format is `<file>::<kind>::<scope>`. Splits on the first two `::` pairs.
-fn id_parts(id_str: &str) -> (&str, &str) {
-    let mut parts = id_str.splitn(3, "::");
-    let file = parts.next().unwrap_or("");
-    let _ = parts.next(); // kind — not needed
-    let scope = parts.next().unwrap_or("");
-    (file, scope)
+/// Uses `EntityId.scope_chain`: a child's `scope_chain` starts with the
+/// container's `scope_chain` (prefix match on the chain, not a string prefix).
+/// File equality is also required. This correctly handles containers and
+/// children that have different `kind` segments in their raw extractor strings.
+fn entity_is_child(child: &EntityCoreData, container: &RawEntity) -> bool {
+    child.id.file_path == container.id.file_path
+        && child
+            .id
+            .scope_chain
+            .starts_with(container.id.scope_chain.as_slice())
+        && child.id.scope_chain.len() > container.id.scope_chain.len()
 }
 
 /// Remove container entities from `result` that have a body-only annotation
@@ -119,21 +109,16 @@ fn apply_container_rule(
     result: &mut Vec<EntityCoreData>,
     raw_modified: &[(&RawEntity, &RawEntity)],
 ) {
-    let to_suppress: Vec<String> = raw_modified
+    let to_suppress: Vec<EntityId> = raw_modified
         .iter()
         .filter(|(be, ae)| {
             is_container(ae.kind) && annotation(be, ae) == ChangeAnnotation::BodyOnly
         })
-        .filter(|(be, _)| {
-            result.iter().any(|e| {
-                let (file, scope) = id_parts(&e.id.0);
-                scope_is_child(scope, file, be)
-            })
-        })
-        .map(|(be, _)| be.id_str.clone())
+        .filter(|(be, _)| result.iter().any(|e| entity_is_child(e, be)))
+        .map(|(be, _)| be.id.clone())
         .collect();
 
-    result.retain(|e| !to_suppress.contains(&e.id.0));
+    result.retain(|e| !to_suppress.contains(&e.id));
 }
 
 // ── Public diff entry point ───────────────────────────────────────────────────
@@ -147,7 +132,7 @@ pub fn diff_entities(before: &[RawEntity], after: &[RawEntity]) -> Vec<EntityCor
     let mut result = Vec::new();
 
     for (be, ae) in &mr.matched {
-        if be.content_hash != ae.content_hash || be.id_str != ae.id_str {
+        if be.content_hash != ae.content_hash || be.id != ae.id {
             if be.file_path == ae.file_path {
                 result.push(make_modified(be, ae));
             } else {

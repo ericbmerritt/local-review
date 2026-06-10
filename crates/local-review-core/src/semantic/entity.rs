@@ -7,17 +7,10 @@
 
 use std::path::PathBuf;
 
-/// Opaque identity placeholder used in Phase 1.
-///
-/// Encoded as `<file_path>::<entity_kind>::<scope_path>` where `<scope_path>`
-/// is the `::` -separated chain of container names and the entity's own name
-/// (e.g., `AuthService::authenticate`). Phase 2 replaces this newtype with
-/// the structured `EntityId` without changing `EntityCoreData`'s field shape.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct PlaceholderEntityId(pub String);
+pub use super::entity_id::EntityId;
 
 /// Classification of a code entity by its syntactic kind.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum EntityKind {
     Function,
     Method,
@@ -42,7 +35,7 @@ pub enum EntityKind {
 }
 
 /// How the entity changed between before and after states.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ChangeType {
     Added,
     Modified,
@@ -51,7 +44,7 @@ pub enum ChangeType {
 }
 
 /// What specifically changed within a modified entity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ChangeAnnotation {
     /// Declaration (signature, generics, visibility, base class) changed.
     SigChanged,
@@ -65,12 +58,11 @@ pub enum ChangeAnnotation {
 
 /// Extraction output and diff classification for one entity.
 ///
-/// Cached to disk by Phase 2; `display_name` and `comment_count` are computed
-/// at render time and therefore not stored here.
-#[derive(Debug, Clone)]
+/// Cached to disk; `display_name` and `comment_count` are computed at render
+/// time and not stored here.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EntityCoreData {
-    /// Opaque identity (Phase 2 replaces with structured `EntityId`).
-    pub id: PlaceholderEntityId,
+    pub id: EntityId,
     pub kind: EntityKind,
     pub change: ChangeType,
     pub annotation: ChangeAnnotation,
@@ -92,11 +84,11 @@ pub struct EntityCoreData {
 /// source text needed for Jaccard similarity matching.
 #[derive(Debug, Clone)]
 pub struct RawEntity {
-    /// The entity's identity string (becomes `PlaceholderEntityId`).
-    pub id_str: String,
-    /// Scope portion only (everything after `<file>::<kind>::`), e.g.
-    /// `Session::refresh`. Used by the Container Rule to detect parent-child
-    /// relationships without brittle `id_str` prefix matching.
+    /// Structured identity.
+    pub id: EntityId,
+    /// Scope portion as a `::` -separated string (e.g., `Session::refresh`).
+    /// Used by the Container Rule to detect parent-child relationships without
+    /// re-parsing `id.scope_chain`.
     pub scope: String,
     pub kind: EntityKind,
     pub start_line: u32,
@@ -108,8 +100,45 @@ pub struct RawEntity {
     /// Hash of the first non-comment, non-decorator declaration line.
     pub sig_hash: u64,
     /// Hash of the body (everything after the first declaration line).
-    /// Used to distinguish `SigChanged` from `SigAndBody`.
     pub body_hash: u64,
-    /// File path; forwarded into `EntityCoreData.id`.
+    /// File path as a `String` (duplicate of `id.file_path`) for perf-sensitive
+    /// comparisons in the differ.
     pub file_path: String,
+}
+
+// ── Render-time types ─────────────────────────────────────────────────────────
+
+/// `(start_line, end_line)` inclusive, 1-indexed.
+pub type LineRange = (u32, u32);
+
+/// Content for the pinned description row at the top of the entity list.
+#[derive(Debug, Clone)]
+pub struct DescriptionSummary {
+    /// Commit subject (ggr) or change description first line (jjr).
+    pub subject: String,
+    /// Number of change-scoped comments on this entry.
+    pub comment_count: usize,
+}
+
+/// Render-time view of one entity; not stored in the cache.
+///
+/// Constructed from `EntityCoreData` + comment store lookups at render time.
+#[derive(Debug, Clone)]
+pub struct EntitySummary {
+    pub id: EntityId,
+    /// Language-native scope path computed at render time.
+    pub display_name: String,
+    pub kind: EntityKind,
+    pub change: ChangeType,
+    pub annotation: ChangeAnnotation,
+    pub file_path: PathBuf,
+    /// Source file for `ChangeType::Moved`.
+    pub source_file: Option<PathBuf>,
+    pub target_line: Option<u32>,
+    pub line_range: LineRange,
+    /// `false` when the only change was formatting or comments.
+    pub structural_change: bool,
+    pub content_hash: u64,
+    /// Number of inline comments anchored inside this entity's line range.
+    pub comment_count: usize,
 }

@@ -219,9 +219,9 @@ trivial entities, tree-sitter-pgsql is community grammar).
 
 ## Phase 2: Identity, cache, surface plumbing
 
-| Status         | Started | Completed |
-| -------------- | ------- | --------- |
-| ⬜ not-started |         |           |
+| Status      | Started    | Completed  |
+| ----------- | ---------- | ---------- |
+| ✅ complete | 2026-06-10 | 2026-06-10 |
 
 Wire the extraction layer from Phase 1 through to the ReviewSurface trait. Build
 the cache. Connect content fetching to both tools.

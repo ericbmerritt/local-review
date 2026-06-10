@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::semantic::entity::{ChangeAnnotation, RawEntity};
+use crate::semantic::entity::{ChangeAnnotation, EntityId, RawEntity};
 
 /// Entities below this token count are not eligible for cross-file Jaccard
 /// matching (trivial getter / stub noise reduction).
@@ -75,16 +75,13 @@ fn id_match<'a>(
     ma: &mut HashSet<usize>,
     out: &mut Vec<(&'a RawEntity, &'a RawEntity)>,
 ) {
-    let by_id: HashMap<&str, usize> = before
-        .iter()
-        .enumerate()
-        .map(|(i, e)| (e.id_str.as_str(), i))
-        .collect();
+    let by_id: HashMap<&EntityId, usize> =
+        before.iter().enumerate().map(|(i, e)| (&e.id, i)).collect();
     for (ai, ae) in after.iter().enumerate() {
         if ma.contains(&ai) {
             continue;
         }
-        if let Some(&bi) = by_id.get(ae.id_str.as_str()) {
+        if let Some(&bi) = by_id.get(&ae.id) {
             if !mb.contains(&bi) {
                 mb.insert(bi);
                 ma.insert(ai);

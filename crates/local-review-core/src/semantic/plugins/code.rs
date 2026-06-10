@@ -23,7 +23,8 @@ use tree_sitter::{Language, Node, Parser, Tree};
 
 use crate::semantic::entity::{EntityKind, RawEntity};
 use crate::semantic::extractor::{
-    body_hash, build_id_str, content_hash, sig_hash, ExtractError, ExtractResult, SemanticExtractor,
+    body_hash, build_entity_id, content_hash, sig_hash, ExtractError, ExtractResult,
+    SemanticExtractor,
 };
 use crate::util::strip_controls;
 
@@ -103,7 +104,7 @@ impl<'t> Collector<'t> {
                 } else {
                     format!("{parent_scope}::{name}")
                 };
-                let id_str = build_id_str(&self.file_path, kind_str, &scope);
+                let entity_id = build_entity_id(&self.file_path, &scope, 0);
                 let content = node.utf8_text(self.src).unwrap_or("").to_owned();
                 let start_line = u32::try_from(node.start_position().row + 1).unwrap_or(1);
                 let end_line = u32::try_from(node.end_position().row + 1).unwrap_or(start_line);
@@ -111,7 +112,7 @@ impl<'t> Collector<'t> {
                 let sh = sig_hash(&content);
                 let bh = body_hash(&content);
                 self.entities.push(RawEntity {
-                    id_str,
+                    id: entity_id,
                     scope: scope.clone(),
                     kind: ek,
                     start_line,
@@ -206,6 +207,28 @@ impl SemanticExtractor for CodePlugin {
         // duration of extraction via the `content` reference.
         let mut collector = Collector::new(content.as_bytes(), self.spec, file_path);
         collector.visit(root, "");
+
+        // Assign ordinals so entities sharing the same (scope_chain,
+        // signature_key) get distinct identities based on source order.
+        // This disambiguates e.g. struct Foo (ordinal 0) from impl Foo
+        // (ordinal 1) within the same file.
+        let keys: Vec<_> = collector
+            .entities
+            .iter()
+            .map(|e| {
+                (
+                    e.id.scope_chain.clone(),
+                    e.id.signature_key.clone(),
+                    e.start_line,
+                )
+            })
+            .collect();
+        let mut ordinals = vec![0u32; keys.len()];
+        crate::semantic::entity_id::assign_ordinals(&keys, &mut ordinals);
+        for (entity, ord) in collector.entities.iter_mut().zip(ordinals.iter()) {
+            entity.id.ordinal = *ord;
+        }
+
         Ok(collector.entities)
     }
 }

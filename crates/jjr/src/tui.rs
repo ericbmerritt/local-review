@@ -525,6 +525,21 @@ impl JjrSurface {
         Some(ReviewTarget::File(path))
     }
 
+    /// Return the `ChangeId` for `entry_idx`, or the current change if
+    /// out of range.
+    fn entry_change_id(&self, entry_idx: usize) -> Result<ChangeId> {
+        if let Some(ctx) = self.stack.as_ref() {
+            ctx.entries
+                .get(entry_idx)
+                .map(|e| e.change_id.clone())
+                .ok_or_else(|| JjrError::JjUnexpectedOutput {
+                    raw: format!("entry index {entry_idx} out of range"),
+                })
+        } else {
+            Ok(self.details.change_id.clone())
+        }
+    }
+
     /// Load, reconcile, and store comments for the current change.
     ///
     /// Returns `None` on success; `Some(msg)` with an error description on
@@ -760,6 +775,56 @@ impl ReviewSurface for JjrSurface {
         let _ = self.reload_comments();
         self.rendered_views = build_rendered_views(&self.details);
         Ok(self.rendered_views.clone())
+    }
+
+    fn fetch_entity_list(
+        &self,
+        entry_idx: usize,
+    ) -> std::result::Result<Vec<local_review_core::semantic::EntitySummary>, JjrError> {
+        let change_id = self.entry_change_id(entry_idx)?;
+        // Use commit_id (content-addressed by jj) as the cache discriminator:
+        // any amendment to the change produces a new commit_id, invalidating
+        // the cache without needing a separate content hash.
+        let details = jj::show(&change_id)?;
+        let commit_id = details.commit_id.as_str().to_owned();
+        let cache_base =
+            crate::store::repo_data_dir(&self.data_home, &self.repo_root).join("entities");
+        let cache_path = local_review_core::semantic::cache::jjr_cache_path(
+            &cache_base,
+            change_id.as_str(),
+            &commit_id,
+        );
+
+        if let Ok(Some(entry)) = local_review_core::semantic::cache::read(&cache_path) {
+            return Ok(build_entity_summaries(entry));
+        }
+
+        let diff = details.diff;
+        let registry = local_review_core::semantic::create_default_registry();
+        let parent_rev = jj::parent_rev(&change_id);
+        let current_rev = change_id.as_str().to_owned();
+        let ctx = FileExtractCtx {
+            registry: &registry,
+            repo_root: &self.repo_root,
+            current_rev: &current_rev,
+            parent_rev: &parent_rev,
+        };
+        let mut entities = Vec::new();
+        let mut failed_files = Vec::new();
+
+        for file in &diff.files {
+            let path = file.display_path().to_string_lossy().into_owned();
+            extract_file_entities(&ctx, &path, &mut entities, &mut failed_files);
+        }
+
+        let cache_entry = local_review_core::semantic::cache::CacheEntry {
+            schema_version: local_review_core::semantic::cache::SCHEMA_VERSION,
+            entities,
+            graph: None,
+            failed_files,
+        };
+        let _ = local_review_core::semantic::cache::write(&cache_path, &cache_entry);
+        Ok(build_entity_summaries(cache_entry))
     }
 
     fn inline_comments_for_view(
@@ -5431,6 +5496,78 @@ fn pick_side(source_line: Option<u32>, target_line: Option<u32>) -> Side {
     } else {
         Side::New
     }
+}
+
+/// Context for extracting entities from a single file.
+struct FileExtractCtx<'a> {
+    registry: &'a local_review_core::semantic::ExtractorRegistry,
+    repo_root: &'a std::path::Path,
+    current_rev: &'a str,
+    parent_rev: &'a str,
+}
+
+/// Extract entities from one changed file and append to `entities`.
+///
+/// Calls `jj file show` for before and after content, then runs the extractor.
+/// Per-file failures append to `failed_files` rather than aborting.
+fn extract_file_entities(
+    ctx: &FileExtractCtx<'_>,
+    file_path: &str,
+    entities: &mut Vec<local_review_core::semantic::EntityCoreData>,
+    failed_files: &mut Vec<String>,
+) {
+    // `file_content_at` returns Ok("") for genuinely absent files (added/deleted).
+    // Propagate real IO / jj failures to the fallback list rather than silently
+    // treating them as empty content, which would produce incorrect diffs.
+    let Ok(before) = jj::file_content_at(ctx.parent_rev, file_path, ctx.repo_root) else {
+        failed_files.push(file_path.to_owned());
+        return;
+    };
+    let Ok(after) = jj::file_content_at(ctx.current_rev, file_path, ctx.repo_root) else {
+        failed_files.push(file_path.to_owned());
+        return;
+    };
+
+    let Ok(before_raw) = ctx.registry.extract(&before, file_path) else {
+        failed_files.push(file_path.to_owned());
+        return;
+    };
+    let Ok(after_raw) = ctx.registry.extract(&after, file_path) else {
+        failed_files.push(file_path.to_owned());
+        return;
+    };
+
+    let changed = local_review_core::semantic::diff_entities(&before_raw, &after_raw);
+    entities.extend(changed);
+}
+
+/// Convert a `CacheEntry` into renderable `EntitySummary` values.
+fn build_entity_summaries(
+    entry: local_review_core::semantic::cache::CacheEntry,
+) -> Vec<local_review_core::semantic::EntitySummary> {
+    entry
+        .entities
+        .into_iter()
+        .map(|e| {
+            let display_name = e.id.display_name();
+            let file_path = e.id.file_path.clone();
+            let source_file = e.source_file.clone();
+            local_review_core::semantic::EntitySummary {
+                id: e.id,
+                display_name,
+                kind: e.kind,
+                change: e.change,
+                annotation: e.annotation,
+                file_path,
+                source_file,
+                target_line: e.target_line,
+                line_range: e.line_range,
+                structural_change: e.structural_change,
+                content_hash: e.content_hash,
+                comment_count: 0,
+            }
+        })
+        .collect()
 }
 
 /// Build the full `rendered_per_file` list for a `ChangeDetails`.
