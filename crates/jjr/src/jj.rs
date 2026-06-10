@@ -208,6 +208,45 @@ fn should_fall_back_on_empty(entries: &[StackEntry]) -> bool {
 /// (and the corresponding hash) so the cursor key matches the actual entries —
 /// a future run with the original revset that also falls back will hash to the
 /// same key.
+/// Return the content of `file_path` at revision `rev`.
+///
+/// Returns `Ok("")` for added files (where the "before" content is empty).
+/// Returns `Err` if the file is absent at that revision for any other reason.
+pub fn file_content_at(rev: &str, file_path: &str, repo_root: &std::path::Path) -> Result<String> {
+    let repo_str = repo_root.to_str().unwrap_or(".");
+    let output = Command::new("jj")
+        .args([
+            "--repository",
+            repo_str,
+            "file",
+            "show",
+            "-r",
+            rev,
+            file_path,
+        ])
+        .output()
+        .map_err(|source| JjrError::Io { source })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // "No such path" means the file didn't exist at this rev (added file).
+        if stderr.contains("No such path") || stderr.contains("does not exist") {
+            return Ok(String::new());
+        }
+        return Err(JjrError::JjFailed {
+            message: local_review_core::util::strip_controls(&stderr),
+            exit_code: output.status.code(),
+        });
+    }
+
+    String::from_utf8(output.stdout).map_err(|source| JjrError::JjOutputEncoding { source })
+}
+
+/// Return the parent rev string for a change (its `@-` equivalent).
+pub fn parent_rev(change_id: &ChangeId) -> String {
+    format!("{}^", change_id.as_str())
+}
+
 pub fn resolve_stack(revset: &str) -> Result<ResolvedStack> {
     let template = log_template();
 

@@ -12,7 +12,8 @@ use tree_sitter::{Node, Parser};
 
 use crate::semantic::entity::{EntityKind, RawEntity};
 use crate::semantic::extractor::{
-    body_hash, build_id_str, content_hash, sig_hash, ExtractError, ExtractResult, SemanticExtractor,
+    body_hash, build_entity_id, content_hash, sig_hash, ExtractError, ExtractResult,
+    SemanticExtractor,
 };
 use crate::util::strip_controls;
 
@@ -81,12 +82,12 @@ fn collect_stmt(stmt_node: Node<'_>, src: &[u8], file_path: &str, entities: &mut
         let Some(name) = extract_name(ddl_node, src) else {
             continue;
         };
-        let id_str = build_id_str(file_path, ddl_node.kind(), &name);
+        let entity_id = build_entity_id(file_path, &name, 0);
         let content = ddl_node.utf8_text(src).unwrap_or("").to_owned();
         let start_line = u32::try_from(ddl_node.start_position().row + 1).unwrap_or(1);
         let end_line = u32::try_from(ddl_node.end_position().row + 1).unwrap_or(start_line);
         entities.push(RawEntity {
-            id_str,
+            id: entity_id,
             scope: name.clone(),
             kind: ek,
             start_line,
@@ -143,6 +144,24 @@ impl SemanticExtractor for SqlPlugin {
             for stmt in toplevel.named_children(&mut c2) {
                 collect_stmt(stmt, src, file_path, &mut entities);
             }
+        }
+
+        // Assign ordinals so that two DDL statements with the same name (e.g.
+        // a table and a view both named "auth") get distinct EntityIds.
+        let keys: Vec<_> = entities
+            .iter()
+            .map(|e| {
+                (
+                    e.id.scope_chain.clone(),
+                    e.id.signature_key.clone(),
+                    e.start_line,
+                )
+            })
+            .collect();
+        let mut ordinals = vec![0u32; keys.len()];
+        crate::semantic::entity_id::assign_ordinals(&keys, &mut ordinals);
+        for (entity, ord) in entities.iter_mut().zip(ordinals.iter()) {
+            entity.id.ordinal = *ord;
         }
 
         Ok(entities)

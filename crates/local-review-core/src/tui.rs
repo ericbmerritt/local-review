@@ -398,6 +398,58 @@ pub trait ReviewSurface: Sized {
     /// reflects the tool's actual keys.
     fn footer_hint(&self, width: u16, has_stack: bool, severity_filter: Option<Severity>)
         -> String;
+
+    // ------------------------------------------------------------------
+    // Entity navigation (Phase 2+)
+    // ------------------------------------------------------------------
+
+    /// Return the entity list for the entry at `entry_idx`.
+    ///
+    /// An empty `Vec` means "no entities extracted for this entry" — the UI
+    /// renders every changed file as a fallback row. Returning `Err` is treated
+    /// the same way.
+    ///
+    /// The default implementation returns an empty vec so that surfaces can
+    /// adopt entity navigation incrementally.
+    fn fetch_entity_list(
+        &self,
+        _entry_idx: usize,
+    ) -> Result<Vec<crate::semantic::EntitySummary>, Self::Error> {
+        Ok(Vec::new())
+    }
+
+    /// Return the full `DiffView` for the file containing entity `entity_idx`,
+    /// plus the entity's line range for pre-scroll and visual highlighting.
+    ///
+    /// The `DiffView` is the **complete** file diff — entity scoping is visual
+    /// only, so line numbers remain accurate for GitHub comment anchors.
+    ///
+    /// The default implementation delegates to `fetch_views` and returns
+    /// `None` for the line range.
+    fn fetch_entity_diff(
+        &mut self,
+        _entry_idx: usize,
+        _entity_idx: usize,
+        _entities: &[crate::semantic::EntitySummary],
+    ) -> Result<Option<(DiffView, crate::semantic::LineRange)>, Self::Error> {
+        // Default impl returns None — surface implementations override this
+        // with tool-specific file-view lookup. String-matching against DiffView
+        // titles is unreliable (no stable format, renamed files show "a -> b").
+        Ok(None)
+    }
+
+    /// Return the description summary for the entry at `entry_idx`.
+    ///
+    /// The default implementation extracts the subject from `entry_description`.
+    fn fetch_description_summary(
+        &self,
+        entry_idx: usize,
+    ) -> Result<crate::semantic::DescriptionSummary, Self::Error> {
+        Ok(crate::semantic::DescriptionSummary {
+            subject: self.entry_description(entry_idx),
+            comment_count: 0,
+        })
+    }
 }
 
 /// Opaque extra-screen state owned by the core `App` but whose type is only

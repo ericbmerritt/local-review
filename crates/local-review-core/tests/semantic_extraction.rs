@@ -17,10 +17,10 @@ fn rust_extracts_top_level_functions() {
     let src = include_str!("semantic-golden/rust/01-functions.rs");
     let r = registry();
     let entities = r.extract(src, "auth.rs").expect("extraction must succeed");
-    let names: Vec<&str> = entities
+    let names: Vec<String> = entities
         .iter()
         .filter(|e| e.kind == EntityKind::Function)
-        .map(|e| e.id_str.as_str())
+        .map(|e| e.id.display_name())
         .collect();
     assert!(
         names.iter().any(|n| n.contains("authenticate")),
@@ -39,7 +39,7 @@ fn rust_extracts_impl_methods() {
     let entities = r.extract(src, "auth.rs").expect("extraction must succeed");
     let has_refresh = entities
         .iter()
-        .any(|e| e.kind == EntityKind::Function && e.id_str.contains("refresh"));
+        .any(|e| e.kind == EntityKind::Function && e.id.display_name().contains("refresh"));
     assert!(has_refresh, "must find refresh method inside impl Session");
 }
 
@@ -84,8 +84,12 @@ fn python_extracts_functions_and_class() {
     let src = include_str!("semantic-golden/python/01-functions.py");
     let r = registry();
     let entities = r.extract(src, "auth.py").expect("extraction must succeed");
-    let has_authenticate = entities.iter().any(|e| e.id_str.contains("authenticate"));
-    let has_session = entities.iter().any(|e| e.id_str.contains("Session"));
+    let has_authenticate = entities
+        .iter()
+        .any(|e| e.id.display_name().contains("authenticate"));
+    let has_session = entities
+        .iter()
+        .any(|e| e.id.display_name().contains("Session"));
     assert!(has_authenticate, "must find authenticate in python");
     assert!(has_session, "must find Session class in python");
 }
@@ -231,9 +235,9 @@ fn strip_controls_applied_to_entity_ids() {
     let entities = r.extract(src, "test\x1b[31mfile.rs").expect("extract");
     for e in &entities {
         assert!(
-            !e.id_str.contains('\x1b'),
+            !e.id.display_name().contains('\x1b'),
             "ESC control character must be stripped from entity id: {}",
-            e.id_str
+            e.id.display_name()
         );
     }
 }

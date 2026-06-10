@@ -54,6 +54,7 @@ lang-postgres = ["dep:tree-sitter", "dep:tree-sitter-postgres"]
 snafu.workspace = true
 blake3.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true
 time.workspace = true

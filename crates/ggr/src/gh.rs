@@ -325,6 +325,112 @@ pub(crate) fn fetch_commit_diff(
     local_review_core::diff::parse(&raw).map_err(GgrError::from)
 }
 
+// ── blob content fetching ─────────────────────────────────────────────────────
+
+/// Per-file result from `fetch_commit_file_contents`.
+#[derive(Debug)]
+pub(crate) struct FilePair {
+    pub path: String,
+    pub before: String,
+    pub after: String,
+}
+
+/// Fetch before/after content for each changed file in `file_paths` using a
+/// single GraphQL batch query.
+///
+/// `commit_sha` is the head commit; the before content uses `<sha>^` (the
+/// git parent notation), which GitHub's GraphQL API accepts. Returns one
+/// `FilePair` per path; missing blobs (added/deleted files) produce empty
+/// strings for the absent side.
+///
+/// On GraphQL error (e.g., response-size limit), all files are returned with
+/// empty content — the caller renders them as fallback rows.
+pub(crate) fn fetch_commit_file_contents(
+    repo_name: &RepoName,
+    commit_sha: &CommitSha,
+    file_paths: &[String],
+    hostname: Option<&str>,
+) -> Vec<FilePair> {
+    if file_paths.is_empty() {
+        return Vec::new();
+    }
+
+    let sha = commit_sha.as_str();
+    let Some((owner, repo)) = repo_name.as_str().split_once('/') else {
+        return fallback_pairs(file_paths);
+    };
+
+    let query = build_blob_query(sha, file_paths);
+    let body = serde_json::json!({
+        "query": query,
+        "variables": { "owner": owner, "repo": repo }
+    });
+    let Ok(body_bytes) = serde_json::to_vec(&body) else {
+        return fallback_pairs(file_paths);
+    };
+
+    let Ok(raw) = run_gh_with_stdin(&["api", "graphql", "--input", "-"], &body_bytes, hostname)
+    else {
+        return fallback_pairs(file_paths);
+    };
+
+    parse_blob_response(&raw, file_paths).unwrap_or_else(|_| fallback_pairs(file_paths))
+}
+
+fn fallback_pairs(file_paths: &[String]) -> Vec<FilePair> {
+    file_paths
+        .iter()
+        .map(|p| FilePair {
+            path: p.clone(),
+            before: String::new(),
+            after: String::new(),
+        })
+        .collect()
+}
+
+/// Build a batch GraphQL query that fetches each file at `<sha>:path` (after)
+/// and `<sha>^:path` (before) using field aliases.
+fn build_blob_query(sha: &str, file_paths: &[String]) -> String {
+    let mut q =
+        String::from("query($owner:String!,$repo:String!){repository(owner:$owner,name:$repo){");
+    for (i, path) in file_paths.iter().enumerate() {
+        let escaped = path.replace('\\', "\\\\").replace('"', "\\\"");
+        let after_alias =
+            format!("h{i}:object(expression:\"{sha}:{escaped}\"){{...on Blob{{text}}}}");
+        let before_alias =
+            format!("b{i}:object(expression:\"{sha}^:{escaped}\"){{...on Blob{{text}}}}");
+        q.push_str(&after_alias);
+        q.push_str(&before_alias);
+    }
+    q.push_str("}}");
+    q
+}
+
+fn parse_blob_response(raw: &str, file_paths: &[String]) -> Result<Vec<FilePair>> {
+    let v: serde_json::Value =
+        serde_json::from_str(raw).map_err(|source| GgrError::GhJsonParse { source })?;
+    let repo = &v["data"]["repository"];
+    let mut pairs = Vec::with_capacity(file_paths.len());
+    for (i, path) in file_paths.iter().enumerate() {
+        let after = repo[format!("h{i}")]
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        let before = repo[format!("b{i}")]
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        pairs.push(FilePair {
+            path: path.clone(),
+            before,
+            after,
+        });
+    }
+    Ok(pairs)
+}
+
 // ── review comments JSON shapes ───────────────────────────────────────────────
 
 /// GitHub API value for the `side` field on a review comment.

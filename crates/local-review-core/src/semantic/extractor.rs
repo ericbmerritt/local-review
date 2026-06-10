@@ -86,10 +86,25 @@ pub(crate) fn body_hash(content: &str) -> u64 {
     content_hash(&body)
 }
 
-/// Build the identity string for a `PlaceholderEntityId`.
+/// Build an `EntityId` from a scope string and file path.
 ///
-/// Format: `<file_path>::<kind>::<scope>` where `scope` is the `::` -separated
-/// container chain and the entity name (e.g., `AuthService::authenticate`).
-pub(crate) fn build_id_str(file_path: &str, kind: &str, scope: &str) -> String {
-    crate::util::strip_controls(&format!("{file_path}::{kind}::{scope}"))
+/// `scope` is the `::` -separated chain including the entity name, e.g.
+/// `"Session::refresh"`. `ordinal` defaults to 0; callers that need ordinal
+/// disambiguation must post-process the batch via `entity_id::assign_ordinals`.
+pub(crate) fn build_entity_id(
+    file_path: &str,
+    scope: &str,
+    ordinal: u32,
+) -> crate::semantic::entity_id::EntityId {
+    let chain: Vec<String> = scope
+        .split("::")
+        .map(crate::util::strip_controls)
+        .filter(|s| !s.is_empty())
+        .collect();
+    crate::semantic::entity_id::EntityId::new(
+        PathBuf::from(file_path),
+        chain,
+        None, // signature_key: computed in a future phase
+        ordinal,
+    )
 }
