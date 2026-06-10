@@ -1,8 +1,8 @@
 ## Phase 1: Semantic extraction layer
 
-| Status         | Started | Completed |
-| -------------- | ------- | --------- |
-| ⬜ not-started |         |           |
+| Status      | Started    | Completed  |
+| ----------- | ---------- | ---------- |
+| ✅ complete | 2026-06-10 | 2026-06-10 |
 
 Absorb sem-core's tree-sitter entity extraction into
 crates/local-review-core/src/semantic/. License attribution (MIT/Apache-2.0)
@@ -193,43 +193,24 @@ trivial entities, tree-sitter-pgsql is community grammar).
 #### Delivers
 
 - crates/local-review-core/src/semantic/ module with absorbed sem-core
-  (SemanticExtractor trait, per-language plugins, differ, Jaccard matcher,
-  identity)
 - 13 tree-sitter grammar deps in workspace Cargo.toml, pinned to exact versions,
-  named in the description
 - Bespoke tree-sitter-pgsql plugin for SQL with Postgres entity rules
-  (schema-qualified)
 - Golden-test corpus per language under
-  crates/local-review-core/tests/semantic-golden/<lang>/, paired
-  source/expected.json files
 - License attribution (MIT/Apache-2.0) for absorbed sem-core code in crate-level
-  docs
 - EntityCoreData public type as the layer's output interface, inline-defined in
-  this phase's domain
 - PlaceholderEntityId(String) newtype as the Phase 1 identity slot, replaced by
-  EntityId in Phase 2 without touching EntityCoreData field shapes
 
 #### Done When
 
 - All 13 languages extract entities from corpus fixtures; comparison is
-  field-exact JSON equality of the extractor output against the checked-in
-  expected.json per fixture
 - SQL plugin extracts tables, indexes, functions, views (and materialized
-  views), types, triggers, RLS policies, schemas, extensions, with schema
-  qualification (public.foo vs private.foo distinct EntityCoreData entries)
 - ALTER TABLE foo ADD COLUMN x is annotated as 'ALTER · ADD COLUMN x' on the
-  table entity, not as generic body change
 - DO blocks appear as anonymous block entities with opaque body content
 - Jaccard matcher links renamed entities across before/after content above 30%
-  similarity threshold
 - Entities below 20 tokens do not cross-file match (Jaccard noise mitigation)
 - strip_controls applied to all string fields entering EntityCoreData (entity
-  names, file paths, scope chain elements)
 - Files producing tree-sitter parses with ERROR nodes treated as full failure
-  (no partial entity list returned)
 - Container Rule holds: containers appear in output only when container
-  declaration itself changes; body-only changes surface contained entities
-  instead
 - just validate passes; clippy lints pass without unwrap/expect/as violations
 
 #### Depends On
@@ -447,48 +428,27 @@ trait additions).
 #### Delivers
 
 - EntityId structured tuple type ({file_path, scope_chain, signature_key,
-  ordinal}) with JSON serialization, replacing Phase 1's PlaceholderEntityId
-  across the extraction layer
 - Disk cache (CacheEntry with schema_version: u32) at
-  $XDG_DATA_HOME/ggr/cache/entities/<owner>/<repo>/<pr>/<commit_sha>.json (ggr)
-  and <repo_root>/.jj-review/entities/<change_id>-<content_hash_hex>.json (jjr);
-  fallback to ~/.local/share/ggr/cache/... when XDG_DATA_HOME unset
 - Content fetching: jj file show for jjr; single gh api graphql query per commit
-  for ggr returning HEAD/BASE blob OIDs + text
 - ReviewSurface trait extensions in crates/local-review-core/src/tui.rs:
-  fetch_entity_list, fetch_entity_diff, fetch_description_summary
 - Existing fetch_views preserved unchanged for the file diff escape hatch path
 - Surface implementations in jjr and ggr wiring extractor → cache → response
 - EntitySummary type (render-time view wrapping EntityCoreData + UI-computed
-  fields), DescriptionSummary type, LineRange type alias
 
 #### Done When
 
 - EntityId JSON roundtrip preserves the structured tuple shape (file_path,
-  scope_chain, signature_key, ordinal)
 - Two distinct entities with same (file_path, scope_chain, signature_key) get
-  different ordinals based on start_byte source order; ordinals are 0, 1, 2 in
-  source order
 - Inserting new entities above an existing duplicate-signature entity does not
-  reshuffle ordinals 0 and 1 of the existing duplicates
 - Cache round-trips through disk: write → read → equal EntityCoreData
 - CacheEntry includes graph: Option<GraphData> field as a forward-compatibility
-  slot (Phase 5 will populate it for jjr); reads with graph=None succeed
-  unchanged
 - Schema version mismatch on read invalidates the entry and triggers
-  re-extraction
 - jjr fetch_entity_list returns entities for a change ID; first call extracts
-  and caches; second call hits cache in under 100ms on developer-class hardware
 - ggr fetches HEAD and BASE blob content for all changed files of a commit via
-  single GraphQL query (not per-file HTTP calls)
 - When GraphQL response exceeds size limits, the tool surfaces the error and
-  renders every file in that commit as a fallback row; does not crash
 - Per-file content-fetch failure marks that file for fallback row downstream;
-  does not abort the rest of the extraction
 - jjr cache invalidates after jj squash modifies entity content (content_hash
-  component of cache key changes)
 - EntitySummary computed at render time from EntityCoreData; cache stores
-  EntityCoreData (semantic core) only, never EntitySummary (UI fields)
 - Cache filename hash formatting uses {:016x} (zero-padded lowercase hex)
 
 #### Depends On
@@ -704,59 +664,32 @@ phase; the toggle ships in Phase 4).
 #### Delivers
 
 - Screen::Main renders the entity list view (replaces previous file diff entry
-  point); Screen state lives in crates/local-review-core/src/tui/app.rs
 - Screen::EntityDiff state — focused full-file diff with pre-scroll + entity
-  range highlight
 - Screen::FileDiff state — relabeled escape hatch behind F
 - Description row as separate Option<DescriptionSummary> state on App, pinned at
-  top of entity list
 - Background extraction worker: std::thread + mpsc::channel for progress
-  events + Arc<AtomicBool> for cancellation
 - Tiered loading indicators (silent <300ms, status-bar spinner 300ms-1s, modal
-  overlay 1s+) with Esc-to-cancel
 - Cosmetic visual treatment: dimmed foreground + [cosmetic] suffix in the
-  annotation column for entries with structural_change=false
 - Bindings per spec: j/k, Enter, F, Tab/Shift-Tab, c, n/p, R, ?, q. Lowercase f
-  and ; have defined no-op behavior; ; toggle ships in Phase 4 (cosmetic
-  visibility binary on by default)
 
 #### Done When
 
 - Opening a change in jjr or a commit in ggr lands on the entity list screen at
-  80x24
 - Entity rows render with correct sigils (Δ/⊕/⊖/≈/○), file path column,
-  annotation column, and ● comment dot
 - Cosmetic entries (structural_change=false) render with DarkGray foreground and
-  [cosmetic] suffix in the annotation column; sigil and change-kind color
-  unchanged
 - Enter on an entity opens Screen::EntityDiff: file diff renders, pre-scrolled
-  to entity anchor line, entity range visually highlighted
 - Esc/q from entity diff returns to entity list
 - Tab from entity diff opens next entity's diff; Shift-Tab previous; both in
-  list order (file then line position)
 - F opens the existing file picker; selecting a file opens Screen::FileDiff
-  (full diff, no entity highlight)
 - Description row shows commit subject; Enter on description row opens the full
-  description screen
 - Loading overlay appears with progress counts (files done / total / failed)
-  when extraction exceeds 1s; spinner glyph appears in status bar between 300ms
-  and 1s
 - Esc during overlay cancels the extraction worker thread (cancellation flag
-  set; worker checks between files); already-extracted files retain their data
-  and render as entity rows; cancelled files render as fallback rows; the entity
-  list screen remains active
 - R subsumes any existing refresh binding — invalidates current commit cache,
-  re-fetches, re-extracts
 - Lowercase f on the entity list screen is a no-op (no error, no beep)
 - Files with extraction failures (binary, unsupported language, content-fetch
-  failure, parse-with-ERROR-nodes) appear as ○ fallback rows; Enter on a
-  fallback row drills to the file diff via fetch_views
 - Long entity names truncate with …; annotation column truncates moved-from
-  source path first when over budget
 - Stack bar continues to show commit/change identity above the entity list;
-  footer shows current bindings
 - Manual smoke test: open a real change in jjr and a real PR commit in ggr,
-  verify the entity list renders and behaves as described
 
 #### Depends On
 
@@ -963,60 +896,30 @@ tests).
 #### Delivers
 
 - entity_id: Option<EntityId> and anchor_fingerprint: AnchorFingerprint added to
-  comment schemas in crates/jjr/src/comment.rs and crates/ggr/src/draft.rs
-  (backward-compatible)
 - Re-anchor pipeline updated in both tools: entity-aware lookup with Jaccard
-  rename matching + fingerprint-based confidence scoring (threshold ≥3)
 - ReviewedBit { commit_id, entity_id, content_hash } storage in jjr
-  (crates/jjr/src/reviewed.rs) and ggr (equivalent), schema-versioned,
-  per-entity bits stored alongside existing per-file bits
 - Auto-mark on entity diff entry; ✓ glyph on reviewed entity rows in the entity
-  list
 - Cosmetic filter toggle: ; key hides cosmetic entries entirely; footer shows
-  current state ([cosmetic: shown] / [cosmetic: hidden]); composes with severity
-  filter (AND semantics)
 - Property-level re-anchoring fuzz tests per spec's Testing Strategy
 
 #### Done When
 
 - New comments capture entity_id (when line is inside an entity) and
-  anchor_fingerprint (always); old drafts without these fields work via legacy
-  re-anchor path
 - Comment on body line of authenticate() survives jj squash that preserves the
-  entity body line content
 - Renames matched by Jaccard (above 30% similarity) carry comments to the new
-  entity_id
 - Renames below Jaccard threshold leave comments without an entity match;
-  comments fall through to step 3 (file-wide search) and mark stale if no
-  fingerprint match
 - Step 2 of re-anchor pipeline (search within matched entity) does NOT fall
-  through to step 3 (file-wide search) — entity match plus fingerprint miss
-  marks stale immediately. Step 3 is only reached when there is no entity match
-  in step 1.
 - Repeated-line content (multiple return Err(e) lines) does not cause silent
-  comment migration to the wrong instance — fingerprint confidence threshold
-  catches this
 - Below-threshold fingerprint matches (score <3) mark stale rather than picking
-  highest-scoring weak match
 - Comments that auto-re-anchor under re-anchor pipeline acquire a fresh
-  anchor_fingerprint at re-anchor time (replacing the stored one) so subsequent
-  re-anchors have updated context
 - Per-entity reviewed bit for authenticate() at content_hash A clears when
-  content changes to hash B
 - Sibling untouched entities in the same file retain their reviewed bits when
-  one method is edited
 - Jaccard rename authenticate() → verifyAuth() with unchanged content
-  (content_hash matches) carries reviewed bit forward
 - Jaccard rename with changed content does not carry reviewed bit — entity
-  appears unreviewed
 - Reviewed-bit storage file gains a schema_version: u32 field; mismatched
-  versions on read trigger migration logic (no-op for v1, but the schema-version
-  mechanism is in place)
 - ; toggle hides cosmetic entities; footer hint reflects current state
 - Severity filter required + ; (cosmetic hidden) shows only entities where
-  severity=required AND structural_change=true (AND composition)
 - Property-level fuzz tests: edit scripts (insert lines, rename function, move
-  function, repeated lines) confirm pipeline behavior matches the criteria above
 
 #### Depends On
 
@@ -1216,42 +1119,24 @@ Enhancements' (ggr+Claude is a different feature, deferred).
 #### Delivers
 
 - Absorbed sem-core dependency-graph + context-budgeting logic in
-  crates/local-review-core/src/semantic/context/
 - Phase 2's CacheEntry graph: Option<GraphData> field populated for jjr at
-  extraction time
 - jjr Claude-handoff path replaced (in crates/jjr/src/claude.rs): each comment
-  gets bundle = comment + target entity + direct deps + direct dependents + diff
-  hunk
 - Token budget via JJR_CONTEXT_BUDGET env var, default 16000 tokens per comment
 - Truncation rule: comment + target entity + diff hunk always packed; dependents
-  dropped first, then dependencies; whole-entry drops only
 - Truncation note appended to Claude prompt when over budget
 - Token counter: char count / 4 heuristic (sufficient for v1; tuneable later)
 
 #### Done When
 
 - Absorbed dependency-graph code resolves cross-file calls within the local
-  repo: given an entity, return its direct callers and callees from the parsed
-  call graph
 - GraphData populates jjr's CacheEntry.graph at extraction time; persists across
-  jjr sessions via the cache
 - jjr handoff includes deps and dependents in the bundle when within budget
 - Bundle progressively truncates when over budget: drop entire dependents
-  entries first, then entire dependencies entries; comment/target/hunk never
-  dropped
 - Setting JJR_CONTEXT_BUDGET=8000 constrains the bundle to approximately that
-  token count using char-count/4 heuristic
 - Over-budget bundle includes 'context truncated to budget; N of M dependents
-  omitted' line in the Claude prompt
 - Bundle replaces the raw-hunk Claude prompt at every Claude invocation call
-  site in jjr
 - ggr Claude path is NOT modified in this phase — ggr+Claude is deferred (see
-  spec's Later Enhancements); the existing absence of ggr Claude integration is
-  preserved unchanged
 - Cache schema version is bumped from Phase 2's value to a new value when
-  GraphData starts populating (or compatible: schema_version stays stable if
-  GraphData was already part of the Phase 2 schema; the design choice is
-  documented in code)
 
 #### Depends On
 
@@ -1350,25 +1235,17 @@ bar' (format and behavior), 'Scope: jjr vs ggr' (caller count is jjr only),
 #### Delivers
 
 - jjr entity diff view shows passive status-bar context when cursor is within an
-  entity's range: 'authenticate() modified · sig+body · called from 8 places'
 - Status bar updates as cursor moves between entities in the diff view
 - ggr entity diff view shows entity context (name + annotation) but no caller
-  count segment
 
 #### Done When
 
 - Opening an entity diff in jjr places cursor on entity anchor line; status bar
-  reads e.g. 'authenticate() modified · sig+body · called from 8 places'
 - Scrolling cursor to a different entity in the same file updates the status-bar
-  context to that entity's name and caller count
 - Scrolling cursor outside any entity range clears the entity-context portion of
-  the status bar (transient messages can still display normally)
 - ggr entity diff view shows 'authenticate() modified · sig+body' (entity name +
-  annotation) but does NOT show 'called from N places' segment
 - Caller count lookup per focus event completes in under 50ms (cached graph +
-  direct-callers walk only — no transitive walk)
 - Transient messages (save confirmations, etc.) display briefly per their
-  existing timeout, then yield back to persistent entity context when cleared
 
 #### Depends On
 

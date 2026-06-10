@@ -19,6 +19,37 @@ include = [
 [lints]
 workspace = true
 
+[features]
+default = ["lang-all"]
+lang-all = [
+  "lang-rust",
+  "lang-typescript",
+  "lang-javascript",
+  "lang-python",
+  "lang-go",
+  "lang-java",
+  "lang-scala",
+  "lang-kotlin",
+  "lang-bash",
+  "lang-yaml",
+  "lang-json",
+  "lang-toml",
+  "lang-postgres",
+]
+lang-rust = ["dep:tree-sitter", "dep:tree-sitter-rust"]
+lang-typescript = ["dep:tree-sitter", "dep:tree-sitter-typescript"]
+lang-javascript = ["dep:tree-sitter", "dep:tree-sitter-javascript"]
+lang-python = ["dep:tree-sitter", "dep:tree-sitter-python"]
+lang-go = ["dep:tree-sitter", "dep:tree-sitter-go"]
+lang-java = ["dep:tree-sitter", "dep:tree-sitter-java"]
+lang-scala = ["dep:tree-sitter", "dep:tree-sitter-scala"]
+lang-kotlin = ["dep:tree-sitter", "dep:tree-sitter-kotlin-ng"]
+lang-bash = ["dep:tree-sitter", "dep:tree-sitter-bash"]
+lang-yaml = ["dep:tree-sitter", "dep:tree-sitter-yaml"]
+lang-json = ["dep:tree-sitter", "dep:tree-sitter-json"]
+lang-toml = ["dep:tree-sitter", "dep:tree-sitter-toml-ng"]
+lang-postgres = ["dep:tree-sitter", "dep:tree-sitter-postgres"]
+
 [dependencies]
 snafu.workspace = true
 blake3.workspace = true
@@ -27,6 +58,20 @@ ratatui.workspace = true
 crossterm.workspace = true
 time.workspace = true
 tempfile.workspace = true
+tree-sitter = { workspace = true, optional = true }
+tree-sitter-bash = { workspace = true, optional = true }
+tree-sitter-go = { workspace = true, optional = true }
+tree-sitter-java = { workspace = true, optional = true }
+tree-sitter-javascript = { workspace = true, optional = true }
+tree-sitter-json = { workspace = true, optional = true }
+tree-sitter-kotlin-ng = { workspace = true, optional = true }
+tree-sitter-postgres = { workspace = true, optional = true }
+tree-sitter-python = { workspace = true, optional = true }
+tree-sitter-rust = { workspace = true, optional = true }
+tree-sitter-scala = { workspace = true, optional = true }
+tree-sitter-toml-ng = { workspace = true, optional = true }
+tree-sitter-typescript = { workspace = true, optional = true }
+tree-sitter-yaml = { workspace = true, optional = true }
 
 [dev-dependencies]
 serde_json.workspace = true
