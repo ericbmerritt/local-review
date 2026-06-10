@@ -14,6 +14,12 @@
 //! - [`severity`] — comment severity enum
 //! - [`comment`], [`change_id`], [`error`] — shared data types
 //!
+//! ## Semantic extraction layer
+//!
+//! The [`semantic`] module provides tree-sitter-based entity extraction and
+//! diff computation. It is feature-gated: each language grammar is an optional
+//! dependency; the `default` feature enables all 13 supported languages.
+//!
 //! ## Terminal rendering layer
 //!
 //! The [`tui`] module adds terminal-rendering and clock dependencies
@@ -28,6 +34,7 @@ pub mod comment;
 pub mod diff;
 pub mod error;
 pub mod revset_hash;
+pub mod semantic;
 pub mod severity;
 pub mod tui;
 pub mod util;
