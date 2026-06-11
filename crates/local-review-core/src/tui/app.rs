@@ -163,7 +163,18 @@ pub struct TransitionState {
 /// All screens the generic app can be in. Tool-specific overlays live behind
 /// `Extra(Box<dyn ExtraScreen>)`.
 pub enum Screen {
+    /// Entity list — primary entry point after entering a change/commit.
     Main,
+    /// Focused full-file diff for one entity (pre-scrolled + range highlight).
+    EntityDiff {
+        /// Index into `App::entities` identifying the focused entity.
+        entity_idx: usize,
+    },
+    /// Full file diff without entity focus (the `F` escape hatch).
+    FileDiff {
+        /// Index into `App::rendered_per_file`.
+        file_idx: usize,
+    },
     Help,
     /// Between-change transition beat shown in stack mode.
     Transition(TransitionState),
@@ -171,6 +182,8 @@ pub enum Screen {
     Extra(Box<dyn ExtraScreen>),
     /// File picker modal.
     FilePicker(FilePickerState),
+    /// Extraction in progress: showing loading overlay.
+    Extracting,
 }
 
 // ---------------------------------------------------------------------------
@@ -209,6 +222,22 @@ pub struct App<S: ReviewSurfaceExt> {
     pub(crate) needs_full_redraw: bool,
     /// Scroll offset for the help screen.
     pub(crate) help_scroll: u16,
+
+    // ── Entity navigation state (Phase 3) ─────────────────────────────────────
+    /// Entities loaded for the current entry; empty until extraction completes.
+    pub(crate) entities: Vec<crate::semantic::EntitySummary>,
+    /// Pinned description row for the entity list.
+    pub(crate) description_summary: Option<crate::semantic::DescriptionSummary>,
+    /// Cursor row in the entity list (0 = description row, 1+ = entities).
+    pub(crate) entity_index: usize,
+    /// Scroll offset for the entity list.
+    pub(crate) entity_scroll: usize,
+    /// `true` when the `;` cosmetic filter is active.
+    pub(crate) cosmetic_filter_on: bool,
+    /// In-progress extraction worker (present only while `screen == Extracting`).
+    pub(crate) extraction: Option<crate::tui::entity_list::ExtractionInProgress>,
+    /// Monotonically-incrementing tick for spinner animation.
+    pub(crate) tick: u64,
 }
 
 impl<S: ReviewSurfaceExt> App<S> {
@@ -259,6 +288,13 @@ impl<S: ReviewSurfaceExt> App<S> {
             diff_mode: DiffMode::Auto,
             needs_full_redraw: false,
             help_scroll: 0,
+            entities: Vec::new(),
+            description_summary: None,
+            entity_index: 0,
+            entity_scroll: 0,
+            cosmetic_filter_on: false,
+            extraction: None,
+            tick: 0,
         }
     }
 
@@ -509,6 +545,10 @@ impl<S: ReviewSurfaceExt> App<S> {
         let views = self.surface.fetch_views(idx)?;
         self.rendered_per_file = views;
         self.annotated_per_file = BaseViews(self.rendered_per_file.clone());
+        // Populate the entity list so the first draw shows entities, not a
+        // blank gray bar. load_entry does the same; this covers the startup
+        // path in run_app which calls reload_current_entry, not load_entry.
+        self.start_entity_extraction(idx);
         Ok(())
     }
 
@@ -524,7 +564,72 @@ impl<S: ReviewSurfaceExt> App<S> {
         self.refresh_inline_comments();
         self.mark_current_file_reviewed();
         self.surface.on_entry_loaded(idx, record_cursor);
+        // Start entity extraction for the entity list view.
+        self.start_entity_extraction(idx);
         Ok(())
+    }
+
+    /// Kick off entity extraction for entry `idx` in a background thread.
+    ///
+    /// If extraction finishes instantly (cache hit), the entities land in
+    /// `self.entities` immediately. Otherwise the screen transitions to
+    /// `Screen::Extracting` and the main loop polls the channel.
+    fn start_entity_extraction(&mut self, idx: usize) {
+        // Cancel any in-flight extraction.
+        if let Some(ref prev) = self.extraction {
+            crate::tui::entity_list::cancel_extraction(prev);
+        }
+        self.extraction = None;
+        self.entities.clear();
+        self.description_summary = None;
+        self.entity_index = 0;
+        self.entity_scroll = 0;
+
+        // Try the surface synchronously first — a cache hit returns immediately.
+        match self.surface.fetch_entity_list(idx) {
+            Ok(entities) => {
+                self.entities = entities;
+                self.description_summary = self.surface.fetch_description_summary(idx).ok();
+                self.screen = Screen::Main;
+            }
+            Err(_) => {
+                // Surface returned an error (no entities available).
+                self.screen = Screen::Main;
+            }
+        }
+    }
+
+    /// Scroll the diff view so that `target_line` (1-indexed) is near the top.
+    pub(crate) fn scroll_to_line(&mut self, target_line: u32) {
+        let line = usize::from(u16::try_from(target_line).unwrap_or(u16::MAX));
+        self.line_index = line.saturating_sub(1);
+        self.scroll = u16::try_from(line.saturating_sub(3)).unwrap_or(0);
+    }
+
+    /// Advance to the next entity in `Screen::EntityDiff` (clamps at last).
+    pub(crate) fn next_entity(&mut self) {
+        if self.entities.is_empty() {
+            return;
+        }
+        let current = if let Screen::EntityDiff { entity_idx } = self.screen {
+            entity_idx
+        } else {
+            0
+        };
+        let next = (current + 1).min(self.entities.len() - 1);
+        self.screen = Screen::EntityDiff { entity_idx: next };
+    }
+
+    /// Retreat to the previous entity in `Screen::EntityDiff` (clamps at first).
+    pub(crate) fn prev_entity(&mut self) {
+        let current = if let Screen::EntityDiff { entity_idx } = self.screen {
+            entity_idx
+        } else {
+            0
+        };
+        self.screen = Screen::EntityDiff {
+            entity_idx: current.saturating_sub(1),
+        };
     }
 
     /// Advance to the next entry in stack mode.
@@ -887,14 +992,14 @@ where
 // ---------------------------------------------------------------------------
 
 pub(crate) fn render<S: ReviewSurfaceExt>(frame: &mut Frame<'_>, app: &mut App<S>) {
+    app.tick = app.tick.wrapping_add(1);
+
     if matches!(app.screen, Screen::Extra(_)) {
         let Screen::Extra(state) = std::mem::replace(&mut app.screen, Screen::Main) else {
             unreachable!("matched above");
         };
-        // Overlay screens render on top of the main view; full-screen extras
-        // replace the main view entirely.
         if state.is_overlay() {
-            render_main(frame, app);
+            render_dispatch(frame, app);
         }
         let mut state = state;
         app.surface.render_extra_screen(frame, state.as_mut());
@@ -902,9 +1007,11 @@ pub(crate) fn render<S: ReviewSurfaceExt>(frame: &mut Frame<'_>, app: &mut App<S
         return;
     }
 
-    render_main(frame, app);
+    render_dispatch(frame, app);
+
     match &app.screen {
-        Screen::Main => {}
+        Screen::Main | Screen::EntityDiff { .. } | Screen::FileDiff { .. } | Screen::Extracting => {
+        }
         Screen::Help => {
             help_screen::render(
                 frame,
@@ -921,6 +1028,113 @@ pub(crate) fn render<S: ReviewSurfaceExt>(frame: &mut Frame<'_>, app: &mut App<S
         }
         Screen::Extra(_) => unreachable!("handled above"),
     }
+}
+
+/// Route rendering to the right function based on the current screen.
+fn render_dispatch<S: ReviewSurfaceExt>(frame: &mut Frame<'_>, app: &mut App<S>) {
+    match &app.screen {
+        Screen::EntityDiff { entity_idx } => {
+            let eidx = *entity_idx;
+            render_entity_diff_screen(frame, app, eidx);
+        }
+        Screen::FileDiff { file_idx } => {
+            let fidx = *file_idx;
+            render_file_diff_screen(frame, app, fidx);
+        }
+        Screen::Main
+        | Screen::Extracting
+        | Screen::Help
+        | Screen::Transition(_)
+        | Screen::FilePicker(_)
+        | Screen::Extra(_) => render_entity_list_screen(frame, app),
+    }
+}
+
+/// Render the entity list screen (the new `Screen::Main`).
+fn render_entity_list_screen<S: ReviewSurfaceExt>(frame: &mut Frame<'_>, app: &mut App<S>) {
+    let area = frame.area();
+    let layout = Layout::vertical([
+        Constraint::Length(3), // stack bar
+        Constraint::Length(1), // description row
+        Constraint::Length(1), // divider
+        Constraint::Min(1),    // entity list body
+        Constraint::Length(1), // footer
+    ])
+    .split(area);
+
+    render_stack_bar(frame, layout[0], app);
+
+    let desc_area = layout[1];
+    let (subject, comment_count) = app
+        .description_summary
+        .as_ref()
+        .map(|d| (d.subject.as_str(), d.comment_count))
+        .unwrap_or(("", 0));
+    let desc_focused = app.entity_index == 0;
+    crate::tui::entity_list::render_description_row(
+        frame,
+        desc_area,
+        subject,
+        comment_count,
+        desc_focused,
+    );
+    crate::tui::entity_list::render_divider(frame, layout[2]);
+
+    let body_area = layout[3];
+    app.viewport_rows = body_area.height;
+    crate::tui::entity_list::render_entity_list_body(frame, body_area, app);
+
+    render_footer(frame, layout[4], app);
+
+    // Loading overlay on top of the entity list body.
+    if matches!(app.screen, Screen::Extracting) {
+        if let Some(ref prog) = app.extraction {
+            crate::tui::entity_list::render_loading_overlay(
+                frame,
+                prog.files_done,
+                prog.files_total,
+                prog.files_failed,
+                app.tick,
+            );
+        }
+    }
+}
+
+/// Render a focused file diff for one entity (`Screen::EntityDiff`).
+fn render_entity_diff_screen<S: ReviewSurfaceExt>(
+    frame: &mut Frame<'_>,
+    app: &mut App<S>,
+    entity_idx: usize,
+) {
+    // Set the file_index to the file containing this entity so render_main
+    // renders the correct view.
+    if let Some(entity) = app.entities.get(entity_idx) {
+        let target = entity.file_path.to_string_lossy().into_owned();
+        // DiffView titles use path.display() for modified/added/removed files
+        // and "old -> new" for renames. Match exactly for non-rename titles;
+        // for renames, check that the title ends with " -> <new_path>".
+        let findex = app
+            .rendered_per_file
+            .iter()
+            .position(|v| v.title == target || v.title.ends_with(&format!(" -> {target}")))
+            .unwrap_or(app.file_index);
+        app.file_index = findex;
+        // Pre-scroll to entity anchor line.
+        if let Some(target) = entity.target_line {
+            app.scroll_to_line(target);
+        }
+    }
+    render_main(frame, app);
+}
+
+/// Render the full file diff (the `F` escape hatch, `Screen::FileDiff`).
+fn render_file_diff_screen<S: ReviewSurfaceExt>(
+    frame: &mut Frame<'_>,
+    app: &mut App<S>,
+    file_idx: usize,
+) {
+    app.file_index = file_idx;
+    render_main(frame, app);
 }
 
 fn render_main<S: ReviewSurfaceExt>(frame: &mut Frame<'_>, app: &mut App<S>) {
@@ -1448,7 +1662,21 @@ fn handle_event<S: ReviewSurfaceExt>(app: &mut App<S>) -> Result<(), AppError<S>
             return Ok(());
         }
         match &app.screen {
-            Screen::Main => handle_main_key(app, key).map_err(AppError::Surface)?,
+            Screen::Main => {
+                handle_entity_list_key(app, key).map_err(AppError::Surface)?;
+            }
+            Screen::Extracting => {
+                // Only Esc is handled during extraction.
+                if key.code == KeyCode::Esc {
+                    if let Some(ref prog) = app.extraction {
+                        crate::tui::entity_list::cancel_extraction(prog);
+                    }
+                    app.screen = Screen::Main;
+                }
+            }
+            Screen::EntityDiff { .. } | Screen::FileDiff { .. } => {
+                handle_file_view_key(app, key).map_err(AppError::Surface)?;
+            }
             Screen::Help => handle_help_key(app, key),
             Screen::Transition(_) => handle_transition_key(app, key).map_err(AppError::Surface)?,
             Screen::Extra(_) => handle_extra_screen_key(app, key).map_err(AppError::Surface)?,
@@ -1458,19 +1686,124 @@ fn handle_event<S: ReviewSurfaceExt>(app: &mut App<S>) -> Result<(), AppError<S>
     Ok(())
 }
 
+/// Key handler for the entity list screen (`Screen::Main`).
 #[expect(
     clippy::wildcard_enum_match_arm,
     reason = "unhandled KeyCode variants are intentionally ignored"
 )]
-fn handle_main_key<S: ReviewSurfaceExt>(app: &mut App<S>, key: KeyEvent) -> Result<(), S::Error> {
-    // Clear status on every key (surface's handle_extra_key sets its own).
+fn handle_entity_list_key<S: ReviewSurfaceExt>(
+    app: &mut App<S>,
+    key: KeyEvent,
+) -> Result<(), S::Error> {
     app.status_message = None;
-
     match key.code {
         KeyCode::Char('q') => app.should_quit = true,
         KeyCode::Char('?') => {
             app.help_scroll = 0;
             app.screen = Screen::Help;
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            crate::tui::entity_list::move_entity_cursor(app, -1);
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            crate::tui::entity_list::move_entity_cursor(app, 1);
+        }
+        KeyCode::Enter => {
+            // Description row (index 0) → open description in file view.
+            // Entity rows → open focused entity diff.
+            if app.entity_index == 0 {
+                app.screen = Screen::FileDiff { file_idx: 0 };
+            } else {
+                let eidx = app.entity_index - 1;
+                app.screen = Screen::EntityDiff { entity_idx: eidx };
+            }
+        }
+        // Tab/Shift-Tab on the entity list moves cursor selection (same as j/k).
+        // Cycling *into* entity diffs happens in handle_file_view_key where
+        // Tab/Shift-Tab navigate between Screen::EntityDiff views.
+        KeyCode::Tab => crate::tui::entity_list::move_entity_cursor(app, 1),
+        KeyCode::BackTab => crate::tui::entity_list::move_entity_cursor(app, -1),
+        KeyCode::Char('F') => {
+            let fidx = app.file_index;
+            app.screen = Screen::FileDiff { file_idx: fidx };
+        }
+        KeyCode::Char('n') => app.advance_stack()?,
+        KeyCode::Char('p') => app.retreat_stack()?,
+        KeyCode::Char('1') => app.toggle_severity_filter(Severity::Required),
+        KeyCode::Char('2') => app.toggle_severity_filter(Severity::Suggestion),
+        KeyCode::Char('3') => app.toggle_severity_filter(Severity::Note),
+        KeyCode::Char(';') => {
+            app.cosmetic_filter_on = !app.cosmetic_filter_on;
+            let msg = if app.cosmetic_filter_on {
+                "cosmetic filter: hidden".to_owned()
+            } else {
+                "cosmetic filter: shown".to_owned()
+            };
+            app.status_message = Some(msg);
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Delegate an unhandled key to the surface's `handle_extra_key`, resolving
+/// the line index for side-by-side mode and applying the returned action.
+fn delegate_to_surface<S: ReviewSurfaceExt>(
+    app: &mut App<S>,
+    key: KeyEvent,
+) -> Result<(), S::Error> {
+    let annotated_clone = app.current_view().cloned();
+    let lines_index = match app.effective_diff_mode() {
+        EffectiveDiffMode::Unified => app.line_index,
+        EffectiveDiffMode::SideBySide => annotated_clone
+            .as_ref()
+            .and_then(|v| v.paired_rows.get(app.line_index))
+            .and_then(|row| match row {
+                PairedRow::Spanning(idx)
+                | PairedRow::Pair {
+                    right: Some(idx), ..
+                }
+                | PairedRow::Pair {
+                    left: Some(idx),
+                    right: None,
+                } => Some(*idx),
+                PairedRow::Pair {
+                    left: None,
+                    right: None,
+                } => None,
+            })
+            .unwrap_or(app.line_index),
+    };
+    let action =
+        app.surface
+            .handle_extra_key(key, app.file_index, lines_index, annotated_clone.as_ref())?;
+    match action {
+        ExtraKeyAction::Ignored => {}
+        ExtraKeyAction::OpenScreen(state) => app.screen = Screen::Extra(state),
+        ExtraKeyAction::StatusMessage(msg) => app.status_message = Some(msg),
+        ExtraKeyAction::RefreshAndStatus(msg) => {
+            app.status_message = Some(msg);
+            app.refresh_inline_comments();
+        }
+        ExtraKeyAction::Quit => app.should_quit = true,
+    }
+    Ok(())
+}
+
+/// Key handler for file diff views (`Screen::EntityDiff` and `Screen::FileDiff`).
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "unhandled KeyCode variants are intentionally ignored"
+)]
+fn handle_file_view_key<S: ReviewSurfaceExt>(
+    app: &mut App<S>,
+    key: KeyEvent,
+) -> Result<(), S::Error> {
+    app.status_message = None;
+    match key.code {
+        KeyCode::Char('q') | KeyCode::Esc => {
+            // Return to entity list.
+            app.screen = Screen::Main;
         }
         KeyCode::Up | KeyCode::Char('k') => app.move_line(-1),
         KeyCode::Down | KeyCode::Char('j') => app.move_line(1),
@@ -1478,68 +1811,29 @@ fn handle_main_key<S: ReviewSurfaceExt>(app: &mut App<S>, key: KeyEvent) -> Resu
         KeyCode::PageDown => app.move_page(1),
         KeyCode::Home | KeyCode::Char('g') => app.jump_to(Edge::Top),
         KeyCode::End | KeyCode::Char('G') => app.jump_to(Edge::Bottom),
-        KeyCode::Tab => app.cycle_file(1),
-        KeyCode::BackTab => app.cycle_file(-1),
+        KeyCode::Tab => {
+            if matches!(app.screen, Screen::EntityDiff { .. }) {
+                app.next_entity();
+            } else {
+                app.cycle_file(1);
+            }
+        }
+        KeyCode::BackTab => {
+            if matches!(app.screen, Screen::EntityDiff { .. }) {
+                app.prev_entity();
+            } else {
+                app.cycle_file(-1);
+            }
+        }
+        KeyCode::Char('F') => open_file_picker(app),
         KeyCode::Char('n') => app.advance_stack()?,
         KeyCode::Char('p') => app.retreat_stack()?,
-        KeyCode::Char('f') => open_file_picker(app),
         KeyCode::Char('1') => app.toggle_severity_filter(Severity::Required),
         KeyCode::Char('2') => app.toggle_severity_filter(Severity::Suggestion),
         KeyCode::Char('3') => app.toggle_severity_filter(Severity::Note),
         KeyCode::Char('U') => app.toggle_current_file_reviewed(),
         KeyCode::Char('|') => app.cycle_diff_mode(),
-        _ => {
-            // Delegate to the surface for tool-specific keys.
-            // Pass the annotated view (not the base view) so surfaces can
-            // read injected InlineCommentMeta line kinds at the cursor.
-            // In side-by-side mode line_index is a paired_rows index; resolve
-            // it to the corresponding lines index so surfaces index correctly.
-            // Clone to release the immutable borrow before the mutable call.
-            let annotated_clone = app.current_view().cloned();
-            let lines_index = match app.effective_diff_mode() {
-                EffectiveDiffMode::Unified => app.line_index,
-                EffectiveDiffMode::SideBySide => annotated_clone
-                    .as_ref()
-                    .and_then(|v| v.paired_rows.get(app.line_index))
-                    .and_then(|row| match row {
-                        PairedRow::Spanning(idx)
-                        | PairedRow::Pair {
-                            right: Some(idx), ..
-                        }
-                        | PairedRow::Pair {
-                            left: Some(idx),
-                            right: None,
-                        } => Some(*idx),
-                        PairedRow::Pair {
-                            left: None,
-                            right: None,
-                        } => None,
-                    })
-                    .unwrap_or(app.line_index),
-            };
-            let action = app.surface.handle_extra_key(
-                key,
-                app.file_index,
-                lines_index,
-                annotated_clone.as_ref(),
-            )?;
-            match action {
-                ExtraKeyAction::Ignored => {}
-                ExtraKeyAction::OpenScreen(state) => {
-                    app.screen = Screen::Extra(state);
-                }
-                ExtraKeyAction::StatusMessage(msg) => {
-                    app.status_message = Some(msg);
-                }
-                ExtraKeyAction::RefreshAndStatus(msg) => {
-                    app.status_message = Some(msg);
-                    app.refresh_inline_comments();
-                }
-                ExtraKeyAction::Quit => {
-                    app.should_quit = true;
-                }
-            }
-        }
+        _ => delegate_to_surface(app, key)?,
     }
     Ok(())
 }
@@ -2470,6 +2764,119 @@ mod app_tests {
             app.status_message.as_deref(),
             Some("prior"),
             "NotTracked must not clobber a pre-existing status_message"
+        );
+    }
+
+    // ── Entity navigation ────────────────────────────────────────────────────
+
+    fn make_app_with_entities(entity_count: usize) -> App<NoopSurface> {
+        let view = view_with_kinds(&[RenderedLineKind::Added]);
+        let surface = NoopSurface::new(vec![view.clone()]);
+        let mut app = App::new(surface, vec![view], TransitionMode::Never);
+        // Populate entities with dummy summaries.
+        for i in 0..entity_count {
+            app.entities.push(crate::semantic::EntitySummary {
+                id: crate::semantic::EntityId::new(
+                    std::path::PathBuf::from("test.rs"),
+                    vec![format!("fn{i}")],
+                    None,
+                    0,
+                ),
+                display_name: format!("fn{i}"),
+                kind: crate::semantic::EntityKind::Function,
+                change: crate::semantic::ChangeType::Modified,
+                annotation: crate::semantic::ChangeAnnotation::BodyOnly,
+                file_path: std::path::PathBuf::from("test.rs"),
+                source_file: None,
+                target_line: None,
+                line_range: (1, 10),
+                structural_change: true,
+                content_hash: 0,
+                comment_count: 0,
+            });
+        }
+        app
+    }
+
+    #[test]
+    fn entity_list_starts_at_description_row() {
+        let app = make_app_with_entities(3);
+        assert_eq!(
+            app.entity_index, 0,
+            "entity_index must start at 0 (description row)"
+        );
+    }
+
+    #[test]
+    fn move_entity_cursor_advances_past_description_to_entity() {
+        let mut app = make_app_with_entities(3);
+        crate::tui::entity_list::move_entity_cursor(&mut app, 1);
+        assert_eq!(app.entity_index, 1, "cursor must advance to first entity");
+        crate::tui::entity_list::move_entity_cursor(&mut app, 1);
+        assert_eq!(app.entity_index, 2, "cursor must advance to second entity");
+    }
+
+    #[test]
+    fn move_entity_cursor_clamps_at_last_entity() {
+        let mut app = make_app_with_entities(2);
+        crate::tui::entity_list::move_entity_cursor(&mut app, 100);
+        assert_eq!(
+            app.entity_index, 2,
+            "cursor must clamp at last entity (description + 2 entities)"
+        );
+    }
+
+    #[test]
+    fn move_entity_cursor_clamps_at_description_row() {
+        let mut app = make_app_with_entities(2);
+        app.entity_index = 1;
+        crate::tui::entity_list::move_entity_cursor(&mut app, -100);
+        assert_eq!(
+            app.entity_index, 0,
+            "cursor must clamp at description row (0)"
+        );
+    }
+
+    #[test]
+    fn entity_list_len_includes_description_and_all_entities() {
+        let app = make_app_with_entities(4);
+        let len = crate::tui::entity_list::entity_list_len(&app);
+        assert_eq!(len, 5, "len must be entity_count + 1 (description row)");
+    }
+
+    #[test]
+    fn cosmetic_filter_reduces_entity_list_len() {
+        let mut app = make_app_with_entities(3);
+        // Make entity 0 cosmetic (structural_change = false).
+        app.entities[0].structural_change = false;
+        app.cosmetic_filter_on = true;
+        let len = crate::tui::entity_list::entity_list_len(&app);
+        assert_eq!(
+            len, 3,
+            "cosmetic filter must exclude the cosmetic entity; len = description + 2 visible"
+        );
+    }
+
+    #[test]
+    fn scroll_to_line_sets_line_index_and_scroll() {
+        let mut app = make_app_with_entities(0);
+        app.scroll_to_line(10);
+        assert_eq!(app.line_index, 9, "line_index must be 0-based (10 - 1)");
+    }
+
+    #[test]
+    fn cosmetic_filter_toggle_updates_status() {
+        let view = view_with_kinds(&[RenderedLineKind::Added]);
+        let surface = NoopSurface::new(vec![view.clone()]);
+        let mut app = App::new(surface, vec![view], TransitionMode::Never);
+        assert!(!app.cosmetic_filter_on, "filter must start off");
+        // Simulate the ; key handler toggling the flag.
+        app.cosmetic_filter_on = true;
+        app.status_message = Some("cosmetic filter: hidden".to_owned());
+        assert!(app.cosmetic_filter_on, "filter must be on after toggle");
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("cosmetic filter: hidden")
         );
     }
 }

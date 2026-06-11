@@ -13,6 +13,7 @@ pub mod app;
 pub mod composer;
 pub mod composer_overlay;
 pub mod diff_view;
+pub mod entity_list;
 pub mod file_picker;
 pub mod help_screen;
 pub mod textarea;
