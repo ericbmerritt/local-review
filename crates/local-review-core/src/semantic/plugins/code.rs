@@ -44,11 +44,18 @@ pub(crate) struct LanguageSpec {
 
 // ── Name extraction ───────────────────────────────────────────────────────────
 
-/// Extract the name text from a node using its `name` named field, or by
-/// scanning for the first `identifier` / `type_identifier` child.
+/// Extract the name text from a node.
+///
+/// Search order:
+/// 1. `name` field (most code languages)
+/// 2. `key` field (YAML `block_mapping_pair`, JSON `pair`, TOML `pair`)
+/// 3. First `identifier`/`type_identifier`/`property_identifier` child
 fn node_name<'t>(node: Node<'t>, src: &'t [u8]) -> Option<&'t str> {
     if let Some(n) = node.child_by_field_name("name") {
         return n.utf8_text(src).ok();
+    }
+    if let Some(k) = node.child_by_field_name("key") {
+        return k.utf8_text(src).ok();
     }
     for child in node.named_children(&mut node.walk()) {
         if matches!(
