@@ -234,6 +234,12 @@ pub struct App<S: ReviewSurfaceExt> {
     pub(crate) entity_scroll: usize,
     /// `true` when the `;` cosmetic filter is active.
     pub(crate) cosmetic_filter_on: bool,
+    /// `true` when `Screen::EntityDiff` shows only lines within the entity's
+    /// range rather than the full file diff. Toggled with `x`.
+    pub(crate) entity_clip: bool,
+    /// Tracks the `(entity_idx, entity_clip)` pair for which scroll was last
+    /// initialized; prevents re-initializing on every render tick.
+    pub(crate) entity_diff_initialized: Option<(usize, bool)>,
     /// In-progress extraction worker (present only while `screen == Extracting`).
     pub(crate) extraction: Option<crate::tui::entity_list::ExtractionInProgress>,
     /// Monotonically-incrementing tick for spinner animation.
@@ -293,6 +299,8 @@ impl<S: ReviewSurfaceExt> App<S> {
             entity_index: 0,
             entity_scroll: 0,
             cosmetic_filter_on: false,
+            entity_clip: true,
+            entity_diff_initialized: None,
             extraction: None,
             tick: 0,
         }
@@ -600,6 +608,8 @@ impl<S: ReviewSurfaceExt> App<S> {
     }
 
     /// Scroll the diff view so that `target_line` (1-indexed) is near the top.
+    /// Used in tests; production code uses diff-view row translation instead.
+    #[cfg(test)]
     pub(crate) fn scroll_to_line(&mut self, target_line: u32) {
         let line = usize::from(u16::try_from(target_line).unwrap_or(u16::MAX));
         self.line_index = line.saturating_sub(1);
@@ -1084,6 +1094,25 @@ fn render_entity_list_screen<S: ReviewSurfaceExt>(frame: &mut Frame<'_>, app: &m
     app.viewport_rows = body_area.height;
     crate::tui::entity_list::render_entity_list_body(frame, body_area, app);
 
+    // When there are no entities, show a dimmed hint so the reviewer
+    // knows the list is empty rather than broken.
+    if app.entities.is_empty() && body_area.height > 0 {
+        use ratatui::style::{Color, Style};
+        use ratatui::text::{Line as TuiLine, Span};
+        use ratatui::widgets::Paragraph;
+        frame.render_widget(
+            Paragraph::new(TuiLine::from(Span::styled(
+                "  no entities — change has no extractable code",
+                Style::default().fg(Color::DarkGray),
+            ))),
+            Rect {
+                y: body_area.y,
+                height: 1,
+                ..body_area
+            },
+        );
+    }
+
     render_footer(frame, layout[4], app);
 
     // Loading overlay on top of the entity list body.
@@ -1100,6 +1129,31 @@ fn render_entity_list_screen<S: ReviewSurfaceExt>(frame: &mut Frame<'_>, app: &m
     }
 }
 
+/// Build a `DiffView` containing only lines within `(start, end)` plus the
+/// hunk headers that introduce each group of matching lines.
+fn clip_diff_view_to_range(view: &DiffView, start: u32, end: u32) -> DiffView {
+    let mut lines = Vec::new();
+    let mut pending_header: Option<RenderedLine> = None;
+    for l in &view.lines {
+        if matches!(
+            l.kind,
+            RenderedLineKind::HunkHeader | RenderedLineKind::HunkSeparator
+        ) {
+            pending_header = Some(l.clone());
+        } else {
+            let in_range = l.target_line.is_some_and(|tl| tl >= start && tl <= end)
+                || l.source_line.is_some_and(|sl| sl >= start && sl <= end);
+            if in_range {
+                if let Some(h) = pending_header.take() {
+                    lines.push(h);
+                }
+                lines.push(l.clone());
+            }
+        }
+    }
+    DiffView::from_lines(view.title.clone(), lines)
+}
+
 /// Render a focused file diff for one entity (`Screen::EntityDiff`).
 fn render_entity_diff_screen<S: ReviewSurfaceExt>(
     frame: &mut Frame<'_>,
@@ -1108,22 +1162,84 @@ fn render_entity_diff_screen<S: ReviewSurfaceExt>(
 ) {
     // Set the file_index to the file containing this entity so render_main
     // renders the correct view.
-    if let Some(entity) = app.entities.get(entity_idx) {
-        let target = entity.file_path.to_string_lossy().into_owned();
-        // DiffView titles use path.display() for modified/added/removed files
-        // and "old -> new" for renames. Match exactly for non-rename titles;
-        // for renames, check that the title ends with " -> <new_path>".
-        let findex = app
-            .rendered_per_file
-            .iter()
-            .position(|v| v.title == target || v.title.ends_with(&format!(" -> {target}")))
-            .unwrap_or(app.file_index);
-        app.file_index = findex;
-        // Pre-scroll to entity anchor line.
-        if let Some(target) = entity.target_line {
-            app.scroll_to_line(target);
+    let Some(entity) = app.entities.get(entity_idx) else {
+        render_main(frame, app);
+        return;
+    };
+    let target = entity.file_path.to_string_lossy().into_owned();
+    // Strip status suffixes that render_title appends for Added/Removed/Binary
+    // files; without this, entity.file_path ("foo.rs") would never match the
+    // DiffView title ("foo.rs (added)").
+    let findex = app
+        .rendered_per_file
+        .iter()
+        .position(|v| {
+            let base = v
+                .title
+                .strip_suffix(" (added)")
+                .or_else(|| v.title.strip_suffix(" (removed)"))
+                .or_else(|| v.title.strip_suffix(" (binary)"))
+                .unwrap_or(&v.title);
+            base == target || v.title.ends_with(&format!(" -> {target}"))
+        })
+        .unwrap_or(app.file_index);
+    app.file_index = findex;
+    let (range_start, range_end) = entity.line_range;
+
+    // Only initialize scroll when entering a new entity or toggling clip mode.
+    // Without this guard the render loop resets scroll every tick, preventing
+    // the user from scrolling within the view.
+    let need_init = app.entity_diff_initialized != Some((entity_idx, app.entity_clip));
+    if need_init {
+        app.entity_diff_initialized = Some((entity_idx, app.entity_clip));
+        if app.entity_clip {
+            app.line_index = 0;
+            app.scroll = 0;
+        } else {
+            // Full-file mode: jump to first changed line in the entity's range.
+            if let Some(view) = app.annotated_per_file.0.get(findex) {
+                let within = |l: &RenderedLine| {
+                    let tl = l.target_line.unwrap_or(0);
+                    let sl = l.source_line.unwrap_or(0);
+                    (tl >= range_start && tl <= range_end) || (sl >= range_start && sl <= range_end)
+                };
+                let changed = |l: &RenderedLine| {
+                    matches!(l.kind, RenderedLineKind::Added | RenderedLineKind::Removed)
+                };
+                let row = view
+                    .lines
+                    .iter()
+                    .position(|l| within(l) && changed(l))
+                    .or_else(|| {
+                        view.lines.iter().position(|l| {
+                            l.target_line.is_some_and(|tl| tl >= range_start)
+                                || l.source_line.is_some_and(|sl| sl >= range_start)
+                        })
+                    });
+                if let Some(r) = row {
+                    app.line_index = r;
+                    app.scroll = u16::try_from(r.saturating_sub(3)).unwrap_or(0);
+                }
+            }
         }
     }
+
+    if app.entity_clip {
+        // Build a view containing only lines within the entity's range.
+        // Swap it in for rendering, then restore.
+        let clipped = app
+            .annotated_per_file
+            .0
+            .get(findex)
+            .map(|v| clip_diff_view_to_range(v, range_start, range_end));
+        if let Some(clipped_view) = clipped {
+            let orig = std::mem::replace(&mut app.annotated_per_file.0[findex], clipped_view);
+            render_main(frame, app);
+            app.annotated_per_file.0[findex] = orig;
+            return;
+        }
+    }
+
     render_main(frame, app);
 }
 
@@ -1535,11 +1651,18 @@ fn render_footer<S: ReviewSurfaceExt>(frame: &mut Frame<'_>, area: Rect, app: &A
         (msg.to_owned(), Style::default().fg(Color::Yellow))
     } else {
         let has_stack = app.surface.entry_count() > 1;
-        (
-            app.surface
-                .footer_hint(area.width, has_stack, app.severity_filter),
-            Style::default(),
-        )
+        let mut hint = app
+            .surface
+            .footer_hint(area.width, has_stack, app.severity_filter);
+        if matches!(app.screen, Screen::EntityDiff { .. }) {
+            let x_hint = if app.entity_clip {
+                "  x full"
+            } else {
+                "  x clip"
+            };
+            hint.push_str(x_hint);
+        }
+        (hint, Style::default())
     };
     let widget = Paragraph::new(text).style(style);
     frame.render_widget(widget, area);
@@ -1833,6 +1956,20 @@ fn handle_file_view_key<S: ReviewSurfaceExt>(
         KeyCode::Char('3') => app.toggle_severity_filter(Severity::Note),
         KeyCode::Char('U') => app.toggle_current_file_reviewed(),
         KeyCode::Char('|') => app.cycle_diff_mode(),
+        // Toggle entity-clipped view (show only entity range vs full file).
+        KeyCode::Char('x') => {
+            if matches!(app.screen, Screen::EntityDiff { .. }) {
+                app.entity_clip = !app.entity_clip;
+                app.line_index = 0;
+                app.scroll = 0;
+                let msg = if app.entity_clip {
+                    "entity view: clipped"
+                } else {
+                    "entity view: full file"
+                };
+                app.status_message = Some(msg.to_owned());
+            }
+        }
         _ => delegate_to_surface(app, key)?,
     }
     Ok(())

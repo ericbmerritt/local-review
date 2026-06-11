@@ -152,6 +152,19 @@ impl PairedRow {
 }
 
 impl DiffView {
+    /// Build a `DiffView` directly from a pre-computed line list.
+    ///
+    /// Used by the entity clip view to build a filtered view from an existing
+    /// `DiffView` without re-parsing the underlying diff.
+    pub fn from_lines(title: String, lines: Vec<RenderedLine>) -> Self {
+        let paired_rows = pair_rows(&lines);
+        Self {
+            title,
+            lines,
+            paired_rows,
+        }
+    }
+
     /// Build a `DiffView` from a parsed diff file.
     pub fn from_file(file: &DiffFile) -> Self {
         let title = render_title(file);

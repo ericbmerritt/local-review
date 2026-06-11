@@ -31,6 +31,12 @@ pub enum EntityKind {
     Extension,
     ConfigProperty,
     AnonymousBlock,
+    /// Markdown document section (bounded by an ATX heading).
+    Section,
+    /// Top-level test suite block (`describe` / `suite`).
+    TestSuite,
+    /// Individual test case (`it` / `test` / `specify`).
+    TestCase,
     Other,
 }
 

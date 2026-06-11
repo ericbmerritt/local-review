@@ -15,12 +15,18 @@
     feature = "lang-bash",
     feature = "lang-yaml",
     feature = "lang-json",
-    feature = "lang-toml",
+    feature = "lang-toml"
 ))]
 mod code;
 
 #[cfg(feature = "lang-postgres")]
 mod sql;
+
+#[cfg(feature = "lang-markdown")]
+mod markdown;
+
+#[cfg(feature = "lang-typescript")]
+mod test;
 
 use crate::semantic::registry::ExtractorRegistry;
 
@@ -30,6 +36,11 @@ use crate::semantic::registry::ExtractorRegistry;
 /// 13 supported languages.
 pub fn create_default_registry() -> ExtractorRegistry {
     let mut r = ExtractorRegistry::new();
+
+    // Test plugin registered first so filename patterns (.spec., .test.) take
+    // priority over the extension-based TypeScript/JavaScript dispatchers.
+    #[cfg(feature = "lang-typescript")]
+    r.register(Box::new(test::TestPlugin));
 
     #[cfg(feature = "lang-rust")]
     r.register(Box::new(code::CodePlugin::new(&code::RUST_SPEC)));
@@ -72,6 +83,9 @@ pub fn create_default_registry() -> ExtractorRegistry {
 
     #[cfg(feature = "lang-postgres")]
     r.register(Box::new(sql::SqlPlugin));
+
+    #[cfg(feature = "lang-markdown")]
+    r.register(Box::new(markdown::MarkdownPlugin));
 
     r
 }

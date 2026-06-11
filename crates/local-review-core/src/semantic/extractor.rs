@@ -34,6 +34,15 @@ pub trait SemanticExtractor: Send + Sync {
     /// File extensions handled by this extractor (lowercase, no leading dot).
     fn extensions(&self) -> &[&str];
 
+    /// Filename substrings that trigger this extractor before extension lookup.
+    ///
+    /// The registry checks filename patterns first; the first matching extractor
+    /// wins. Use this for files where the full name matters more than the
+    /// extension (e.g., `.spec.tsx` vs `.tsx`).
+    fn filename_patterns(&self) -> &[&str] {
+        &[]
+    }
+
     /// Extract semantic entities from `content`.
     ///
     /// Returns `Err(ParseContainsErrors)` when tree-sitter produces ERROR nodes.

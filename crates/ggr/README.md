@@ -22,7 +22,7 @@ brew install ericbmerritt/jjr/ggr
 binary is not on crates.io yet. To install from source meanwhile:
 
 ```sh
-cargo install --path crates/ggr --locked
+cargo install --path crates/ggr
 ```
 
 Requires [`gh`](https://cli.github.com) authenticated to GitHub (or GitHub

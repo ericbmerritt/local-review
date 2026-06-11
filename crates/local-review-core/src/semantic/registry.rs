@@ -1,4 +1,5 @@
-//! Registry that maps file extensions to `SemanticExtractor` implementations.
+//! Registry that maps file extensions and filename patterns to `SemanticExtractor`
+//! implementations.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -7,9 +8,16 @@ use crate::semantic::entity::RawEntity;
 use crate::semantic::extractor::{ExtractError, ExtractResult, SemanticExtractor};
 
 /// Resolves file paths to the appropriate extractor and drives extraction.
+///
+/// Dispatch order:
+/// 1. Filename-pattern match: the first registered extractor whose
+///    `filename_patterns()` contains a substring found in the file's base name.
+/// 2. Extension match: the most recently registered extractor for the extension.
 pub struct ExtractorRegistry {
     extractors: Vec<Box<dyn SemanticExtractor>>,
     by_extension: HashMap<String, usize>,
+    /// `(pattern, extractor_idx)` in registration order — first match wins.
+    by_filename_pattern: Vec<(String, usize)>,
 }
 
 impl ExtractorRegistry {
@@ -18,13 +26,20 @@ impl ExtractorRegistry {
         Self {
             extractors: Vec::new(),
             by_extension: HashMap::new(),
+            by_filename_pattern: Vec::new(),
         }
     }
 
-    /// Register an extractor. Each extension is mapped to the most recently
-    /// registered extractor for that extension.
+    /// Register an extractor.
+    ///
+    /// Filename patterns are checked before extensions; within each group the
+    /// first-registered extractor wins for patterns, and the last-registered
+    /// extractor wins for extensions.
     pub fn register(&mut self, extractor: Box<dyn SemanticExtractor>) {
         let idx = self.extractors.len();
+        for &pat in extractor.filename_patterns() {
+            self.by_filename_pattern.push((pat.to_owned(), idx));
+        }
         for &ext in extractor.extensions() {
             self.by_extension.insert(ext.to_owned(), idx);
         }
@@ -33,6 +48,20 @@ impl ExtractorRegistry {
 
     /// Return the extractor for `file_path`, or `None` if unsupported.
     pub fn get(&self, file_path: &str) -> Option<&dyn SemanticExtractor> {
+        let file_name = Path::new(file_path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+
+        // Filename-pattern dispatch takes priority over extension dispatch.
+        for (pattern, idx) in &self.by_filename_pattern {
+            if file_name.contains(pattern.as_str()) {
+                if let Some(ext) = self.extractors.get(*idx) {
+                    return Some(ext.as_ref());
+                }
+            }
+        }
+
         let ext = Path::new(file_path)
             .extension()
             .and_then(|e| e.to_str())?
