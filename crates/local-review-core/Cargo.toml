@@ -35,6 +35,7 @@ lang-all = [
   "lang-json",
   "lang-toml",
   "lang-postgres",
+  "lang-markdown",
 ]
 lang-rust = ["dep:tree-sitter", "dep:tree-sitter-rust"]
 lang-typescript = ["dep:tree-sitter", "dep:tree-sitter-typescript"]
@@ -49,6 +50,7 @@ lang-yaml = ["dep:tree-sitter", "dep:tree-sitter-yaml"]
 lang-json = ["dep:tree-sitter", "dep:tree-sitter-json"]
 lang-toml = ["dep:tree-sitter", "dep:tree-sitter-toml-ng"]
 lang-postgres = ["dep:tree-sitter", "dep:tree-sitter-postgres"]
+lang-markdown = ["dep:tree-sitter", "dep:tree-sitter-md"]
 
 [dependencies]
 snafu.workspace = true
@@ -73,6 +75,7 @@ tree-sitter-scala = { workspace = true, optional = true }
 tree-sitter-toml-ng = { workspace = true, optional = true }
 tree-sitter-typescript = { workspace = true, optional = true }
 tree-sitter-yaml = { workspace = true, optional = true }
+tree-sitter-md = { workspace = true, optional = true }
 
 [dev-dependencies]
 serde_json.workspace = true

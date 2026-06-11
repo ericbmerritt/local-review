@@ -12,7 +12,7 @@ use ratatui::text::{Line as TuiLine, Span};
 use ratatui::widgets::{Block, Paragraph};
 use ratatui::Frame;
 
-use crate::semantic::{ChangeAnnotation, ChangeType, EntitySummary};
+use crate::semantic::{ChangeAnnotation, ChangeType, EntityKind, EntitySummary};
 use crate::tui::app::App;
 use crate::tui::ReviewSurfaceExt;
 
@@ -72,12 +72,59 @@ fn entity_sigil(e: &EntitySummary) -> (&'static str, Color) {
     }
 }
 
-fn annotation_text(e: &EntitySummary) -> &'static str {
-    match e.annotation {
-        ChangeAnnotation::SigChanged => "sig changed",
-        ChangeAnnotation::BodyOnly => "body",
-        ChangeAnnotation::SigAndBody => "sig+body",
-        ChangeAnnotation::None => "",
+fn kind_label(kind: EntityKind) -> &'static str {
+    match kind {
+        EntityKind::Function => "fn",
+        EntityKind::Method => "method",
+        EntityKind::Class => "class",
+        EntityKind::Struct => "struct",
+        EntityKind::Enum => "enum",
+        EntityKind::Trait => "trait",
+        EntityKind::Interface => "iface",
+        EntityKind::Module => "mod",
+        EntityKind::Type => "type",
+        EntityKind::Constant => "const",
+        EntityKind::Table => "table",
+        EntityKind::View => "view",
+        EntityKind::Index => "index",
+        EntityKind::Trigger => "trigger",
+        EntityKind::Policy => "policy",
+        EntityKind::Schema => "schema",
+        EntityKind::Extension => "ext",
+        EntityKind::ConfigProperty => "prop",
+        EntityKind::AnonymousBlock => "block",
+        EntityKind::Section => "§",
+        EntityKind::TestSuite => "suite",
+        EntityKind::TestCase => "test",
+        EntityKind::Other => "",
+    }
+}
+
+fn annotation_text(e: &EntitySummary) -> String {
+    let kind = kind_label(e.kind);
+    let change = match e.change {
+        ChangeType::Added => "added".to_owned(),
+        ChangeType::Deleted => "deleted".to_owned(),
+        ChangeType::Moved => {
+            let src = e
+                .source_file
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .unwrap_or("?");
+            format!("moved from {src}")
+        }
+        ChangeType::Modified => match e.annotation {
+            ChangeAnnotation::SigChanged => "sig changed".to_owned(),
+            ChangeAnnotation::BodyOnly => "body".to_owned(),
+            ChangeAnnotation::SigAndBody => "sig+body".to_owned(),
+            ChangeAnnotation::None => String::new(),
+        },
+    };
+    if kind.is_empty() || change.is_empty() {
+        format!("{kind}{change}")
+    } else {
+        format!("{kind} · {change}")
     }
 }
 
@@ -132,7 +179,7 @@ fn entity_row_line(
         &if is_cosmetic(entity) {
             format!("{annot_raw} [cosmetic]")
         } else {
-            annot_raw.to_owned()
+            annot_raw
         },
         ANNOT_MAX,
     );

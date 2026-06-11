@@ -457,9 +457,9 @@ trait additions).
 
 ## Phase 3: Entity list and entity diff with loading
 
-| Status         | Started    | Completed |
-| -------------- | ---------- | --------- |
-| 🟡 in-progress | 2026-06-11 |           |
+| Status      | Started    | Completed  |
+| ----------- | ---------- | ---------- |
+| ✅ complete | 2026-06-11 | 2026-06-11 |
 
 The first user-visible phase. Phase 2 wired the surface; this phase delivers
 entity navigation as a usable feature.
