@@ -64,6 +64,14 @@ pub const STATUS_DESCRIPTION_UNAVAILABLE: &str =
 pub const STATUS_LINE_UNAVAILABLE: &str =
     "line scope unavailable: cursor is not on a commentable line";
 
+/// Confirmation shown when a severity chord is accepted. Repurposes the
+/// in-modal status slot (otherwise used for refused-chord hints) to surface
+/// a visible signal that the chord reached the handler — addresses the
+/// case where the picker re-render is too subtle to notice.
+pub const STATUS_SEVERITY_REQUIRED: &str = "severity: required";
+pub const STATUS_SEVERITY_SUGGESTION: &str = "severity: suggestion";
+pub const STATUS_SEVERITY_NOTE: &str = "severity: note";
+
 /// All data needed to build a `LineAnchor` once the composer saves.
 #[derive(Debug, Clone)]
 pub struct LineTarget {
@@ -121,11 +129,51 @@ pub struct EditingContext {
     pub comment_index: Option<usize>,
 }
 
+/// Which of the composer's three fields currently has keyboard focus.
+///
+/// Tab cycles forward (`Body → Severity → Scope → Body`) and Shift+Tab cycles
+/// backward. Space cycles the value within a focused picker (Severity or
+/// Scope). When focus is `Body`, keypresses are forwarded to the text area as
+/// usual. The Alt-chord direct selectors (`M-r`, `M-s`, `M-n`, `M-l`, `M-c`,
+/// `M-k`, `M-d`) still work regardless of focus — they are a faster path on
+/// terminals where the chords are not intercepted by a multiplexer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComposerFocus {
+    Body,
+    Severity,
+    Scope,
+}
+
+impl ComposerFocus {
+    /// Next focus in the Tab cycle.
+    #[must_use]
+    pub fn next(self) -> Self {
+        match self {
+            Self::Body => Self::Severity,
+            Self::Severity => Self::Scope,
+            Self::Scope => Self::Body,
+        }
+    }
+
+    /// Previous focus in the Tab cycle (used by `Shift+Tab` / `BackTab`).
+    #[must_use]
+    pub fn prev(self) -> Self {
+        match self {
+            Self::Body => Self::Scope,
+            Self::Severity => Self::Body,
+            Self::Scope => Self::Severity,
+        }
+    }
+}
+
 /// State for the comment composer modal.
 pub struct Composer {
     pub(crate) scope: ComposerScope,
     pub(crate) severity: Severity,
     pub(crate) body: TextArea,
+    /// Which field has keyboard focus. Tab cycles; Space cycles values within
+    /// a focused picker.
+    pub(crate) focus: ComposerFocus,
     /// `Some` when the composer is in edit mode; `None` for new comments.
     pub(crate) editing: Option<EditingContext>,
     /// In-modal status hint, set when a chord is refused. Cleared on the next
@@ -157,6 +205,7 @@ impl Composer {
             scope: init.scope,
             severity: init.severity,
             body: TextArea::default(),
+            focus: ComposerFocus::Body,
             editing: None,
             refusal_status: None,
             change_id: init.change_id,
@@ -179,6 +228,7 @@ impl Composer {
             scope: edited.init.scope,
             severity: edited.init.severity,
             body: textarea,
+            focus: ComposerFocus::Body,
             editing: Some(EditingContext {
                 identity: edited.identity,
                 comment_index: edited.comment_index,
@@ -270,6 +320,10 @@ pub trait ComposerOps {
     fn line_available_clone(&self) -> Option<LineTarget>;
     fn stack_available_clone(&self) -> Option<StackContextSnapshot>;
     fn description_available_clone(&self) -> Option<DescriptionContext>;
+    fn current_severity(&self) -> Severity;
+    fn current_scope_tag(&self) -> ScopeTag;
+    fn focus(&self) -> ComposerFocus;
+    fn set_focus(&mut self, focus: ComposerFocus);
     fn set_scope(&mut self, scope: ComposerScope);
     fn set_severity(&mut self, severity: Severity);
     fn clear_refusal_status(&mut self);
@@ -292,6 +346,22 @@ impl ComposerOps for Composer {
 
     fn description_available_clone(&self) -> Option<DescriptionContext> {
         self.description_available.clone()
+    }
+
+    fn current_severity(&self) -> Severity {
+        self.severity
+    }
+
+    fn current_scope_tag(&self) -> ScopeTag {
+        ScopeTag::of(&self.scope)
+    }
+
+    fn focus(&self) -> ComposerFocus {
+        self.focus
+    }
+
+    fn set_focus(&mut self, focus: ComposerFocus) {
+        self.focus = focus;
     }
 
     fn set_scope(&mut self, scope: ComposerScope) {
@@ -333,6 +403,22 @@ impl<C: ComposerOps> ComposerOps for Box<C> {
 
     fn description_available_clone(&self) -> Option<DescriptionContext> {
         (**self).description_available_clone()
+    }
+
+    fn current_severity(&self) -> Severity {
+        (**self).current_severity()
+    }
+
+    fn current_scope_tag(&self) -> ScopeTag {
+        (**self).current_scope_tag()
+    }
+
+    fn focus(&self) -> ComposerFocus {
+        (**self).focus()
+    }
+
+    fn set_focus(&mut self, focus: ComposerFocus) {
+        (**self).set_focus(focus);
     }
 
     fn set_scope(&mut self, scope: ComposerScope) {
@@ -379,77 +465,218 @@ pub enum ComposerAction {
 /// (`Alt+R`, `Alt+S`, `Alt+N`) are Alt-chorded; save/delete (`^X`, `^D`)
 /// remain Ctrl-chorded. All intercepted keys are consumed before being
 /// forwarded to the body editor; everything else flows through.
-#[expect(
-    clippy::wildcard_enum_match_arm,
-    reason = "unhandled Alt+/Ctrl+ KeyCode variants are intentionally ignored; forwarded to textarea"
-)]
 pub fn handle_composer_key<C: ComposerOps>(composer: &mut C, key: KeyEvent) -> ComposerAction {
     composer.clear_refusal_status();
 
-    if key.modifiers == KeyModifiers::CONTROL {
-        match key.code {
-            KeyCode::Char('x') => {
-                return ComposerAction::Save;
-            }
-            KeyCode::Char('d') if composer.editing_is_some() => {
-                return ComposerAction::Delete;
-            }
-            _ => {}
-        }
+    if let Some(action) = try_handle_ctrl_chord(composer, key) {
+        return action;
     }
-
-    if key.modifiers == KeyModifiers::ALT {
-        match key.code {
-            KeyCode::Char('l' | 'L') => {
-                if let Some(line) = composer.line_available_clone() {
-                    composer.set_scope(ComposerScope::Line(line));
-                    return ComposerAction::Continue;
-                }
-                composer.set_refusal_status(STATUS_LINE_UNAVAILABLE);
-                return ComposerAction::RefusedScopeChord(STATUS_LINE_UNAVAILABLE);
-            }
-            KeyCode::Char('c' | 'C') => {
-                composer.set_scope(ComposerScope::Change);
-                return ComposerAction::Continue;
-            }
-            KeyCode::Char('k' | 'K') => {
-                if let Some(stack) = composer.stack_available_clone() {
-                    composer.set_scope(ComposerScope::Stack(stack));
-                    return ComposerAction::Continue;
-                }
-                composer.set_refusal_status(STATUS_STACK_UNAVAILABLE);
-                return ComposerAction::RefusedScopeChord(STATUS_STACK_UNAVAILABLE);
-            }
-            KeyCode::Char('r' | 'R') => {
-                composer.set_severity(Severity::Required);
-                return ComposerAction::Continue;
-            }
-            KeyCode::Char('s' | 'S') => {
-                composer.set_severity(Severity::Suggestion);
-                return ComposerAction::Continue;
-            }
-            KeyCode::Char('n' | 'N') => {
-                composer.set_severity(Severity::Note);
-                return ComposerAction::Continue;
-            }
-            KeyCode::Char('d' | 'D') => {
-                if let Some(desc) = composer.description_available_clone() {
-                    composer.set_scope(ComposerScope::Description(desc));
-                    return ComposerAction::Continue;
-                }
-                composer.set_refusal_status(STATUS_DESCRIPTION_UNAVAILABLE);
-                return ComposerAction::RefusedScopeChord(STATUS_DESCRIPTION_UNAVAILABLE);
-            }
-            _ => {}
-        }
+    if let Some(action) = try_handle_alt_chord(composer, key) {
+        return action;
     }
-
     if key.code == KeyCode::Esc {
         return ComposerAction::Cancel;
     }
+    if let Some(action) = try_handle_focus_chord(composer, key) {
+        return action;
+    }
+    if let Some(action) = try_handle_space_cycle(composer, key) {
+        return action;
+    }
 
-    composer.body_input(key);
+    // Only forward keypresses to the text area when the body has focus.
+    // In picker focus the user is navigating, not typing — silently
+    // dropping keys is correct here.
+    if composer.focus() == ComposerFocus::Body {
+        composer.body_input(key);
+    }
     ComposerAction::Continue
+}
+
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "unhandled Ctrl+ KeyCode variants are intentionally ignored"
+)]
+fn try_handle_ctrl_chord<C: ComposerOps>(composer: &C, key: KeyEvent) -> Option<ComposerAction> {
+    if key.modifiers != KeyModifiers::CONTROL {
+        return None;
+    }
+    match key.code {
+        KeyCode::Char('x') => Some(ComposerAction::Save),
+        KeyCode::Char('d') if composer.editing_is_some() => Some(ComposerAction::Delete),
+        _ => None,
+    }
+}
+
+/// Alt-chord direct selectors (severity and scope). Accepts both `ALT` and
+/// `META` modifiers (terminals vary), tolerates `SHIFT` for uppercase keys,
+/// and rejects combinations including `CONTROL` to avoid colliding with the
+/// `Ctrl-X` / `Ctrl-D` chords.
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "unhandled Alt+ KeyCode variants pass through to other handlers"
+)]
+fn try_handle_alt_chord<C: ComposerOps>(composer: &mut C, key: KeyEvent) -> Option<ComposerAction> {
+    let alt_like = key
+        .modifiers
+        .intersects(KeyModifiers::ALT | KeyModifiers::META)
+        && !key.modifiers.contains(KeyModifiers::CONTROL);
+    if !alt_like {
+        return None;
+    }
+    match key.code {
+        KeyCode::Char('l' | 'L') => Some(apply_line_scope(composer)),
+        KeyCode::Char('c' | 'C') => {
+            composer.set_scope(ComposerScope::Change);
+            Some(ComposerAction::Continue)
+        }
+        KeyCode::Char('k' | 'K') => Some(apply_stack_scope(composer)),
+        KeyCode::Char('r' | 'R') => Some(apply_severity(composer, Severity::Required)),
+        KeyCode::Char('s' | 'S') => Some(apply_severity(composer, Severity::Suggestion)),
+        KeyCode::Char('n' | 'N') => Some(apply_severity(composer, Severity::Note)),
+        KeyCode::Char('d' | 'D') => Some(apply_description_scope(composer)),
+        _ => None,
+    }
+}
+
+fn apply_line_scope<C: ComposerOps>(composer: &mut C) -> ComposerAction {
+    if let Some(line) = composer.line_available_clone() {
+        composer.set_scope(ComposerScope::Line(line));
+        return ComposerAction::Continue;
+    }
+    composer.set_refusal_status(STATUS_LINE_UNAVAILABLE);
+    ComposerAction::RefusedScopeChord(STATUS_LINE_UNAVAILABLE)
+}
+
+fn apply_stack_scope<C: ComposerOps>(composer: &mut C) -> ComposerAction {
+    if let Some(stack) = composer.stack_available_clone() {
+        composer.set_scope(ComposerScope::Stack(stack));
+        return ComposerAction::Continue;
+    }
+    composer.set_refusal_status(STATUS_STACK_UNAVAILABLE);
+    ComposerAction::RefusedScopeChord(STATUS_STACK_UNAVAILABLE)
+}
+
+fn apply_description_scope<C: ComposerOps>(composer: &mut C) -> ComposerAction {
+    if let Some(desc) = composer.description_available_clone() {
+        composer.set_scope(ComposerScope::Description(desc));
+        return ComposerAction::Continue;
+    }
+    composer.set_refusal_status(STATUS_DESCRIPTION_UNAVAILABLE);
+    ComposerAction::RefusedScopeChord(STATUS_DESCRIPTION_UNAVAILABLE)
+}
+
+fn apply_severity<C: ComposerOps>(composer: &mut C, severity: Severity) -> ComposerAction {
+    composer.set_severity(severity);
+    composer.set_refusal_status(match severity {
+        Severity::Note => STATUS_SEVERITY_NOTE,
+        Severity::Suggestion => STATUS_SEVERITY_SUGGESTION,
+        Severity::Required => STATUS_SEVERITY_REQUIRED,
+    });
+    ComposerAction::Continue
+}
+
+/// `Tab` / `Shift+Tab` cycle focus through the three composer fields. This is
+/// the multiplexer-safe path equivalent to the Alt-chord direct selectors:
+/// available on every terminal regardless of multiplexer Alt-key interception.
+fn try_handle_focus_chord<C: ComposerOps>(
+    composer: &mut C,
+    key: KeyEvent,
+) -> Option<ComposerAction> {
+    if key.code == KeyCode::Tab && !key.modifiers.contains(KeyModifiers::SHIFT) {
+        composer.set_focus(composer.focus().next());
+        return Some(ComposerAction::Continue);
+    }
+    if key.code == KeyCode::BackTab
+        || (key.code == KeyCode::Tab && key.modifiers.contains(KeyModifiers::SHIFT))
+    {
+        composer.set_focus(composer.focus().prev());
+        return Some(ComposerAction::Continue);
+    }
+    None
+}
+
+/// `Space` cycles the current value within a focused picker. When focus is
+/// on the body, the space passes through to the text editor below.
+fn try_handle_space_cycle<C: ComposerOps>(
+    composer: &mut C,
+    key: KeyEvent,
+) -> Option<ComposerAction> {
+    if !matches!(key.code, KeyCode::Char(' ')) {
+        return None;
+    }
+    if key
+        .modifiers
+        .intersects(KeyModifiers::ALT | KeyModifiers::META | KeyModifiers::CONTROL)
+    {
+        return None;
+    }
+    match composer.focus() {
+        ComposerFocus::Severity => {
+            cycle_severity_forward(composer);
+            Some(ComposerAction::Continue)
+        }
+        ComposerFocus::Scope => {
+            cycle_scope_forward(composer);
+            Some(ComposerAction::Continue)
+        }
+        ComposerFocus::Body => None,
+    }
+}
+
+/// Cycle to the next severity (`Note → Suggestion → Required → Note`).
+fn cycle_severity_forward<C: ComposerOps>(composer: &mut C) {
+    let next = match composer.current_severity() {
+        Severity::Note => Severity::Suggestion,
+        Severity::Suggestion => Severity::Required,
+        Severity::Required => Severity::Note,
+    };
+    composer.set_severity(next);
+    composer.set_refusal_status(match next {
+        Severity::Note => STATUS_SEVERITY_NOTE,
+        Severity::Suggestion => STATUS_SEVERITY_SUGGESTION,
+        Severity::Required => STATUS_SEVERITY_REQUIRED,
+    });
+}
+
+/// Cycle to the next *available* scope. Unavailable scopes (e.g., `Line`
+/// when the cursor is not on a commentable line) are skipped. `Change` is
+/// always available; the cycle therefore always makes progress and never
+/// loops indefinitely.
+fn cycle_scope_forward<C: ComposerOps>(composer: &mut C) {
+    let order = [
+        ScopeTag::Line,
+        ScopeTag::Change,
+        ScopeTag::Stack,
+        ScopeTag::Description,
+    ];
+    let current = composer.current_scope_tag();
+    let start = order.iter().position(|t| *t == current).unwrap_or(0);
+    // Try up to four positions ahead, skipping unavailable scopes.
+    for step in 1..=order.len() {
+        let candidate = order[(start + step) % order.len()];
+        let applied = match candidate {
+            ScopeTag::Line => composer
+                .line_available_clone()
+                .map(|t| composer.set_scope(ComposerScope::Line(t)))
+                .is_some(),
+            ScopeTag::Change => {
+                composer.set_scope(ComposerScope::Change);
+                true
+            }
+            ScopeTag::Stack => composer
+                .stack_available_clone()
+                .map(|s| composer.set_scope(ComposerScope::Stack(s)))
+                .is_some(),
+            ScopeTag::Description => composer
+                .description_available_clone()
+                .map(|d| composer.set_scope(ComposerScope::Description(d)))
+                .is_some(),
+        };
+        if applied {
+            return;
+        }
+    }
 }
 
 /// Choose the opening severity for a new comment.
@@ -665,6 +892,46 @@ mod tests {
         let action = handle_composer_key(&mut c, key);
         assert_eq!(action, ComposerAction::Continue);
         assert_eq!(c.severity, Severity::Required);
+    }
+
+    // Some terminals send META instead of ALT for the Option/Alt key (e.g.
+    // certain xterm.js builds, kitty's keyboard protocol). Accept both so the
+    // composer's severity/scope chords work across terminals without
+    // requiring users to configure their Option key behavior.
+    #[test]
+    fn handle_composer_key_meta_r_also_sets_required() {
+        let mut c = make_composer(Severity::Note);
+        let key = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::META);
+        let action = handle_composer_key(&mut c, key);
+        assert_eq!(action, ComposerAction::Continue);
+        assert_eq!(c.severity, Severity::Required);
+    }
+
+    // When the terminal sends ALT+SHIFT for a capital-letter chord (some
+    // emulators do this; macOS Terminal.app does on certain keymaps),
+    // the strict `modifiers == ALT` check would have rejected it. We accept
+    // any modifier combination that includes ALT (or META) but excludes
+    // CONTROL.
+    #[test]
+    fn handle_composer_key_alt_shift_r_sets_required() {
+        let mut c = make_composer(Severity::Note);
+        let key = KeyEvent::new(KeyCode::Char('R'), KeyModifiers::ALT | KeyModifiers::SHIFT);
+        let action = handle_composer_key(&mut c, key);
+        assert_eq!(action, ComposerAction::Continue);
+        assert_eq!(c.severity, Severity::Required);
+    }
+
+    // Ctrl-Alt-r must NOT trigger severity-required; CONTROL is reserved for
+    // save/delete chords and may also collide with terminal escape sequences.
+    #[test]
+    fn handle_composer_key_ctrl_alt_r_does_not_set_severity() {
+        let mut c = make_composer(Severity::Note);
+        let key = KeyEvent::new(
+            KeyCode::Char('r'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        );
+        let _ = handle_composer_key(&mut c, key);
+        assert_eq!(c.severity, Severity::Note, "CTRL+ALT must not chord");
     }
 
     #[test]

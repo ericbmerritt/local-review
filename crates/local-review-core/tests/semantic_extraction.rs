@@ -44,13 +44,22 @@ fn rust_extracts_impl_methods() {
 }
 
 #[test]
-fn rust_parse_error_nodes_returns_err() {
-    let bad_rust = "fn broken( { this is not valid rust !!!";
+fn rust_parse_error_nodes_extracts_what_it_can() {
+    // Mostly-valid source with one malformed function. The valid `good`
+    // function must still surface as an entity; the broken span is skipped.
+    // This keeps navigation working for files that exercise grammar features
+    // older tree-sitter-rust versions don't recognise.
+    let mixed = "fn good() -> i32 { 1 }\nfn broken( { this is not valid rust !!!\n";
     let r = registry();
-    let result = r.extract(bad_rust, "broken.rs");
+    let entities = r
+        .extract(mixed, "mixed.rs")
+        .expect("permissive parse: mostly-valid file must succeed");
+    let has_good = entities
+        .iter()
+        .any(|e| e.kind == EntityKind::Function && e.id.display_name().contains("good"));
     assert!(
-        result.is_err(),
-        "file with ERROR nodes must return Err, not a partial list"
+        has_good,
+        "valid `good` function must extract despite errors elsewhere; got {entities:?}"
     );
 }
 

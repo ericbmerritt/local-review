@@ -12,9 +12,15 @@ use snafu::Snafu;
 
 use crate::semantic::entity::EntityCoreData;
 
-/// Current schema version. Bump when `EntityCoreData` or `CacheEntry`
-/// gains a breaking change; mismatched reads are treated as cache misses.
-pub const SCHEMA_VERSION: u32 = 1;
+/// Current schema version. Bump only when `EntityCoreData` or `CacheEntry`
+/// gain a structural change incompatible with earlier readers.
+///
+/// New language plugins do NOT require a schema bump — they are handled
+/// automatically via `extractor_fingerprint` stored in each `CacheEntry`.
+///
+/// History: 1 = original; 2 = added markdown + test-file plugins (Phase 3);
+/// 3 = added `AnchorFingerprint` / entity-reviewed fields (Phase 4).
+pub const SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Snafu)]
 pub enum CacheError {
@@ -35,10 +41,22 @@ pub enum CacheError {
     },
 }
 
+/// Build-time hash of all `src/semantic/*.rs` source files, set by `build.rs`.
+///
+/// Any change to extraction logic — plugins, differ, Container Rule, identity
+/// matcher — produces a different hash at compile time. Cache entries whose
+/// `extraction_hash` does not match this constant are treated as misses and
+/// trigger re-extraction automatically, with no manual version bump required.
+pub const EXTRACTION_HASH: &str = env!("SEMANTIC_EXTRACTION_HASH");
+
 /// The persisted cache entry.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct CacheEntry {
     pub schema_version: u32,
+    /// Build-time hash of the extraction source code that produced this entry.
+    /// A mismatch means the logic changed; treat as miss and re-extract.
+    #[serde(default)]
+    pub extraction_hash: String,
     pub entities: Vec<EntityCoreData>,
     /// Forward-compatibility slot for the dependency graph (Phase 5).
     /// `None` until graph computation is implemented.
@@ -69,10 +87,12 @@ pub fn write(path: &Path, entry: &CacheEntry) -> Result<(), CacheError> {
     })
 }
 
-/// Read a cache entry from `path`.
+/// Read a cache entry from `path`, validating both the schema version and the
+/// build-time extraction hash.
 ///
-/// Returns `None` when the file does not exist or the schema version does
-/// not match — both are treated as cache misses, not errors.
+/// Returns `None` when the file does not exist, the schema version does not
+/// match, or the extraction hash differs from [`EXTRACTION_HASH`].
+/// All cases are treated as cache misses, not errors.
 pub fn read(path: &Path) -> Result<Option<CacheEntry>, CacheError> {
     let bytes = match fs::read(path) {
         Ok(b) => b,
@@ -89,6 +109,9 @@ pub fn read(path: &Path) -> Result<Option<CacheEntry>, CacheError> {
         source,
     })?;
     if entry.schema_version != SCHEMA_VERSION {
+        return Ok(None);
+    }
+    if entry.extraction_hash != EXTRACTION_HASH {
         return Ok(None);
     }
     Ok(Some(entry))
@@ -118,16 +141,21 @@ pub fn jjr_cache_path(base: &Path, change_id: &str, commit_id: &str) -> PathBuf 
 mod tests {
     use super::*;
 
+    fn make_entry(schema_version: u32, hash: &str) -> CacheEntry {
+        CacheEntry {
+            schema_version,
+            extraction_hash: hash.to_owned(),
+            entities: Vec::new(),
+            graph: None,
+            failed_files: Vec::new(),
+        }
+    }
+
     #[test]
     fn roundtrip_empty_entry() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.json");
-        let entry = CacheEntry {
-            schema_version: SCHEMA_VERSION,
-            entities: Vec::new(),
-            graph: None,
-            failed_files: Vec::new(),
-        };
+        let entry = make_entry(SCHEMA_VERSION, EXTRACTION_HASH);
         write(&path, &entry).unwrap();
         let loaded = read(&path).unwrap().expect("entry must load");
         assert_eq!(loaded.schema_version, SCHEMA_VERSION);
@@ -138,15 +166,21 @@ mod tests {
     fn schema_version_mismatch_returns_none() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("old.json");
-        let entry = CacheEntry {
-            schema_version: 0,
-            entities: Vec::new(),
-            graph: None,
-            failed_files: Vec::new(),
-        };
-        write(&path, &entry).unwrap();
+        write(&path, &make_entry(0, EXTRACTION_HASH)).unwrap();
         let result = read(&path).unwrap();
         assert!(result.is_none(), "mismatched schema version must be a miss");
+    }
+
+    #[test]
+    fn extraction_hash_mismatch_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old_logic.json");
+        write(&path, &make_entry(SCHEMA_VERSION, "aabbccdd")).unwrap();
+        let result = read(&path).unwrap();
+        assert!(
+            result.is_none(),
+            "stale extraction logic must be a cache miss"
+        );
     }
 
     #[test]

@@ -160,6 +160,11 @@ pub struct Comment {
     pub updated_at: Option<OffsetDateTime>,
     pub status: Option<Status>,
     pub mismatch_reason: Option<MismatchReason>,
+    /// Semantic entity this comment belongs to; populated at comment-creation
+    /// time when entity extraction has run.
+    pub entity_id: Option<local_review_core::semantic::EntityId>,
+    /// Three-point re-anchoring fingerprint; populated for line-scoped comments.
+    pub anchor_fingerprint: Option<local_review_core::AnchorFingerprint>,
 }
 
 impl Serialize for Comment {
@@ -228,6 +233,10 @@ struct CommentDto {
     status: Option<Status>,
     #[serde(skip_serializing_if = "Option::is_none")]
     mismatch_reason: Option<MismatchReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    entity_id: Option<local_review_core::semantic::EntityId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    anchor_fingerprint: Option<local_review_core::AnchorFingerprint>,
 }
 
 fn default_scope() -> String {
@@ -292,6 +301,8 @@ impl CommentDto {
             updated_at,
             status: c.status,
             mismatch_reason: c.mismatch_reason,
+            entity_id: c.entity_id.clone(),
+            anchor_fingerprint: c.anchor_fingerprint.clone(),
         })
     }
 
@@ -339,6 +350,8 @@ impl CommentDto {
             updated_at,
             status: self.status,
             mismatch_reason: self.mismatch_reason,
+            entity_id: self.entity_id,
+            anchor_fingerprint: self.anchor_fingerprint,
         })
     }
 }
@@ -600,6 +613,8 @@ mod tests {
             updated_at: None,
             status: Some(Status::Pending),
             mismatch_reason: None,
+            entity_id: None,
+            anchor_fingerprint: None,
         }
     }
 
@@ -627,6 +642,8 @@ mod tests {
             updated_at: None,
             status: Some(Status::Pending),
             mismatch_reason: None,
+            entity_id: None,
+            anchor_fingerprint: None,
         };
         let json = serde_json::to_string(&original).unwrap();
         let restored: Comment = serde_json::from_str(&json).unwrap();
@@ -653,6 +670,8 @@ mod tests {
             updated_at: None,
             status: None,
             mismatch_reason: None,
+            entity_id: None,
+            anchor_fingerprint: None,
         };
         let json = serde_json::to_string(&original).unwrap();
         let restored: Comment = serde_json::from_str(&json).unwrap();
@@ -674,6 +693,8 @@ mod tests {
             updated_at: None,
             status: None,
             mismatch_reason: None,
+            entity_id: None,
+            anchor_fingerprint: None,
         };
         let v: serde_json::Value = serde_json::to_value(&c).unwrap();
         assert_eq!(v["scope"], "stack");
@@ -795,6 +816,8 @@ mod tests {
             updated_at: None,
             status: None,
             mismatch_reason: None,
+            entity_id: None,
+            anchor_fingerprint: None,
         };
         let v: serde_json::Value = serde_json::to_value(&c).unwrap();
         assert_eq!(v["scope"], "change");
@@ -820,6 +843,8 @@ mod tests {
             updated_at: None,
             status: None,
             mismatch_reason: None,
+            entity_id: None,
+            anchor_fingerprint: None,
         };
         let v: serde_json::Value = serde_json::to_value(&c).unwrap();
         assert_eq!(v["scope"], "stack");
@@ -854,6 +879,8 @@ mod tests {
             updated_at: None,
             status: None,
             mismatch_reason: None,
+            entity_id: None,
+            anchor_fingerprint: None,
         };
         let json = serde_json::to_string(&comment).unwrap();
         let restored: Comment = serde_json::from_str(&json).unwrap();
@@ -1060,6 +1087,8 @@ mod tests {
             updated_at: None,
             status: Some(Status::Pending),
             mismatch_reason: None,
+            entity_id: None,
+            anchor_fingerprint: None,
         }
     }
 
@@ -1146,6 +1175,8 @@ mod tests {
             updated_at: None,
             status: None,
             mismatch_reason: None,
+            entity_id: None,
+            anchor_fingerprint: None,
         };
         let json = serde_json::to_string(&c).unwrap();
         let restored: Comment = serde_json::from_str(&json).unwrap();

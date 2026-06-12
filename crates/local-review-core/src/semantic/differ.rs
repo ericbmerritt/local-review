@@ -23,6 +23,8 @@ fn is_container(kind: EntityKind) -> bool {
             | EntityKind::Trait
             | EntityKind::Interface
             | EntityKind::Module
+            | EntityKind::Section   // markdown heading section
+            | EntityKind::TestSuite // describe() block
     )
 }
 
@@ -86,12 +88,19 @@ fn make_moved(be: &RawEntity, ae: &RawEntity) -> EntityCoreData {
 
 // ── Container Rule suppression ────────────────────────────────────────────────
 
-/// True when `child` is a direct or transitive child of `container`.
-///
-/// Uses `EntityId.scope_chain`: a child's `scope_chain` starts with the
-/// container's `scope_chain` (prefix match on the chain, not a string prefix).
-/// File equality is also required. This correctly handles containers and
-/// children that have different `kind` segments in their raw extractor strings.
+/// True when `child` is a direct or transitive descendant of `container`
+/// by scope-chain prefix match within the same file.
+fn entity_is_child_of(child: &EntityCoreData, container: &EntityCoreData) -> bool {
+    child.id.file_path == container.id.file_path
+        && child
+            .id
+            .scope_chain
+            .starts_with(container.id.scope_chain.as_slice())
+        && child.id.scope_chain.len() > container.id.scope_chain.len()
+}
+
+/// Variant used in the Modified-container path where the container identity
+/// comes from the before-state `RawEntity`.
 fn entity_is_child(child: &EntityCoreData, container: &RawEntity) -> bool {
     child.id.file_path == container.id.file_path
         && child
@@ -101,15 +110,30 @@ fn entity_is_child(child: &EntityCoreData, container: &RawEntity) -> bool {
         && child.id.scope_chain.len() > container.id.scope_chain.len()
 }
 
-/// Remove container entities from `result` that have a body-only annotation
-/// and at least one changed child (added, deleted, or modified) in the result.
-/// Called after all entities are in `result` so added/deleted children are
-/// visible — not just modified ones.
+/// Remove redundant entities from `result` so the entity list shows the
+/// most-useful unit of review for each change type.
+///
+/// Two cases, opposite directions:
+///
+/// 1. **Modified containers** with body-only changes are suppressed in favor
+///    of their changed children. If only `Foo::bar()`'s body changed, the
+///    reviewer wants `bar` in the list, not `Foo`. The most-specific changed
+///    entity is the useful one.
+///
+/// 2. **Children of Added/Deleted containers** are suppressed in favor of
+///    the parent. Adding `impl Deref for BuildDate { type Target = str; fn
+///    deref(...) }` is one logical change; the reviewer wants the impl
+///    block in the list, not separate rows for `Target` and `deref`. The
+///    broadest added/deleted entity is the useful one.
+///
+/// Called after all entities are in `result` so added/deleted/modified
+/// children are already present.
 fn apply_container_rule(
     result: &mut Vec<EntityCoreData>,
     raw_modified: &[(&RawEntity, &RawEntity)],
 ) {
-    let to_suppress: Vec<EntityId> = raw_modified
+    // Case 1: Modified containers whose only change is in their children.
+    let modified_suppress: Vec<EntityId> = raw_modified
         .iter()
         .filter(|(be, ae)| {
             is_container(ae.kind) && annotation(be, ae) == ChangeAnnotation::BodyOnly
@@ -118,7 +142,26 @@ fn apply_container_rule(
         .map(|(be, _)| be.id.clone())
         .collect();
 
-    result.retain(|e| !to_suppress.contains(&e.id));
+    // Case 2: Added/Deleted children inside an Added/Deleted container of the
+    // same change type. Suppress the children — the parent already conveys
+    // "this entire block is new/gone."
+    let added_deleted_child_suppress: Vec<EntityId> = result
+        .iter()
+        .filter(|child| matches!(child.change, ChangeType::Added | ChangeType::Deleted))
+        .filter(|child| {
+            result.iter().any(|parent| {
+                parent.id != child.id
+                    && parent.change == child.change
+                    && is_container(parent.kind)
+                    && entity_is_child_of(child, parent)
+            })
+        })
+        .map(|c| c.id.clone())
+        .collect();
+
+    result.retain(|e| {
+        !modified_suppress.contains(&e.id) && !added_deleted_child_suppress.contains(&e.id)
+    });
 }
 
 // ── Public diff entry point ───────────────────────────────────────────────────

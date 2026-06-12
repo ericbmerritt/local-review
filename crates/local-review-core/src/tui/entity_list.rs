@@ -56,6 +56,26 @@ pub fn cancel_extraction(progress: &ExtractionInProgress) {
     progress.cancel.store(true, Ordering::Relaxed);
 }
 
+/// Trait for an extraction task that can run on a background thread.
+///
+/// Implementations clone whatever surface data they need (paths, change
+/// ids, registry handles, etc.) and run the extraction work without
+/// referencing the surface, so the main thread is free to render the
+/// loading overlay while extraction proceeds.
+///
+/// The implementation should:
+/// - Poll `cancel.load(Relaxed)` between files and exit early via
+///   `ExtractionEvent::Cancelled` if it returns `true`.
+/// - Send `Progress { files_done, files_total, files_failed }` events as
+///   counts change so the overlay updates.
+/// - Send `FileExtracted { file_path, entities }` as each file completes
+///   so the entity list can accumulate.
+/// - Finish with `Complete` on success, `Cancelled` on cancel, or
+///   `Error(String)` on fatal failure.
+pub trait ExtractionRunner: Send + 'static {
+    fn run(self: Box<Self>, tx: std::sync::mpsc::Sender<ExtractionEvent>, cancel: Arc<AtomicBool>);
+}
+
 // ── Entity list rendering ─────────────────────────────────────────────────────
 
 const SIGIL_PAD: usize = 5; // "  Δ  " — 2-char indent + 2-char sigil + space
@@ -196,12 +216,20 @@ fn entity_row_line(
             .saturating_sub(name_col + 2)
             .saturating_sub(file.chars().count()),
     );
-    let trailing = if annot_end < width {
-        " ".repeat(width - annot_end)
+    // Reserve trailing space for the comment dot and reviewed check so the
+    // row width stays bounded at `width`. Each glyph is rendered as " ●" /
+    // " ✓" — leading space plus the glyph itself — and contributes 2
+    // display columns. Padding `trailing` to fill the full `width` before
+    // appending the suffixes (the prior shape) pushed them past the right
+    // edge: the row clipped or wrapped, and the ✓ sometimes didn't render.
+    let dot = if comment_indicator { " ●" } else { "" };
+    let check = if entity.reviewed { " ✓" } else { "" };
+    let suffix_width = dot.chars().count() + check.chars().count();
+    let trailing = if annot_end + suffix_width < width {
+        " ".repeat(width - annot_end - suffix_width)
     } else {
         String::new()
     };
-    let dot = if comment_indicator { " ●" } else { "" };
     TuiLine::from(vec![
         Span::raw("  "),
         Span::styled(
@@ -218,6 +246,7 @@ fn entity_row_line(
             Style::default().fg(Color::DarkGray),
         ),
         Span::styled(format!("{annot}{trailing}{dot}"), style.fg(Color::DarkGray)),
+        Span::styled(check, Style::default().fg(Color::Green)),
     ])
 }
 
@@ -316,9 +345,20 @@ pub fn render_loading_overlay(
     } else {
         String::new()
     };
-    let text =
-        format!(" {spinner} Extracting entities  ·  {files_done} / {files_total} files{fail_str}");
-    let hint = "   Esc to cancel";
+    // Hide the file counter when there is no real progress data
+    // (`files_total == 0` is the initial synchronous-load case where no
+    // background worker is sending Progress events). A static `0 / 0`
+    // counter reads as broken; an ellipsis reads as in-progress.
+    let text = if files_total == 0 {
+        format!(" {spinner} Extracting entities…")
+    } else {
+        format!(" {spinner} Extracting entities  ·  {files_done} / {files_total} files{fail_str}")
+    };
+    let hint = if files_total == 0 {
+        "   (this can take a few seconds for large changes)"
+    } else {
+        "   Esc to cancel"
+    };
 
     let area = frame.area();
     let height = 4u16;

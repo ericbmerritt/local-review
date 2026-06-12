@@ -55,6 +55,7 @@ pub struct ComposerRenderView<'a> {
     pub change_id: &'a str,
     pub change_description: &'a str,
     pub editing_is_some: bool,
+    pub focus: crate::tui::composer::ComposerFocus,
 }
 
 impl<'a> ComposerRenderView<'a> {
@@ -68,6 +69,7 @@ impl<'a> ComposerRenderView<'a> {
             change_id: composer.change_id.as_str(),
             change_description: &composer.change_description,
             editing_is_some: composer.editing.is_some(),
+            focus: composer.focus,
         }
     }
 }
@@ -328,10 +330,23 @@ fn scope_picker_text(active: ScopeTag, change_id: &str) -> String {
     out
 }
 
-fn scope_picker_spans(active: ScopeTag, change_id: &str) -> Vec<Span<'static>> {
+fn scope_picker_spans(active: ScopeTag, change_id: &str, focused: bool) -> Vec<Span<'static>> {
     let segs = picker_segments(active, change_id);
     let mut spans: Vec<Span<'static>> = Vec::with_capacity(segs.len() * 2 + 1);
-    spans.push(Span::raw("  scope    ".to_owned()));
+    // `▸ ` marker when focused, two spaces otherwise — preserves alignment.
+    let label = if focused {
+        "▸ scope    ".to_owned()
+    } else {
+        "  scope    ".to_owned()
+    };
+    let label_style = if focused {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+    spans.push(Span::styled(label, label_style));
     for (i, (mark, label, is_active)) in segs.into_iter().enumerate() {
         if i > 0 {
             spans.push(Span::raw("  ".to_owned()));
@@ -350,7 +365,8 @@ fn scope_picker_spans(active: ScopeTag, change_id: &str) -> Vec<Span<'static>> {
 }
 
 fn render_scope_picker(frame: &mut Frame<'_>, area: Rect, view: &ComposerRenderView<'_>) {
-    let spans = scope_picker_spans(ScopeTag::of(view.scope), view.change_id);
+    let focused = view.focus == crate::tui::composer::ComposerFocus::Scope;
+    let spans = scope_picker_spans(ScopeTag::of(view.scope), view.change_id, focused);
     let widget = Paragraph::new(TuiLine::from(spans));
     frame.render_widget(widget, area);
 }
@@ -375,8 +391,22 @@ fn render_severity_picker(frame: &mut Frame<'_>, area: Rect, view: &ComposerRend
         .fg(severity_color(view.severity))
         .add_modifier(Modifier::BOLD);
 
+    let focused = view.focus == crate::tui::composer::ComposerFocus::Severity;
+    let label = if focused {
+        "▸ severity  "
+    } else {
+        "  severity  "
+    };
+    let label_style = if focused {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+
     let mut spans: Vec<Span<'_>> = Vec::with_capacity(8);
-    spans.push(Span::raw("  severity  "));
+    spans.push(Span::styled(label, label_style));
     if view.severity == Severity::Note {
         spans.push(Span::styled(format!("{note_mark} note"), picked_style));
     } else {
@@ -404,12 +434,15 @@ fn render_body_editor(frame: &mut Frame<'_>, area: Rect, view: &ComposerRenderVi
 }
 
 fn footer_lines(editing: bool) -> [&'static str; 2] {
-    let line1 = "  M-l line  M-c change  M-k stack  M-d description";
-    let line2 = if editing {
-        "  M-r required  M-s suggestion  M-n note  ^D delete  ^X save"
+    // Primary line: the multiplexer-safe pattern that works in every
+    // terminal. Secondary line: the Alt-chord direct selectors (faster
+    // when not intercepted by a multiplexer like zellij/tmux).
+    let line1 = if editing {
+        "  Tab focus  Space cycle  ^X save  ^D delete  Esc cancel"
     } else {
-        "  M-r required  M-s suggestion  M-n note  ^X save"
+        "  Tab focus  Space cycle  ^X save  Esc cancel"
     };
+    let line2 = "  alt: M-r/M-s/M-n severity  M-l/M-c/M-k/M-d scope";
     [line1, line2]
 }
 
@@ -590,7 +623,7 @@ mod tests {
 
     #[test]
     fn scope_picker_spans_reverses_active_scope_label() {
-        let spans = scope_picker_spans(ScopeTag::Description, "abcdefgh");
+        let spans = scope_picker_spans(ScopeTag::Description, "abcdefgh", false);
         let active = spans
             .iter()
             .find(|s| s.content.contains("description"))

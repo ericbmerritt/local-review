@@ -1251,6 +1251,158 @@ bar' (format and behavior), 'Scope: jjr vs ggr' (caller count is jjr only),
 
 - claude-context-bundle-for-jjr
 
+## Phase 7: PR-level overview screen (ggr)
+
+| Status         | Started | Completed |
+| -------------- | ------- | --------- |
+| ⬜ not-started |         |           |
+
+Reshape entry 0 in `ggr` so a reviewer who opens a PR can answer "what is this
+about" and "what does it touch" without walking each commit. Description gets
+the room it needs; the aggregated entity list joins it on the same screen under
+a single-key toggle.
+
+**Default landing pane: description body**
+
+Entry 0 lands on the description pane. The pane renders the full PR description
+as **plain text** (no Markdown rendering in v1). Replaces the current one-line
+subject row that pinned in the entity list. Vertical scroll uses the diff-view
+bindings (`j`/`k`, `PgUp`/`PgDn`, `g`/`G`).
+
+The pane is read-only. PR-scoped comments retain the existing `P` binding from
+any screen; the description pane does not host a comment composer in v1.
+Anchoring inline comments to Markdown source lines would require its own model
+and is deferred.
+
+**Second pane: aggregated PR entity list**
+
+`e` from the description pane toggles to the entity pane. The entity pane is the
+**net entity delta** across the entire PR — every changed entity, once,
+classified against the PR base (merge base of the PR branch with its target). An
+entity modified in commit 1 and again in commit 3 appears as one
+`ChangeType::Modified` row whose annotation reflects the net diff.
+
+The aggregation reuses Phase 3's entity-list rendering. All existing entity
+bindings apply in the entity pane: `j`/`k`, `Tab`/`Shift-Tab`, severity filter
+(`1`/`2`/`3`), cosmetic toggle (`;`), `F` for the file list. `Enter` on an
+entity row opens that entity's diff at the commit where the entity was last
+modified.
+
+`e` toggles back to the description pane. Pane selection lives on `App` as
+`Pane::Description | Pane::Entities`; it is TUI state, not surface state.
+
+**Surface contract extension**
+
+`ReviewSurface` gains:
+
+```rust
+fn fetch_pr_entity_list(&self) -> Result<Vec<EntitySummary>, Self::Error>;
+fn fetch_pr_description_body(&self) -> Result<String, Self::Error>;
+```
+
+`jjr` implements both as trivial stubs (`Ok(Vec::new())` and the change
+description respectively). Both calls are gated by `entry_idx == 0`; entries
+1..N continue to use `fetch_entity_list` and `fetch_description_summary`
+unchanged.
+
+**Cache key for the PR-level extraction**
+
+The PR-level entity list has its own cache entry, keyed by the PR base SHA so
+target-branch updates invalidate cleanly:
+
+```
+$XDG_DATA_HOME/ggr/cache/entities/<host>/<owner>/<repo>/<pr>/_pr-<base_sha>.json
+```
+
+`schema_version` and `extraction_hash` rules from the per-commit cache apply
+unchanged. The aggregator computes against `base..head` (the merge base of the
+PR branch with its target, against the PR HEAD), not against any single commit's
+parent.
+
+**Stack bar disambiguates view scope**
+
+The stack bar must distinguish the aggregated PR view from per-commit views:
+
+- Entry 0, description pane: `PR #N · description`
+- Entry 0, entity pane: `PR #N · all entities (K)`
+- Entries 1..N: `PR #N · commit i of M · <short-sha>` (existing)
+
+Without this, the entity pane at entry 0 and an entity list at entry 1 look
+identical, and the reviewer loses track of which scope they are reading.
+
+**De-duplication semantics**
+
+The aggregator de-duplicates by `EntityId`. Multiple `Modified` records for the
+same `EntityId` fold to one against the PR base. The Container Rule applies on
+the aggregated set the same way it applies per commit (containers suppressed
+when a child entity appears in the result). `Added` entities across commits
+collapse to one `Added`; an entity `Added` then `Deleted` within the PR's commit
+range does not appear in the aggregated list.
+
+**Bounded fan-out — what we do not solve in v1**
+
+A PR touching 200+ entities is unscrollable as one flat list. v1 ships without
+tree-folding or directory grouping. The existing severity filter, cosmetic
+toggle, and `Tab`/`Shift-Tab` cycling are the only navigational controls.
+Tree-fold by file path joins Later Enhancements if observed PRs commonly exceed
+~50 distinct entities — not before evidence.
+
+**`jjr` is unaffected**
+
+`jjr` has no PR analogue. Entry 0 in `jjr` continues to be the change
+description as it is today. The `e` toggle is a ggr-only binding. Surface
+methods return stubs in `jjr`.
+
+**Reference**
+
+specs/semantic-entity-navigation.md sections: 'PR-level overview screen (ggr)'
+(default landing, toggle, aggregation rules), 'Navigation Model' (entry-0 shape
+and how it differs between ggr and jjr), 'Implementation Impact' (new surface
+methods and `App` pane state).
+
+#### Delivers
+
+- Entry 0 in ggr renders the full PR description body as plain text on first
+  landing (replacing the pinned one-line subject row).
+- `e` toggle on entry 0 switches between description pane and aggregated entity
+  pane; pane selection persists per session.
+- Aggregated entity list at entry 0 in ggr: net delta against the PR base,
+  de-duplicated by EntityId, Container Rule applied.
+- `fetch_pr_entity_list` and `fetch_pr_description_body` on `ReviewSurface`; jjr
+  stubs them.
+- Cache file `_pr-<base_sha>.json` under the per-PR cache directory; same
+  schema_version and extraction_hash invariants as the per-commit cache.
+- Stack bar segment that names the active scope (PR description / PR entities /
+  per-commit).
+- `Enter` on an aggregated entity row opens that entity's diff at the commit
+  that last modified it (existing `Screen::EntityDiff` with the resolved entry
+  index).
+
+#### Done When
+
+- Opening a ggr PR lands on entry 0 with the full description body visible
+  (multi-line descriptions render their full content, scrollable).
+- `e` toggles to an aggregated entity list with at least one row per distinct
+  entity changed in the PR (verified on a representative multi-commit PR).
+- An entity modified in two commits appears as one row, not two.
+- An entity added then deleted within the PR does not appear in the aggregated
+  list.
+- The stack bar text reflects current scope: "description", "all entities (K)",
+  or "commit i of M".
+- `Enter` on an aggregated entity row navigates to a per-commit entity diff for
+  the commit that last modified that entity.
+- All existing entity-list bindings (j/k, Tab/Shift-Tab, severity filter,
+  cosmetic toggle, F) work in the entity pane without modification.
+- PR-level cache `_pr-<base_sha>.json` is written on first extraction and reused
+  on the next open within the same target-branch state.
+- jjr is unmodified: entry 0 continues to render the change description with no
+  `e` binding.
+- `just validate` passes.
+
+#### Depends On
+
+- entity-list-and-entity-diff-with-loading
+
 ## Notes
 
 ### Index glossary

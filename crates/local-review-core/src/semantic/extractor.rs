@@ -45,13 +45,20 @@ pub trait SemanticExtractor: Send + Sync {
 
     /// Extract semantic entities from `content`.
     ///
-    /// Returns `Err(ParseContainsErrors)` when tree-sitter produces ERROR nodes.
-    /// Returns `Ok([])` for valid but entity-free files.
+    /// Implementations should be permissive: tree-sitter is fault-tolerant
+    /// and produces a tree even when the source contains unparseable spans
+    /// (older grammar versions stumble on newer language features). Skipping
+    /// descent into ERROR / MISSING nodes lets extraction recover entities
+    /// from the rest of the file rather than erasing navigation for one
+    /// syntactic glitch. Plugins that need to reject pathological inputs
+    /// (e.g., SQL where partial extraction is misleading) may still return
+    /// `Err(ParseContainsErrors)`. Returns `Ok([])` for valid but
+    /// entity-free files.
     fn extract(&self, content: &str, file_path: &str) -> ExtractResult;
 }
 
 /// Compute the first-8-bytes blake3 hash of a string, returned as u64.
-pub(crate) fn content_hash(s: &str) -> u64 {
+pub fn content_hash(s: &str) -> u64 {
     let bytes = blake3::hash(s.as_bytes());
     let arr: [u8; 8] = bytes.as_bytes()[..8].try_into().unwrap_or([0u8; 8]);
     u64::from_le_bytes(arr)

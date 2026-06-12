@@ -7,11 +7,11 @@
 //! paths. `ComposerOps` is implemented here for jjr's `Composer` so that the
 //! shared `handle_composer_key` can drive it.
 
-use local_review_core::tui::composer::ComposerOps;
 pub(crate) use local_review_core::tui::composer::{
     default_severity, format_age, handle_composer_key, ComposerAction, ComposerInit, ComposerScope,
     DescriptionContext, LineTarget, ScopeTag, StackContextSnapshot,
 };
+use local_review_core::tui::composer::{ComposerFocus, ComposerOps};
 
 use crossterm::event::KeyEvent;
 use time::OffsetDateTime;
@@ -75,6 +75,9 @@ pub(crate) struct Composer {
     pub(crate) scope: ComposerScope,
     pub(crate) severity: Severity,
     pub(crate) body: TextArea,
+    /// Which field has keyboard focus. Tab cycles; Space cycles values
+    /// within a focused picker.
+    pub(crate) focus: ComposerFocus,
     /// `Some` when the composer is in edit mode; `None` for new comments.
     pub(crate) editing: Option<EditingContext>,
     /// In-modal status hint, set when a chord is refused (Alt+D without
@@ -102,6 +105,7 @@ impl Composer {
             scope: init.scope,
             severity: init.severity,
             body: TextArea::default(),
+            focus: ComposerFocus::Body,
             editing: None,
             refusal_status: None,
             change_id: init.change_id,
@@ -124,6 +128,7 @@ impl Composer {
             scope: edited.init.scope,
             severity: edited.init.severity,
             body: textarea,
+            focus: ComposerFocus::Body,
             editing: Some(EditingContext {
                 identity: edited.identity,
                 original_anchor: edited.original_anchor,
@@ -183,6 +188,22 @@ impl ComposerOps for Composer {
 
     fn description_available_clone(&self) -> Option<DescriptionContext> {
         self.description_available.clone()
+    }
+
+    fn current_severity(&self) -> Severity {
+        self.severity
+    }
+
+    fn current_scope_tag(&self) -> ScopeTag {
+        ScopeTag::of(&self.scope)
+    }
+
+    fn focus(&self) -> ComposerFocus {
+        self.focus
+    }
+
+    fn set_focus(&mut self, focus: ComposerFocus) {
+        self.focus = focus;
     }
 
     fn set_scope(&mut self, scope: ComposerScope) {

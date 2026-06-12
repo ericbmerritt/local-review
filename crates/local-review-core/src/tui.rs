@@ -17,6 +17,7 @@ pub mod entity_list;
 pub mod file_picker;
 pub mod help_screen;
 pub mod textarea;
+pub mod yank;
 
 pub use app::{
     footer_text_for_width, run_app, App, AppError, BaseViews, DiffMode, Edge, EffectiveDiffMode,
@@ -450,6 +451,21 @@ pub trait ReviewSurface: Sized {
             subject: self.entry_description(entry_idx),
             comment_count: 0,
         })
+    }
+
+    /// Optional async extraction. When `Some(task)` is returned, the core
+    /// runs the task on a background thread and the event loop polls the
+    /// resulting channel — the loading-overlay spinner animates because
+    /// the main thread is no longer blocked.
+    ///
+    /// Default returns `None`, in which case `start_entity_extraction`
+    /// falls back to the synchronous `fetch_entity_list` path (static
+    /// spinner during the wait).
+    fn entity_extraction_task(
+        &self,
+        _entry_idx: usize,
+    ) -> Option<Box<dyn entity_list::ExtractionRunner>> {
+        None
     }
 }
 

@@ -267,11 +267,20 @@ diff escape hatch.
 The hierarchy is:
 
 ```
-PR / jj stack
-  └── commit (ggr) / change (jjr)
-        └── entity list                ← primary navigation level
-              └── entity diff view     ← focused file diff (pre-scrolled, highlighted)
+PR (ggr) / jj stack
+  ├── entry 0 — PR overview (ggr only)
+  │     ├── description pane         ← default landing in ggr (full body)
+  │     └── entity pane              ← aggregated net delta across all commits
+  │           (toggle with `e`)
+  └── commit (ggr) / change (jjr)    ← entries 1..N
+        └── entity list              ← primary navigation level
+              └── entity diff view   ← focused file diff (pre-scrolled, highlighted)
 ```
+
+In `jjr`, there is no PR analogue; entry 0 is the change description. In `ggr`,
+entry 0 carries both the description and an aggregated entity view of the whole
+PR so a reviewer can answer "what is this PR about" and "what does it touch"
+without walking commit by commit.
 
 File access remains as an escape hatch:
 
@@ -706,6 +715,115 @@ context, "this class lost 3 methods" structural view via the source file).
 The file diff view continues to use the existing per-file reviewed bit. The
 entity diff view uses the new per-entity bit. The two are independent.
 
+### PR-level overview screen (ggr)
+
+In the per-commit navigation model above, the reviewer must press `n`/`p`
+through every commit to learn what a PR touches. For a 7-commit PR that is 7
+cache fetches, 7 entity lists, and no aggregated view. The description-page
+landing (entry 0) shows the PR description as a one-line subject in a pinned row
+of an otherwise empty entity list, which is a header pointing at content rather
+than the content itself.
+
+Entry 0 in ggr is reshaped to be the **PR-level overview**: the screen the
+reviewer naturally lands on, and the screen they return to when they want a
+whole-PR picture without leaving and re-entering. Per-commit entity lists at
+entries 1..N remain unchanged.
+
+**Two panes at entry 0, one key to toggle**
+
+- **Description pane** (default landing): full PR description body rendered as
+  plain text. Replaces the current one-line subject row. Long descriptions with
+  test plans and architectural context get the room they need. Vertical scroll
+  uses the same `j`/`k`/`PgUp`/`PgDn` bindings as the diff view.
+- **Entity pane**: aggregated entity list spanning every commit in the PR.
+
+`e` toggles between the two panes at entry 0. The toggle is a single binding
+because the two panes answer two questions a reviewer asks in sequence — "what
+is this PR about" then "what does it touch" — and round-tripping between them
+must be free. Footer indicates which pane is active.
+
+Markdown rendering of the description body is **out of v1**. Plain text is
+strictly better than the current state; pretty rendering is a separate piece of
+work and lives in Later Enhancements.
+
+**Aggregated entity list**
+
+The aggregated list is the **net entity delta** across the PR, computed against
+the PR base (the merge base of the PR branch and its target branch), not against
+the first commit's parent. This matches what GitHub's "Files changed" tab shows
+and what `gh pr view` reports: what hits trunk if the PR merges.
+
+An entity modified in commit 1 and again in commit 3 appears **once**, as one
+`ChangeType::Modified` row with `ChangeAnnotation` reflecting the net diff. The
+reviewer cares about the net effect on the target branch; the commit-by- commit
+dance is available at entries 1..N for reviewers walking the evolution.
+
+Cache key for the PR-level entry: `<owner>/<repo>/<pr>/_pr-<base_sha>.json`,
+discriminated by the merge base so target-branch updates invalidate cleanly.
+Schema and `extraction_hash` rules from the per-commit cache apply unchanged.
+
+**Surface contract extension**
+
+`ReviewSurface` gains:
+
+```rust
+fn fetch_pr_entity_list(&self) -> Result<Vec<EntitySummary>, Self::Error>;
+fn fetch_pr_description_body(&self) -> Result<String, Self::Error>;
+```
+
+`fetch_pr_entity_list` returns the aggregated net list. `jjr` returns
+`Ok(Vec::new())` — there is no PR analogue. `fetch_pr_description_body` returns
+the full body text for the description pane; `jjr` returns the change
+description.
+
+**Stack bar disambiguates view scope**
+
+The stack bar (top row) currently shows the position within the stack
+(`PR #2972 · commit 3 of 7`). It must now distinguish the aggregated PR view
+from the per-commit view:
+
+- Entry 0, description pane: `PR #2972 · description`
+- Entry 0, entity pane: `PR #2972 · all entities (12)`
+- Entries 1..N: `PR #2972 · commit 3 of 7 · <short-sha>`
+
+Without this, the entity pane at entry 0 and an entity list at entry 1 look
+identical, and the reviewer loses track of which scope they are in.
+
+**Bindings on entry 0**
+
+- `e` — toggle description ↔ entity pane (within entry 0 only)
+- `Enter` — in entity pane: open the entity's diff at the commit that last
+  modified that entity (entry index for that commit)
+- `n`/`p` — advance/retreat in the stack (existing)
+- All other entity-list bindings (`j`/`k`, `Tab`/`Shift-Tab`, severity filter,
+  `;` cosmetic toggle, `F` file list) apply in the entity pane
+- All diff-scroll bindings apply in the description pane
+
+**Description pane is read-only**
+
+No comment composer on the description pane in v1. PR-scoped comments retain
+their existing `P` binding from any screen. The description pane exists to read
+the description, not to annotate it. Annotating Markdown source lines would
+require its own anchor model and is out of scope here.
+
+**Why aggregated, not appended**
+
+A naive aggregation would concatenate each commit's entity list and let
+duplicates exist. That fails: a function rebased through 5 commits would appear
+5 times. The reviewer asks "did `authenticate` change?" and "yes, once" is the
+only useful answer. The aggregator de-duplicates by `EntityId`, folding multiple
+`Modified` records into one against the PR base (`base..head` content
+comparison, same extraction pipeline as per-commit). Container Rule applies on
+the aggregated set the same way it applies per commit.
+
+**Bounded fan-out — what we do not solve in v1**
+
+A PR touching 200+ entities renders an unscrollable wall. v1 ships without
+tree-folding or directory grouping; the existing severity filter (`1`/`2`/`3`),
+cosmetic toggle (`;`), and `Tab`/`Shift-Tab` cycling are the navigational tools.
+If observed PRs commonly exceed 50 distinct entities, tree-fold by file path
+joins the Later Enhancements list — not before evidence.
+
 ## Semantic Extraction Layer
 
 The new layer that turns file content into `Vec<EntitySummary>`.
@@ -1127,6 +1245,18 @@ since it is not an entity.
 produce entity data return an empty `Vec<EntitySummary>`; the tool surfaces
 every changed file as a fallback row.
 
+For the PR-level overview screen at entry 0 (`ggr` only), two further methods
+appear on `ReviewSurface`:
+
+- `fetch_pr_entity_list() → Vec<EntitySummary>` returning the aggregated net
+  delta against the PR base.
+- `fetch_pr_description_body() → String` returning the full description body
+  (plain text; rendering is the UI's concern).
+
+`jjr` implements both as trivial stubs (`fetch_pr_entity_list → Vec::new()`,
+`fetch_pr_description_body → change description`). The entry-0 pane toggle is
+TUI state on `App`, not surface state.
+
 ### Reviewed-bit storage
 
 `is_view_reviewed(view_idx)` → file index. New contracts:
@@ -1139,10 +1269,12 @@ layer is preserved for fallback rows.
 
 ### Description view
 
-Description was view index 0. Now: the description is the pinned first row of
-the entity list with content from `fetch_description_summary`. `Enter` opens the
-existing description screen. The `file_index == 0 → description` special case is
-removed from `App`.
+Description was view index 0. Now: at entry 0 in `ggr`, the description is the
+default landing pane (full body, plain text), toggled with `e` to the aggregated
+entity pane. In `jjr` the description page retains its existing shape (change
+description, no toggle since there is no PR aggregation). The
+`file_index == 0 → description` special case is removed from `App`; entry-0 pane
+selection is its own state field (`Pane::Description | Pane::Entities`).
 
 ### `Tab` / `Shift-Tab` semantics
 

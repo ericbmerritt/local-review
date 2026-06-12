@@ -8,6 +8,7 @@ allow = [
   "MIT-0",
   "BSD-2-Clause",
   "BSD-3-Clause",
+  "BSL-1.0",
   "Unicode-3.0",
   "Unlicense",
   "Zlib",
@@ -22,6 +23,7 @@ highlight = "all"
 skip = [
   { crate = "wit-bindgen@0.51.0", reason = "two wit-bindgen versions reach us via tempfile's wasip2/wasip3 deps; cannot collapse without forking. Pinned so the skip fails when 0.51 drops out and we can re-evaluate." },
   { crate = "hashbrown@0.16.1", reason = "ratatui 0.30.x pulls in two hashbrown versions transitively: kasuari (its constraint solver) uses 0.16, lru uses 0.17. Cannot collapse without upstream coordination. Pinned so the skip fails when 0.16 drops out and we can re-evaluate." },
+  { crate = "windows-sys@0.60.2", reason = "arboard 3.6 pulls in windows-sys 0.60 via clipboard-win 5.4; the rest of the workspace (anstyle-query, rustix, etc.) uses 0.61. Cannot collapse without upstream arboard release. Pinned so the skip fails when 0.60 drops out and we can re-evaluate." },
 ]
 
 [sources]

@@ -138,6 +138,11 @@ pub(crate) struct GgrDraft {
     pub(crate) status: Option<DraftStatus>,
     /// Human-readable reason set when `status == Stale`.
     pub(crate) mismatch_reason: Option<String>,
+    /// Semantic entity this draft belongs to; populated at creation when
+    /// entity extraction has run.
+    pub(crate) entity_id: Option<local_review_core::semantic::EntityId>,
+    /// Three-point re-anchoring fingerprint; populated for line-scoped drafts.
+    pub(crate) anchor_fingerprint: Option<local_review_core::AnchorFingerprint>,
 }
 
 // ── construction ──────────────────────────────────────────────────────────────
@@ -186,6 +191,27 @@ impl GgrDraft {
                     .map(|s| strip_controls(s))
                     .collect(),
             },
+            // Strip controls on every input. The stored `context_before` /
+            // `context_after` above are sanitized, so the fingerprint must
+            // be computed from the same sanitized text — otherwise the hash
+            // captures bytes the stored context no longer contains, and
+            // re-anchoring on the next open recomputes a different hash and
+            // marks the comment stale.
+            anchor_fingerprint: Some(local_review_core::AnchorFingerprint::compute(
+                &strip_controls(&anchor.target_text),
+                &anchor
+                    .context_before
+                    .last()
+                    .map(|s| strip_controls(s))
+                    .unwrap_or_default(),
+                &anchor
+                    .context_after
+                    .first()
+                    .map(|s| strip_controls(s))
+                    .unwrap_or_default(),
+            )),
+            // TODO: populate entity_id from entity list
+            entity_id: None,
         })
     }
 
@@ -206,6 +232,8 @@ impl GgrDraft {
             status: None,
             mismatch_reason: None,
             anchor: GgrAnchor::Commit { commit_sha: sha },
+            entity_id: None,
+            anchor_fingerprint: None,
         })
     }
 
@@ -223,6 +251,8 @@ impl GgrDraft {
             status: None,
             mismatch_reason: None,
             anchor: GgrAnchor::Pr,
+            entity_id: None,
+            anchor_fingerprint: None,
         })
     }
 
@@ -254,6 +284,8 @@ impl GgrDraft {
         let updated_at = w.updated_at.as_deref().map(strip_controls);
         let status = w.status;
         let mismatch_reason = w.mismatch_reason.as_deref().map(strip_controls);
+        let entity_id = w.entity_id.clone();
+        let anchor_fingerprint = w.anchor_fingerprint.clone();
 
         let common = CommonParams {
             host: w.host,
@@ -298,6 +330,8 @@ impl GgrDraft {
         draft.updated_at = updated_at;
         draft.status = status;
         draft.mismatch_reason = mismatch_reason;
+        draft.entity_id = entity_id;
+        draft.anchor_fingerprint = anchor_fingerprint;
         Ok(draft)
     }
 
@@ -361,6 +395,8 @@ impl GgrDraft {
             context_after: None,
             status: self.status,
             mismatch_reason: self.mismatch_reason.clone(),
+            entity_id: self.entity_id.clone(),
+            anchor_fingerprint: self.anchor_fingerprint.clone(),
         }
     }
 }
@@ -448,6 +484,10 @@ struct WireDraft {
     status: Option<DraftStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     mismatch_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    entity_id: Option<local_review_core::semantic::EntityId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    anchor_fingerprint: Option<local_review_core::AnchorFingerprint>,
 }
 
 // ── validation ────────────────────────────────────────────────────────────────

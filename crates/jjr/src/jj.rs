@@ -213,17 +213,9 @@ fn should_fall_back_on_empty(entries: &[StackEntry]) -> bool {
 /// Returns `Ok("")` for added files (where the "before" content is empty).
 /// Returns `Err` if the file is absent at that revision for any other reason.
 pub fn file_content_at(rev: &str, file_path: &str, repo_root: &std::path::Path) -> Result<String> {
-    let repo_str = repo_root.to_str().unwrap_or(".");
     let output = Command::new("jj")
-        .args([
-            "--repository",
-            repo_str,
-            "file",
-            "show",
-            "-r",
-            rev,
-            file_path,
-        ])
+        .args(["file", "show", "-r", rev, file_path])
+        .current_dir(repo_root)
         .output()
         .map_err(|source| JjrError::Io { source })?;
 
@@ -243,8 +235,10 @@ pub fn file_content_at(rev: &str, file_path: &str, repo_root: &std::path::Path) 
 }
 
 /// Return the parent rev string for a change (its `@-` equivalent).
+///
+/// jj uses `-` (not git's `^`) as the postfix parent operator.
 pub fn parent_rev(change_id: &ChangeId) -> String {
-    format!("{}^", change_id.as_str())
+    format!("{}-", change_id.as_str())
 }
 
 pub fn resolve_stack(revset: &str) -> Result<ResolvedStack> {
@@ -616,5 +610,100 @@ mod tests {
         let meta = log_metadata_from_records(&change_id, entries, raw).unwrap();
         assert_eq!(meta.change_id.as_str(), "abc11111");
         assert_eq!(meta.commit_id.as_str(), "aabbccdd11223344");
+    }
+
+    // jj uses `-` as the postfix parent operator, not git's `^`.
+    // This test pins the exact syntax so a copy-paste from git docs can't
+    // silently break entity extraction for all added/deleted files.
+    #[test]
+    fn parent_rev_uses_jj_dash_operator_not_git_caret() {
+        let id = ChangeId::parse("ovxkqtqkrvxv").unwrap();
+        let rev = parent_rev(&id);
+        assert!(
+            rev.ends_with('-'),
+            "jj parent operator is `-`, got: {rev:?}"
+        );
+        assert!(
+            !rev.ends_with('^'),
+            "do not use git `^` operator in jj revsets, got: {rev:?}"
+        );
+    }
+
+    /// Integration test: `file_content_at` returns the correct content for
+    /// both the current revision and the parent revision in a real jj repo.
+    ///
+    /// This test requires `jj` on PATH and is skipped when it is absent.
+    /// It directly exercises the shell boundary that previously broke entity
+    /// extraction for all added/deleted/modified files (wrong `^` vs `-`
+    /// parent operator).
+    #[test]
+    fn file_content_at_reads_current_and_parent_revisions() {
+        let jj_available = Command::new("jj")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !jj_available {
+            eprintln!("jj not on PATH; skipping file_content_at integration test");
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+
+        // Minimal jj config to avoid prompting for user info.
+        let config = repo.join("jjconfig.toml");
+        std::fs::write(
+            &config,
+            "[user]\nname = \"Test\"\nemail = \"test@example.com\"\n",
+        )
+        .unwrap();
+
+        let jj = |args: &[&str]| {
+            Command::new("jj")
+                .args(args)
+                .env("JJ_CONFIG", &config)
+                .current_dir(repo)
+                .output()
+                .unwrap()
+        };
+
+        jj(&["git", "init", "--quiet"]);
+
+        // First commit: add a file.
+        std::fs::write(repo.join("main.py"), "def hello():\n    pass\n").unwrap();
+        jj(&["describe", "-m", "add main.py", "--quiet"]);
+        jj(&["new", "--quiet"]);
+
+        // Second commit: modify the file.
+        std::fs::write(repo.join("main.py"), "def hello():\n    return 42\n").unwrap();
+        jj(&["describe", "-m", "modify main.py", "--quiet"]);
+
+        // Resolve the current change and its parent.
+        let change_id = {
+            let out = jj(&["log", "--no-graph", "-r@", "-T", "change_id.short()"]);
+            String::from_utf8(out.stdout).unwrap().trim().to_owned()
+        };
+        let id = ChangeId::parse(&change_id).unwrap();
+        let parent = parent_rev(&id);
+
+        // Current rev must return the modified content.
+        let after = file_content_at(&change_id, "main.py", repo).unwrap();
+        assert!(
+            after.contains("return 42"),
+            "current rev must contain modified content"
+        );
+
+        // Parent rev must return the original content.
+        let before = file_content_at(&parent, "main.py", repo).unwrap();
+        assert!(
+            before.contains("pass"),
+            "parent rev must contain original content; \
+             check that `parent_rev` uses jj `-` not git `^`"
+        );
+
+        // Added file: parent rev returns empty string (not an error).
+        let absent = file_content_at(&parent, "nonexistent.py", repo).unwrap();
+        assert!(absent.is_empty(), "absent file must return empty string");
     }
 }

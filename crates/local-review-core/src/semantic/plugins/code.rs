@@ -40,6 +40,12 @@ pub(crate) struct LanguageSpec {
     pub entity_kinds: &'static [(&'static str, EntityKind)],
     /// Node kinds whose children may also contain entities (container nodes).
     pub container_kinds: &'static [&'static str],
+    /// Node kinds that are entities only when at the file's top level — i.e.,
+    /// not nested inside any container. Used for kinds whose body-scope
+    /// occurrences are noise (e.g. bash `variable_assignment` inside a
+    /// function), but whose file-scope occurrences are meaningful (e.g.
+    /// configuration variables and case-dispatch branches at script root).
+    pub top_level_only_kinds: &'static [&'static str],
 }
 
 // ── Name extraction ───────────────────────────────────────────────────────────
@@ -69,10 +75,65 @@ fn node_name<'t>(node: Node<'t>, src: &'t [u8]) -> Option<&'t str> {
 }
 
 /// Extract the text of any named-field `name` from node, stripping controls.
+///
+/// Special-cased for Rust `impl_item` nodes: tree-sitter exposes both a
+/// `trait` field (for trait impls) and a `type` field (the implementing
+/// type). The generic name lookup would return whichever identifier comes
+/// first lexically — for `impl Deref for PlanId`, that's "Deref" — making
+/// every `impl Deref for X` block in a file collapse to the same display
+/// name. Build a composite "Trait for Type" name so each impl is distinct
+/// in the entity list and its methods get unique scope chains.
 fn entity_name(node: Node<'_>, src: &[u8]) -> Option<String> {
+    if node.kind() == "impl_item" {
+        return impl_item_name(node, src);
+    }
+    if node.kind() == "case_item" {
+        return case_item_name(node, src);
+    }
     node_name(node, src)
         .map(strip_controls)
         .filter(|s| !s.is_empty())
+}
+
+/// Name a bash `case_item` by the text of its pattern (the first named child).
+/// Patterns can be a `word`, `string`, `raw_string`, `concatenation`, or
+/// alternation like `'foo'|"bar"`. We render whatever was written so users
+/// see the same text in the entity list as they see in the source.
+fn case_item_name(node: Node<'_>, src: &[u8]) -> Option<String> {
+    let mut cursor = node.walk();
+    let pattern = node.named_children(&mut cursor).next()?;
+    pattern
+        .utf8_text(src)
+        .ok()
+        .map(strip_controls)
+        .filter(|s| !s.is_empty())
+}
+
+/// Compose a name for a Rust `impl_item` node:
+/// - `impl Trait for Type` → `"Trait for Type"`
+/// - `impl Type`           → `"Type"`
+///
+/// Falls back to the generic name extractor if neither field is present
+/// (e.g., an in-progress parse where the impl block is incomplete).
+fn impl_item_name(node: Node<'_>, src: &[u8]) -> Option<String> {
+    let ty = node
+        .child_by_field_name("type")
+        .and_then(|n| n.utf8_text(src).ok())
+        .map(strip_controls)
+        .filter(|s| !s.is_empty());
+    let tr = node
+        .child_by_field_name("trait")
+        .and_then(|n| n.utf8_text(src).ok())
+        .map(strip_controls)
+        .filter(|s| !s.is_empty());
+    match (tr, ty) {
+        (Some(tr), Some(ty)) => Some(format!("{tr} for {ty}")),
+        (None, Some(ty)) => Some(ty),
+        (Some(tr), None) => Some(tr),
+        (None, None) => node_name(node, src)
+            .map(strip_controls)
+            .filter(|s| !s.is_empty()),
+    }
 }
 
 // ── Traversal ────────────────────────────────────────────────────────────────
@@ -103,8 +164,25 @@ impl<'t> Collector<'t> {
     }
 
     fn visit(&mut self, node: Node<'t>, parent_scope: &str) {
+        // Tree-sitter is fault-tolerant: it produces a tree even for code it
+        // can't fully parse, marking unparseable spans with ERROR or MISSING
+        // nodes. Don't extract from inside those — their structure isn't
+        // meaningful — but keep walking the rest of the file. Older grammar
+        // versions stumble on newer language features (let-else, async fn in
+        // traits, etc.); rejecting the whole file would erase navigation for
+        // every modern Rust codebase.
+        if node.is_error() || node.is_missing() {
+            return;
+        }
         let kind_str = node.kind();
         if let Some(ek) = self.kind_for(kind_str) {
+            let restricted = self.spec.top_level_only_kinds.contains(&kind_str);
+            if restricted && !parent_scope.is_empty() {
+                // Top-level-only kind nested inside a container: skip emission,
+                // but keep descending — children may still contain entities.
+                self.visit_children(node, parent_scope);
+                return;
+            }
             if let Some(name) = entity_name(node, self.src) {
                 let scope = if parent_scope.is_empty() {
                     name.clone()
@@ -152,21 +230,6 @@ impl<'t> Collector<'t> {
     }
 }
 
-// ── Error-node detection ──────────────────────────────────────────────────────
-
-fn has_error_nodes(root: Node<'_>) -> bool {
-    if root.is_error() || root.is_missing() {
-        return true;
-    }
-    let mut cursor = root.walk();
-    for child in root.children(&mut cursor) {
-        if has_error_nodes(child) {
-            return true;
-        }
-    }
-    false
-}
-
 // ── Plugin implementation ─────────────────────────────────────────────────────
 
 pub(crate) struct CodePlugin {
@@ -203,11 +266,6 @@ impl SemanticExtractor for CodePlugin {
             })?;
 
         let root = tree.root_node();
-        if has_error_nodes(root) {
-            return Err(ExtractError::ParseContainsErrors {
-                file_path: file_path.into(),
-            });
-        }
 
         // Use content.as_bytes() directly — no copy. The Tree doesn't own the
         // source bytes; the caller (this method) keeps them alive for the
@@ -259,6 +317,7 @@ pub(crate) static RUST_SPEC: LanguageSpec = LanguageSpec {
         ("static_item", EntityKind::Constant),
     ],
     container_kinds: &["impl_item", "mod_item", "trait_item"],
+    top_level_only_kinds: &[],
 };
 
 #[cfg(feature = "lang-python")]
@@ -271,6 +330,7 @@ pub(crate) static PYTHON_SPEC: LanguageSpec = LanguageSpec {
         ("class_definition", EntityKind::Class),
     ],
     container_kinds: &["class_definition"],
+    top_level_only_kinds: &[],
 };
 
 #[cfg(feature = "lang-go")]
@@ -284,6 +344,7 @@ pub(crate) static GO_SPEC: LanguageSpec = LanguageSpec {
         ("type_declaration", EntityKind::Type),
     ],
     container_kinds: &[],
+    top_level_only_kinds: &[],
 };
 
 #[cfg(feature = "lang-java")]
@@ -303,6 +364,7 @@ pub(crate) static JAVA_SPEC: LanguageSpec = LanguageSpec {
         "enum_declaration",
         "interface_declaration",
     ],
+    top_level_only_kinds: &[],
 };
 
 #[cfg(feature = "lang-javascript")]
@@ -316,6 +378,7 @@ pub(crate) static JAVASCRIPT_SPEC: LanguageSpec = LanguageSpec {
         ("method_definition", EntityKind::Method),
     ],
     container_kinds: &["class_declaration"],
+    top_level_only_kinds: &[],
 };
 
 #[cfg(feature = "lang-typescript")]
@@ -332,6 +395,7 @@ pub(crate) static TYPESCRIPT_SPEC: LanguageSpec = LanguageSpec {
         ("method_definition", EntityKind::Method),
     ],
     container_kinds: &["class_declaration", "interface_declaration"],
+    top_level_only_kinds: &[],
 };
 
 #[cfg(feature = "lang-typescript")]
@@ -341,6 +405,7 @@ pub(crate) static TSX_SPEC: LanguageSpec = LanguageSpec {
     language_fn: || tree_sitter_typescript::LANGUAGE_TSX.into(),
     entity_kinds: TYPESCRIPT_SPEC.entity_kinds,
     container_kinds: TYPESCRIPT_SPEC.container_kinds,
+    top_level_only_kinds: TYPESCRIPT_SPEC.top_level_only_kinds,
 };
 
 #[cfg(feature = "lang-scala")]
@@ -356,6 +421,7 @@ pub(crate) static SCALA_SPEC: LanguageSpec = LanguageSpec {
         ("val_definition", EntityKind::Constant),
     ],
     container_kinds: &["class_definition", "object_definition", "trait_definition"],
+    top_level_only_kinds: &[],
 };
 
 #[cfg(feature = "lang-kotlin")]
@@ -370,15 +436,28 @@ pub(crate) static KOTLIN_SPEC: LanguageSpec = LanguageSpec {
         ("primary_constructor", EntityKind::Method),
     ],
     container_kinds: &["class_declaration", "object_declaration"],
+    top_level_only_kinds: &[],
 };
 
+// Bash entity model:
+// - `function_definition` is always an entity, at any depth, and acts as a
+//   container so nested functions get scoped names ("outer::inner").
+// - `case_item` and `variable_assignment` are entities only at the file's top
+//   level. Inside a function they're implementation detail and would explode
+//   the entity list with noise; at the file level they're meaningful (CLI
+//   dispatch patterns, configuration / exports / readonly assignments).
 #[cfg(feature = "lang-bash")]
 pub(crate) static BASH_SPEC: LanguageSpec = LanguageSpec {
     id: "bash",
     extensions: &["sh", "bash"],
     language_fn: || tree_sitter_bash::LANGUAGE.into(),
-    entity_kinds: &[("function_definition", EntityKind::Function)],
-    container_kinds: &[],
+    entity_kinds: &[
+        ("function_definition", EntityKind::Function),
+        ("case_item", EntityKind::Function),
+        ("variable_assignment", EntityKind::Constant),
+    ],
+    container_kinds: &["function_definition"],
+    top_level_only_kinds: &["case_item", "variable_assignment"],
 };
 
 #[cfg(feature = "lang-yaml")]
@@ -388,6 +467,7 @@ pub(crate) static YAML_SPEC: LanguageSpec = LanguageSpec {
     language_fn: || tree_sitter_yaml::LANGUAGE.into(),
     entity_kinds: &[("block_mapping_pair", EntityKind::ConfigProperty)],
     container_kinds: &[],
+    top_level_only_kinds: &[],
 };
 
 #[cfg(feature = "lang-json")]
@@ -397,6 +477,7 @@ pub(crate) static JSON_SPEC: LanguageSpec = LanguageSpec {
     language_fn: || tree_sitter_json::LANGUAGE.into(),
     entity_kinds: &[("pair", EntityKind::ConfigProperty)],
     container_kinds: &[],
+    top_level_only_kinds: &[],
 };
 
 #[cfg(feature = "lang-toml")]
@@ -410,4 +491,5 @@ pub(crate) static TOML_SPEC: LanguageSpec = LanguageSpec {
         ("pair", EntityKind::ConfigProperty),
     ],
     container_kinds: &["table", "array_table"],
+    top_level_only_kinds: &[],
 };
