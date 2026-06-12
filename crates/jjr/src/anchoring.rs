@@ -169,6 +169,8 @@ mod tests {
             updated_at: None,
             status,
             mismatch_reason: reason,
+            entity_id: None,
+            anchor_fingerprint: None,
         }
     }
 

@@ -36,14 +36,17 @@ pub mod error;
 pub mod revset_hash;
 pub mod semantic;
 pub mod severity;
+pub mod startup_spinner;
 pub mod tui;
 pub mod util;
 
-pub use anchoring::{match_anchor, match_description_anchor, AnchorOutcome};
+pub use anchoring::{
+    match_anchor, match_anchor_with_entity, match_description_anchor, AnchorOutcome,
+};
 pub use change_id::{ChangeId, CommitId};
 pub use comment::{
-    DescriptionAnchor, LineAnchor, MismatchReason, Side, CONTEXT_MAX, TARGET_TEXT_MAX,
-    TRUNCATION_SUFFIX,
+    AnchorFingerprint, DescriptionAnchor, LineAnchor, MismatchReason, Side, CONTEXT_MAX,
+    TARGET_TEXT_MAX, TRUNCATION_SUFFIX,
 };
 pub use diff::{Diff, DiffFile, Hunk, Line, LineKind};
 pub use error::{Error, Result};

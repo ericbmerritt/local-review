@@ -59,6 +59,7 @@ serde.workspace = true
 serde_json.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true
+arboard.workspace = true
 time.workspace = true
 tempfile.workspace = true
 tree-sitter = { workspace = true, optional = true }
@@ -76,6 +77,9 @@ tree-sitter-toml-ng = { workspace = true, optional = true }
 tree-sitter-typescript = { workspace = true, optional = true }
 tree-sitter-yaml = { workspace = true, optional = true }
 tree-sitter-md = { workspace = true, optional = true }
+
+[build-dependencies]
+blake3.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

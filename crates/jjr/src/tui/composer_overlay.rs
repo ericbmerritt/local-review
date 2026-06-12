@@ -33,6 +33,7 @@ pub(super) fn render_composer_overlay(
         change_id: composer.change_id.as_str(),
         change_description: &composer.change_description,
         editing_is_some: composer.editing.is_some(),
+        focus: composer.focus,
     };
     render_composer_overlay_view(frame, &view, current_view);
 }

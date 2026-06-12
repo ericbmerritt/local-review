@@ -12,7 +12,7 @@
 //! whether the comment can be re-anchored cleanly or must be marked stale
 //! (and why).
 
-use crate::comment::{DescriptionAnchor, LineAnchor, MismatchReason, Side};
+use crate::comment::{AnchorFingerprint, DescriptionAnchor, LineAnchor, MismatchReason, Side};
 use crate::diff::{Diff, DiffFile, Hunk};
 
 /// Outcome of attempting to re-anchor a saved comment.
@@ -83,6 +83,86 @@ pub fn match_description_anchor(
         1 => AnchorOutcome::ReAnchored(desc_build_updated_anchor(anchor, exact_matches[0])),
         _ => desc_resolve_multiple_exact(anchor, &exact_matches),
     }
+}
+
+/// Re-anchor using the 3-step entity-aware pipeline.
+///
+/// 1. If `entity_line_range` is `Some`, search within that range first using
+///    the fingerprint. A miss within the range does NOT fall through to the
+///    file-wide search.
+/// 2. Fallback: file-wide search (existing `match_anchor` logic).
+pub fn match_anchor_with_entity(
+    anchor: &LineAnchor,
+    fingerprint: Option<&AnchorFingerprint>,
+    entity_line_range: Option<(u32, u32)>,
+    diff: &Diff,
+) -> AnchorOutcome<LineAnchor> {
+    if let (Some(fp), Some((range_start, range_end))) = (fingerprint, entity_line_range) {
+        let Some(diff_file) = diff
+            .files
+            .iter()
+            .find(|f| f.display_path() == anchor.file.as_path())
+        else {
+            return AnchorOutcome::Stale(MismatchReason::FileNotInDiff);
+        };
+
+        let mut best_score: u8 = 0;
+        let mut best_hunk: Option<(&Hunk, usize)> = None;
+        // Count lines tied at `best_score` so we can reject ambiguous matches.
+        // When multiple lines inside `entity_line_range` score identically
+        // (common at the minimum-acceptable score of 3, where only
+        // `line_hash` matched), silently picking the first occurrence can
+        // re-anchor a comment to an unrelated line. Treating ambiguous best
+        // scores as Stale is safer; the reviewer sees the comment moved to
+        // the stale tray and can re-attach manually.
+        let mut tie_count: u32 = 0;
+
+        for hunk in diff_file.hunks() {
+            for (line_idx, line) in hunk.lines.iter().enumerate() {
+                // `entity_line_range` is in the after-state. Skip removed
+                // lines (no `target_line`) and use `target_line` exclusively
+                // for the in-range check — `source_line` indexes the
+                // before-state and can differ from `target_line` after
+                // deletions, causing false range rejections.
+                let Some(line_num) = line.target_line else {
+                    continue;
+                };
+                if line_num < range_start || line_num > range_end {
+                    continue;
+                }
+                let candidate_fp = fingerprint_for_hunk_line(hunk, line_idx);
+                let score = fp.score_against(&candidate_fp);
+                if score > best_score {
+                    best_score = score;
+                    best_hunk = Some((hunk, line_idx));
+                    tie_count = 1;
+                } else if score == best_score && best_score > 0 {
+                    tie_count = tie_count.saturating_add(1);
+                }
+            }
+        }
+
+        if best_score >= 3 && tie_count == 1 {
+            if let Some((hunk, line_idx)) = best_hunk {
+                return AnchorOutcome::ReAnchored(build_updated_anchor(anchor, hunk, line_idx));
+            }
+        }
+        return AnchorOutcome::Stale(MismatchReason::AnchorNotFound);
+    }
+
+    match_anchor(anchor, diff)
+}
+
+/// Compute an `AnchorFingerprint` for a specific line within a hunk.
+fn fingerprint_for_hunk_line(hunk: &Hunk, line_idx: usize) -> AnchorFingerprint {
+    let line_text = hunk.lines.get(line_idx).map_or("", |l| l.text.as_str());
+    let before_text = if line_idx > 0 {
+        hunk.lines.get(line_idx - 1).map_or("", |l| l.text.as_str())
+    } else {
+        ""
+    };
+    let after_text = hunk.lines.get(line_idx + 1).map_or("", |l| l.text.as_str());
+    AnchorFingerprint::compute(line_text, before_text, after_text)
 }
 
 /// A hunk header has the form `@@ -N,N +N,N @@ <function-context>`.
@@ -1354,5 +1434,238 @@ mod tests {
         }
         .normalized();
         assert_eq!(anchor.target_text, "foo bar");
+    }
+
+    // ── match_anchor_with_entity ───────────────────────────────────────
+    //
+    // The entity-aware path narrows the fingerprint search to lines whose
+    // after-state line number falls inside `entity_line_range`. Tests cover:
+    //  - clean re-anchor when the unique best score lies in range
+    //  - lines outside the entity range are skipped even if they would
+    //    have been the best match globally
+    //  - removed lines (no `target_line`) are never considered
+    //  - tied best scores return Stale rather than picking arbitrarily
+    //  - fallback to plain `match_anchor` when no fingerprint or no range
+    //    is supplied
+
+    fn line_anchor_for(file: &str, target_text: &str) -> LineAnchor {
+        AnchorSpec {
+            file,
+            side: Side::New,
+            old_line: None,
+            new_line: Some(10),
+            hunk_header: "@@ -1,5 +1,5 @@",
+            target_text,
+            before: vec!["context_before"],
+            after: vec!["context_after"],
+        }
+        .build()
+    }
+
+    #[test]
+    fn entity_aware_reanchors_inside_range() {
+        let fp = AnchorFingerprint::compute("needle", "ctx_before", "ctx_after");
+        // Hunk where the after-state target_line for the needle is 12 — inside
+        // the entity range (10..=15). Surrounding lines are deliberately
+        // different so only line 12 can match.
+        let hunk = make_hunk(
+            "@@ -10,4 +10,4 @@",
+            None,
+            vec![
+                ctx_line("ctx_before", 10, 10),
+                ctx_line("noise_a", 11, 11),
+                ctx_line("needle", 12, 12),
+                ctx_line("ctx_after", 13, 13),
+            ],
+        );
+        let diff = make_diff(vec![modified_file("foo.rs", vec![hunk])]);
+        let anchor = line_anchor_for("foo.rs", "needle");
+        let outcome = match_anchor_with_entity(&anchor, Some(&fp), Some((10, 15)), &diff);
+        assert!(
+            matches!(outcome, AnchorOutcome::ReAnchored(ref a) if a.new_line == Some(12)),
+            "expected ReAnchored at line 12; got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn entity_aware_skips_match_outside_range() {
+        let fp = AnchorFingerprint::compute("needle", "", "");
+        // The needle exists at line 5, but the entity range is 10..=20. The
+        // line-5 candidate would have a perfect score globally; it must be
+        // ignored, leaving no match → Stale.
+        let hunk = make_hunk(
+            "@@ -1,8 +1,8 @@",
+            None,
+            vec![
+                ctx_line("a", 1, 1),
+                ctx_line("b", 2, 2),
+                ctx_line("c", 3, 3),
+                ctx_line("d", 4, 4),
+                ctx_line("needle", 5, 5),
+                ctx_line("e", 6, 6),
+                ctx_line("f", 7, 7),
+                ctx_line("g", 8, 8),
+            ],
+        );
+        let diff = make_diff(vec![modified_file("foo.rs", vec![hunk])]);
+        let anchor = line_anchor_for("foo.rs", "needle");
+        let outcome = match_anchor_with_entity(&anchor, Some(&fp), Some((10, 20)), &diff);
+        assert!(
+            matches!(
+                outcome,
+                AnchorOutcome::Stale(MismatchReason::AnchorNotFound)
+            ),
+            "expected Stale(AnchorNotFound) when the only match lies outside the entity range; got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn entity_aware_skips_removed_lines() {
+        let fp = AnchorFingerprint::compute("needle", "", "");
+        // The needle appears only on a removed line. Removed lines have no
+        // `target_line`, so they cannot belong to the after-state entity
+        // range — the search must ignore them and return Stale.
+        let hunk = make_hunk(
+            "@@ -10,3 +10,2 @@",
+            None,
+            vec![
+                ctx_line("a", 10, 10),
+                removed_line("needle", 11),
+                ctx_line("b", 12, 11),
+            ],
+        );
+        let diff = make_diff(vec![modified_file("foo.rs", vec![hunk])]);
+        let anchor = line_anchor_for("foo.rs", "needle");
+        let outcome = match_anchor_with_entity(&anchor, Some(&fp), Some((10, 15)), &diff);
+        assert!(
+            matches!(
+                outcome,
+                AnchorOutcome::Stale(MismatchReason::AnchorNotFound)
+            ),
+            "expected Stale when needle is only on a removed line; got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn entity_aware_ambiguous_best_score_returns_stale() {
+        // Two lines inside the entity range have the same text — both score
+        // identically (3 = line_hash only) against a fingerprint whose
+        // before/after don't match either candidate's neighbours. The
+        // earlier behavior silently returned the first; the fix returns
+        // Stale on ambiguity so the comment surfaces in the stale tray
+        // rather than mis-anchoring.
+        let fp = AnchorFingerprint::compute("dup", "unmatched_before", "unmatched_after");
+        let hunk = make_hunk(
+            "@@ -10,5 +10,5 @@",
+            None,
+            vec![
+                ctx_line("head", 10, 10),
+                ctx_line("dup", 11, 11),
+                ctx_line("middle", 12, 12),
+                ctx_line("dup", 13, 13),
+                ctx_line("tail", 14, 14),
+            ],
+        );
+        let diff = make_diff(vec![modified_file("foo.rs", vec![hunk])]);
+        let anchor = line_anchor_for("foo.rs", "dup");
+        let outcome = match_anchor_with_entity(&anchor, Some(&fp), Some((10, 15)), &diff);
+        assert!(
+            matches!(
+                outcome,
+                AnchorOutcome::Stale(MismatchReason::AnchorNotFound)
+            ),
+            "expected Stale on ambiguous best-score; got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn entity_aware_falls_back_when_no_fingerprint() {
+        // With no fingerprint, the entity-aware path must defer to
+        // `match_anchor`. A diff that `match_anchor` would re-anchor to a
+        // shifted line proves the fallback fired (rather than the fingerprint
+        // branch returning Stale for the missing fp).
+        let hunk = make_hunk(
+            "@@ -1,3 +1,4 @@",
+            None,
+            vec![
+                added_line("inserted", 1),
+                ctx_line("hello", 1, 2),
+                ctx_line("world", 2, 3),
+                ctx_line("end", 3, 4),
+            ],
+        );
+        let diff = make_diff(vec![modified_file("foo.rs", vec![hunk])]);
+        let anchor = AnchorSpec {
+            file: "foo.rs",
+            side: Side::New,
+            old_line: None,
+            new_line: Some(1),
+            hunk_header: "@@ -1,3 +1,4 @@",
+            target_text: "hello",
+            before: vec![],
+            after: vec!["world"],
+        }
+        .build();
+        let outcome = match_anchor_with_entity(&anchor, None, Some((1, 10)), &diff);
+        assert!(
+            matches!(outcome, AnchorOutcome::ReAnchored(ref a) if a.new_line == Some(2)),
+            "expected fallback path to re-anchor via plain match_anchor; got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn entity_aware_falls_back_when_no_range() {
+        // Same reasoning: with `entity_line_range = None` the fingerprint
+        // branch is gated off and we fall through to `match_anchor`.
+        let fp = AnchorFingerprint::compute("hello", "", "world");
+        let hunk = make_hunk(
+            "@@ -1,3 +1,4 @@",
+            None,
+            vec![
+                added_line("inserted", 1),
+                ctx_line("hello", 1, 2),
+                ctx_line("world", 2, 3),
+                ctx_line("end", 3, 4),
+            ],
+        );
+        let diff = make_diff(vec![modified_file("foo.rs", vec![hunk])]);
+        let anchor = AnchorSpec {
+            file: "foo.rs",
+            side: Side::New,
+            old_line: None,
+            new_line: Some(1),
+            hunk_header: "@@ -1,3 +1,4 @@",
+            target_text: "hello",
+            before: vec![],
+            after: vec!["world"],
+        }
+        .build();
+        let outcome = match_anchor_with_entity(&anchor, Some(&fp), None, &diff);
+        assert!(
+            matches!(outcome, AnchorOutcome::ReAnchored(ref a) if a.new_line == Some(2)),
+            "expected fallback path to re-anchor via plain match_anchor; got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn entity_aware_file_not_in_diff_is_stale() {
+        let fp = AnchorFingerprint::compute("x", "", "");
+        let diff = make_diff(vec![modified_file(
+            "other.rs",
+            vec![make_hunk(
+                "@@ -1,1 +1,1 @@",
+                None,
+                vec![ctx_line("x", 1, 1)],
+            )],
+        )]);
+        let anchor = line_anchor_for("missing.rs", "x");
+        let outcome = match_anchor_with_entity(&anchor, Some(&fp), Some((1, 10)), &diff);
+        assert!(
+            matches!(
+                outcome,
+                AnchorOutcome::Stale(MismatchReason::FileNotInDiff)
+            ),
+            "expected Stale(FileNotInDiff) when the anchor's file isn't in the diff; got {outcome:?}"
+        );
     }
 }

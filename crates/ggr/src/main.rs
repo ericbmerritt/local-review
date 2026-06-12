@@ -105,18 +105,24 @@ fn cmd_review(pr_str: &str, url: Option<&str>) -> error::Result<()> {
             parsed.hostname = Some(host);
         }
     }
+    let spinner = local_review_core::startup_spinner::StartupSpinner::start(format!(
+        "Loading PR #{}…",
+        parsed.number
+    ));
     let pr = gh::fetch_pr_details(
         parsed.number,
         parsed.repo_flag.as_deref(),
         parsed.hostname.as_deref(),
     )?;
     if pr.commits.is_empty() {
+        spinner.stop();
         return Err(GgrError::PrNotFound { pr: parsed.number });
     }
     // Re-anchor local drafts against the freshly fetched PR state.
     let stale_count = util::data_home()
         .map(|base| reanchor::reanchor_all(&pr, &base))
         .unwrap_or(0);
+    spinner.stop();
     tui::run(pr, stale_count)
 }
 

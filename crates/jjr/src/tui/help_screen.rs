@@ -32,6 +32,8 @@ Views
 
 Actions
     C                     send current change to Claude
+    y                     yank ±10 lines around cursor (with file:line header)
+                          to system clipboard — paste into Claude as context
 
 Review tracking
     U                     toggle reviewed status on current file

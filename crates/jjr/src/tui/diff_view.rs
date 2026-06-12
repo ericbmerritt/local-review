@@ -181,6 +181,8 @@ mod tests {
             updated_at: None,
             status: Some(Status::Pending),
             mismatch_reason: None,
+            entity_id: None,
+            anchor_fingerprint: None,
         }
     }
 
@@ -303,6 +305,8 @@ mod tests {
             updated_at: None,
             status: Some(Status::Pending),
             mismatch_reason: None,
+            entity_id: None,
+            anchor_fingerprint: None,
         }
     }
 
@@ -459,6 +463,8 @@ mod tests {
             updated_at: None,
             status: Some(Status::Pending),
             mismatch_reason: None,
+            entity_id: None,
+            anchor_fingerprint: None,
         }
     }
 
@@ -538,6 +544,8 @@ mod tests {
                 updated_at: None,
                 status: Some(Status::Pending),
                 mismatch_reason: None,
+                entity_id: None,
+                anchor_fingerprint: None,
             }
         };
         let change_comment = make_change_comment(&cid, Severity::Required);

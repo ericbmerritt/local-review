@@ -393,6 +393,8 @@ mod tests {
             updated_at: None,
             status,
             mismatch_reason: None,
+            entity_id: None,
+            anchor_fingerprint: None,
         }
     }
 
@@ -544,6 +546,8 @@ mod tests {
             updated_at: None,
             status: Some(Status::Stale),
             mismatch_reason: None,
+            entity_id: None,
+            anchor_fingerprint: None,
         };
         let diff = diff_with_file("foo.rs", "line", 1);
         assert!(matches!(

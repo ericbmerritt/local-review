@@ -81,7 +81,11 @@ impl<'t> Collector<'t> {
         let entity_id = build_entity_id(&self.file_path, &scope, 0);
         let content = node.utf8_text(self.src).unwrap_or("").to_owned();
         let start_line = u32::try_from(node.start_position().row + 1).unwrap_or(1);
-        let end_line = u32::try_from(node.end_position().row + 1).unwrap_or(start_line);
+        // tree-sitter-md uses an EXCLUSIVE end_position for section nodes:
+        // the end row equals the start row of the next sibling, not the last
+        // content row. Convert without +1 so the range stays within the
+        // section's own content and does not bleed into the next heading.
+        let end_line = u32::try_from(node.end_position().row).unwrap_or(start_line);
         let ch = content_hash(&content);
         let sh = sig_hash(&content);
         let bh = body_hash(&content);

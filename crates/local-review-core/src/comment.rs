@@ -180,6 +180,54 @@ fn truncate_target_text(s: &str) -> String {
     truncate_with_ellipsis(oneline, TARGET_TEXT_MAX)
 }
 
+/// Three-point fingerprint for re-anchoring a line comment after edits.
+///
+/// Hashes are whitespace-normalized so reformatting alone does not break
+/// anchors. `before_hash` and `after_hash` are 0 when the line is at the
+/// top/bottom of the file respectively.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AnchorFingerprint {
+    pub line_hash: u64,
+    pub before_hash: u64,
+    pub after_hash: u64,
+}
+
+impl AnchorFingerprint {
+    /// Compute from a line and its immediate neighbours.
+    pub fn compute(line: &str, before: &str, after: &str) -> Self {
+        fn normalize_hash(s: &str) -> u64 {
+            if s.is_empty() {
+                return 0;
+            }
+            let normalized: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
+            crate::semantic::extractor::content_hash(&normalized)
+        }
+        Self {
+            line_hash: normalize_hash(line),
+            before_hash: normalize_hash(before),
+            after_hash: normalize_hash(after),
+        }
+    }
+
+    /// Score this fingerprint against a candidate.
+    ///
+    /// - 3 points: `line_hash` matches (mandatory for ≥3)
+    /// - 1 point each: `before_hash`, `after_hash`
+    pub fn score_against(&self, candidate: &Self) -> u8 {
+        let mut score = 0u8;
+        if self.line_hash == candidate.line_hash {
+            score += 3;
+        }
+        if self.before_hash == candidate.before_hash {
+            score += 1;
+        }
+        if self.after_hash == candidate.after_hash {
+            score += 1;
+        }
+        score
+    }
+}
+
 fn cap_context(lines: Vec<String>) -> Vec<String> {
     if lines.len() <= CONTEXT_MAX {
         lines

@@ -186,6 +186,20 @@ pub enum Screen {
     Extracting,
 }
 
+/// Snapshot of the screen the user was on before opening a `Screen::Extra`
+/// overlay (typically the comment composer). Used by `handle_extra_screen_key`
+/// to restore the caller's screen on `ExtraScreenAction::Close` so that
+/// saving a comment from the entity-diff view returns to the entity-diff
+/// view rather than dropping back to the entity list.
+///
+/// Only the screen kinds that can host an `OpenScreen` action appear here —
+/// composers only open from `EntityDiff` and `FileDiff` today.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ScreenBeforeExtra {
+    EntityDiff { entity_idx: usize },
+    FileDiff { file_idx: usize },
+}
+
 // ---------------------------------------------------------------------------
 // App struct
 // ---------------------------------------------------------------------------
@@ -240,6 +254,12 @@ pub struct App<S: ReviewSurfaceExt> {
     /// Tracks the `(entity_idx, entity_clip)` pair for which scroll was last
     /// initialized; prevents re-initializing on every render tick.
     pub(crate) entity_diff_initialized: Option<(usize, bool)>,
+    /// Screen to restore when an `Screen::Extra` overlay closes. Set when
+    /// transitioning into `Extra` via an `OpenScreen` action, consumed on
+    /// `Close`. Without this the user always lands on the entity list after
+    /// saving a comment, even when they opened the composer from inside the
+    /// entity diff or the file diff.
+    pub(crate) screen_before_extra: Option<ScreenBeforeExtra>,
     /// In-progress extraction worker (present only while `screen == Extracting`).
     pub(crate) extraction: Option<crate::tui::entity_list::ExtractionInProgress>,
     /// Monotonically-incrementing tick for spinner animation.
@@ -301,6 +321,7 @@ impl<S: ReviewSurfaceExt> App<S> {
             cosmetic_filter_on: false,
             entity_clip: true,
             entity_diff_initialized: None,
+            screen_before_extra: None,
             extraction: None,
             tick: 0,
         }
@@ -468,6 +489,13 @@ impl<S: ReviewSurfaceExt> App<S> {
         self.file_index = new_index;
         self.line_index = 0;
         self.scroll = 0;
+        // Keep the Screen::FileDiff variant in sync so render_file_diff_screen
+        // does not reset file_index back to the entry value on the next tick.
+        if matches!(self.screen, Screen::FileDiff { .. }) {
+            self.screen = Screen::FileDiff {
+                file_idx: new_index,
+            };
+        }
         self.mark_current_file_reviewed();
     }
 
@@ -480,6 +508,26 @@ impl<S: ReviewSurfaceExt> App<S> {
         let last_visible = self.scroll.saturating_add(viewport_rows.saturating_sub(1));
         if line_index_u16 > last_visible {
             self.scroll = line_index_u16.saturating_sub(viewport_rows.saturating_sub(1));
+        }
+    }
+
+    /// Scroll so that `margin` rows after the cursor are visible. Used right
+    /// after a comment is saved: the cursor stays on the commented line, but
+    /// the freshly injected `┃ ● ...` rows sit one row past the cursor and
+    /// would otherwise spill below the viewport — making the comment look
+    /// like it disappeared. A small margin (a handful of rows) is enough to
+    /// surface the typical 1–3 line inline comment without yanking the
+    /// cursor away from where the user was working.
+    pub fn ensure_rows_after_cursor_visible(&mut self, margin: u16) {
+        let viewport_rows = self.viewport_rows;
+        if viewport_rows == 0 {
+            return;
+        }
+        let line_index_u16 = u16::try_from(self.line_index).unwrap_or(u16::MAX);
+        let target = line_index_u16.saturating_add(margin);
+        let last_visible = self.scroll.saturating_add(viewport_rows.saturating_sub(1));
+        if target > last_visible {
+            self.scroll = target.saturating_sub(viewport_rows.saturating_sub(1));
         }
     }
 
@@ -593,16 +641,58 @@ impl<S: ReviewSurfaceExt> App<S> {
         self.entity_index = 0;
         self.entity_scroll = 0;
 
-        // Try the surface synchronously first — a cache hit returns immediately.
+        // Preserve the current diff view when reloading after a comment save.
+        // Only navigate to Screen::Main when arriving at an entry fresh (e.g.
+        // load_entry, startup) — not when reload_current_entry refreshes
+        // inline comments while the user is already inside an entity diff.
+        let in_diff_view = matches!(
+            self.screen,
+            Screen::EntityDiff { .. } | Screen::FileDiff { .. }
+        );
+
+        // Async path: surface owns a runnable extraction task. Spawn it on a
+        // background thread, set up the progress channel, and transition to
+        // `Screen::Extracting`. The event loop polls the channel with a
+        // timeout so the spinner animates while the worker runs.
+        if let Some(task) = self.surface.entity_extraction_task(idx) {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let cancel_for_thread = std::sync::Arc::clone(&cancel);
+            std::thread::spawn(move || task.run(tx, cancel_for_thread));
+            self.extraction = Some(crate::tui::entity_list::ExtractionInProgress {
+                rx,
+                cancel,
+                files_done: 0,
+                files_total: 0,
+                files_failed: 0,
+            });
+            self.description_summary = self.surface.fetch_description_summary(idx).ok();
+            // The async path always uses the loading overlay so the user
+            // sees feedback. When extraction completes the event loop
+            // restores the diff view via `screen_before_extra` if needed.
+            // For the diff-view case (reload after comment save), the user
+            // is in `EntityDiff` and we keep them there — the entity list
+            // is invisible to them anyway. For the fresh-load case we want
+            // the overlay, so we transition.
+            if !in_diff_view {
+                self.screen = Screen::Extracting;
+            }
+            return;
+        }
+
+        // Sync fallback: surface has no async task. Block on fetch_entity_list.
         match self.surface.fetch_entity_list(idx) {
             Ok(entities) => {
                 self.entities = entities;
                 self.description_summary = self.surface.fetch_description_summary(idx).ok();
-                self.screen = Screen::Main;
+                if !in_diff_view {
+                    self.screen = Screen::Main;
+                }
             }
             Err(_) => {
-                // Surface returned an error (no entities available).
-                self.screen = Screen::Main;
+                if !in_diff_view {
+                    self.screen = Screen::Main;
+                }
             }
         }
     }
@@ -628,6 +718,7 @@ impl<S: ReviewSurfaceExt> App<S> {
         };
         let next = (current + 1).min(self.entities.len() - 1);
         self.screen = Screen::EntityDiff { entity_idx: next };
+        self.mark_current_entity_reviewed();
     }
 
     /// Retreat to the previous entity in `Screen::EntityDiff` (clamps at first).
@@ -640,6 +731,39 @@ impl<S: ReviewSurfaceExt> App<S> {
         self.screen = Screen::EntityDiff {
             entity_idx: current.saturating_sub(1),
         };
+        self.mark_current_entity_reviewed();
+    }
+
+    /// Mark the entity currently shown in `Screen::EntityDiff` as reviewed.
+    ///
+    /// No-op when the screen is not `EntityDiff` or the entity index is
+    /// out-of-bounds.
+    pub(crate) fn mark_current_entity_reviewed(&mut self) {
+        let entity_idx = if let Screen::EntityDiff { entity_idx } = &self.screen {
+            *entity_idx
+        } else {
+            return;
+        };
+        self.mark_entity_reviewed_at(entity_idx);
+    }
+
+    /// Persist the reviewed bit for `self.entities[entity_idx]` and update
+    /// the in-memory copy in lockstep. Both writes must succeed-or-no-op
+    /// together: surface-only persists across sessions but leaves the
+    /// entity-list ✓ stale until reload; in-memory-only flickers a ✓ that
+    /// disappears on next open. Callers from both the tab-cycle path
+    /// (`mark_current_entity_reviewed`) and the render-path auto-mark on
+    /// first entry must go through here so the ✓ is consistent.
+    pub(crate) fn mark_entity_reviewed_at(&mut self, entity_idx: usize) {
+        let Some(entity) = self.entities.get_mut(entity_idx) else {
+            return;
+        };
+        let entry_idx = self.surface.current_entry_index();
+        let entity_id = entity.id.clone();
+        let content_hash = entity.content_hash;
+        entity.reviewed = true;
+        self.surface
+            .mark_entity_reviewed(entry_idx, &entity_id, content_hash);
     }
 
     /// Advance to the next entry in stack mode.
@@ -790,6 +914,28 @@ pub trait ReviewSurfaceExt: ReviewSurface {
     ) -> Result<Option<ExtraScreenAction>, Self::Error> {
         Ok(None)
     }
+
+    /// Mark the entity at `entity_id` with `content_hash` as reviewed for the
+    /// entry at `entry_idx`. Default is a no-op so surfaces can adopt entity
+    /// reviewed tracking incrementally.
+    fn mark_entity_reviewed(
+        &mut self,
+        _entry_idx: usize,
+        _entity_id: &crate::semantic::EntityId,
+        _content_hash: u64,
+    ) {
+    }
+
+    /// Return `true` when the entity has been previously marked reviewed at
+    /// the given `content_hash`. Default always returns `false`.
+    fn is_entity_reviewed(
+        &self,
+        _entry_idx: usize,
+        _entity_id: &crate::semantic::EntityId,
+        _content_hash: u64,
+    ) -> bool {
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -882,6 +1028,20 @@ where
     B::Error: core::error::Error + Send + Sync + 'static,
     F: FnOnce(&mut App<S>),
 {
+    // Paint a "Extracting entities…" overlay before the first
+    // `reload_current_entry` call. That call is synchronous and can block
+    // for several seconds while extracting entities for a large change.
+    // Without this paint, the alt screen would sit blank during that wait.
+    // We can't use the stderr startup spinner here — the terminal is
+    // already in raw mode and on the alt screen, so stderr writes are
+    // invisible. `Screen::Extracting` already has a centered loading
+    // overlay; reuse it for the first-paint case.
+    let saved_screen = std::mem::replace(&mut app.screen, Screen::Extracting);
+    terminal
+        .draw(|frame| render(frame, app))
+        .map_err(|e| AppError::Io(std::io::Error::other(e)))?;
+    app.screen = saved_screen;
+
     // Seed the first entry.
     if let Err(e) = app.reload_current_entry() {
         return Err(AppError::Surface(e));
@@ -951,11 +1111,114 @@ where
             }
         }
 
+        // While extraction is running on a background thread, poll the
+        // progress channel with a short timeout instead of blocking on
+        // user input. On timeout we loop back to the top — the next
+        // `draw` advances `app.tick`, so the spinner animates.
+        if matches!(app.screen, Screen::Extracting)
+            && app.extraction.is_some()
+            && drain_extraction_events(app)
+        {
+            continue;
+        }
+
         handle_event(app)?;
     }
 
     on_exit(app);
     Ok(())
+}
+
+/// Pump messages from the background extraction worker into `App` state.
+///
+/// Drains all immediately-available events, then blocks for up to ~100 ms
+/// waiting for the next one. The timeout doubles as the spinner frame
+/// rate: every tick we either get an event (and update progress / fold in
+/// entities / transition out of `Extracting`) or we time out (and the
+/// next render cycle advances the tick, animating the spinner).
+///
+/// Returns `Ok(true)` if the caller should `continue` (skip
+/// `handle_event`) — either we made progress, the channel closed, or we
+/// timed out (we still want to re-render the spinner frame).
+fn drain_extraction_events<S: ReviewSurfaceExt>(app: &mut App<S>) -> bool {
+    use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
+    use std::time::Duration;
+    // The `ExtractionEvent` import is intentionally inside
+    // `apply_extraction_event` where it is used.
+
+    // Pull every event already in the queue without blocking. If we process
+    // a terminating event (Complete / Cancelled / Error), `app.extraction`
+    // becomes None during the loop — at that point return `true` so the
+    // caller re-renders with the final state instead of falling through to
+    // `handle_event`, which would block until a keystroke arrives.
+    loop {
+        let Some(prog) = app.extraction.as_ref() else {
+            return true;
+        };
+        match prog.rx.try_recv() {
+            Ok(event) => apply_extraction_event(app, event),
+            Err(TryRecvError::Empty) => break,
+            Err(TryRecvError::Disconnected) => {
+                end_extraction(app);
+                return true;
+            }
+        }
+    }
+
+    // Block briefly for the next event so the frame rate is bounded.
+    let Some(prog) = app.extraction.as_ref() else {
+        return true;
+    };
+    match prog.rx.recv_timeout(Duration::from_millis(100)) {
+        Ok(event) => {
+            apply_extraction_event(app, event);
+            true
+        }
+        Err(RecvTimeoutError::Timeout) => true,
+        Err(RecvTimeoutError::Disconnected) => {
+            end_extraction(app);
+            true
+        }
+    }
+}
+
+/// Tear down the in-progress extraction handle and exit the loading screen.
+fn end_extraction<S: ReviewSurfaceExt>(app: &mut App<S>) {
+    app.extraction = None;
+    if matches!(app.screen, Screen::Extracting) {
+        app.screen = Screen::Main;
+    }
+}
+
+/// Fold a single `ExtractionEvent` into the in-flight extraction state.
+fn apply_extraction_event<S: ReviewSurfaceExt>(
+    app: &mut App<S>,
+    event: crate::tui::entity_list::ExtractionEvent,
+) {
+    use crate::tui::entity_list::ExtractionEvent;
+    match event {
+        ExtractionEvent::Progress {
+            files_done,
+            files_total,
+            files_failed,
+        } => {
+            if let Some(prog) = app.extraction.as_mut() {
+                prog.files_done = files_done;
+                prog.files_total = files_total;
+                prog.files_failed = files_failed;
+            }
+        }
+        ExtractionEvent::FileExtracted { entities, .. } => {
+            app.entities.extend(entities);
+        }
+        // Treat Complete, Cancelled, and Error identically from the
+        // event-loop perspective: all three end the worker's lifetime and
+        // return control to the user. The distinction lives in the
+        // status-message path, which the worker drives before sending.
+        ExtractionEvent::Complete | ExtractionEvent::Cancelled | ExtractionEvent::Error(_) => {
+            end_extraction(app);
+        }
+    }
 }
 
 /// Error type for `run_app`.
@@ -1009,7 +1272,26 @@ pub(crate) fn render<S: ReviewSurfaceExt>(frame: &mut Frame<'_>, app: &mut App<S
             unreachable!("matched above");
         };
         if state.is_overlay() {
+            // Restore the underlying screen for the dispatch render so a
+            // composer over an `EntityDiff` paints the diff behind the
+            // overlay — not the entity list. Without this, the mem::replace
+            // above leaves `app.screen` as `Screen::Main`, and dispatching
+            // would render the entity list as the composer's backdrop even
+            // though the user opened the composer from a diff view.
+            let placeholder = match &app.screen_before_extra {
+                Some(ScreenBeforeExtra::EntityDiff { entity_idx }) => Screen::EntityDiff {
+                    entity_idx: *entity_idx,
+                },
+                Some(ScreenBeforeExtra::FileDiff { file_idx }) => Screen::FileDiff {
+                    file_idx: *file_idx,
+                },
+                None => Screen::Main,
+            };
+            app.screen = placeholder;
             render_dispatch(frame, app);
+            // `render_dispatch` may have mutated `app.screen` (e.g.
+            // `render_file_diff_screen` syncs `file_idx`); the value left
+            // here is replaced by `Screen::Extra(state)` below.
         }
         let mut state = state;
         app.surface.render_extra_screen(frame, state.as_mut());
@@ -1115,17 +1397,19 @@ fn render_entity_list_screen<S: ReviewSurfaceExt>(frame: &mut Frame<'_>, app: &m
 
     render_footer(frame, layout[4], app);
 
-    // Loading overlay on top of the entity list body.
+    // Loading overlay on top of the entity list body. Render whenever
+    // `Screen::Extracting` is active, even when the async extraction worker
+    // is absent (initial synchronous load in `run_app` before the first
+    // event tick) — otherwise the alt screen shows the empty "no entities"
+    // message during the multi-second blocking reload, which reads as
+    // "broken" rather than "loading."
     if matches!(app.screen, Screen::Extracting) {
-        if let Some(ref prog) = app.extraction {
-            crate::tui::entity_list::render_loading_overlay(
-                frame,
-                prog.files_done,
-                prog.files_total,
-                prog.files_failed,
-                app.tick,
-            );
-        }
+        let (done, total, failed) = app
+            .extraction
+            .as_ref()
+            .map(|p| (p.files_done, p.files_total, p.files_failed))
+            .unwrap_or((0, 0, 0));
+        crate::tui::entity_list::render_loading_overlay(frame, done, total, failed, app.tick);
     }
 }
 
@@ -1161,12 +1445,17 @@ fn render_entity_diff_screen<S: ReviewSurfaceExt>(
     entity_idx: usize,
 ) {
     // Set the file_index to the file containing this entity so render_main
-    // renders the correct view.
-    let Some(entity) = app.entities.get(entity_idx) else {
-        render_main(frame, app);
-        return;
+    // renders the correct view. Extract everything we need from `entity`
+    // up front so the borrow ends before `mark_entity_reviewed_at` (which
+    // takes &mut self.entities) is called below.
+    let (target, range_start, range_end) = {
+        let Some(entity) = app.entities.get(entity_idx) else {
+            render_main(frame, app);
+            return;
+        };
+        let (rs, re) = entity.line_range;
+        (entity.file_path.to_string_lossy().into_owned(), rs, re)
     };
-    let target = entity.file_path.to_string_lossy().into_owned();
     // Strip status suffixes that render_title appends for Added/Removed/Binary
     // files; without this, entity.file_path ("foo.rs") would never match the
     // DiffView title ("foo.rs (added)").
@@ -1184,7 +1473,6 @@ fn render_entity_diff_screen<S: ReviewSurfaceExt>(
         })
         .unwrap_or(app.file_index);
     app.file_index = findex;
-    let (range_start, range_end) = entity.line_range;
 
     // Only initialize scroll when entering a new entity or toggling clip mode.
     // Without this guard the render loop resets scroll every tick, preventing
@@ -1192,6 +1480,13 @@ fn render_entity_diff_screen<S: ReviewSurfaceExt>(
     let need_init = app.entity_diff_initialized != Some((entity_idx, app.entity_clip));
     if need_init {
         app.entity_diff_initialized = Some((entity_idx, app.entity_clip));
+
+        // Auto-mark the entity as reviewed on first entry. Go through the
+        // shared helper so both the on-disk reviewed bit and the in-memory
+        // `EntitySummary.reviewed` flag flip together — otherwise returning
+        // to the entity list shows no ✓ until the list is re-fetched.
+        app.mark_entity_reviewed_at(entity_idx);
+
         if app.entity_clip {
             app.line_index = 0;
             app.scroll = 0;
@@ -1869,15 +2164,54 @@ fn handle_entity_list_key<S: ReviewSurfaceExt>(
     Ok(())
 }
 
+/// When the entity clip view is active, `app.line_index` is a position within
+/// the clipped subset of lines. Comment placement needs the corresponding
+/// index in the *full* file view. This function translates it.
+fn clip_to_file_line_index<S: ReviewSurfaceExt>(app: &App<S>) -> usize {
+    let Screen::EntityDiff { entity_idx } = app.screen else {
+        return app.line_index;
+    };
+    let Some(entity) = app.entities.get(entity_idx) else {
+        return app.line_index;
+    };
+    let Some(full_view) = app.annotated_per_file.0.get(app.file_index) else {
+        return app.line_index;
+    };
+    let (range_start, range_end) = entity.line_range;
+    let clipped = clip_diff_view_to_range(full_view, range_start, range_end);
+    let Some(clip_line) = clipped.lines.get(app.line_index) else {
+        return app.line_index;
+    };
+    // Match the clip line against the full view by its file-side line numbers
+    // and kind — the clip is a subset of the full view's lines so there is
+    // always an exact match for non-header rows.
+    full_view
+        .lines
+        .iter()
+        .position(|fl| {
+            fl.kind == clip_line.kind
+                && fl.target_line == clip_line.target_line
+                && fl.source_line == clip_line.source_line
+        })
+        .unwrap_or(app.line_index)
+}
+
 /// Delegate an unhandled key to the surface's `handle_extra_key`, resolving
 /// the line index for side-by-side mode and applying the returned action.
 fn delegate_to_surface<S: ReviewSurfaceExt>(
     app: &mut App<S>,
     key: KeyEvent,
 ) -> Result<(), S::Error> {
+    // In entity clip view the cursor is in clip-space; translate to file-space
+    // so comment anchors land on the correct full-file line number.
+    let raw_line_index = if matches!(app.screen, Screen::EntityDiff { .. }) && app.entity_clip {
+        clip_to_file_line_index(app)
+    } else {
+        app.line_index
+    };
     let annotated_clone = app.current_view().cloned();
     let lines_index = match app.effective_diff_mode() {
-        EffectiveDiffMode::Unified => app.line_index,
+        EffectiveDiffMode::Unified => raw_line_index,
         EffectiveDiffMode::SideBySide => annotated_clone
             .as_ref()
             .and_then(|v| v.paired_rows.get(app.line_index))
@@ -1895,14 +2229,32 @@ fn delegate_to_surface<S: ReviewSurfaceExt>(
                     right: None,
                 } => None,
             })
-            .unwrap_or(app.line_index),
+            .unwrap_or(raw_line_index),
     };
     let action =
         app.surface
             .handle_extra_key(key, app.file_index, lines_index, annotated_clone.as_ref())?;
     match action {
         ExtraKeyAction::Ignored => {}
-        ExtraKeyAction::OpenScreen(state) => app.screen = Screen::Extra(state),
+        ExtraKeyAction::OpenScreen(state) => {
+            // Capture the underlying screen so `Close` can restore it.
+            // Composers and other overlays only open from the diff views;
+            // record which one so we land back there on save/cancel rather
+            // than the entity list.
+            app.screen_before_extra = match app.screen {
+                Screen::EntityDiff { entity_idx } => {
+                    Some(ScreenBeforeExtra::EntityDiff { entity_idx })
+                }
+                Screen::FileDiff { file_idx } => Some(ScreenBeforeExtra::FileDiff { file_idx }),
+                Screen::Main
+                | Screen::Help
+                | Screen::Transition(_)
+                | Screen::Extra(_)
+                | Screen::FilePicker(_)
+                | Screen::Extracting => None,
+            };
+            app.screen = Screen::Extra(state);
+        }
         ExtraKeyAction::StatusMessage(msg) => app.status_message = Some(msg),
         ExtraKeyAction::RefreshAndStatus(msg) => {
             app.status_message = Some(msg);
@@ -1911,6 +2263,50 @@ fn delegate_to_surface<S: ReviewSurfaceExt>(
         ExtraKeyAction::Quit => app.should_quit = true,
     }
     Ok(())
+}
+
+/// Copy a ±10-line diff window around the cursor to the clipboard, formatted
+/// with a `file:start-end` header so the result is ready to paste into a
+/// Claude conversation. When the user is in entity-clip mode we yank from
+/// the clipped view (matching what's visually under the cursor); otherwise
+/// from the full file diff.
+fn yank_cursor_window<S: ReviewSurfaceExt>(app: &mut App<S>) {
+    let Some(full_view) = app.annotated_per_file.0.get(app.file_index) else {
+        app.status_message = Some("yank: no file open".to_owned());
+        return;
+    };
+    // In entity-clip mode the rendered view is clipped to the entity's line
+    // range; yanking from the full view would feed Claude lines the user
+    // can't see. Pull the same clip the renderer uses so the window matches
+    // what's under the cursor.
+    let clipped_entity = if let Screen::EntityDiff { entity_idx } = app.screen {
+        app.entity_clip
+            .then(|| app.entities.get(entity_idx))
+            .flatten()
+    } else {
+        None
+    };
+    let view = match clipped_entity {
+        Some(entity) => {
+            let (start, end) = entity.line_range;
+            clip_diff_view_to_range(full_view, start, end)
+        }
+        None => full_view.clone(),
+    };
+    let cursor_idx = app.line_index;
+    let Some(payload) = crate::tui::yank::format_yank(&view, cursor_idx) else {
+        app.status_message = Some("yank: nothing to copy at cursor".to_owned());
+        return;
+    };
+    match crate::tui::yank::copy_to_clipboard(&payload) {
+        Ok(()) => {
+            let bytes = payload.len();
+            app.status_message = Some(format!("yanked {bytes} bytes to clipboard"));
+        }
+        Err(e) => {
+            app.status_message = Some(format!("yank failed: {e}"));
+        }
+    }
 }
 
 /// Key handler for file diff views (`Screen::EntityDiff` and `Screen::FileDiff`).
@@ -1956,6 +2352,7 @@ fn handle_file_view_key<S: ReviewSurfaceExt>(
         KeyCode::Char('3') => app.toggle_severity_filter(Severity::Note),
         KeyCode::Char('U') => app.toggle_current_file_reviewed(),
         KeyCode::Char('|') => app.cycle_diff_mode(),
+        KeyCode::Char('y') => yank_cursor_window(app),
         // Toggle entity-clipped view (show only entity range vs full file).
         KeyCode::Char('x') => {
             if matches!(app.screen, Screen::EntityDiff { .. }) {
@@ -2058,14 +2455,32 @@ fn handle_extra_screen_key<S: ReviewSurfaceExt>(
             navigate_to_entry: &mut navigate_to_entry,
         },
     )?;
+    let was_close = matches!(action, ExtraScreenAction::Close);
     match action {
         ExtraScreenAction::StayOpen => {
             app.screen = Screen::Extra(state);
         }
         ExtraScreenAction::Close => {
             if let Some(idx) = navigate_to_entry {
+                // Cross-entry navigation overrides the screen-restore stack;
+                // `load_entry` re-seeds App state from scratch and discards
+                // the prior screen.
+                app.screen_before_extra = None;
                 app.load_entry(idx, true)?;
+            } else if let Some(prev) = app.screen_before_extra.take() {
+                // Restore the screen the user was on when the overlay opened
+                // (entity diff or file diff). Without this they would always
+                // land on the entity list after saving a comment.
+                app.screen = match prev {
+                    ScreenBeforeExtra::EntityDiff { entity_idx } => {
+                        Screen::EntityDiff { entity_idx }
+                    }
+                    ScreenBeforeExtra::FileDiff { file_idx } => Screen::FileDiff { file_idx },
+                };
             }
+            // else: no snapshot recorded (e.g., overlay opened from a path
+            // that does not delegate through `handle_extra_key`); fall back
+            // to the `Screen::Main` placeholder set by the mem::replace above.
         }
         ExtraScreenAction::OpenScreen(new_state) => {
             app.screen = Screen::Extra(new_state);
@@ -2074,6 +2489,15 @@ fn handle_extra_screen_key<S: ReviewSurfaceExt>(
     // After any extra-screen key, re-inject inline comments in case the
     // surface mutated its comment state.
     app.refresh_inline_comments();
+    // A composer save injects a new `┃ ● …` block of rows right below the
+    // cursor. If the cursor was near the bottom of the viewport when the
+    // composer opened, those rows would render past the visible area and
+    // the user would see "comment vanished" until they scroll. Scroll
+    // forward enough to keep ~4 rows past the cursor in view so a typical
+    // 1–3 line inline comment is visible the moment the composer closes.
+    if was_close {
+        app.ensure_rows_after_cursor_visible(4);
+    }
     Ok(())
 }
 
@@ -2930,6 +3354,7 @@ mod app_tests {
                 structural_change: true,
                 content_hash: 0,
                 comment_count: 0,
+                reviewed: false,
             });
         }
         app
@@ -3014,6 +3439,170 @@ mod app_tests {
         assert_eq!(
             app.status_message.as_deref(),
             Some("cosmetic filter: hidden")
+        );
+    }
+
+    // ─── Screen restore after Extra overlay (composer / picker) ─────────
+    //
+    // Regression coverage for: "Ctrl-X save lands me on the entity list
+    // instead of returning to the entity diff." The fix tracks the
+    // underlying screen in `App::screen_before_extra` so `Close` can
+    // restore it. These tests pin the state-machine contract so a future
+    // refactor cannot silently revert the behavior.
+
+    /// `OpenScreen` captures `EntityDiff` as the underlying screen.
+    #[test]
+    fn open_screen_from_entity_diff_captures_entity_diff_snapshot() {
+        let view = view_with_kinds(&[RenderedLineKind::Added]);
+        let mut app = make_app(view);
+        app.screen = Screen::EntityDiff { entity_idx: 3 };
+
+        // Mirror the capture logic from `delegate_to_surface`.
+        app.screen_before_extra = match app.screen {
+            Screen::EntityDiff { entity_idx } => Some(ScreenBeforeExtra::EntityDiff { entity_idx }),
+            Screen::FileDiff { file_idx } => Some(ScreenBeforeExtra::FileDiff { file_idx }),
+            Screen::Main
+            | Screen::Help
+            | Screen::Transition(_)
+            | Screen::Extra(_)
+            | Screen::FilePicker(_)
+            | Screen::Extracting => None,
+        };
+
+        assert!(matches!(
+            app.screen_before_extra,
+            Some(ScreenBeforeExtra::EntityDiff { entity_idx: 3 })
+        ));
+    }
+
+    /// `OpenScreen` captures `FileDiff` as the underlying screen.
+    #[test]
+    fn open_screen_from_file_diff_captures_file_diff_snapshot() {
+        let view = view_with_kinds(&[RenderedLineKind::Added]);
+        let mut app = make_app(view);
+        app.screen = Screen::FileDiff { file_idx: 2 };
+
+        app.screen_before_extra = match app.screen {
+            Screen::EntityDiff { entity_idx } => Some(ScreenBeforeExtra::EntityDiff { entity_idx }),
+            Screen::FileDiff { file_idx } => Some(ScreenBeforeExtra::FileDiff { file_idx }),
+            Screen::Main
+            | Screen::Help
+            | Screen::Transition(_)
+            | Screen::Extra(_)
+            | Screen::FilePicker(_)
+            | Screen::Extracting => None,
+        };
+
+        assert!(matches!(
+            app.screen_before_extra,
+            Some(ScreenBeforeExtra::FileDiff { file_idx: 2 })
+        ));
+    }
+
+    /// Restoring from a `ScreenBeforeExtra::EntityDiff` snapshot returns to
+    /// the exact same `entity_idx` the user was viewing before the overlay.
+    #[test]
+    fn close_restores_entity_diff_with_original_entity_idx() {
+        let view = view_with_kinds(&[RenderedLineKind::Added]);
+        let mut app = make_app(view);
+        app.screen_before_extra = Some(ScreenBeforeExtra::EntityDiff { entity_idx: 7 });
+
+        // Mirror the restore branch from `handle_extra_screen_key`'s
+        // `ExtraScreenAction::Close` arm.
+        if let Some(prev) = app.screen_before_extra.take() {
+            app.screen = match prev {
+                ScreenBeforeExtra::EntityDiff { entity_idx } => Screen::EntityDiff { entity_idx },
+                ScreenBeforeExtra::FileDiff { file_idx } => Screen::FileDiff { file_idx },
+            };
+        }
+
+        assert!(matches!(app.screen, Screen::EntityDiff { entity_idx: 7 }));
+        assert!(
+            app.screen_before_extra.is_none(),
+            "snapshot must be consumed on restore"
+        );
+    }
+
+    /// Restoring from a `ScreenBeforeExtra::FileDiff` snapshot returns to
+    /// the exact same `file_idx` the user was viewing.
+    #[test]
+    fn close_restores_file_diff_with_original_file_idx() {
+        let view = view_with_kinds(&[RenderedLineKind::Added]);
+        let mut app = make_app(view);
+        app.screen_before_extra = Some(ScreenBeforeExtra::FileDiff { file_idx: 4 });
+
+        if let Some(prev) = app.screen_before_extra.take() {
+            app.screen = match prev {
+                ScreenBeforeExtra::EntityDiff { entity_idx } => Screen::EntityDiff { entity_idx },
+                ScreenBeforeExtra::FileDiff { file_idx } => Screen::FileDiff { file_idx },
+            };
+        }
+
+        assert!(matches!(app.screen, Screen::FileDiff { file_idx: 4 }));
+    }
+
+    /// When the composer is opened from a screen that is NOT a diff view
+    /// (e.g., main entity list — though this isn't currently a code path),
+    /// no snapshot is captured and the post-Close screen stays as the
+    /// `Screen::Main` placeholder from the `mem::replace`.
+    #[test]
+    fn open_screen_from_main_captures_no_snapshot() {
+        let view = view_with_kinds(&[RenderedLineKind::Added]);
+        let mut app = make_app(view);
+        app.screen = Screen::Main;
+
+        app.screen_before_extra = match app.screen {
+            Screen::EntityDiff { entity_idx } => Some(ScreenBeforeExtra::EntityDiff { entity_idx }),
+            Screen::FileDiff { file_idx } => Some(ScreenBeforeExtra::FileDiff { file_idx }),
+            Screen::Main
+            | Screen::Help
+            | Screen::Transition(_)
+            | Screen::Extra(_)
+            | Screen::FilePicker(_)
+            | Screen::Extracting => None,
+        };
+
+        assert!(app.screen_before_extra.is_none());
+    }
+
+    // ─── cycle_file keeps Screen::FileDiff variant in sync ──────────────
+    //
+    // Regression coverage for: "Tab in FileDiff doesn't advance because
+    // `render_file_diff_screen` resets `file_index` from `file_idx` on
+    // every render." `cycle_file` must update both `app.file_index` AND
+    // the `Screen::FileDiff { file_idx }` payload.
+
+    #[test]
+    fn cycle_file_in_file_diff_screen_updates_variant() {
+        let v1 = view_with_kinds(&[RenderedLineKind::HunkHeader, RenderedLineKind::Added]);
+        let v2 = view_with_kinds(&[RenderedLineKind::HunkHeader, RenderedLineKind::Removed]);
+        let v3 = view_with_kinds(&[RenderedLineKind::HunkHeader, RenderedLineKind::Context]);
+        let mut app = make_app_with_views(vec![v1, v2, v3]);
+        app.screen = Screen::FileDiff { file_idx: 0 };
+
+        app.cycle_file(1);
+
+        assert_eq!(app.file_index, 1, "file_index advances");
+        assert!(
+            matches!(app.screen, Screen::FileDiff { file_idx: 1 }),
+            "Screen::FileDiff variant must track file_index, otherwise the \
+             next render resets file_index back to the variant's value"
+        );
+    }
+
+    #[test]
+    fn cycle_file_outside_file_diff_does_not_set_file_diff_screen() {
+        let v1 = view_with_kinds(&[RenderedLineKind::Added]);
+        let v2 = view_with_kinds(&[RenderedLineKind::Removed]);
+        let mut app = make_app_with_views(vec![v1, v2]);
+        app.screen = Screen::Main;
+
+        app.cycle_file(1);
+
+        assert_eq!(app.file_index, 1);
+        assert!(
+            matches!(app.screen, Screen::Main),
+            "cycle_file from Main must leave the screen alone"
         );
     }
 }

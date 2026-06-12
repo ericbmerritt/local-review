@@ -321,8 +321,11 @@ fn run_single(revset: &str) -> Result<(), JjrError> {
             data_home.display()
         );
     }
+    let spinner = local_review_core::startup_spinner::StartupSpinner::start("Loading change…");
     let change_id = jj::resolve_revset(revset)?;
-    tui::run(&change_id, &repo_root, &data_home)
+    // Pass spinner into tui::run so it stays alive through the slow
+    // `jj show` call inside, stopping just before the terminal is grabbed.
+    tui::run(&change_id, &repo_root, &data_home, Some(spinner))
 }
 
 fn run_stack(revset: &str, restart: bool) -> Result<(), JjrError> {
@@ -336,8 +339,12 @@ fn run_stack(revset: &str, restart: bool) -> Result<(), JjrError> {
             data_home.display()
         );
     }
+    let spinner = local_review_core::startup_spinner::StartupSpinner::start("Loading stack…");
     let resolved = jj::resolve_stack(revset)?;
-    tui::run_stack(&repo_root, &resolved, restart, &data_home)
+    // Pass spinner into tui::run_stack so it stays alive through the
+    // per-entry `jj show`/`diff_for_change` work, stopping just before
+    // the terminal is grabbed.
+    tui::run_stack(&repo_root, &resolved, restart, &data_home, Some(spinner))
 }
 
 fn run_clear(revset: &str, stale: bool, orphaned: bool, yes: bool) -> Result<(), JjrError> {

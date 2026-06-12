@@ -7,6 +7,16 @@ use crate::change_id::{ChangeId, CommitId};
 use crate::error::{JjrError, Result};
 use crate::util::{atomic_write_bytes, log_warning};
 
+/// A per-entity reviewed bit, keyed by entity id and content hash.
+///
+/// The `content_hash` acts as an invalidation token: when the entity's source
+/// changes, the hash flips, and the reviewed bit is no longer considered valid.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ReviewedBit {
+    pub(crate) entity_id: local_review_core::semantic::EntityId,
+    pub(crate) content_hash: u64,
+}
+
 /// What the user just landed on for review-tracking purposes. The description
 /// view (`file_index` = 0 in the TUI) is a first-class target rather than a
 /// reserved sentinel `PathBuf`, so the state model never has to encode "is this
@@ -39,6 +49,10 @@ pub(crate) struct ReviewedEntry {
     pub(crate) commit_id: CommitId,
     pub(crate) description_reviewed: bool,
     pub(crate) reviewed_files: BTreeSet<PathBuf>,
+    /// Per-entity reviewed bits. Each entry stores the entity id and the
+    /// content hash at the time it was marked, so stale entities can be
+    /// detected at render time.
+    pub(crate) entity_bits: Vec<ReviewedBit>,
 }
 
 impl ReviewedEntry {
@@ -47,6 +61,7 @@ impl ReviewedEntry {
             commit_id,
             description_reviewed: false,
             reviewed_files: BTreeSet::new(),
+            entity_bits: Vec::new(),
         }
     }
 
@@ -167,6 +182,68 @@ impl ReviewedState {
     }
 }
 
+impl ReviewedState {
+    /// Mark the entity at `(change_id, entity_id, content_hash)` as reviewed.
+    ///
+    /// Idempotent: if an entry with the same `entity_id` already exists for
+    /// this change, it is replaced (updating the `content_hash` in case the
+    /// entity changed between sessions). No commit-id invalidation is done here
+    /// — entity bits are invalidated naturally when `content_hash` changes.
+    pub(crate) fn mark_entity_reviewed(
+        &mut self,
+        change_id: ChangeId,
+        entity_id: local_review_core::semantic::EntityId,
+        content_hash: u64,
+    ) {
+        // Use a placeholder commit_id when no entry exists yet; the file-based
+        // reviewed bits carry the canonical commit_id.
+        let entry = self.entries.entry(change_id).or_insert_with(|| {
+            // We don't have the commit_id here; use an all-zero placeholder.
+            // The entry will be properly initialised the next time a file or
+            // description is marked via `mark()`.
+            ReviewedEntry {
+                commit_id: CommitId::parse("0000000000000000").unwrap_or_else(|_|
+                    // SAFETY: "0000000000000000" is valid hex.
+                    unreachable!()),
+                description_reviewed: false,
+                reviewed_files: BTreeSet::new(),
+                entity_bits: Vec::new(),
+            }
+        });
+
+        // Replace existing bit for this entity, or push a new one.
+        if let Some(bit) = entry
+            .entity_bits
+            .iter_mut()
+            .find(|b| b.entity_id == entity_id)
+        {
+            bit.content_hash = content_hash;
+        } else {
+            entry.entity_bits.push(ReviewedBit {
+                entity_id,
+                content_hash,
+            });
+        }
+    }
+
+    /// Return `true` when the entity has been marked reviewed with a matching
+    /// `content_hash`.
+    pub(crate) fn is_entity_reviewed(
+        &self,
+        change_id: &ChangeId,
+        entity_id: &local_review_core::semantic::EntityId,
+        content_hash: u64,
+    ) -> bool {
+        let Some(entry) = self.entries.get(change_id) else {
+            return false;
+        };
+        entry
+            .entity_bits
+            .iter()
+            .any(|b| &b.entity_id == entity_id && b.content_hash == content_hash)
+    }
+}
+
 /// Outcome of [`ReviewedState::mark`]. Tells the caller whether the call
 /// dropped a stale entry for the same `change_id` (`commit_id` mismatch) so
 /// the TUI can surface a status toast distinguishing "first encounter"
@@ -233,6 +310,10 @@ impl ReviewedState {
 /// fields are missing.
 #[derive(Debug, Serialize, Deserialize)]
 struct ReviewedStateDto {
+    /// Schema version: 1 = no `entity_bits`, 2 = `entity_bits` present.
+    /// Absent in old files; treated as version 1.
+    #[serde(default)]
+    schema_version: u32,
     /// Map keyed by `ChangeId.as_str()`. Using the string key here keeps the
     /// JSON shape ergonomic to read by hand without sacrificing the typed
     /// `ChangeId` boundary check on load.
@@ -247,10 +328,14 @@ struct ReviewedEntryDto {
     description_reviewed: bool,
     #[serde(default)]
     reviewed_files: Vec<String>,
+    #[serde(default)]
+    entity_bits: Vec<ReviewedBit>,
 }
 
 impl ReviewedStateDto {
     fn from_state(state: &ReviewedState) -> Self {
+        let has_entity_bits = state.entries.values().any(|e| !e.entity_bits.is_empty());
+        let schema_version = if has_entity_bits { 2 } else { 1 };
         let entries = state
             .entries
             .iter()
@@ -265,11 +350,15 @@ impl ReviewedStateDto {
                             .iter()
                             .map(|p| p.to_string_lossy().into_owned())
                             .collect(),
+                        entity_bits: entry.entity_bits.clone(),
                     },
                 )
             })
             .collect();
-        Self { entries }
+        Self {
+            schema_version,
+            entries,
+        }
     }
 
     /// Convert wire DTO into a typed `ReviewedState`, dropping entries whose
@@ -319,6 +408,7 @@ impl ReviewedStateDto {
                         commit_id,
                         description_reviewed: dto.description_reviewed,
                         reviewed_files,
+                        entity_bits: dto.entity_bits,
                     },
                 ))
             })

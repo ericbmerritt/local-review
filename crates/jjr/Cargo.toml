@@ -40,3 +40,4 @@ toml.workspace = true
 [dev-dependencies]
 assert_cmd.workspace = true
 predicates.workspace = true
+expectrl.workspace = true

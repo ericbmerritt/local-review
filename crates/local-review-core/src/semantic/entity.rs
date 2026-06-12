@@ -8,6 +8,7 @@
 use std::path::PathBuf;
 
 pub use super::entity_id::EntityId;
+use crate::diff::DiffFile;
 
 /// Classification of a code entity by its syntactic kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -126,6 +127,51 @@ pub struct DescriptionSummary {
     pub comment_count: usize,
 }
 
+/// Build a synthetic "whole-file" `EntitySummary` for a file with no
+/// extracted entities — either because extraction failed (parse errors,
+/// IO failure, unsupported language) or because the file is a valid
+/// source with no entity-kind matches (e.g., a plain text file in a diff
+/// of markdown + plaintext). The user still needs to see and comment on
+/// the change, so the entity list surfaces one row per file representing
+/// the whole file. Navigating to it opens the file diff.
+pub fn fallback_summary_for_file(file: &DiffFile) -> EntitySummary {
+    let (path, source_file, change) = match file {
+        DiffFile::Added { path, .. } => (path.clone(), None, ChangeType::Added),
+        DiffFile::Removed { path, .. } => (path.clone(), None, ChangeType::Deleted),
+        DiffFile::Renamed { from, to, .. } => (to.clone(), Some(from.clone()), ChangeType::Moved),
+        DiffFile::Modified { path, .. } | DiffFile::Binary { path } => {
+            (path.clone(), None, ChangeType::Modified)
+        }
+    };
+    let display_name = path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string_lossy().into_owned());
+    let id = EntityId::new(path.clone(), vec![display_name.clone()], None, 0);
+    EntitySummary {
+        id,
+        display_name,
+        kind: EntityKind::Other,
+        change,
+        annotation: ChangeAnnotation::None,
+        file_path: path,
+        source_file,
+        target_line: None,
+        // Whole-file range: a fallback row represents the entire file (no
+        // entity-level granularity), so when the user navigates into it
+        // they should see the full diff. Using `(0, 0)` here would cause
+        // entity-clip mode to render an empty view because
+        // `clip_diff_view_to_range` filters lines whose source/target line
+        // numbers fall inside the range, and real diff lines start at 1.
+        // `(1, u32::MAX)` captures every line on either side of the diff.
+        line_range: (1, u32::MAX),
+        structural_change: true,
+        content_hash: 0,
+        comment_count: 0,
+        reviewed: false,
+    }
+}
+
 /// Render-time view of one entity; not stored in the cache.
 ///
 /// Constructed from `EntityCoreData` + comment store lookups at render time.
@@ -147,4 +193,6 @@ pub struct EntitySummary {
     pub content_hash: u64,
     /// Number of inline comments anchored inside this entity's line range.
     pub comment_count: usize,
+    /// `true` when the reviewer has visited and auto-marked this entity.
+    pub reviewed: bool,
 }

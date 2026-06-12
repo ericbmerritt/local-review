@@ -254,6 +254,8 @@ mod tests {
             updated_at: None,
             status: None,
             mismatch_reason: None,
+            entity_id: None,
+            anchor_fingerprint: None,
         }
     }
 
@@ -272,6 +274,8 @@ mod tests {
             updated_at: None,
             status: Some(Status::Pending),
             mismatch_reason: None,
+            entity_id: None,
+            anchor_fingerprint: None,
         }
     }
 
@@ -300,6 +304,8 @@ mod tests {
             updated_at: None,
             status: Some(Status::Pending),
             mismatch_reason: None,
+            entity_id: None,
+            anchor_fingerprint: None,
         }
     }
 
@@ -715,6 +721,8 @@ mod tests {
             updated_at: None,
             status: None,
             mismatch_reason: None,
+            entity_id: None,
+            anchor_fingerprint: None,
         };
         let data = ExportData {
             revset: "@".to_owned(),
@@ -771,6 +779,8 @@ mod tests {
             updated_at: None,
             status: Some(Status::Stale),
             mismatch_reason: Some(MismatchReason::AnchorNotFound),
+            entity_id: None,
+            anchor_fingerprint: None,
         };
         store::save_comment(dir.path(), dir.path(), &stale).unwrap();
 
@@ -827,6 +837,8 @@ mod tests {
             updated_at: None,
             status: Some(Status::Orphaned),
             mismatch_reason: None,
+            entity_id: None,
+            anchor_fingerprint: None,
         };
         store::save_comment(dir.path(), dir.path(), &orphaned).unwrap();
 

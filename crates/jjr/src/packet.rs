@@ -707,6 +707,8 @@ mod tests {
             updated_at: None,
             status: None,
             mismatch_reason: None,
+            entity_id: None,
+            anchor_fingerprint: None,
         }
     }
 
@@ -725,6 +727,8 @@ mod tests {
             updated_at: None,
             status: Some(Status::Pending),
             mismatch_reason: None,
+            entity_id: None,
+            anchor_fingerprint: None,
         }
     }
 
@@ -762,6 +766,8 @@ mod tests {
             updated_at: None,
             status: Some(Status::Pending),
             mismatch_reason: None,
+            entity_id: None,
+            anchor_fingerprint: None,
         }
     }
 
@@ -1068,6 +1074,8 @@ mod tests {
             updated_at: None,
             status: Some(Status::Pending),
             mismatch_reason: None,
+            entity_id: None,
+            anchor_fingerprint: None,
         };
 
         let block = render_line_comment_block(&comment);
@@ -1465,6 +1473,8 @@ mod tests {
             updated_at: None,
             status: Some(Status::Pending),
             mismatch_reason: None,
+            entity_id: None,
+            anchor_fingerprint: None,
         }
     }
 
@@ -1753,6 +1763,8 @@ mod tests {
             updated_at: None,
             status: Some(Status::Pending),
             mismatch_reason: None,
+            entity_id: None,
+            anchor_fingerprint: None,
         };
         let packet = Packet {
             data_home: PathBuf::from("/data"),
@@ -1861,6 +1873,8 @@ mod tests {
             updated_at: None,
             status: Some(Status::Pending),
             mismatch_reason: None,
+            entity_id: None,
+            anchor_fingerprint: None,
         };
         let packet = Packet {
             data_home: PathBuf::from("/data"),

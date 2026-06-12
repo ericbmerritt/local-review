@@ -930,14 +930,19 @@ impl ReviewSurface for GgrSurface {
             ggr_entity_cache_base(owner_repo, self.pr.number, self.pr.hostname.as_deref())
                 .map(|base| local_review_core::semantic::cache::ggr_cache_path(&base, sha));
 
-        if let Some(ref p) = cache_path {
-            if let Ok(Some(entry)) = local_review_core::semantic::cache::read(p) {
-                return Ok(ggr_build_entity_summaries(entry));
-            }
-        }
+        let registry = local_review_core::semantic::create_default_registry();
 
+        // Always fetch the diff: cache-hit path needs it to interleave fallback
+        // rows for files that produced no entities. The diff itself is cheap
+        // (a single gh API call) compared to extraction.
         let diff =
             gh::fetch_commit_diff(&self.pr.repo_name, &commit.sha, self.pr.hostname.as_deref())?;
+
+        if let Some(ref p) = cache_path {
+            if let Ok(Some(entry)) = local_review_core::semantic::cache::read(p) {
+                return Ok(ggr_build_entity_summaries_interleaved(entry, &diff));
+            }
+        }
 
         let file_paths: Vec<String> = diff
             .files
@@ -952,7 +957,6 @@ impl ReviewSurface for GgrSurface {
             self.pr.hostname.as_deref(),
         );
 
-        let registry = local_review_core::semantic::create_default_registry();
         let mut entities = Vec::new();
         let mut failed_files = Vec::new();
 
@@ -969,6 +973,7 @@ impl ReviewSurface for GgrSurface {
 
         let cache_entry = local_review_core::semantic::cache::CacheEntry {
             schema_version: local_review_core::semantic::cache::SCHEMA_VERSION,
+            extraction_hash: local_review_core::semantic::cache::EXTRACTION_HASH.to_owned(),
             entities,
             graph: None,
             failed_files,
@@ -976,7 +981,7 @@ impl ReviewSurface for GgrSurface {
         if let Some(ref p) = cache_path {
             let _ = local_review_core::semantic::cache::write(p, &cache_entry);
         }
-        Ok(ggr_build_entity_summaries(cache_entry))
+        Ok(ggr_build_entity_summaries_interleaved(cache_entry, &diff))
     }
 
     fn appended_comments_for_view(
@@ -1475,9 +1480,37 @@ fn ggr_build_entity_summaries(
                 structural_change: e.structural_change,
                 content_hash: e.content_hash,
                 comment_count: 0,
+                reviewed: false,
             }
         })
         .collect()
+}
+
+/// Build summaries from a cache entry, interleaving a synthetic fallback row
+/// for every file in `diff` that has no entities. Order follows `diff.files`
+/// so the entity list stays aligned with the diff — extraction failure or
+/// an unrecognised language never erases a file from the reviewer's view.
+fn ggr_build_entity_summaries_interleaved(
+    entry: local_review_core::semantic::cache::CacheEntry,
+    diff: &local_review_core::diff::Diff,
+) -> Vec<local_review_core::semantic::EntitySummary> {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    let raw = ggr_build_entity_summaries(entry);
+    let mut by_path: HashMap<PathBuf, Vec<local_review_core::semantic::EntitySummary>> =
+        HashMap::new();
+    for s in raw {
+        by_path.entry(s.file_path.clone()).or_default().push(s);
+    }
+    let mut out = Vec::new();
+    for file in &diff.files {
+        let path = file.display_path().to_path_buf();
+        match by_path.remove(&path) {
+            Some(file_entities) if !file_entities.is_empty() => out.extend(file_entities),
+            _ => out.push(local_review_core::semantic::fallback_summary_for_file(file)),
+        }
+    }
+    out
 }
 
 fn ggr_footer_text_for_width(width: u16, severity_filter: Option<Severity>) -> String {
@@ -1524,6 +1557,8 @@ Comments
 Views
     f                     file picker
     R                     refresh — re-fetch PR state and re-anchor drafts
+    y                     yank ±10 lines around cursor (with file:line header)
+                          to system clipboard — paste into Claude as context
     S                     submit review (opens verdict modal)
     |                     cycle diff layout: auto / unified / side-by-side
                           (auto picks side-by-side at >=120 cols)
@@ -1552,7 +1587,15 @@ In comment composer
 // ── ReviewSurfaceExt impl ─────────────────────────────────────────────────────
 
 impl ReviewSurfaceExt for GgrSurface {
-    fn on_entry_loaded(&mut self, _idx: usize, _record_cursor: bool) {}
+    fn on_entry_loaded(&mut self, _idx: usize, _record_cursor: bool) {
+        // `load_entry` always calls `fetch_views` before `on_entry_loaded`,
+        // and `fetch_views` already sets `self.state` with the real commit diff
+        // and clears `pending_initial_index`. This hook only needs to ensure
+        // `pending_initial_index` is cleared so `current_entry_index()` returns
+        // the updated index rather than the stale startup value — that is the
+        // fix for `n`/`p` navigation appearing to do nothing.
+        self.pending_initial_index = None;
+    }
 
     fn take_pending_status_message(&mut self) -> Option<String> {
         self.pending_stale_message.take()
@@ -3203,6 +3246,177 @@ mod tests {
         }
     }
 
+    // Regression: user reported a line-scope draft disappearing immediately
+    // after Ctrl-X save in ggr. Save succeeded (status bar showed "line
+    // draft saved") and the draft was on disk (re-opening composer found
+    // it). This test mirrors the user's flow end-to-end and exercises the
+    // full pipeline up through `with_inline_comments` injection.
+    #[test]
+    #[serial]
+    fn save_line_draft_then_view_contains_inline_meta() {
+        use local_review_core::diff::{Hunk, Line, LineKind};
+        use local_review_core::tui::composer::LineTarget;
+        use local_review_core::tui::diff_view::{DiffView, RenderedLineKind};
+
+        let dir = tempfile::tempdir().unwrap();
+        let prev = std::env::var("XDG_DATA_HOME").ok();
+        std::env::set_var("XDG_DATA_HOME", dir.path());
+
+        let mut surface = GgrSurface::new(make_pr(), None);
+        // Real-shape diff: one file with a hunk that contains line 42 in the
+        // after-state, so `with_inline_comments` has a row to match against.
+        let hunk = Hunk {
+            header: "@@ -40,6 +40,7 @@".to_owned(),
+            function_context: None,
+            source_start: 40,
+            source_length: 3,
+            target_start: 40,
+            target_length: 3,
+            lines: vec![
+                Line {
+                    kind: LineKind::Context,
+                    text: "fn foo() {".to_owned(),
+                    source_line: Some(40),
+                    target_line: Some(40),
+                },
+                Line {
+                    kind: LineKind::Context,
+                    text: "    let x = 1;".to_owned(),
+                    source_line: Some(41),
+                    target_line: Some(42),
+                },
+                Line {
+                    kind: LineKind::Context,
+                    text: "}".to_owned(),
+                    source_line: Some(42),
+                    target_line: Some(43),
+                },
+            ],
+        };
+        surface.state = State::CommitDiff {
+            index: 1,
+            diff: Diff {
+                files: vec![DiffFile::Modified {
+                    path: std::path::PathBuf::from("src/foo.rs"),
+                    hunks: vec![hunk.clone()],
+                }],
+            },
+        };
+
+        let target = LineTarget {
+            file: std::path::PathBuf::from("src/foo.rs"),
+            rendered_index: 3,
+            source_line: None,
+            target_line: Some(42),
+            target_text: "    let x = 1;".to_owned(),
+            hunk_header: "@@ -40,6 +40,7 @@".to_owned(),
+            context_before: vec!["fn foo() {".to_owned()],
+            context_after: vec!["}".to_owned()],
+        };
+        let scope = ComposerScope::Line(target);
+        let req = SaveRequest {
+            scope: &scope,
+            severity: Severity::Required,
+            body: "fix this",
+            entry_idx: 0,
+        };
+        let outcome = surface.save_comment(req).unwrap();
+        assert!(
+            matches!(outcome, SaveOutcome::Saved { .. }),
+            "save: {outcome:?}"
+        );
+
+        // Step 1: surface returns the new draft as an inline comment.
+        let now = std::time::SystemTime::now();
+        let inline = surface.inline_comments_for_view(now, 1, None);
+        assert_eq!(
+            inline.len(),
+            1,
+            "inline_comments_for_view must return the draft"
+        );
+
+        // Step 2: a fresh DiffView built from the diff file, with comments
+        // injected, contains an `InlineCommentMeta` row below line 42.
+        let file = match &surface.state {
+            State::CommitDiff { diff, .. } => &diff.files[0],
+            State::Description => panic!("state must be CommitDiff"),
+        };
+        let view = DiffView::from_file(file).with_inline_comments(&inline);
+        let meta_position = view
+            .lines
+            .iter()
+            .position(|l| matches!(l.kind, RenderedLineKind::InlineCommentMeta { .. }));
+        assert!(
+            meta_position.is_some(),
+            "with_inline_comments must inject an InlineCommentMeta row; got {:?}",
+            view.lines.iter().map(|l| &l.kind).collect::<Vec<_>>()
+        );
+
+        if let Some(p) = prev {
+            std::env::set_var("XDG_DATA_HOME", p);
+        } else {
+            std::env::remove_var("XDG_DATA_HOME");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn save_line_draft_then_inline_comments_returns_it() {
+        use local_review_core::tui::composer::LineTarget;
+
+        let dir = tempfile::tempdir().unwrap();
+        let prev = std::env::var("XDG_DATA_HOME").ok();
+        std::env::set_var("XDG_DATA_HOME", dir.path());
+
+        let mut surface = GgrSurface::new(make_pr(), None);
+        set_commit_diff_state(&mut surface);
+
+        let target = LineTarget {
+            file: std::path::PathBuf::from("src/foo.rs"),
+            rendered_index: 3,
+            source_line: None,
+            target_line: Some(42),
+            target_text: "let x = 1;".to_owned(),
+            hunk_header: "@@ -40,6 +40,7 @@".to_owned(),
+            context_before: vec!["fn foo() {".to_owned()],
+            context_after: vec!["}".to_owned()],
+        };
+        let scope = ComposerScope::Line(target);
+        let req = SaveRequest {
+            scope: &scope,
+            severity: Severity::Required,
+            body: "fix this",
+            entry_idx: 0,
+        };
+        let outcome = surface.save_comment(req).unwrap();
+        assert!(
+            matches!(outcome, SaveOutcome::Saved { .. }),
+            "save: {outcome:?}"
+        );
+        assert_eq!(surface.loaded_drafts.len(), 1, "draft must be in memory");
+
+        // view_idx=1 → first diff file (view_idx=0 is the description sub-view).
+        let now = std::time::SystemTime::now();
+        let inline = surface.inline_comments_for_view(now, 1, None);
+        assert_eq!(
+            inline.len(),
+            1,
+            "inline_comments_for_view must return the just-saved draft; got {inline:?}"
+        );
+        assert_eq!(
+            inline[0].target_line,
+            Some(42),
+            "inline comment must point at the after-state line; got {:?}",
+            inline[0]
+        );
+
+        if let Some(p) = prev {
+            std::env::set_var("XDG_DATA_HOME", p);
+        } else {
+            std::env::remove_var("XDG_DATA_HOME");
+        }
+    }
+
     #[test]
     #[serial]
     fn update_comment_changes_body() {
@@ -4108,5 +4322,77 @@ mod tests {
             "lookup must strip_controls on the diff path to match the saved (stripped) cursor file"
         );
         assert_eq!(pos.1, 3, "line must be preserved");
+    }
+
+    // ── on_entry_loaded updates current_entry_index ───────────────────────────
+
+    #[test]
+    fn on_entry_loaded_clears_pending_so_current_index_follows_state() {
+        // Regression: on_entry_loaded was a no-op, so pending_initial_index
+        // was never cleared. current_entry_index() returned the startup value
+        // on every call, making n/p navigation appear to do nothing.
+        //
+        // In production, load_entry always calls fetch_views THEN
+        // on_entry_loaded. fetch_views sets self.state (with the real diff) and
+        // also clears pending_initial_index. on_entry_loaded's job is to ensure
+        // pending_initial_index is cleared even when fetch_views has already run.
+        let pr = make_pr(); // 2 commits → entry_count() == 3
+        let sha = pr.commits[0].sha.as_str().to_owned();
+        let cursor = make_cursor_state(&sha, "src/lib.rs", 5);
+        let mut surface = GgrSurface::new(pr, Some(&cursor));
+
+        // Startup: pending drives index = 1.
+        assert_eq!(surface.current_entry_index(), 1);
+
+        // Simulate fetch_views having set state to CommitDiff { index: 2 }.
+        surface.state = State::CommitDiff {
+            index: 2,
+            diff: Diff { files: Vec::new() },
+        };
+
+        // on_entry_loaded clears pending so current_entry_index follows state.
+        surface.on_entry_loaded(2, false);
+        assert_eq!(
+            surface.current_entry_index(),
+            2,
+            "current_entry_index must follow state.index after pending is cleared"
+        );
+        assert!(
+            surface.pending_initial_index.is_none(),
+            "pending_initial_index must be cleared after on_entry_loaded"
+        );
+    }
+
+    #[test]
+    fn on_entry_loaded_does_not_overwrite_state_set_by_fetch_views() {
+        // on_entry_loaded must only clear pending_initial_index; it must NOT
+        // overwrite self.state. fetch_views runs before on_entry_loaded in
+        // load_entry and sets the real commit diff; overwriting it with an
+        // empty placeholder breaks inline-comment lookup and entity counts.
+        let pr = make_pr();
+        let mut surface = GgrSurface::new(pr, None);
+        // Simulate fetch_views having set CommitDiff with real data.
+        surface.state = State::CommitDiff {
+            index: 1,
+            diff: Diff {
+                files: vec![DiffFile::Modified {
+                    path: std::path::PathBuf::from("src/foo.py"),
+                    hunks: vec![],
+                }],
+            },
+        };
+        surface.on_entry_loaded(1, false);
+        // State must be preserved — diff files must not be cleared.
+        match &surface.state {
+            State::CommitDiff { index, diff } => {
+                assert_eq!(*index, 1);
+                assert_eq!(
+                    diff.files.len(),
+                    1,
+                    "on_entry_loaded must not overwrite fetch_views diff"
+                );
+            }
+            State::Description => panic!("expected CommitDiff state, got Description"),
+        }
     }
 }

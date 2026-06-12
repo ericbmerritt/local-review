@@ -203,9 +203,17 @@ pub fn run(
     change_id: &ChangeId,
     repo_root: &std::path::Path,
     data_home: &std::path::Path,
+    spinner: Option<local_review_core::startup_spinner::StartupSpinner>,
 ) -> Result<()> {
     let details = jj::show(change_id)?;
     let revset = change_id.as_str().to_owned();
+
+    // Stop the startup spinner after the slow `jj show` call completes,
+    // before crossterm grabs the terminal. The spinner's stderr writes
+    // would otherwise interleave with the alt-screen entry sequence.
+    if let Some(s) = spinner {
+        s.stop();
+    }
 
     let (mut terminal, guard) = enter_tui_session(data_home, repo_root)?;
     let ctx = JjrContext {
@@ -223,6 +231,7 @@ pub fn run_stack(
     resolved: &ResolvedStack,
     restart: bool,
     data_home: &std::path::Path,
+    spinner: Option<local_review_core::startup_spinner::StartupSpinner>,
 ) -> Result<()> {
     if resolved.entries.is_empty() {
         return Err(JjrError::RevsetNoMatch {
@@ -305,6 +314,13 @@ pub fn run_stack(
         revset: resolved.revset.clone(),
         revset_hash: resolved.revset_hash,
     };
+
+    // Stop the startup spinner after all per-entry `jj show` and
+    // `jj diff_for_change` calls complete, before crossterm grabs the
+    // terminal. On large stacks this is where most of the latency lives.
+    if let Some(s) = spinner {
+        s.stop();
+    }
 
     let (mut terminal, guard) = enter_tui_session(data_home, repo_root)?;
     let ctx = JjrContext {
@@ -795,12 +811,13 @@ impl ReviewSurface for JjrSurface {
             &commit_id,
         );
 
+        let registry = local_review_core::semantic::create_default_registry();
         if let Ok(Some(entry)) = local_review_core::semantic::cache::read(&cache_path) {
-            return Ok(build_entity_summaries(entry));
+            let summaries = build_entity_summaries_interleaved(entry, &details.diff);
+            return Ok(self.populate_reviewed_bits(entry_idx, summaries));
         }
 
         let diff = details.diff;
-        let registry = local_review_core::semantic::create_default_registry();
         let parent_rev = jj::parent_rev(&change_id);
         let current_rev = change_id.as_str().to_owned();
         let ctx = FileExtractCtx {
@@ -819,12 +836,31 @@ impl ReviewSurface for JjrSurface {
 
         let cache_entry = local_review_core::semantic::cache::CacheEntry {
             schema_version: local_review_core::semantic::cache::SCHEMA_VERSION,
+            extraction_hash: local_review_core::semantic::cache::EXTRACTION_HASH.to_owned(),
             entities,
             graph: None,
             failed_files,
         };
         let _ = local_review_core::semantic::cache::write(&cache_path, &cache_entry);
-        Ok(build_entity_summaries(cache_entry))
+        let summaries = build_entity_summaries_interleaved(cache_entry, &diff);
+        Ok(self.populate_reviewed_bits(entry_idx, summaries))
+    }
+
+    /// Build a background extraction task. Clones only the data the
+    /// runnable needs (paths, change id) so the task is `Send` and can
+    /// outlive the surface borrow. Returns `None` if the entry index does
+    /// not map to a change, in which case the core falls back to the
+    /// synchronous `fetch_entity_list` path.
+    fn entity_extraction_task(
+        &self,
+        entry_idx: usize,
+    ) -> Option<Box<dyn local_review_core::tui::entity_list::ExtractionRunner>> {
+        let change_id = self.entry_change_id(entry_idx).ok()?;
+        Some(Box::new(JjrExtractionTask {
+            change_id,
+            repo_root: self.repo_root.clone(),
+            data_home: self.data_home.clone(),
+        }))
     }
 
     fn inline_comments_for_view(
@@ -893,6 +929,16 @@ impl ReviewSurface for JjrSurface {
 
         let anchor = build_anchor_from_scope(scope, &self.details.change_id, &self.details);
 
+        let anchor_fingerprint = if let Anchor::Line { ref location, .. } = anchor {
+            Some(local_review_core::AnchorFingerprint::compute(
+                &location.target_text,
+                location.context_before.last().map_or("", |s| s.as_str()),
+                location.context_after.first().map_or("", |s| s.as_str()),
+            ))
+        } else {
+            None
+        };
+
         let comment = Comment {
             schema_version: SchemaVersion,
             anchor,
@@ -905,6 +951,9 @@ impl ReviewSurface for JjrSurface {
             updated_at: None,
             status: Some(Status::Pending),
             mismatch_reason: None,
+            // TODO: populate entity_id from entity list
+            entity_id: None,
+            anchor_fingerprint,
         };
 
         match crate::store::save_comment(&self.data_home, &self.repo_root, &comment) {
@@ -1222,6 +1271,36 @@ impl ReviewSurfaceExt for JjrSurface {
     fn take_pending_status_message(&mut self) -> Option<String> {
         self.pending_status_message.take()
     }
+
+    fn mark_entity_reviewed(
+        &mut self,
+        entry_idx: usize,
+        entity_id: &local_review_core::semantic::EntityId,
+        content_hash: u64,
+    ) {
+        let change_id = self
+            .stack
+            .as_ref()
+            .and_then(|s| s.entries.get(entry_idx).map(|e| e.change_id.clone()))
+            .unwrap_or_else(|| self.details.change_id.clone());
+        self.reviewed
+            .mark_entity_reviewed(change_id, entity_id.clone(), content_hash);
+    }
+
+    fn is_entity_reviewed(
+        &self,
+        entry_idx: usize,
+        entity_id: &local_review_core::semantic::EntityId,
+        content_hash: u64,
+    ) -> bool {
+        let change_id = self
+            .stack
+            .as_ref()
+            .and_then(|s| s.entries.get(entry_idx).map(|e| &e.change_id));
+        let cid = change_id.unwrap_or(&self.details.change_id);
+        self.reviewed
+            .is_entity_reviewed(cid, entity_id, content_hash)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1229,6 +1308,19 @@ impl ReviewSurfaceExt for JjrSurface {
 // ---------------------------------------------------------------------------
 
 impl JjrSurface {
+    /// Stamp each `EntitySummary` with its current `reviewed` bit from the
+    /// persisted reviewed state.
+    fn populate_reviewed_bits(
+        &self,
+        entry_idx: usize,
+        mut summaries: Vec<local_review_core::semantic::EntitySummary>,
+    ) -> Vec<local_review_core::semantic::EntitySummary> {
+        for s in &mut summaries {
+            s.reviewed = self.is_entity_reviewed(entry_idx, &s.id, s.content_hash);
+        }
+        summaries
+    }
+
     /// Build the `SendToClaudeState` for the current change. Returns
     /// `Ok(state)` on success or `Err(status_msg)` on failure.
     fn build_send_to_claude(&self) -> std::result::Result<SendToClaudeState, String> {
@@ -2362,6 +2454,8 @@ fn delete_via_composer_impl(
             updated_at: None,
             status: Some(Status::Pending),
             mismatch_reason: None,
+            entity_id: None,
+            anchor_fingerprint: None,
         },
     };
     match crate::store::delete_comment(data_home, repo_root, &comment) {
@@ -5365,6 +5459,8 @@ fn build_comment_from_composer(
         updated_at: None,
         status: Some(Status::Pending),
         mismatch_reason: None,
+        entity_id: None,
+        anchor_fingerprint: None,
     }
 }
 
@@ -5454,6 +5550,8 @@ fn delete_via_composer(app: &mut App, composer: &Composer) -> SaveOutcome {
             updated_at: None,
             status: Some(Status::Pending),
             mismatch_reason: None,
+            entity_id: None,
+            anchor_fingerprint: None,
         },
     };
 
@@ -5510,6 +5608,167 @@ struct FileExtractCtx<'a> {
 ///
 /// Calls `jj file show` for before and after content, then runs the extractor.
 /// Per-file failures append to `failed_files` rather than aborting.
+/// Background extraction task for `entity_extraction_task`.
+///
+/// Owns clones of `change_id`, `repo_root`, and `data_home` so it can run
+/// on a separate thread without borrowing the surface. Sends
+/// `Progress` / `FileExtracted` / `Complete` events through the channel
+/// so the TUI loading overlay animates and the entity list populates
+/// incrementally.
+struct JjrExtractionTask {
+    change_id: ChangeId,
+    repo_root: PathBuf,
+    data_home: PathBuf,
+}
+
+impl local_review_core::tui::entity_list::ExtractionRunner for JjrExtractionTask {
+    fn run(
+        self: Box<Self>,
+        tx: std::sync::mpsc::Sender<local_review_core::tui::entity_list::ExtractionEvent>,
+        cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        use local_review_core::semantic::cache;
+        use local_review_core::tui::entity_list::ExtractionEvent;
+
+        let cache_base =
+            crate::store::repo_data_dir(&self.data_home, &self.repo_root).join("entities");
+        let details = match jj::show(&self.change_id) {
+            Ok(d) => d,
+            Err(e) => {
+                let _ = tx.send(ExtractionEvent::Error(format!("jj show failed: {e}")));
+                return;
+            }
+        };
+        let commit_id = details.commit_id.as_str().to_owned();
+        let cache_path = cache::jjr_cache_path(&cache_base, self.change_id.as_str(), &commit_id);
+
+        // Cache hit: skip the per-file work entirely.
+        if let Ok(Some(entry)) = cache::read(&cache_path) {
+            emit_cache_hit(&tx, entry, &details.diff);
+            return;
+        }
+
+        // Cache miss: stream per-file extraction with progress.
+        extract_and_emit(&self, &tx, &cancel, &details.diff, &cache_path);
+    }
+}
+
+/// Emit cached entities as a single batch, interleaved with fallback rows
+/// for any file in the diff that has no entities. Cache hits don't benefit
+/// from per-file streaming — the work is already done; sending it as one
+/// event is faster — but we still walk `diff.files` so the order matches
+/// the streaming path and fallback rows land in their natural position.
+fn emit_cache_hit(
+    tx: &std::sync::mpsc::Sender<local_review_core::tui::entity_list::ExtractionEvent>,
+    entry: local_review_core::semantic::cache::CacheEntry,
+    diff: &local_review_core::diff::Diff,
+) {
+    use local_review_core::tui::entity_list::ExtractionEvent;
+    let summaries = build_entity_summaries_interleaved(entry, diff);
+    let total = diff.files.len();
+    let _ = tx.send(ExtractionEvent::Progress {
+        files_done: total,
+        files_total: total,
+        files_failed: 0,
+    });
+    let _ = tx.send(ExtractionEvent::FileExtracted {
+        file_path: String::new(),
+        entities: summaries,
+    });
+    let _ = tx.send(ExtractionEvent::Complete);
+}
+
+/// Run per-file extraction, streaming progress events through `tx`. Writes
+/// a cache entry on success so the next open hits the warm path.
+fn extract_and_emit(
+    task: &JjrExtractionTask,
+    tx: &std::sync::mpsc::Sender<local_review_core::tui::entity_list::ExtractionEvent>,
+    cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    diff: &local_review_core::diff::Diff,
+    cache_path: &std::path::Path,
+) {
+    use local_review_core::semantic::cache::{self, CacheEntry, EXTRACTION_HASH, SCHEMA_VERSION};
+    use local_review_core::tui::entity_list::ExtractionEvent;
+    use std::sync::atomic::Ordering;
+
+    let registry = local_review_core::semantic::create_default_registry();
+    let parent_rev = jj::parent_rev(&task.change_id);
+    let current_rev = task.change_id.as_str().to_owned();
+    let ctx = FileExtractCtx {
+        registry: &registry,
+        repo_root: &task.repo_root,
+        current_rev: &current_rev,
+        parent_rev: &parent_rev,
+    };
+    let total = diff.files.len();
+    let _ = tx.send(ExtractionEvent::Progress {
+        files_done: 0,
+        files_total: total,
+        files_failed: 0,
+    });
+
+    let mut all_entities: Vec<local_review_core::semantic::EntityCoreData> = Vec::new();
+    let mut failed_files: Vec<String> = Vec::new();
+
+    for (i, file) in diff.files.iter().enumerate() {
+        if cancel.load(Ordering::Relaxed) {
+            let _ = tx.send(ExtractionEvent::Cancelled);
+            return;
+        }
+        let path = file.display_path().to_string_lossy().into_owned();
+        let mut file_entities = Vec::new();
+        let mut file_failed = Vec::new();
+        extract_file_entities(&ctx, &path, &mut file_entities, &mut file_failed);
+
+        // Stream this file's summaries to the UI. If extraction yielded no
+        // entities — whether the file actually failed to parse, the language
+        // isn't registered (plain text, lock files), or the source genuinely
+        // has nothing that matches our entity_kinds — we still emit a single
+        // fallback summary so the file remains navigable from the entity
+        // list. The diff is independent of extraction, and the reviewer
+        // needs to see and comment on every changed file.
+        let summaries = if file_entities.is_empty() {
+            vec![local_review_core::semantic::fallback_summary_for_file(file)]
+        } else {
+            build_entity_summaries(CacheEntry {
+                schema_version: SCHEMA_VERSION,
+                extraction_hash: EXTRACTION_HASH.to_owned(),
+                entities: file_entities.clone(),
+                graph: None,
+                failed_files: Vec::new(),
+            })
+        };
+        let _ = tx.send(ExtractionEvent::FileExtracted {
+            file_path: path.clone(),
+            entities: summaries,
+        });
+        all_entities.extend(file_entities);
+        failed_files.extend(file_failed);
+
+        let _ = tx.send(ExtractionEvent::Progress {
+            files_done: i + 1,
+            files_total: total,
+            files_failed: failed_files.len(),
+        });
+    }
+
+    // Signal completion before writing the cache. Serializing the full
+    // CacheEntry for a large repo (thousands of entities) can take seconds;
+    // sending Complete first lets the UI transition out of the loading
+    // overlay immediately. The cache is a pure next-open optimization —
+    // this session's in-memory state was already populated by the
+    // FileExtracted events inside the loop.
+    let cache_entry = CacheEntry {
+        schema_version: SCHEMA_VERSION,
+        extraction_hash: EXTRACTION_HASH.to_owned(),
+        entities: all_entities,
+        graph: None,
+        failed_files,
+    };
+    let _ = tx.send(ExtractionEvent::Complete);
+    let _ = cache::write(cache_path, &cache_entry);
+}
+
 fn extract_file_entities(
     ctx: &FileExtractCtx<'_>,
     file_path: &str,
@@ -5565,9 +5824,39 @@ fn build_entity_summaries(
                 structural_change: e.structural_change,
                 content_hash: e.content_hash,
                 comment_count: 0,
+                reviewed: false,
             }
         })
         .collect()
+}
+
+/// Build summaries from a cache entry, interleaving a synthetic fallback row
+/// for every file in `diff` that has no entities. Order follows `diff.files`:
+/// per file, emit all its entities (in cache order, which is source order),
+/// or a single fallback if extraction produced none. Keeps the entity list
+/// aligned with the diff so reviewers can navigate the entire change.
+fn build_entity_summaries_interleaved(
+    entry: local_review_core::semantic::cache::CacheEntry,
+    diff: &local_review_core::diff::Diff,
+) -> Vec<local_review_core::semantic::EntitySummary> {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    let raw_summaries = build_entity_summaries(entry);
+    // Group by file path so we can scan the diff once.
+    let mut by_path: HashMap<PathBuf, Vec<local_review_core::semantic::EntitySummary>> =
+        HashMap::new();
+    for s in raw_summaries {
+        by_path.entry(s.file_path.clone()).or_default().push(s);
+    }
+    let mut out = Vec::new();
+    for file in &diff.files {
+        let path = file.display_path().to_path_buf();
+        match by_path.remove(&path) {
+            Some(file_entities) if !file_entities.is_empty() => out.extend(file_entities),
+            _ => out.push(local_review_core::semantic::fallback_summary_for_file(file)),
+        }
+    }
+    out
 }
 
 /// Build the full `rendered_per_file` list for a `ChangeDetails`.
@@ -5957,6 +6246,8 @@ mod tests {
             updated_at: None,
             status: Some(Status::Pending),
             mismatch_reason: None,
+            entity_id: None,
+            anchor_fingerprint: None,
         };
         let err = JjrError::Io {
             source: std::io::Error::other("nope\x1b]8;;evil\x07hyperlink"),
@@ -6039,6 +6330,8 @@ mod tests {
             updated_at: None,
             status: Some(Status::Pending),
             mismatch_reason: None,
+            entity_id: None,
+            anchor_fingerprint: None,
         }
     }
 
@@ -7147,6 +7440,8 @@ mod tests {
             updated_at: None,
             status: None,
             mismatch_reason: None,
+            entity_id: None,
+            anchor_fingerprint: None,
         };
         crate::store::save_comment(dir.path(), dir.path(), &original).unwrap();
 
@@ -7341,6 +7636,8 @@ mod tests {
             updated_at: None,
             status: None,
             mismatch_reason: None,
+            entity_id: None,
+            anchor_fingerprint: None,
         };
         crate::store::save_comment(dir.path(), dir.path(), &original).unwrap();
 
@@ -7383,6 +7680,8 @@ mod tests {
             updated_at: None,
             status: Some(Status::Pending),
             mismatch_reason: None,
+            entity_id: None,
+            anchor_fingerprint: None,
         };
         crate::store::save_comment(dir.path(), dir.path(), &original).unwrap();
 
@@ -7492,6 +7791,8 @@ mod tests {
             updated_at: None,
             status: Some(Status::Pending),
             mismatch_reason: None,
+            entity_id: None,
+            anchor_fingerprint: None,
         };
         crate::store::save_comment(dir, dir, &comment).unwrap();
         app.refresh_inline_comments();
@@ -7581,6 +7882,8 @@ mod tests {
             updated_at: None,
             status: Some(Status::Pending),
             mismatch_reason: None,
+            entity_id: None,
+            anchor_fingerprint: None,
         };
         crate::store::save_comment(dir.path(), dir.path(), &comment).unwrap();
         app.refresh_inline_comments();
@@ -7669,6 +7972,8 @@ mod tests {
                 updated_at: None,
                 status: Some(Status::Pending),
                 mismatch_reason: None,
+                entity_id: None,
+                anchor_fingerprint: None,
             };
             crate::store::save_comment(dir.path(), dir.path(), &comment).unwrap();
         }
@@ -8100,6 +8405,8 @@ mod tests {
             updated_at: None,
             status: Some(Status::Pending),
             mismatch_reason: None,
+            entity_id: None,
+            anchor_fingerprint: None,
         }
     }
 
@@ -8412,6 +8719,8 @@ mod tests {
             updated_at: None,
             status: Some(Status::Stale),
             mismatch_reason: Some(MismatchReason::TargetTextChanged),
+            entity_id: None,
+            anchor_fingerprint: None,
         }
     }
 
@@ -8929,6 +9238,8 @@ mod tests {
             updated_at: None,
             status: None,
             mismatch_reason: None,
+            entity_id: None,
+            anchor_fingerprint: None,
         };
         crate::store::save_comment(dir.path(), dir.path(), &original).unwrap();
 
@@ -8981,6 +9292,8 @@ mod tests {
             updated_at: None,
             status: Some(Status::Pending),
             mismatch_reason: None,
+            entity_id: None,
+            anchor_fingerprint: None,
         };
         crate::store::save_comment(dir.path(), dir.path(), &original).unwrap();
 
@@ -9032,6 +9345,8 @@ mod tests {
             updated_at: None,
             status: Some(Status::Pending),
             mismatch_reason: None,
+            entity_id: None,
+            anchor_fingerprint: None,
         };
 
         open_meta_comment_editor(&mut app, &original);
@@ -9104,6 +9419,8 @@ mod tests {
             updated_at: None,
             status: Some(Status::Pending),
             mismatch_reason: None,
+            entity_id: None,
+            anchor_fingerprint: None,
         };
         crate::store::save_comment(dir.path(), dir.path(), &orphan_comment).unwrap();
 
@@ -9122,6 +9439,8 @@ mod tests {
             updated_at: None,
             status: Some(Status::Pending),
             mismatch_reason: None,
+            entity_id: None,
+            anchor_fingerprint: None,
         };
         crate::store::save_comment(dir.path(), dir.path(), &active_comment).unwrap();
 
@@ -9175,6 +9494,8 @@ mod tests {
             updated_at: None,
             status: Some(Status::Pending),
             mismatch_reason: None,
+            entity_id: None,
+            anchor_fingerprint: None,
         };
         crate::store::save_comment(dir.path(), dir.path(), &comment).unwrap();
 
@@ -9208,6 +9529,8 @@ mod tests {
             updated_at: None,
             status: None,
             mismatch_reason: None,
+            entity_id: None,
+            anchor_fingerprint: None,
         };
         crate::store::save_comment(dir.path(), dir.path(), &original).unwrap();
 
@@ -9302,6 +9625,8 @@ mod tests {
             updated_at: None,
             status: Some(Status::Pending),
             mismatch_reason: None,
+            entity_id: None,
+            anchor_fingerprint: None,
         };
         crate::store::save_comment(dir.path(), dir.path(), &on_b).unwrap();
 
@@ -9371,6 +9696,8 @@ mod tests {
             updated_at: None,
             status: Some(Status::Pending),
             mismatch_reason: None,
+            entity_id: None,
+            anchor_fingerprint: None,
         };
         crate::store::save_comment(dir.path(), dir.path(), &on_current).unwrap();
 
@@ -9391,6 +9718,8 @@ mod tests {
             updated_at: None,
             status: Some(Status::Pending),
             mismatch_reason: None,
+            entity_id: None,
+            anchor_fingerprint: None,
         };
         crate::store::save_comment(dir.path(), dir.path(), &on_unrelated).unwrap();
 
@@ -9456,6 +9785,8 @@ mod tests {
             updated_at: None,
             status: Some(Status::Pending),
             mismatch_reason: None,
+            entity_id: None,
+            anchor_fingerprint: None,
         };
         crate::store::save_comment(dir.path(), dir.path(), &on_current).unwrap();
 
@@ -10553,6 +10884,8 @@ mod tests {
                 updated_at: None,
                 status: Some(Status::Pending),
                 mismatch_reason: None,
+                entity_id: None,
+                anchor_fingerprint: None,
             };
             crate::store::save_comment(dir, dir, &comment).unwrap();
         }
@@ -10648,6 +10981,8 @@ mod tests {
             updated_at: None,
             status: Some(Status::Stale),
             mismatch_reason: Some(crate::comment::MismatchReason::TargetTextChanged),
+            entity_id: None,
+            anchor_fingerprint: None,
         }
     }
 
@@ -11082,6 +11417,8 @@ mod tests {
             updated_at: None,
             status: Some(Status::Stale),
             mismatch_reason: None,
+            entity_id: None,
+            anchor_fingerprint: None,
         };
         app.loaded_comments = vec![stale];
         app.screen = Screen::Stale(StaleScreenState {
@@ -12290,6 +12627,8 @@ mod tests {
             updated_at: None,
             status: Some(Status::Pending),
             mismatch_reason: None,
+            entity_id: None,
+            anchor_fingerprint: None,
         };
         app.loaded_comments = vec![comment];
         app.rebuild_annotated_views();
@@ -12371,6 +12710,8 @@ mod tests {
             updated_at: None,
             status: Some(Status::Pending),
             mismatch_reason: None,
+            entity_id: None,
+            anchor_fingerprint: None,
         };
         app.loaded_comments = vec![comment];
         app.rebuild_annotated_views();
