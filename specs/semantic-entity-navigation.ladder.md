@@ -697,9 +697,9 @@ phase; the toggle ships in Phase 4).
 
 ## Phase 4: Comment and reviewed-bit migration
 
-| Status         | Started | Completed |
-| -------------- | ------- | --------- |
-| ⬜ not-started |         |           |
+| Status      | Started    | Completed  |
+| ----------- | ---------- | ---------- |
+| ✅ complete | 2026-06-22 | 2026-06-22 |
 
 Migrate comment storage to be entity-aware. Migrate reviewed-bit storage to
 per-entity with content hashing. Wire the cosmetic visibility toggle. Phase 3
@@ -927,9 +927,9 @@ tests).
 
 ## Phase 5: Claude context bundle for jjr
 
-| Status         | Started | Completed |
-| -------------- | ------- | --------- |
-| ⬜ not-started |         |           |
+| Status      | Started    | Completed  |
+| ----------- | ---------- | ---------- |
+| ✅ complete | 2026-06-23 | 2026-06-23 |
 
 Replace the raw-hunk Claude prompt in jjr with a semantic bundle. This is the
 'machine helps you understand the change' payoff — Claude gets entity-shaped

@@ -118,9 +118,11 @@ pub fn render_prompt(packet: &Packet) -> String {
 /// `Inline` arm splices each change as `header → comments → diff` to keep
 /// `jjr packet`'s output byte-stable. `JsonlPaths` arm omits the comments
 /// section per change since the JSONL files referenced up top carry it.
-pub fn render_prompt_with_mode(packet: &Packet, mode: PromptMode) -> String {
+/// System-instruction preamble shared by all prompt modes. Callers that build
+/// non-standard prompt layouts (e.g. the entity-bundle renderer in `tui.rs`)
+/// call this to obtain the canonical header text rather than duplicating it.
+pub(crate) fn system_preamble(packet: &Packet) -> String {
     let mut out = String::new();
-
     out.push_str("You are editing a local jj working copy.\n");
     out.push('\n');
     out.push_str(
@@ -156,6 +158,11 @@ pub fn render_prompt_with_mode(packet: &Packet, mode: PromptMode) -> String {
     out.push('\n');
     let _ = writeln!(out, "Repository: {}", packet.repo_root.display());
     let _ = writeln!(out, "Revision: {}", packet.revset);
+    out
+}
+
+pub fn render_prompt_with_mode(packet: &Packet, mode: PromptMode) -> String {
+    let mut out = system_preamble(packet);
 
     match mode {
         PromptMode::Inline => {
@@ -203,7 +210,7 @@ pub fn render_prompt_with_mode(packet: &Packet, mode: PromptMode) -> String {
 /// empty string when neither per-change nor stack files would be referenced
 /// — preserves the "no comments" semantics so the prompt doesn't carry a
 /// dangling section heading.
-fn render_jsonl_paths_section(packet: &Packet) -> String {
+pub(crate) fn render_jsonl_paths_section(packet: &Packet) -> String {
     let include_stack = !packet.stack_comments.is_empty();
 
     let change_paths: Vec<(String, PathBuf)> = packet
@@ -262,7 +269,7 @@ fn render_jsonl_paths_section(packet: &Packet) -> String {
     out
 }
 
-fn render_change_header(cp: &ChangePacket) -> String {
+pub(crate) fn render_change_header(cp: &ChangePacket) -> String {
     let mut out = String::new();
     out.push('\n');
     let _ = writeln!(out, "Change ID: {}", cp.change_id.as_str());
@@ -300,7 +307,7 @@ fn render_inline_change_comments(cp: &ChangePacket) -> String {
     out
 }
 
-fn render_change_diff_context(cp: &ChangePacket) -> String {
+pub(crate) fn render_change_diff_context(cp: &ChangePacket) -> String {
     let mut out = String::new();
     if let Some(diff) = &cp.diff {
         if !cp.line_comments.is_empty() {
@@ -488,7 +495,7 @@ fn render_change_comment_block(comment: &Comment) -> String {
     out
 }
 
-fn render_line_comment_block(comment: &Comment) -> String {
+pub(crate) fn render_line_comment_block(comment: &Comment) -> String {
     let Anchor::Line {
         location: anchor, ..
     } = &comment.anchor
@@ -601,7 +608,7 @@ fn hunk_contains_anchored_line(
     })
 }
 
-fn render_hunk(hunk: &Hunk) -> String {
+pub(crate) fn render_hunk(hunk: &Hunk) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "{}", hunk.header);
     for line in &hunk.lines {

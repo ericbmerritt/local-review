@@ -803,10 +803,9 @@ impl ReviewSurface for JjrSurface {
         // the cache without needing a separate content hash.
         let details = jj::show(&change_id)?;
         let commit_id = details.commit_id.as_str().to_owned();
-        let cache_base =
-            crate::store::repo_data_dir(&self.data_home, &self.repo_root).join("entities");
-        let cache_path = local_review_core::semantic::cache::jjr_cache_path(
-            &cache_base,
+        let cache_path = entity_cache_path(
+            &self.data_home,
+            &self.repo_root,
             change_id.as_str(),
             &commit_id,
         );
@@ -834,11 +833,26 @@ impl ReviewSurface for JjrSurface {
             extract_file_entities(&ctx, &path, &mut entities, &mut failed_files);
         }
 
+        // Build the cross-file call graph for the Claude bundle. Mirrors
+        // the async path's `build_graph_best_effort`: missing graph is a
+        // degraded bundle, not a hard error. Inline here (no streaming) is
+        // fine — the sync path is only hit when the surface skips the async
+        // extraction (cache miss without a worker).
+        let graph = jj::list_tracked_files(change_id.as_str(), &self.repo_root);
+        let graph = if graph.is_empty() {
+            None
+        } else {
+            Some(local_review_core::semantic::build_graph(
+                &registry,
+                &self.repo_root,
+                &graph,
+            ))
+        };
         let cache_entry = local_review_core::semantic::cache::CacheEntry {
             schema_version: local_review_core::semantic::cache::SCHEMA_VERSION,
             extraction_hash: local_review_core::semantic::cache::EXTRACTION_HASH.to_owned(),
             entities,
-            graph: None,
+            graph,
             failed_files,
         };
         let _ = local_review_core::semantic::cache::write(&cache_path, &cache_entry);
@@ -2138,10 +2152,8 @@ impl JjrSurface {
         };
 
         let change_id = data.change_id.clone();
-        let prompt = crate::packet::render_prompt_with_mode(
-            &data.packet,
-            crate::packet::PromptMode::JsonlPaths,
-        );
+        let prompt =
+            build_entity_bundle_prompt(&data.packet, &self.data_home, &self.repo_root, &change_id);
         let repo_root = self.repo_root.clone();
 
         if let Some(g) = self.stderr_guard.as_ref() {
@@ -5596,6 +5608,284 @@ fn pick_side(source_line: Option<u32>, target_line: Option<u32>) -> Side {
     }
 }
 
+// ── Entity-bundle prompt assembly ────────────────────────────────────────────
+
+/// Build the Claude prompt for `invoke_claude_impl`. When an entity cache
+/// exists for `change_id`, line comments get entity-aware context bundles
+/// (target entity body + direct deps and dependents + diff hunk). Falls back
+/// to the existing flat-hunk `JsonlPaths` rendering when the cache is absent.
+fn build_entity_bundle_prompt(
+    packet: &crate::packet::Packet,
+    data_home: &std::path::Path,
+    repo_root: &std::path::Path,
+    change_id: &ChangeId,
+) -> String {
+    let cache_entry = load_entity_cache_for_bundle(data_home, repo_root, change_id);
+    match cache_entry {
+        Some(entry) => render_entity_bundle_prompt(packet, &entry, repo_root),
+        None => {
+            crate::packet::render_prompt_with_mode(packet, crate::packet::PromptMode::JsonlPaths)
+        }
+    }
+}
+
+/// Compute the on-disk cache path for `(change_id, commit_id)`.
+///
+/// Shared by `fetch_entity_list`, the extraction worker, and
+/// `load_entity_cache_for_bundle` to avoid the pattern being repeated.
+fn entity_cache_path(
+    data_home: &std::path::Path,
+    repo_root: &std::path::Path,
+    change_id: &str,
+    commit_id: &str,
+) -> PathBuf {
+    let cache_base = crate::store::repo_data_dir(data_home, repo_root).join("entities");
+    local_review_core::semantic::cache::jjr_cache_path(&cache_base, change_id, commit_id)
+}
+
+/// Load the entity cache for `change_id`, returning `None` on miss or error.
+fn load_entity_cache_for_bundle(
+    data_home: &std::path::Path,
+    repo_root: &std::path::Path,
+    change_id: &ChangeId,
+) -> Option<local_review_core::semantic::cache::CacheEntry> {
+    let details = jj::show(change_id).ok()?;
+    let commit_id = details.commit_id.as_str().to_owned();
+    let cache_path = entity_cache_path(data_home, repo_root, change_id.as_str(), &commit_id);
+    local_review_core::semantic::cache::read(&cache_path)
+        .ok()
+        .flatten()
+}
+
+/// Render the full prompt with entity bundles replacing the raw-hunk diff
+/// context for line-scoped comments. Change-scoped and stack-scoped comments
+/// remain in the JSONL files Claude reads via the paths section.
+fn render_entity_bundle_prompt(
+    packet: &crate::packet::Packet,
+    cache: &local_review_core::semantic::cache::CacheEntry,
+    repo_root: &std::path::Path,
+) -> String {
+    let mut out = crate::packet::system_preamble(packet);
+
+    let jsonl = crate::packet::render_jsonl_paths_section(packet);
+    if !jsonl.is_empty() {
+        out.push('\n');
+        out.push_str(&jsonl);
+    }
+
+    if packet.changes.is_empty() {
+        return out;
+    }
+
+    out.push('\n');
+    out.push_str("## Changes\n");
+
+    for cp in &packet.changes {
+        out.push_str(&crate::packet::render_change_header(cp));
+
+        if cp.line_comments.is_empty() {
+            // No line comments: include the raw diff context so Claude has
+            // orientation even when there's nothing to bundle.
+            out.push_str(&crate::packet::render_change_diff_context(cp));
+            continue;
+        }
+
+        out.push('\n');
+        out.push_str("### Line-Level Entity Context\n");
+
+        let budget = local_review_core::semantic::context::budget_from_env();
+        for comment in &cp.line_comments {
+            out.push('\n');
+            if let Some(bundle) = entity_bundle_for_comment(
+                comment,
+                cp.diff.as_ref(),
+                &cache.entities,
+                cache.graph.as_ref(),
+                repo_root,
+            ) {
+                out.push_str(&local_review_core::semantic::context::render_with_budget(
+                    &bundle, budget,
+                ));
+            } else {
+                // Entity context unavailable (line outside all entities or
+                // file unreadable). Fall back to the existing flat rendering.
+                out.push_str(&crate::packet::render_line_comment_block(comment));
+                if let Some(diff) = &cp.diff {
+                    let hunk = hunk_text_for_comment(comment, diff);
+                    if !hunk.is_empty() {
+                        out.push_str("#### Diff Hunk\n\n");
+                        out.push_str(&hunk);
+                    }
+                }
+            }
+        }
+    }
+
+    out
+}
+
+/// Build a context `Bundle` for a single line comment. Returns `None` when the
+/// comment has no entity context (line is outside all entities, or the entity
+/// body cannot be read from disk).
+fn entity_bundle_for_comment(
+    comment: &Comment,
+    diff: Option<&local_review_core::diff::Diff>,
+    entities: &[local_review_core::semantic::EntityCoreData],
+    graph: Option<&local_review_core::semantic::cache::GraphData>,
+    repo_root: &std::path::Path,
+) -> Option<local_review_core::semantic::context::Bundle> {
+    use local_review_core::semantic::context::{Bundle, BundleEntity};
+
+    let Anchor::Line { location, .. } = &comment.anchor else {
+        return None;
+    };
+
+    let target_entity = entity_for_comment_line(location, comment.entity_id.as_ref(), entities)?;
+    let target_body = read_entity_body(target_entity, repo_root)?;
+    let target = BundleEntity {
+        display_name: target_entity.id.display_name(),
+        file_path: target_entity.id.file_path.clone(),
+        line_range: target_entity.line_range,
+        body: target_body,
+    };
+
+    let (dependencies, dependents) = match graph {
+        Some(g) => graph_bundle_entities(&target_entity.id, g, entities, repo_root),
+        None => (Vec::new(), Vec::new()),
+    };
+
+    let hunk_text = diff
+        .map(|d| hunk_text_for_comment(comment, d))
+        .unwrap_or_default();
+
+    Some(Bundle {
+        comment_body: comment.body.clone(),
+        comment_severity: comment.severity,
+        target,
+        dependencies,
+        dependents,
+        hunk_file: location.file.clone(),
+        hunk_line: location.new_line.or(location.old_line).unwrap_or(0),
+        hunk_text,
+    })
+}
+
+/// Locate the entity whose line range contains the commented line. Prefers
+/// `entity_id` when set, falls back to line-range scan.
+fn entity_for_comment_line<'e>(
+    location: &LineAnchor,
+    entity_id: Option<&local_review_core::semantic::EntityId>,
+    entities: &'e [local_review_core::semantic::EntityCoreData],
+) -> Option<&'e local_review_core::semantic::EntityCoreData> {
+    if let Some(eid) = entity_id {
+        if let Some(e) = entities.iter().find(|e| &e.id == eid) {
+            return Some(e);
+        }
+    }
+    let target_line = location.new_line?;
+    entities.iter().find(|e| {
+        e.id.file_path == location.file
+            && e.line_range.0 <= target_line
+            && target_line <= e.line_range.1
+    })
+}
+
+/// Read the source lines for `entity.line_range` from disk. Returns `None`
+/// when the file is unreadable or the range falls outside the file.
+fn read_entity_body(
+    entity: &local_review_core::semantic::EntityCoreData,
+    repo_root: &std::path::Path,
+) -> Option<String> {
+    let abs_path = repo_root.join(&entity.id.file_path);
+    let content = std::fs::read_to_string(&abs_path).ok()?;
+    let lines: Vec<&str> = content.lines().collect();
+    let start = usize::try_from(entity.line_range.0.saturating_sub(1)).ok()?;
+    let end = usize::try_from(entity.line_range.1).ok()?.min(lines.len());
+    if start >= lines.len() {
+        return None;
+    }
+    // File content is external input — strip ANSI/OSC injection vectors while
+    // preserving tab indentation and newlines so the code remains readable.
+    Some(local_review_core::util::strip_injection_controls(
+        &lines[start..end].join("\n"),
+    ))
+}
+
+/// Build `BundleEntity` lists for the direct deps (callees) and dependents
+/// (callers) of `target_id` using the dependency graph.
+///
+/// Deduplicates by entity path before building bodies so the bundle doesn't
+/// show the same entity twice (which wastes token budget) even when the graph
+/// has duplicate edges from an older cache entry.
+fn graph_bundle_entities(
+    target_id: &local_review_core::semantic::EntityId,
+    graph: &local_review_core::semantic::cache::GraphData,
+    entities: &[local_review_core::semantic::EntityCoreData],
+    repo_root: &std::path::Path,
+) -> (
+    Vec<local_review_core::semantic::context::BundleEntity>,
+    Vec<local_review_core::semantic::context::BundleEntity>,
+) {
+    let mut seen = std::collections::HashSet::new();
+    let deps = graph
+        .edges
+        .iter()
+        .filter(|e| &e.from == target_id && seen.insert(&e.to))
+        .filter_map(|e| bundle_entity_for_id(&e.to, entities, repo_root))
+        .collect();
+    seen.clear();
+    let dependents = graph
+        .edges
+        .iter()
+        .filter(|e| &e.to == target_id && seen.insert(&e.from))
+        .filter_map(|e| bundle_entity_for_id(&e.from, entities, repo_root))
+        .collect();
+    (deps, dependents)
+}
+
+/// Look up `id` in the entity list and build a `BundleEntity` if its body
+/// can be read from disk.
+fn bundle_entity_for_id(
+    id: &local_review_core::semantic::EntityId,
+    entities: &[local_review_core::semantic::EntityCoreData],
+    repo_root: &std::path::Path,
+) -> Option<local_review_core::semantic::context::BundleEntity> {
+    let entity = entities.iter().find(|e| &e.id == id)?;
+    let body = read_entity_body(entity, repo_root)?;
+    Some(local_review_core::semantic::context::BundleEntity {
+        display_name: entity.id.display_name(),
+        file_path: entity.id.file_path.clone(),
+        line_range: entity.line_range,
+        body,
+    })
+}
+
+/// Extract and render the diff hunk that contains the comment's anchored line.
+/// Returns an empty string when no matching hunk is found.
+fn hunk_text_for_comment(comment: &Comment, diff: &local_review_core::diff::Diff) -> String {
+    let Anchor::Line { location, .. } = &comment.anchor else {
+        return String::new();
+    };
+    let Some(target_line) = location.new_line.or(location.old_line) else {
+        return String::new();
+    };
+    for file in &diff.files {
+        if file.display_path() != location.file {
+            continue;
+        }
+        for hunk in file.hunks() {
+            let contains = hunk.lines.iter().any(|l| match location.side {
+                Side::New => l.target_line == Some(target_line),
+                Side::Old => l.source_line == Some(target_line),
+            });
+            if contains {
+                return crate::packet::render_hunk(hunk);
+            }
+        }
+    }
+    String::new()
+}
+
 /// Context for extracting entities from a single file.
 struct FileExtractCtx<'a> {
     registry: &'a local_review_core::semantic::ExtractorRegistry,
@@ -5630,8 +5920,6 @@ impl local_review_core::tui::entity_list::ExtractionRunner for JjrExtractionTask
         use local_review_core::semantic::cache;
         use local_review_core::tui::entity_list::ExtractionEvent;
 
-        let cache_base =
-            crate::store::repo_data_dir(&self.data_home, &self.repo_root).join("entities");
         let details = match jj::show(&self.change_id) {
             Ok(d) => d,
             Err(e) => {
@@ -5640,7 +5928,12 @@ impl local_review_core::tui::entity_list::ExtractionRunner for JjrExtractionTask
             }
         };
         let commit_id = details.commit_id.as_str().to_owned();
-        let cache_path = cache::jjr_cache_path(&cache_base, self.change_id.as_str(), &commit_id);
+        let cache_path = entity_cache_path(
+            &self.data_home,
+            &self.repo_root,
+            self.change_id.as_str(),
+            &commit_id,
+        );
 
         // Cache hit: skip the per-file work entirely.
         if let Ok(Some(entry)) = cache::read(&cache_path) {
@@ -5752,21 +6045,47 @@ fn extract_and_emit(
         });
     }
 
-    // Signal completion before writing the cache. Serializing the full
-    // CacheEntry for a large repo (thousands of entities) can take seconds;
-    // sending Complete first lets the UI transition out of the loading
-    // overlay immediately. The cache is a pure next-open optimization —
-    // this session's in-memory state was already populated by the
-    // FileExtracted events inside the loop.
+    // Signal completion before writing the cache or building the graph.
+    // Both can take seconds on large repos; the UI is fully populated by
+    // the FileExtracted events inside the loop, so we can transition out
+    // of the loading overlay immediately and finish the slow work in this
+    // worker thread without holding the reviewer. The graph is best-effort
+    // and a pure next-open optimization for Claude bundles — if the user
+    // triggers Claude before the cache is written, the bundle simply drops
+    // its deps / dependents sections.
+    let _ = tx.send(ExtractionEvent::Complete);
+    let graph = build_graph_best_effort(
+        &local_review_core::semantic::create_default_registry(),
+        &task.repo_root,
+        task.change_id.as_str(),
+    );
     let cache_entry = CacheEntry {
         schema_version: SCHEMA_VERSION,
         extraction_hash: EXTRACTION_HASH.to_owned(),
         entities: all_entities,
-        graph: None,
+        graph,
         failed_files,
     };
-    let _ = tx.send(ExtractionEvent::Complete);
     let _ = cache::write(cache_path, &cache_entry);
+}
+
+/// Build the cross-file dependency graph for `change_id`, falling back to
+/// `None` on any error. The graph is a Claude-bundle convenience: missing
+/// it means the bundle drops deps / dependents, not that the reviewer is
+/// blocked. An empty file list (jj missing, revision unresolvable, etc.)
+/// is treated the same as graph-build failure.
+fn build_graph_best_effort(
+    registry: &local_review_core::semantic::ExtractorRegistry,
+    repo_root: &std::path::Path,
+    change_id: &str,
+) -> Option<local_review_core::semantic::GraphData> {
+    let files = jj::list_tracked_files(change_id, repo_root);
+    if files.is_empty() {
+        return None;
+    }
+    Some(local_review_core::semantic::build_graph(
+        registry, repo_root, &files,
+    ))
 }
 
 fn extract_file_entities(
@@ -12884,6 +13203,176 @@ mod tests {
             "line_index must be clamped to current_row_count(); got {} >= {}",
             app.line_index,
             paired_count
+        );
+    }
+
+    // ── entity-bundle assembly tests ─────────────────────────────────────────
+
+    use crate::diff::Diff as TestDiff;
+    use local_review_core::semantic::cache::{GraphData, GraphEdge, GraphNode};
+    use local_review_core::semantic::{
+        ChangeAnnotation, ChangeType, EntityCoreData, EntityId, EntityKind,
+    };
+
+    fn bundle_eid(file: &str, name: &str) -> EntityId {
+        EntityId::new(PathBuf::from(file), vec![name.to_owned()], None, 0)
+    }
+
+    fn bundle_ent(file: &str, name: &str, start: u32, end: u32) -> EntityCoreData {
+        EntityCoreData {
+            id: bundle_eid(file, name),
+            kind: EntityKind::Function,
+            change: ChangeType::Modified,
+            annotation: ChangeAnnotation::BodyOnly,
+            line_range: (start, end),
+            source_file: None,
+            target_line: None,
+            structural_change: true,
+            content_hash: 0,
+        }
+    }
+
+    fn bundle_anchor(file: &str, new_line: u32) -> LineAnchor {
+        LineAnchor {
+            file: PathBuf::from(file),
+            side: Side::New,
+            old_line: None,
+            new_line: Some(new_line),
+            hunk_header: "@@ -1 +1 @@".to_owned(),
+            target_text: "fn foo() {}".to_owned(),
+            context_before: vec![],
+            context_after: vec![],
+        }
+    }
+
+    #[test]
+    fn entity_for_comment_line_prefers_entity_id_match() {
+        let eid = bundle_eid("src/foo.rs", "bar");
+        let entities = vec![
+            bundle_ent("src/foo.rs", "bar", 1, 10),
+            bundle_ent("src/foo.rs", "baz", 11, 20),
+        ];
+        let anchor = bundle_anchor("src/foo.rs", 15);
+        // With entity_id pointing at "bar" (lines 1-10), even though line 15
+        // falls in "baz", the entity_id match wins.
+        let result = entity_for_comment_line(&anchor, Some(&eid), &entities);
+        assert_eq!(result.map(|e| e.id.name()), Some("bar"));
+    }
+
+    #[test]
+    fn entity_for_comment_line_falls_back_to_line_range() {
+        let entities = vec![
+            bundle_ent("src/foo.rs", "alpha", 1, 5),
+            bundle_ent("src/foo.rs", "beta", 6, 15),
+        ];
+        let anchor = bundle_anchor("src/foo.rs", 10);
+        let result = entity_for_comment_line(&anchor, None, &entities);
+        assert_eq!(result.map(|e| e.id.name()), Some("beta"));
+    }
+
+    #[test]
+    fn entity_for_comment_line_returns_none_when_no_match() {
+        let entities = vec![bundle_ent("src/foo.rs", "alpha", 1, 5)];
+        let anchor = bundle_anchor("src/foo.rs", 50);
+        let result = entity_for_comment_line(&anchor, None, &entities);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn entity_for_comment_line_old_side_uses_entity_id_not_line_range() {
+        let eid = bundle_eid("src/foo.rs", "alpha");
+        let entities = vec![bundle_ent("src/foo.rs", "alpha", 1, 10)];
+        let mut anchor = bundle_anchor("src/foo.rs", 0);
+        anchor.side = Side::Old;
+        anchor.new_line = None;
+        anchor.old_line = Some(3);
+        // entity_id match should succeed even though new_line is None.
+        let result = entity_for_comment_line(&anchor, Some(&eid), &entities);
+        assert_eq!(result.map(|e| e.id.name()), Some("alpha"));
+    }
+
+    #[test]
+    fn hunk_text_for_comment_returns_empty_for_non_line_anchor() {
+        let comment = Comment {
+            schema_version: SchemaVersion,
+            anchor: Anchor::Change {
+                change_id: ChangeId::parse("abc12345").unwrap(),
+            },
+            repo_root: PathBuf::new(),
+            revset: String::new(),
+            commit_id: None,
+            body: "test".to_owned(),
+            severity: Severity::Required,
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
+            updated_at: None,
+            status: None,
+            mismatch_reason: None,
+            entity_id: None,
+            anchor_fingerprint: None,
+        };
+        let diff = TestDiff { files: vec![] };
+        assert_eq!(hunk_text_for_comment(&comment, &diff), "");
+    }
+
+    #[test]
+    fn read_entity_body_strips_injection_controls() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("src/evil.rs");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // File contains an ESC (ANSI injection) but tabs and newlines should
+        // survive (tabs = indentation, newlines = line structure).
+        std::fs::write(&path, "fn foo() {\n\tlet _x = 1;\n\x1b[31mevil\x1b[0m\n}").unwrap();
+        let entity = bundle_ent("src/evil.rs", "foo", 1, 4);
+        let body = read_entity_body(&entity, dir.path()).unwrap();
+        assert!(!body.contains('\x1b'), "ESC must be stripped");
+        assert!(body.contains('\t'), "tabs must be preserved");
+        assert!(body.contains('\n'), "newlines must be preserved");
+    }
+
+    #[test]
+    fn graph_bundle_entities_deduplicates_multiple_calls_to_same_target() {
+        let source = bundle_eid("src/a.rs", "caller");
+        let target = bundle_eid("src/b.rs", "callee");
+        // Three edges from source → target (one per call site in the source).
+        let graph = GraphData {
+            nodes: vec![
+                GraphNode {
+                    id: source.clone(),
+                    kind: EntityKind::Function,
+                },
+                GraphNode {
+                    id: target.clone(),
+                    kind: EntityKind::Function,
+                },
+            ],
+            edges: vec![
+                GraphEdge {
+                    from: source.clone(),
+                    to: target.clone(),
+                },
+                GraphEdge {
+                    from: source.clone(),
+                    to: target.clone(),
+                },
+                GraphEdge {
+                    from: source.clone(),
+                    to: target.clone(),
+                },
+            ],
+        };
+        let entities = vec![
+            bundle_ent("src/a.rs", "caller", 1, 10),
+            bundle_ent("src/b.rs", "callee", 1, 5),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let callee_path = dir.path().join("src/b.rs");
+        std::fs::create_dir_all(callee_path.parent().unwrap()).unwrap();
+        std::fs::write(&callee_path, "fn callee() {}\n").unwrap();
+        let (deps, _dependents) = graph_bundle_entities(&source, &graph, &entities, dir.path());
+        assert_eq!(
+            deps.len(),
+            1,
+            "three edges to the same callee should dedup to one BundleEntity"
         );
     }
 }

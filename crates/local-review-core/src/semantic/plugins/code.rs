@@ -46,6 +46,12 @@ pub(crate) struct LanguageSpec {
     /// function), but whose file-scope occurrences are meaningful (e.g.
     /// configuration variables and case-dispatch branches at script root).
     pub top_level_only_kinds: &'static [&'static str],
+    /// Node kinds that represent function/method call sites. Used by the
+    /// graph builder to build cross-file `caller → callee` edges. Leave
+    /// empty for data/config languages with no call concept
+    /// (YAML, JSON, TOML, markdown, bash — bash "calls" are commands, a
+    /// different graph and out of scope for v1).
+    pub call_kinds: &'static [&'static str],
 }
 
 // ── Name extraction ───────────────────────────────────────────────────────────
@@ -296,6 +302,101 @@ impl SemanticExtractor for CodePlugin {
 
         Ok(collector.entities)
     }
+
+    fn extract_calls(
+        &self,
+        content: &str,
+        _file_path: &str,
+    ) -> Vec<crate::semantic::extractor::CallSite> {
+        // No call kinds configured for this language → no edges. The graph
+        // builder treats the empty list as "no calls detected" rather than
+        // "no calls exist," which is the honest signal.
+        if self.spec.call_kinds.is_empty() {
+            return Vec::new();
+        }
+        let Some(tree) = self.parse(content) else {
+            return Vec::new();
+        };
+        let src = content.as_bytes();
+        let mut out = Vec::new();
+        collect_call_sites(tree.root_node(), src, self.spec.call_kinds, &mut out);
+        out
+    }
+}
+
+/// Walk the tree-sitter tree and emit a `CallSite` for every node whose
+/// kind is in `call_kinds`. The callee name is the first identifier-shaped
+/// child of the `function`/`functionExpression` field — or, if that field
+/// isn't present, the leftmost identifier in the call expression.
+///
+/// Skips ERROR / MISSING subtrees so a corrupt span in one part of a file
+/// doesn't suppress edges from the rest of it.
+fn collect_call_sites(
+    node: Node<'_>,
+    src: &[u8],
+    call_kinds: &[&str],
+    out: &mut Vec<crate::semantic::extractor::CallSite>,
+) {
+    if node.is_error() || node.is_missing() {
+        return;
+    }
+    if call_kinds.contains(&node.kind()) {
+        if let Some(name) = call_callee_name(node, src) {
+            let line = u32::try_from(node.start_position().row + 1).unwrap_or(1);
+            out.push(crate::semantic::extractor::CallSite {
+                line,
+                callee_name: name,
+            });
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_call_sites(child, src, call_kinds, out);
+    }
+}
+
+/// Resolve the callee identifier of a call-expression node to its leaf
+/// name. Handles the common shapes — bare `foo()`, qualified `path::foo()`,
+/// method `obj.foo()`, `Self::foo()`, generic `foo::<T>()` — by walking
+/// down the function field and returning the rightmost identifier-shaped
+/// descendant. Returns `None` for indirect calls (e.g. `(closure)()`) where
+/// no static identifier is available.
+fn call_callee_name(call: Node<'_>, src: &[u8]) -> Option<String> {
+    let function = call
+        .child_by_field_name("function")
+        .or_else(|| call.named_child(0))?;
+    rightmost_identifier(function, src)
+}
+
+fn rightmost_identifier(node: Node<'_>, src: &[u8]) -> Option<String> {
+    // Identifier-shaped leaf kinds across the languages we support. The set
+    // is permissive: tree-sitter grammars name identifier nodes slightly
+    // differently per language (`identifier`, `property_identifier`,
+    // `type_identifier`, `field_identifier`, `shorthand_property_identifier`).
+    const IDENTIFIER_KINDS: &[&str] = &[
+        "identifier",
+        "property_identifier",
+        "type_identifier",
+        "field_identifier",
+        "shorthand_property_identifier",
+    ];
+    if IDENTIFIER_KINDS.contains(&node.kind()) {
+        return node
+            .utf8_text(src)
+            .ok()
+            .map(strip_controls)
+            .filter(|s| !s.is_empty());
+    }
+    // Walk children right-to-left to surface the rightmost identifier
+    // (`a.b.c` → `c`, `mod::Type::method` → `method`).
+    let mut cursor = node.walk();
+    let children: Vec<Node<'_>> = node.children(&mut cursor).collect();
+    for child in children.iter().rev() {
+        if let Some(name) = rightmost_identifier(*child, src) {
+            return Some(name);
+        }
+    }
+    None
 }
 
 // ── Language specs ────────────────────────────────────────────────────────────
@@ -318,6 +419,7 @@ pub(crate) static RUST_SPEC: LanguageSpec = LanguageSpec {
     ],
     container_kinds: &["impl_item", "mod_item", "trait_item"],
     top_level_only_kinds: &[],
+    call_kinds: &["call_expression"],
 };
 
 #[cfg(feature = "lang-python")]
@@ -331,6 +433,7 @@ pub(crate) static PYTHON_SPEC: LanguageSpec = LanguageSpec {
     ],
     container_kinds: &["class_definition"],
     top_level_only_kinds: &[],
+    call_kinds: &["call"],
 };
 
 #[cfg(feature = "lang-go")]
@@ -345,6 +448,7 @@ pub(crate) static GO_SPEC: LanguageSpec = LanguageSpec {
     ],
     container_kinds: &[],
     top_level_only_kinds: &[],
+    call_kinds: &["call_expression"],
 };
 
 #[cfg(feature = "lang-java")]
@@ -365,6 +469,7 @@ pub(crate) static JAVA_SPEC: LanguageSpec = LanguageSpec {
         "interface_declaration",
     ],
     top_level_only_kinds: &[],
+    call_kinds: &[],
 };
 
 #[cfg(feature = "lang-javascript")]
@@ -379,6 +484,7 @@ pub(crate) static JAVASCRIPT_SPEC: LanguageSpec = LanguageSpec {
     ],
     container_kinds: &["class_declaration"],
     top_level_only_kinds: &[],
+    call_kinds: &["call_expression"],
 };
 
 #[cfg(feature = "lang-typescript")]
@@ -396,6 +502,7 @@ pub(crate) static TYPESCRIPT_SPEC: LanguageSpec = LanguageSpec {
     ],
     container_kinds: &["class_declaration", "interface_declaration"],
     top_level_only_kinds: &[],
+    call_kinds: &["call_expression"],
 };
 
 #[cfg(feature = "lang-typescript")]
@@ -406,6 +513,7 @@ pub(crate) static TSX_SPEC: LanguageSpec = LanguageSpec {
     entity_kinds: TYPESCRIPT_SPEC.entity_kinds,
     container_kinds: TYPESCRIPT_SPEC.container_kinds,
     top_level_only_kinds: TYPESCRIPT_SPEC.top_level_only_kinds,
+    call_kinds: TYPESCRIPT_SPEC.call_kinds,
 };
 
 #[cfg(feature = "lang-scala")]
@@ -422,6 +530,7 @@ pub(crate) static SCALA_SPEC: LanguageSpec = LanguageSpec {
     ],
     container_kinds: &["class_definition", "object_definition", "trait_definition"],
     top_level_only_kinds: &[],
+    call_kinds: &[],
 };
 
 #[cfg(feature = "lang-kotlin")]
@@ -437,6 +546,7 @@ pub(crate) static KOTLIN_SPEC: LanguageSpec = LanguageSpec {
     ],
     container_kinds: &["class_declaration", "object_declaration"],
     top_level_only_kinds: &[],
+    call_kinds: &[],
 };
 
 // Bash entity model:
@@ -458,6 +568,7 @@ pub(crate) static BASH_SPEC: LanguageSpec = LanguageSpec {
     ],
     container_kinds: &["function_definition"],
     top_level_only_kinds: &["case_item", "variable_assignment"],
+    call_kinds: &[],
 };
 
 #[cfg(feature = "lang-yaml")]
@@ -468,6 +579,7 @@ pub(crate) static YAML_SPEC: LanguageSpec = LanguageSpec {
     entity_kinds: &[("block_mapping_pair", EntityKind::ConfigProperty)],
     container_kinds: &[],
     top_level_only_kinds: &[],
+    call_kinds: &[],
 };
 
 #[cfg(feature = "lang-json")]
@@ -478,6 +590,7 @@ pub(crate) static JSON_SPEC: LanguageSpec = LanguageSpec {
     entity_kinds: &[("pair", EntityKind::ConfigProperty)],
     container_kinds: &[],
     top_level_only_kinds: &[],
+    call_kinds: &[],
 };
 
 #[cfg(feature = "lang-toml")]
@@ -492,4 +605,5 @@ pub(crate) static TOML_SPEC: LanguageSpec = LanguageSpec {
     ],
     container_kinds: &["table", "array_table"],
     top_level_only_kinds: &[],
+    call_kinds: &[],
 };
