@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::semantic::entity::RawEntity;
-use crate::semantic::extractor::{ExtractError, ExtractResult, SemanticExtractor};
+use crate::semantic::extractor::{CallSite, ExtractError, ExtractResult, SemanticExtractor};
 
 /// Resolves file paths to the appropriate extractor and drives extraction.
 ///
@@ -82,6 +82,17 @@ impl ExtractorRegistry {
             });
         };
         ext.extract(content, file_path)
+    }
+
+    /// Extract function/method call sites from `content` using the extractor
+    /// for `file_path`. Returns an empty `Vec` if no extractor handles the
+    /// file — call extraction is best-effort and an unknown language is the
+    /// same as "no calls" for graph purposes.
+    pub fn extract_calls(&self, content: &str, file_path: &str) -> Vec<CallSite> {
+        match self.get(file_path) {
+            Some(ext) => ext.extract_calls(content, file_path),
+            None => Vec::new(),
+        }
     }
 
     /// Extract from both before and after content and return a combined list

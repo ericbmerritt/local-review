@@ -17,20 +17,28 @@
 //! - [`plugins`] — `create_default_registry()` with all 13 languages
 
 pub mod cache;
+pub mod context;
 pub mod differ;
 pub mod entity;
 pub mod entity_id;
 pub mod extractor;
+pub mod graph;
 pub mod identity;
 pub mod plugins;
 pub mod registry;
 
+pub use cache::{GraphData, GraphEdge, GraphNode};
+pub use context::{
+    render as render_bundle, render_with_truncation as render_bundle_with_truncation, Bundle,
+    BundleEntity,
+};
 pub use differ::diff_entities;
 pub use entity::{
     fallback_summary_for_file, ChangeAnnotation, ChangeType, DescriptionSummary, EntityCoreData,
     EntityKind, EntitySummary, LineRange, RawEntity,
 };
 pub use entity_id::EntityId;
-pub use extractor::{ExtractError, ExtractResult, SemanticExtractor};
+pub use extractor::{CallSite, ExtractError, ExtractResult, SemanticExtractor};
+pub use graph::build_graph;
 pub use plugins::create_default_registry;
 pub use registry::ExtractorRegistry;

@@ -174,9 +174,24 @@ fn show_diff(change_id: &ChangeId) -> Result<Diff> {
 
 /// Default revset used when stack mode runs without an explicit revset.
 ///
-/// `trunk()..@` is exclusive on the left (excludes trunk itself) and inclusive
-/// on the right (includes @), giving exactly the user's work since trunk.
-pub const DEFAULT_STACK_REVSET: &str = "trunk()..@";
+/// `trunk()..heads(@::)` is exclusive on the left (excludes trunk itself) and
+/// inclusive on the right, walking from @ up to the head(s) of whatever stack
+/// @ sits in. This is the correct shape regardless of where @ falls in the
+/// stack:
+///
+/// - @ at the top → `heads(@::) == @` → revset reduces to `trunk()..@` (the
+///   classic case)
+/// - @ in the middle or at the bottom (the user has `jj edit`-ed an earlier
+///   change to work on it) → `heads(@::)` is the stack tip, so the revset
+///   covers @ AND all its descendants up to the head. Without the
+///   `heads(@::)` extension the stack collapses to a single change and the
+///   reviewer can't see the rest of their work.
+///
+/// If @ has multiple descendant chains (a fork above @), every head is
+/// included; both forks land in the review surface. That's the right call
+/// for a tool whose mental model is "show me all the work I have stacked
+/// here" — under-showing on a fork would silently hide changes.
+pub const DEFAULT_STACK_REVSET: &str = "trunk()..heads(@::)";
 
 /// Decide whether a jj error message indicates the revset should fall back to
 /// `@`. Pure helper so the heuristic is testable without spawning jj.
@@ -239,6 +254,40 @@ pub fn file_content_at(rev: &str, file_path: &str, repo_root: &std::path::Path) 
 /// jj uses `-` (not git's `^`) as the postfix parent operator.
 pub fn parent_rev(change_id: &ChangeId) -> String {
     format!("{}-", change_id.as_str())
+}
+
+/// List every tracked file at the given revision, as repo-relative paths.
+///
+/// Used by the graph builder, which needs the full repo file set (not just
+/// the diff files) so cross-file `caller → callee` edges can resolve.
+/// `jj files -r REV` respects `.gitignore` / `.jjignore` and excludes the
+/// internal `.jj/` directory; nothing further to filter.
+///
+/// Best-effort: an empty list is returned when `jj files` fails (binary
+/// missing, revision unresolvable, etc.) so the caller can degrade
+/// gracefully — a missing file list means an empty graph, which means the
+/// Claude bundle drops its deps / dependents sections rather than blocking
+/// the reviewer.
+pub fn list_tracked_files(rev: &str, repo_root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let output = Command::new("jj")
+        .args(["files", "-r", rev])
+        .current_dir(repo_root)
+        .output();
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    let Ok(stdout) = String::from_utf8(output.stdout) else {
+        return Vec::new();
+    };
+    stdout
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(|l| std::path::PathBuf::from(local_review_core::util::strip_controls(l)))
+        .collect()
 }
 
 pub fn resolve_stack(revset: &str) -> Result<ResolvedStack> {
@@ -454,9 +503,13 @@ mod tests {
     }
 
     #[test]
-    fn default_stack_revset_is_trunk_dotdot_at() {
-        // Pin the constant so any future edit is deliberate.
-        assert_eq!(DEFAULT_STACK_REVSET, "trunk()..@");
+    fn default_stack_revset_walks_to_stack_head() {
+        // Pin the constant so any future edit is deliberate. The
+        // `heads(@::)` extension is load-bearing: it lets the default revset
+        // cover the whole stack when @ has been `jj edit`-ed to an earlier
+        // change for editing — without it the surface collapses to a single
+        // change.
+        assert_eq!(DEFAULT_STACK_REVSET, "trunk()..heads(@::)");
     }
 
     // ---- fallback-decision predicates ----

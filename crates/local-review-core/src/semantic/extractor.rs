@@ -6,6 +6,24 @@ use snafu::Snafu;
 
 use crate::semantic::entity::RawEntity;
 
+/// A single function/method call site in a source file. Used by the graph
+/// builder to construct `caller → callee` edges across the repo.
+///
+/// The graph builder resolves `callee_name` against the entity index for the
+/// whole repo (by leaf name); the resolution is intentionally approximate in
+/// v1 — same-name entities in different modules all become candidate
+/// targets. Good enough for the "deps / dependents" Claude bundle, where
+/// some extra context is preferable to none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallSite {
+    /// 1-based line number of the call expression in the after-state source.
+    pub line: u32,
+    /// Leaf identifier text of the callee (e.g. `parse` for `db::parse()` or
+    /// `obj.parse()`). Resolution is by leaf name only; module/scope
+    /// disambiguation is deferred to a later phase.
+    pub callee_name: String,
+}
+
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)))]
 pub enum ExtractError {
@@ -55,6 +73,16 @@ pub trait SemanticExtractor: Send + Sync {
     /// `Err(ParseContainsErrors)`. Returns `Ok([])` for valid but
     /// entity-free files.
     fn extract(&self, content: &str, file_path: &str) -> ExtractResult;
+
+    /// Extract function/method call sites from `content`. Used by the graph
+    /// builder; defaults to empty so non-code plugins (markdown,
+    /// SQL, test specs, config) don't need to implement it. Implementations
+    /// MUST be tolerant of parse errors in the same way `extract` is — a
+    /// call-extraction failure is silent and degrades the graph rather than
+    /// blocking it.
+    fn extract_calls(&self, _content: &str, _file_path: &str) -> Vec<CallSite> {
+        Vec::new()
+    }
 }
 
 /// Compute the first-8-bytes blake3 hash of a string, returned as u64.

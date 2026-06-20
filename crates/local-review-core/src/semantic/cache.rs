@@ -18,9 +18,10 @@ use crate::semantic::entity::EntityCoreData;
 /// New language plugins do NOT require a schema bump — they are handled
 /// automatically via `extractor_fingerprint` stored in each `CacheEntry`.
 ///
-/// History: 1 = original; 2 = added markdown + test-file plugins (Phase 3);
-/// 3 = added `AnchorFingerprint` / entity-reviewed fields (Phase 4).
-pub const SCHEMA_VERSION: u32 = 3;
+/// History: 1 = original; 2 = added markdown + test-file plugins;
+/// 3 = added `AnchorFingerprint` / entity-reviewed fields;
+/// 4 = populated `GraphData` with real `nodes`/`edges`.
+pub const SCHEMA_VERSION: u32 = 4;
 
 #[derive(Debug, Snafu)]
 pub enum CacheError {
@@ -58,17 +59,42 @@ pub struct CacheEntry {
     #[serde(default)]
     pub extraction_hash: String,
     pub entities: Vec<EntityCoreData>,
-    /// Forward-compatibility slot for the dependency graph (Phase 5).
-    /// `None` until graph computation is implemented.
+    /// Cross-file call graph over every entity in the repo, used by jjr's
+    /// Claude bundle to surface direct dependencies and dependents of the
+    /// commented entity. `None` when graph construction was skipped or
+    /// failed (best-effort: a missing graph degrades the bundle without
+    /// blocking the reviewer). ggr never populates this — it lacks the
+    /// local repo.
     pub graph: Option<GraphData>,
     /// Files for which extraction failed (for display as fallback rows).
     pub failed_files: Vec<String>,
 }
 
-/// Placeholder for the dependency graph (populated in Phase 5).
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+/// Cross-file call graph. Direct callers of an entity are the `from` side of
+/// edges where `to == entity.id`; direct callees are the `to` side of edges
+/// where `from == entity.id`.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct GraphData {
-    // populated in Phase 5
+    pub nodes: Vec<GraphNode>,
+    pub edges: Vec<GraphEdge>,
+}
+
+/// One entity in the graph. The graph indexes every entity in the repo, not
+/// just the changed entities in the current cache entry — callers/callees
+/// of the change may live outside the diff.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct GraphNode {
+    pub id: crate::semantic::entity::EntityId,
+    pub kind: crate::semantic::entity::EntityKind,
+}
+
+/// A directed `caller → callee` edge between two entities by `EntityId`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct GraphEdge {
+    /// The entity that contains the call site.
+    pub from: crate::semantic::entity::EntityId,
+    /// The entity being called.
+    pub to: crate::semantic::entity::EntityId,
 }
 
 // ── Read / write ─────────────────────────────────────────────────────────────
