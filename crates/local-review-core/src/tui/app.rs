@@ -264,6 +264,11 @@ pub struct App<S: ReviewSurfaceExt> {
     pub(crate) extraction: Option<crate::tui::entity_list::ExtractionInProgress>,
     /// Monotonically-incrementing tick for spinner animation.
     pub(crate) tick: u64,
+    /// Persistent entity context shown in the footer while in
+    /// `Screen::EntityDiff`. Updated each render tick from the cursor
+    /// position; `None` when the cursor is outside every entity's line range.
+    /// Shown only when no transient `status_message` is active.
+    pub(crate) entity_context: Option<String>,
 }
 
 impl<S: ReviewSurfaceExt> App<S> {
@@ -324,6 +329,7 @@ impl<S: ReviewSurfaceExt> App<S> {
             screen_before_extra: None,
             extraction: None,
             tick: 0,
+            entity_context: None,
         }
     }
 
@@ -1519,6 +1525,11 @@ fn render_entity_diff_screen<S: ReviewSurfaceExt>(
         }
     }
 
+    // Update the persistent entity context for the footer: find which entity
+    // (if any) contains the line the cursor is currently on, then format the
+    // name + annotation + caller count string.
+    app.entity_context = entity_context_for_cursor(app, findex);
+
     if app.entity_clip {
         // Build a view containing only lines within the entity's range.
         // Swap it in for rendering, then restore.
@@ -1536,6 +1547,82 @@ fn render_entity_diff_screen<S: ReviewSurfaceExt>(
     }
 
     render_main(frame, app);
+}
+
+/// Find the entity whose line range contains the current cursor line in
+/// `Screen::EntityDiff`, and format the status-bar context string.
+///
+/// Returns `None` when the cursor is on a hunk-separator or otherwise outside
+/// every entity's line range.
+fn entity_context_for_cursor<S: ReviewSurfaceExt>(app: &App<S>, findex: usize) -> Option<String> {
+    let view = app.annotated_per_file.0.get(findex)?;
+    let rendered = view.lines.get(app.line_index)?;
+
+    // Prefer the after-state (target) line number; fall back to source for
+    // pure-deletion lines. Hunk-separator rows have neither.
+    let file_line = rendered.target_line.or(rendered.source_line)?;
+
+    // Find the entity in the current file whose range contains this line.
+    let current_file = app
+        .rendered_per_file
+        .get(findex)
+        .map(|v| v.title.as_str())
+        .unwrap_or("");
+
+    let entity = app.entities.iter().find(|e| {
+        // Match by display path string — same as render_entity_diff_screen does.
+        let path = e.file_path.to_string_lossy();
+        (path == current_file
+            || current_file.ends_with(path.as_ref())
+            || current_file.ends_with(&format!("-> {path}")))
+            && file_line >= e.line_range.0
+            && file_line <= e.line_range.1
+    })?;
+
+    let entry_idx = app.surface.current_entry_index();
+    let count = app.surface.caller_count(entry_idx, &entity.id);
+    Some(format_entity_context(entity, count))
+}
+
+/// Format the status-bar context string for one entity.
+///
+/// jjr example: `authenticate() modified · sig+body · called from 8 places`
+/// ggr example: `authenticate() modified · sig+body`
+fn format_entity_context(
+    entity: &crate::semantic::EntitySummary,
+    caller_count: Option<usize>,
+) -> String {
+    use crate::semantic::{ChangeAnnotation, ChangeType};
+    use std::fmt::Write as _;
+    let name = &entity.display_name;
+    let change = match entity.change {
+        ChangeType::Added => "added",
+        ChangeType::Deleted => "deleted",
+        ChangeType::Modified => "modified",
+        ChangeType::Moved => "moved",
+    };
+    let annotation = match entity.change {
+        ChangeType::Modified => match entity.annotation {
+            ChangeAnnotation::SigChanged => Some("sig changed"),
+            ChangeAnnotation::BodyOnly => Some("body"),
+            ChangeAnnotation::SigAndBody => Some("sig+body"),
+            ChangeAnnotation::None => None,
+        },
+        ChangeType::Added | ChangeType::Deleted | ChangeType::Moved => None,
+    };
+
+    let mut out = format!("{name} {change}");
+    if let Some(ann) = annotation {
+        out.push_str(" · ");
+        out.push_str(ann);
+    }
+    if let Some(n) = caller_count {
+        if n > 0 {
+            let places = if n == 1 { "place" } else { "places" };
+            let _ = write!(out, " · called from {n} {places}");
+        }
+    }
+    out
 }
 
 /// Render the full file diff (the `F` escape hatch, `Screen::FileDiff`).
@@ -1942,14 +2029,31 @@ fn render_rendered_line(line: &RenderedLine, focused: bool, width: u16) -> TuiLi
 }
 
 fn render_footer<S: ReviewSurfaceExt>(frame: &mut Frame<'_>, area: Rect, app: &App<S>) {
+    let in_entity_diff = matches!(app.screen, Screen::EntityDiff { .. });
     let (text, style) = if let Some(msg) = app.status_message.as_deref() {
         (msg.to_owned(), Style::default().fg(Color::Yellow))
+    } else if in_entity_diff {
+        if let Some(ctx) = app.entity_context.as_deref() {
+            (ctx.to_owned(), Style::default().fg(Color::DarkGray))
+        } else {
+            let has_stack = app.surface.entry_count() > 1;
+            let mut hint = app
+                .surface
+                .footer_hint(area.width, has_stack, app.severity_filter);
+            let x_hint = if app.entity_clip {
+                "  x full"
+            } else {
+                "  x clip"
+            };
+            hint.push_str(x_hint);
+            (hint, Style::default())
+        }
     } else {
         let has_stack = app.surface.entry_count() > 1;
         let mut hint = app
             .surface
             .footer_hint(area.width, has_stack, app.severity_filter);
-        if matches!(app.screen, Screen::EntityDiff { .. }) {
+        if in_entity_diff {
             let x_hint = if app.entity_clip {
                 "  x full"
             } else {

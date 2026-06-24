@@ -467,6 +467,23 @@ pub trait ReviewSurface: Sized {
     ) -> Option<Box<dyn entity_list::ExtractionRunner>> {
         None
     }
+
+    /// Return the number of direct callers of `entity_id` in the entry's
+    /// dependency graph, or `None` when graph data is unavailable.
+    ///
+    /// "Direct callers" means edges where `edge.to == entity_id` — transitive
+    /// callers are out of scope. Returns `None` (not `Some(0)`) when the graph
+    /// was never built, so callers can distinguish "no callers" from "no data."
+    ///
+    /// Only jjr populates the graph (it has the local repo). ggr always returns
+    /// `None` from this default implementation.
+    fn caller_count(
+        &self,
+        _entry_idx: usize,
+        _entity_id: &crate::semantic::EntityId,
+    ) -> Option<usize> {
+        None
+    }
 }
 
 /// Opaque extra-screen state owned by the core `App` but whose type is only
