@@ -877,6 +877,28 @@ impl ReviewSurface for JjrSurface {
         }))
     }
 
+    fn caller_count(
+        &self,
+        entry_idx: usize,
+        entity_id: &local_review_core::semantic::EntityId,
+    ) -> Option<usize> {
+        let change_id = self.entry_change_id(entry_idx).ok()?;
+        let details = jj::show(&change_id).ok()?;
+        let commit_id = details.commit_id.as_str().to_owned();
+        let cache_path = entity_cache_path(
+            &self.data_home,
+            &self.repo_root,
+            change_id.as_str(),
+            &commit_id,
+        );
+        let entry = local_review_core::semantic::cache::read(&cache_path)
+            .ok()
+            .flatten()?;
+        let graph = entry.graph?;
+        let count = graph.edges.iter().filter(|e| &e.to == entity_id).count();
+        Some(count)
+    }
+
     fn inline_comments_for_view(
         &self,
         now: std::time::SystemTime,

@@ -1145,8 +1145,8 @@ Enhancements' (ggr+Claude is a different feature, deferred).
 ## Phase 6: Caller count in status bar
 
 | Status         | Started | Completed |
-| -------------- | ------- | --------- |
-| ⬜ not-started |         |           |
+| ----------- | ---------- | ---------- |
+| ✅ complete | 2026-06-23 | 2026-06-23 |
 
 Wire the dependency graph from Phase 5 into the entity diff view's status-bar
 context line. This is the final piece of the 'machine helps you understand the
