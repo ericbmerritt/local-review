@@ -51,6 +51,15 @@ const DRAFT_BODY_MAX: usize = 65_536;
 
 // ── GgrSurface ────────────────────────────────────────────────────────────────
 
+/// Which pane is active for entry 0 (the PR overview).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrPane {
+    /// Full PR description body as scrollable text (default).
+    Description,
+    /// Aggregated entity list across all commits.
+    Entities,
+}
+
 /// Loaded-entry state for [`GgrSurface`].
 ///
 /// The invariant — "description has no diff; commit-diff entries always carry
@@ -96,6 +105,14 @@ pub(crate) struct GgrSurface {
     /// Verdict chosen in the verdict modal; executed by `poll_immediate_action`
     /// on the first draw tick after the submitting overlay is visible.
     pending_submit: Option<crate::submit::Verdict>,
+    /// Active pane for entry 0. Persists across `n`/`p` navigation so the
+    /// reviewer's pane preference is remembered within a session.
+    pr_pane: PrPane,
+    /// Maps each position in the aggregated PR entity list back to the
+    /// commit index (1-based entry index) that last modified that entity.
+    /// Populated by `fetch_entity_list(0)` in entity pane mode; used by
+    /// `fetch_entity_diff(0, entity_idx, ...)` to load the right commit diff.
+    pr_entity_commit_indices: Vec<usize>,
 }
 
 impl GgrSurface {
@@ -120,6 +137,8 @@ impl GgrSurface {
             last_severity: None,
             pending_stale_message: None,
             pending_submit: None,
+            pr_pane: PrPane::Description,
+            pr_entity_commit_indices: Vec::new(),
         }
     }
 
@@ -861,7 +880,13 @@ impl ReviewSurface for GgrSurface {
 
     fn entry_id_display(&self, idx: usize) -> String {
         if idx == 0 {
-            return format!("#{}", self.pr.number);
+            return match self.pr_pane {
+                PrPane::Description => "description".to_owned(),
+                PrPane::Entities => {
+                    let k = self.pr_entity_commit_indices.len();
+                    format!("all entities ({k})")
+                }
+            };
         }
         self.pr
             .commits
@@ -914,11 +939,14 @@ impl ReviewSurface for GgrSurface {
     }
 
     fn fetch_entity_list(
-        &self,
+        &mut self,
         entry_idx: usize,
     ) -> std::result::Result<Vec<local_review_core::semantic::EntitySummary>, GgrError> {
         if entry_idx == 0 {
-            return Ok(Vec::new()); // description page has no entities
+            // Entity pane: aggregate entities across all commits.
+            let (summaries, commit_indices) = self.aggregate_pr_entities();
+            self.pr_entity_commit_indices = commit_indices;
+            return Ok(summaries);
         }
         let commit_idx = entry_idx - 1;
         let Some(commit) = self.pr.commits.get(commit_idx) else {
@@ -982,6 +1010,32 @@ impl ReviewSurface for GgrSurface {
             let _ = local_review_core::semantic::cache::write(p, &cache_entry);
         }
         Ok(ggr_build_entity_summaries_interleaved(cache_entry, &diff))
+    }
+
+    fn has_pr_pane_toggle(&self, entry_idx: usize) -> bool {
+        entry_idx == 0
+    }
+
+    fn is_description_entry(&self, entry_idx: usize) -> bool {
+        entry_idx == 0 && self.pr_pane == PrPane::Description
+    }
+
+    fn toggle_pr_pane(&mut self) {
+        self.pr_pane = match self.pr_pane {
+            PrPane::Description => PrPane::Entities,
+            PrPane::Entities => PrPane::Description,
+        };
+    }
+
+    fn pr_entity_commit_entry(&self, entity_idx: usize) -> Option<usize> {
+        let entry = self.pr_entity_commit_indices.get(entity_idx).copied()?;
+        // Sentinel 0 means commit index unknown (cached aggregation without
+        // index data). Fall back to None so the core uses the current entry.
+        if entry == 0 {
+            None
+        } else {
+            Some(entry)
+        }
     }
 
     fn appended_comments_for_view(
@@ -1429,6 +1483,112 @@ impl ReviewSurface for GgrSurface {
     }
 }
 
+impl GgrSurface {
+    /// Aggregate entities across all commits into a net PR-level entity list.
+    ///
+    /// Returns `(summaries, commit_indices)` where `commit_indices[i]` is the
+    /// 1-based entry index of the commit that last modified `summaries[i]`.
+    ///
+    /// Cache key: `_pr-<head_sha>.json` under the ggr entity cache base.
+    /// Head SHA is the last commit's SHA; this invalidates when new commits are
+    /// pushed without requiring a separate base-SHA API call.
+    fn aggregate_pr_entities(
+        &self,
+    ) -> (Vec<local_review_core::semantic::EntitySummary>, Vec<usize>) {
+        use local_review_core::semantic::EntityCoreData;
+        use std::collections::HashMap;
+
+        let owner_repo = self.pr.repo_name.as_str();
+        let host = self.pr.hostname.as_deref();
+
+        // Cache check: try the PR-level cache entry first.
+        let head_sha = self
+            .pr
+            .commits
+            .last()
+            .map(|c| format!("_pr-{}", c.sha.as_str()))
+            .unwrap_or_else(|| "_pr-empty".to_owned());
+        let pr_cache_path = ggr_entity_cache_base(owner_repo, self.pr.number, host)
+            .map(|base| local_review_core::semantic::cache::ggr_cache_path(&base, &head_sha));
+
+        // A cached aggregation entry has no `diff` to interleave fallback rows
+        // against, so we store and return raw EntityCoreData and rebuild the
+        // commit-index mapping from the entity list order stored in the cache.
+        if let Some(ref p) = pr_cache_path {
+            if let Ok(Some(entry)) = local_review_core::semantic::cache::read(p) {
+                let summaries: Vec<_> = entry
+                    .entities
+                    .iter()
+                    .map(ggr_entity_summary_from_core)
+                    .collect();
+                // The cache entry stores entities in the aggregated order;
+                // commit_indices were not persisted, so fall back to sentinel 0
+                // (unknown) for cache hits. fetch_entity_diff handles 0 by
+                // scanning commits to find the one with this entity.
+                let indices = vec![0usize; summaries.len()];
+                return (summaries, indices);
+            }
+        }
+
+        // Cache miss: walk all commits, load per-commit caches, aggregate.
+        // `by_entity` maps EntityId to (EntityCoreData, 1-based entry_idx).
+        // Later commits overwrite earlier ones — last writer wins for the net
+        // change type. Added-then-Deleted pairs cancel out (removed from map).
+        let mut by_entity: HashMap<local_review_core::semantic::EntityId, (EntityCoreData, usize)> =
+            HashMap::new();
+
+        for (commit_idx, commit) in self.pr.commits.iter().enumerate() {
+            let entry_idx = commit_idx + 1;
+            let sha = commit.sha.as_str();
+            let cache_path = ggr_entity_cache_base(owner_repo, self.pr.number, host)
+                .map(|base| local_review_core::semantic::cache::ggr_cache_path(&base, sha));
+            let cache_entry = cache_path
+                .as_ref()
+                .and_then(|p| local_review_core::semantic::cache::read(p).ok().flatten());
+
+            if let Some(entry) = cache_entry {
+                for entity in entry.entities {
+                    use local_review_core::semantic::ChangeType;
+                    // Added-then-Deleted: net is absent.
+                    if entity.change == ChangeType::Deleted {
+                        by_entity.remove(&entity.id);
+                    } else {
+                        by_entity.insert(entity.id.clone(), (entity, entry_idx));
+                    }
+                }
+            }
+        }
+
+        // Sort by file path, then by start line for stable ordering.
+        let mut pairs: Vec<(EntityCoreData, usize)> = by_entity.into_values().collect();
+        pairs.sort_by(|(a, _), (b, _)| {
+            a.id.file_path
+                .cmp(&b.id.file_path)
+                .then(a.line_range.0.cmp(&b.line_range.0))
+        });
+
+        let summaries: Vec<_> = pairs
+            .iter()
+            .map(|(e, _)| ggr_entity_summary_from_core(e))
+            .collect();
+        let commit_indices: Vec<usize> = pairs.iter().map(|(_, idx)| *idx).collect();
+
+        // Write the aggregated list to the PR-level cache for next time.
+        if let Some(ref p) = pr_cache_path {
+            let agg_entry = local_review_core::semantic::cache::CacheEntry {
+                schema_version: local_review_core::semantic::cache::SCHEMA_VERSION,
+                extraction_hash: local_review_core::semantic::cache::EXTRACTION_HASH.to_owned(),
+                entities: pairs.into_iter().map(|(e, _)| e).collect(),
+                graph: None,
+                failed_files: Vec::new(),
+            };
+            let _ = local_review_core::semantic::cache::write(p, &agg_entry);
+        }
+
+        (summaries, commit_indices)
+    }
+}
+
 /// Return the XDG-style cache base path for ggr entity extraction.
 ///
 /// `owner_repo` is `"owner/repo"`. Creates a path like:
@@ -1457,6 +1617,29 @@ fn ggr_entity_cache_base(
 }
 
 /// Convert a `CacheEntry` into renderable `EntitySummary` values.
+/// Convert a single `EntityCoreData` to an `EntitySummary` without a diff
+/// context (no fallback rows, `comment_count` 0, `reviewed` false).
+fn ggr_entity_summary_from_core(
+    e: &local_review_core::semantic::EntityCoreData,
+) -> local_review_core::semantic::EntitySummary {
+    let display_name = e.id.display_name();
+    local_review_core::semantic::EntitySummary {
+        id: e.id.clone(),
+        display_name,
+        kind: e.kind,
+        change: e.change,
+        annotation: e.annotation,
+        file_path: e.id.file_path.clone(),
+        source_file: e.source_file.clone(),
+        target_line: e.target_line,
+        line_range: e.line_range,
+        structural_change: e.structural_change,
+        content_hash: e.content_hash,
+        comment_count: 0,
+        reviewed: false,
+    }
+}
+
 fn ggr_build_entity_summaries(
     entry: local_review_core::semantic::cache::CacheEntry,
 ) -> Vec<local_review_core::semantic::EntitySummary> {
@@ -2498,9 +2681,10 @@ mod tests {
     }
 
     #[test]
-    fn entry_id_display_returns_pr_number_for_index_0() {
+    fn entry_id_display_returns_description_for_index_0() {
         let surface = GgrSurface::new(make_pr(), None);
-        assert_eq!(surface.entry_id_display(0), "#42");
+        // Entry 0 defaults to description pane; the label reflects the pane.
+        assert_eq!(surface.entry_id_display(0), "description");
     }
 
     #[test]

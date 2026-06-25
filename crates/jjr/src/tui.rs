@@ -794,7 +794,7 @@ impl ReviewSurface for JjrSurface {
     }
 
     fn fetch_entity_list(
-        &self,
+        &mut self,
         entry_idx: usize,
     ) -> std::result::Result<Vec<local_review_core::semantic::EntitySummary>, JjrError> {
         let change_id = self.entry_change_id(entry_idx)?;
