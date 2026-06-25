@@ -656,6 +656,16 @@ impl<S: ReviewSurfaceExt> App<S> {
             Screen::EntityDiff { .. } | Screen::FileDiff { .. }
         );
 
+        // Description pane (ggr entry 0, description pane active): show the
+        // DiffView that fetch_views already loaded and skip entity extraction.
+        // The user switches to the entity pane with `e`.
+        if self.surface.is_description_entry(idx) {
+            if !in_diff_view {
+                self.screen = Screen::FileDiff { file_idx: 0 };
+            }
+            return;
+        }
+
         // Async path: surface owns a runnable extraction task. Spawn it on a
         // background thread, set up the progress channel, and transition to
         // `Screen::Extracting`. The event loop polls the channel with a
@@ -2237,7 +2247,23 @@ fn handle_entity_list_key<S: ReviewSurfaceExt>(
                 app.screen = Screen::FileDiff { file_idx: 0 };
             } else {
                 let eidx = app.entity_index - 1;
-                app.screen = Screen::EntityDiff { entity_idx: eidx };
+                // PR overview entity pane: navigate to the commit that last
+                // modified this entity, then find the entity there and open
+                // its diff. ggr entity loading is synchronous so app.entities
+                // is populated immediately after load_entry.
+                if let Some(commit_entry) = app.surface.pr_entity_commit_entry(eidx) {
+                    let entity_id = app.entities.get(eidx).map(|e| e.id.clone());
+                    app.load_entry(commit_entry, false)?;
+                    if let Some(eid) = entity_id {
+                        if let Some(new_eidx) = app.entities.iter().position(|e| e.id == eid) {
+                            app.screen = Screen::EntityDiff {
+                                entity_idx: new_eidx,
+                            };
+                        }
+                    }
+                } else {
+                    app.screen = Screen::EntityDiff { entity_idx: eidx };
+                }
             }
         }
         // Tab/Shift-Tab on the entity list moves cursor selection (same as j/k).
@@ -2262,6 +2288,18 @@ fn handle_entity_list_key<S: ReviewSurfaceExt>(
                 "cosmetic filter: shown".to_owned()
             };
             app.status_message = Some(msg);
+        }
+        // PR overview pane toggle: switch from entity list back to description.
+        KeyCode::Char('e')
+            if app
+                .surface
+                .has_pr_pane_toggle(app.surface.current_entry_index()) =>
+        {
+            let idx = app.surface.current_entry_index();
+            app.surface.toggle_pr_pane();
+            // is_description_entry now returns true; start_entity_extraction
+            // will navigate to Screen::FileDiff for the description view.
+            app.start_entity_extraction(idx);
         }
         _ => {}
     }
@@ -2457,6 +2495,16 @@ fn handle_file_view_key<S: ReviewSurfaceExt>(
         KeyCode::Char('U') => app.toggle_current_file_reviewed(),
         KeyCode::Char('|') => app.cycle_diff_mode(),
         KeyCode::Char('y') => yank_cursor_window(app),
+        // PR overview pane toggle: switch from description to entity list.
+        KeyCode::Char('e')
+            if app
+                .surface
+                .is_description_entry(app.surface.current_entry_index()) =>
+        {
+            let idx = app.surface.current_entry_index();
+            app.surface.toggle_pr_pane();
+            app.start_entity_extraction(idx);
+        }
         // Toggle entity-clipped view (show only entity range vs full file).
         KeyCode::Char('x') => {
             if matches!(app.screen, Screen::EntityDiff { .. }) {

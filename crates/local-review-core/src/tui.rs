@@ -414,7 +414,7 @@ pub trait ReviewSurface: Sized {
     /// The default implementation returns an empty vec so that surfaces can
     /// adopt entity navigation incrementally.
     fn fetch_entity_list(
-        &self,
+        &mut self,
         _entry_idx: usize,
     ) -> Result<Vec<crate::semantic::EntitySummary>, Self::Error> {
         Ok(Vec::new())
@@ -482,6 +482,39 @@ pub trait ReviewSurface: Sized {
         _entry_idx: usize,
         _entity_id: &crate::semantic::EntityId,
     ) -> Option<usize> {
+        None
+    }
+
+    /// Return `true` when `entry_idx` is a description-first entry that
+    /// supports a pane toggle — i.e., the user can press `e` to switch between
+    /// a description view and an aggregated entity list.
+    ///
+    /// ggr returns `true` for entry 0 only. All other surfaces return the
+    /// default `false`.
+    fn has_pr_pane_toggle(&self, _entry_idx: usize) -> bool {
+        false
+    }
+
+    /// Return `true` when `entry_idx` should land on the description file view
+    /// rather than the entity list. ggr returns `true` for entry 0 when the
+    /// description pane is active. The core uses this in
+    /// `start_entity_extraction` to navigate to `Screen::FileDiff` instead of
+    /// `Screen::Main`.
+    fn is_description_entry(&self, _entry_idx: usize) -> bool {
+        false
+    }
+
+    /// Toggle the active PR pane for entry 0 between description and entity
+    /// list. No-op for surfaces that have no PR overview (jjr, default).
+    fn toggle_pr_pane(&mut self) {}
+
+    /// For aggregated PR entity lists: return the 1-based entry index of the
+    /// commit that last modified the entity at `entity_idx`. The core uses
+    /// this to navigate to the right commit before opening the entity diff.
+    ///
+    /// Returns `None` for all surfaces that do not have a PR overview (jjr,
+    /// default) and for entities whose commit origin is unknown.
+    fn pr_entity_commit_entry(&self, _entity_idx: usize) -> Option<usize> {
         None
     }
 }

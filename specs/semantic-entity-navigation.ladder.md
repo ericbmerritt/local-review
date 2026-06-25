@@ -1144,7 +1144,7 @@ Enhancements' (ggr+Claude is a different feature, deferred).
 
 ## Phase 6: Caller count in status bar
 
-| Status         | Started | Completed |
+| Status      | Started    | Completed  |
 | ----------- | ---------- | ---------- |
 | ✅ complete | 2026-06-23 | 2026-06-23 |
 
@@ -1253,9 +1253,9 @@ bar' (format and behavior), 'Scope: jjr vs ggr' (caller count is jjr only),
 
 ## Phase 7: PR-level overview screen (ggr)
 
-| Status         | Started | Completed |
-| -------------- | ------- | --------- |
-| ⬜ not-started |         |           |
+| Status      | Started    | Completed  |
+| ----------- | ---------- | ---------- |
+| ✅ complete | 2026-06-25 | 2026-06-25 |
 
 Reshape entry 0 in `ggr` so a reviewer who opens a PR can answer "what is this
 about" and "what does it touch" without walking each commit. Description gets
