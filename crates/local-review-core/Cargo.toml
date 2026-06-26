@@ -36,6 +36,7 @@ lang-all = [
   "lang-toml",
   "lang-postgres",
   "lang-markdown",
+  "lang-nix",
 ]
 lang-rust = ["dep:tree-sitter", "dep:tree-sitter-rust"]
 lang-typescript = ["dep:tree-sitter", "dep:tree-sitter-typescript"]
@@ -51,6 +52,7 @@ lang-json = ["dep:tree-sitter", "dep:tree-sitter-json"]
 lang-toml = ["dep:tree-sitter", "dep:tree-sitter-toml-ng"]
 lang-postgres = ["dep:tree-sitter", "dep:tree-sitter-postgres"]
 lang-markdown = ["dep:tree-sitter", "dep:tree-sitter-md"]
+lang-nix = ["dep:tree-sitter", "dep:tree-sitter-nix"]
 
 [dependencies]
 snafu.workspace = true
@@ -77,6 +79,7 @@ tree-sitter-toml-ng = { workspace = true, optional = true }
 tree-sitter-typescript = { workspace = true, optional = true }
 tree-sitter-yaml = { workspace = true, optional = true }
 tree-sitter-md = { workspace = true, optional = true }
+tree-sitter-nix = { workspace = true, optional = true }
 
 [build-dependencies]
 blake3.workspace = true

@@ -25,6 +25,9 @@ mod sql;
 #[cfg(feature = "lang-markdown")]
 mod markdown;
 
+#[cfg(feature = "lang-nix")]
+mod nix;
+
 #[cfg(feature = "lang-typescript")]
 mod test;
 
@@ -86,6 +89,9 @@ pub fn create_default_registry() -> ExtractorRegistry {
 
     #[cfg(feature = "lang-markdown")]
     r.register(Box::new(markdown::MarkdownPlugin));
+
+    #[cfg(feature = "lang-nix")]
+    r.register(Box::new(nix::NixPlugin));
 
     r
 }

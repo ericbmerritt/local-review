@@ -1,203 +1,147 @@
 # jjr
 
-**Local stack review for agent-generated code.**
+**Review agent-generated code before it ships.**
 
-Before agent-generated commits leave your workstation as PRs, you have to review
-them. They have your name on them. The agent wrote the code; you're the one
-who's accountable for it.
-
-`jjr` is the tool for that pass. It walks you through a stack of jj changes,
-captures line / change / description / stack-scoped comments, and hands the
-comments to Claude (or another agent CLI) for remediation. The agent edits the
-changes in place. You re-review. Repeat until you push.
-
-This is **self-review**, not collaboration. Comments stay on disk, ignored by
-git and jj. Nothing is committed. Nothing is shared.
+When an agent writes commits on your behalf, your name goes on them. `jjr` is
+how you check the work. It walks your local jj stack, extracts every changed
+entity (function, method, struct, …) using tree-sitter, sorts them by dependency
+order, and lets you comment at any scope. When you're done, `C` sends a
+structured context bundle to Claude — the changed entity's full body plus its
+direct callers and callees — and Claude edits the code in place. You re-review.
+Repeat until you push.
 
 ## Why jujutsu
 
-Agent-driven coding generates many small commits that need rewriting before they
-ship: split this one, squash these two, drop that experiment, fix the
-description. The git workflow for that is interactive rebase — slow,
-error-prone, and easy to bail on. The friction tax is paid every cycle.
+`jj` makes the review loop cheap enough to run repeatedly:
 
-`jj` removes that tax in three places that matter for the review loop:
+- **History rewriting is first-class.** `jj split`, `jj squash`, `jj absorb` are
+  everyday commands. The agent re-shapes its stack when told to.
+- **Working copy is a commit.** Edits are tracked the moment they hit disk.
+- **`trunk()..@` is a stable scope.** The boundary of "what I'm reviewing"
+  doesn't shift while you're looking at it.
 
-- **History rewriting is first-class.** `jj split`, `jj squash`, `jj rebase`,
-  `jj absorb` are everyday commands, not ceremony. The agent re-shapes its own
-  stack when told to, and `jj` records conflicts as first-class objects in
-  commits rather than halting the rebase — descendants re-parent automatically
-  and you handle conflicts where they actually live instead of in a 30-minute
-  interactive rebase.
-- **Working copy is a commit.** The agent's edits are tracked the moment they
-  hit disk. There's no "did I `git add`?" failure mode and no staging area to
-  desynchronize from intent.
-- **A stack is the review unit.** `trunk()..@` gives `jjr` a stable, exact
-  definition of "the work I'm reviewing." One change is one commit is one review
-  pass. The boundary doesn't drift while you're looking at it.
+## Quick start
 
-`jjr` exists because `jj`'s data model removes the friction the agent loop
-generates. The reviewer points at content; the tool re-anchors comments across
-the agent's rewrites; the cycle stays cheap enough to run as many times as the
-work needs. None of that is impossible on git, but on git it costs enough that
-you stop running the loop. That's why `jjr` is a jj-only tool, not a git-review
-tool.
-
-## Synopsis
-
-```
-jjr [revset]
-jjr <subcommand> [args]
+```sh
+cd your-jj-repo
+jjr                  # open the entity list for trunk()..@
+# j/k to move, Enter to open an entity diff
+# c to comment on the current line, Ctrl-X to save
+# C to send comments to Claude
+jjr                  # re-review the edited stack
+jj git push          # ship it
 ```
 
-Two modes:
+## The entity list
 
-- **Stack mode** (default; bare `jjr`, `jjr --stack`, or `jjr <revset>` where
-  the revset returns multiple changes): walk a sequence of changes
-  oldest-to-newest with `n` / `p`.
-- **Single-change mode** (`jjr <change-id>`, or any revset that returns one
-  change): review a single change. Stack-mode keys (`s`, `n`, `p`) are inert.
+The default screen shows changed entities sorted deepest-dependency-first:
+entities that others call appear before the things that call them. On wide
+terminals, each row shows name, file, line range, caller count, and change
+annotation.
 
-The default revset is `trunk()..@`.
-
-## Status
-
-MVP complete and stable. Shipped: read-only diff view, line / change /
-description / stack-scoped comments with severity, stack walking with cursor
-resume, side-by-side diff at wide widths, line re-anchoring with stale view,
-packet generation, single-change Claude handoff via the CLI (`jjr claude`) and
-stack-wide handoff via the in-TUI `C` key in stack mode (both with working-copy
-guard), per-file reviewed tracking, file picker, severity filters, refresh,
-JSONL/markdown export, configurable agent CLI.
-
-Not yet implemented (deferred): inter-cycle diff feature, full `jjr orphans`
-view (the `--orphaned` flag on `jjr clear` covers cleanup), syntax highlighting,
-GitHub integration, multiple-reviewer support.
-
-See the [engineering design document](specs/local-stack-review-edd.md) for the
-full spec and the [TUI design document](specs/jjr-tui-design.md) for screen
-layouts.
-
-## Install
-
-The flake exposes a package, so the one-liner is:
-
-```bash
-nix profile install github:ericbmerritt/local-review
+```
+  Δ authenticate()          src/auth/login.rs :42-78    fn · sig+body    8 callers   ●
+  ⊕ UserToken               src/auth/token.rs :12-28    struct · added
+  Δ session_parse()         src/db/session.rs :90-115   fn · body         2 callers
 ```
 
-To run without installing:
+Press `o` to toggle between dependency order and file+line order.
 
-```bash
-nix run github:ericbmerritt/local-review -- --help
-```
+Entities with only cosmetic changes (whitespace, comment rewrapping) are dimmed
+and annotated `[cosmetic]`; press `;` to hide them entirely.
 
-To build from a clone (Rust toolchain and review tooling come from the dev
-shell):
+## Entity diff view
 
-```bash
-git clone https://github.com/ericbmerritt/local-review
-cd local-review
-nix develop                    # or `direnv allow` if you use direnv
-cargo install --path crates/jjr  # builds and installs `jjr` to ~/.cargo/bin
-```
+`Enter` on an entity opens a focused diff: the full file diff, pre-scrolled to
+the entity's start line, with the entity's range highlighted. `Tab` /
+`Shift-Tab` cycles between entities. `F` opens the file list if you want to
+browse by file instead. `x` clips the view to just the entity's lines.
 
-`jj` (jujutsu) must be on `PATH` at runtime — `jjr` does not bundle it, so it
-uses whatever `jj` your environment provides. The Nix dev shell installs one;
-outside the dev shell, install jj separately. The `claude` CLI is optional —
-only needed for `jjr claude` and the `C` keybind.
+The status bar shows passive context:
+`authenticate() modified · sig+body · called from 8 places`
 
-## Quickstart
+## Claude context bundle
 
-From inside any jj-tracked repository:
+When you press `C`, the prompt sent to Claude includes — for each line comment —
+the full body of the entity containing the commented line, plus its direct
+callers and direct callees. Claude can address a comment without breaking the
+API surface it relies on.
 
-```bash
-$ jjr                          # opens the stack
-  # ↑ ↓ to scan a diff, n / p to move between changes (oldest-to-newest)
-  # Tab cycles files; f opens the file picker
-  # Enter on a line to comment; Ctrl-X saves
-  # press C to send comments to Claude
+Budget: 16k tokens per comment (override with `JJR_CONTEXT_BUDGET=<n>`). When
+over budget, dependents drop first, then dependencies, then a truncation note is
+appended.
 
-$ jjr claude @                 # alternative: send from CLI without entering the TUI
+## Comments
 
-$ jjr                          # re-review the modified stack
-  # resumes where you stopped; stale comments surface separately under S
+Four scopes, set in the composer with `M-l` / `M-c` / `M-k` / `M-d`:
 
-$ jj git push                  # ship it
-```
+| Scope       | Where it renders             | Use for                               |
+| ----------- | ---------------------------- | ------------------------------------- |
+| line        | Inline below the anchor line | "this `.unwrap()` will panic"         |
+| change      | Change description view      | "this commit does too much, split it" |
+| description | Inline in the commit message | "this bullet doesn't match the code"  |
+| stack       | Stack overview (`s`)         | "rename across the whole stack"       |
 
-## Commands
+Three severities, set with `M-r` / `M-s` / `M-n`:
 
-| Command                                             | Description                                                                                                                                |
-| --------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
-| `jjr`                                               | Walk the stack (`trunk()..@`); fresh stack opens at oldest, resumed stack opens at the most-recent unreviewed change; `n` / `p` to advance |
-| `jjr --stack`                                       | Same as bare `jjr`; explicit form                                                                                                          |
-| `jjr --stack --restart`                             | Clear the saved cursor and start at the oldest change                                                                                      |
-| `jjr <change-id>`                                   | Review a single specific change                                                                                                            |
-| `jjr <revset>`                                      | Review changes returned by an arbitrary jj revset                                                                                          |
-| `jjr packet [revset] [--include-stale] [-o <path>]` | Print the rendered Claude prompt to stdout, or write it to a file                                                                          |
-| `jjr claude [revset] [--include-stale]`             | Send comments to the configured agent CLI for remediation                                                                                  |
-| `jjr export [revset] [--format markdown\|jsonl]`    | Export comments as JSONL (default) or markdown                                                                                             |
-| `jjr clear <revset> [--stale\|--orphaned] [--yes]`  | Clear comments for a revset                                                                                                                |
+- **required** — Claude addresses this. Non-response is legible in the next
+  diff.
+- **suggestion** — Claude addresses if safe and consistent with the change's
+  design.
+- **note** — Informational; Claude doesn't act on it.
 
 ## Keybindings
 
-### Main view
+### Entity list (`Screen::Main`)
 
-| Key                    | Action                                                                    |
-| ---------------------- | ------------------------------------------------------------------------- |
-| `↑` `↓` / `j` `k`      | Move line cursor                                                          |
-| `PgUp` `PgDn`          | Page up / down                                                            |
-| `Home` `End` / `g` `G` | Top / bottom of diff                                                      |
-| `Tab` / `Shift-Tab`    | Next / previous file                                                      |
-| `n` / `p`              | Next / previous change in stack                                           |
-| `Enter` / `c`          | New comment on current line                                               |
-| `e`                    | Edit comment (cursor on a comment)                                        |
-| `d`                    | Delete comment (cursor on a comment)                                      |
-| `1` / `2` / `3`        | Filter to required / suggestion / note (press again to clear)             |
-| `f`                    | File picker — jump to a file or the change description                    |
-| `r`                    | Refresh — re-run `jj show` and reload comments                            |
-| `s`                    | Stack overview                                                            |
-| `S`                    | Stale comments view                                                       |
-| `U`                    | Toggle reviewed status on the current file                                |
-| <code>&#124;</code>    | Cycle diff layout: auto / unified / side-by-side                          |
-| `C`                    | Send to Claude (current change in single mode; whole stack in stack mode) |
-| `?`                    | Help                                                                      |
-| `q`                    | Quit                                                                      |
+| Key                 | Action                                            |
+| ------------------- | ------------------------------------------------- |
+| `j` `k` / `↑` `↓`   | Move cursor                                       |
+| `Enter`             | Open entity diff (or description for row 0)       |
+| `Tab` / `Shift-Tab` | Next / previous entity (cursor only, on the list) |
+| `F`                 | Open file list (escape hatch)                     |
+| `n` / `p`           | Next / previous change in stack                   |
+| `c`                 | New comment (scope follows cursor position)       |
+| `1` / `2` / `3`     | Filter by required / suggestion / note            |
+| `;`                 | Toggle cosmetic entity visibility                 |
+| `o`                 | Toggle sort: dependency order ↔ file order        |
+| `R`                 | Clear entity cache and re-extract                 |
+| `s`                 | Stack overview                                    |
+| `S`                 | Stale comments view                               |
+| `?`                 | Help                                              |
+| `q`                 | Quit                                              |
 
-### Composer (when writing a comment)
+### Entity diff view
+
+| Key                 | Action                                             |
+| ------------------- | -------------------------------------------------- |
+| `j` `k` / `↑` `↓`   | Scroll line                                        |
+| `PgUp` `PgDn`       | Scroll page                                        |
+| `g` `G`             | Top / bottom                                       |
+| `Tab` / `Shift-Tab` | Next / previous entity's diff                      |
+| `x`                 | Toggle entity-clip (entity lines only ↔ full file) |
+| `F`                 | Open file list                                     |
+| `n` / `p`           | Next / previous change                             |
+| `c` / `Enter`       | New comment on current line                        |
+| `e`                 | Edit existing comment                              |
+| `d`                 | Delete existing comment                            |
+| `1` / `2` / `3`     | Severity filter                                    |
+| `\|`                | Cycle diff layout: auto / unified / side-by-side   |
+| `U`                 | Toggle file reviewed                               |
+| `C`                 | Send to Claude                                     |
+| `Esc` / `q`         | Return to entity list                              |
+
+### Composer
 
 | Key                           | Action                                     |
 | ----------------------------- | ------------------------------------------ |
 | `M-l` / `M-c` / `M-k` / `M-d` | Scope: line / change / stack / description |
 | `M-r` / `M-s` / `M-n`         | Severity: required / suggestion / note     |
 | `Ctrl-X`                      | Save                                       |
-| `Ctrl-D`                      | Delete (when editing an existing comment)  |
+| `Ctrl-D`                      | Delete (when editing)                      |
 | `Esc`                         | Cancel                                     |
 
-`Ctrl-X` (not `Ctrl-S`) is deliberate — POSIX terminals eat `Ctrl-S` for XOFF
-flow control.
-
-### Stack overview (`s` from main view)
-
-| Key               | Action                                                                                          |
-| ----------------- | ----------------------------------------------------------------------------------------------- |
-| `↑` `↓` / `j` `k` | Select row                                                                                      |
-| `Enter`           | Open change (on a change row) / edit comment (on a comment row)                                 |
-| `c`               | New comment; scope defaults from cursor (stack header → stack scope; change row → change scope) |
-| `q` / `Esc`       | Back to main view                                                                               |
-
-### Stale view (`S` from main view)
-
-| Key               | Action                                                    |
-| ----------------- | --------------------------------------------------------- |
-| `↑` `↓` / `j` `k` | Select entry                                              |
-| `Enter`           | View in source — navigate main view to the anchor         |
-| `e`               | Edit and re-anchor (switch to main view, pick a new line) |
-| `d`               | Delete focused stale comment                              |
-| `q` / `Esc`       | Back to main view                                         |
-
-### Send to Claude (`C` from main view)
+### Send to Claude (`C`)
 
 | Key     | Action                                              |
 | ------- | --------------------------------------------------- |
@@ -205,125 +149,66 @@ flow control.
 | `Enter` | Send — suspends TUI, runs Claude, redraws on return |
 | `Esc`   | Cancel                                              |
 
-## Comments
+## Commands
 
-Comments come in four scopes:
-
-- **line** — anchored to a specific line in a specific file in a specific
-  change. Renders inline directly below the target line, indented with a `┃`
-  column marker. The default. For "this `.unwrap()` will panic" or "rename this
-  variable."
-- **change** — anchored to a whole change. Renders in that change's description
-  view (file index 0), appended after the description body with a
-  `─ on this change ─` separator. For "this commit does too much, split it" or
-  "the description doesn't match the code."
-- **description** — anchored to a specific line in a change's commit message.
-  Renders inline below the anchor line in the description view. For "this bullet
-  doesn't reflect what the code actually does."
-- **stack** — anchored to the whole stack you're reviewing. Renders in the stack
-  overview (`s`), at the top above the change rows. For "rename `retry_wrapper`
-  to `retry_policy` throughout" or "don't introduce new public APIs in this
-  stack."
-
-Each comment carries a severity:
-
-- **required** — Claude addresses this by editing the code. If it's not
-  addressed in the next cycle's diff, you'll see that and can re-comment,
-  escalate, or fix it yourself.
-- **suggestion** — Claude addresses if safe and consistent with the change's
-  design. If a suggestion would broaden scope or break intent, Claude leaves it.
-  The diff (or its absence) is the response.
-- **note** — Informational. Claude doesn't act on it.
-
-There's no decline-with-reasoning channel. Claude responds by editing the code,
-full stop. If it doesn't change something you flagged, that's the conversation —
-you read the next diff and adjudicate.
-
-## Re-review and stale comments
-
-After Claude edits the working copy, the diff changes. `jjr` re-anchors comments
-by matching `target_text` plus surrounding context — not line numbers, which
-shift on every edit.
-
-- Comments that re-anchor cleanly show inline as before.
-- Comments that can't re-anchor are marked **stale** and surface in a separate
-  panel (`S`) showing was/now lines and the mismatch reason: target text
-  changed, anchor not found, or file removed.
-
-Stale comments aren't auto-deleted. You decide whether to clear them, edit them
-to re-anchor, or send them anyway with `--include-stale`.
-
-Stack-scoped comments are never stale (no anchoring to content); they reappear
-in every cycle until cleared. Description-scoped comments re-anchor against the
-commit message; if the message changes enough they go stale alongside
-line-scoped comments.
+| Command                                            | Description                                 |
+| -------------------------------------------------- | ------------------------------------------- |
+| `jjr`                                              | Walk the stack (`trunk()..heads(@::)`)      |
+| `jjr --stack --restart`                            | Reset cursor and start at the oldest change |
+| `jjr <change-id>` / `jjr <revset>`                 | Review one change or a custom revset        |
+| `jjr claude [revset] [--include-stale]`            | Send comments to Claude from the CLI        |
+| `jjr packet [revset]`                              | Print the rendered Claude prompt to stdout  |
+| `jjr export [revset] [--format markdown\|jsonl]`   | Export comments                             |
+| `jjr clear <revset> [--stale\|--orphaned] [--yes]` | Clear comments                              |
 
 ## Configuration
 
-Settings live in a single global file: `$XDG_CONFIG_HOME/jjr/config.toml` if
-`XDG_CONFIG_HOME` is set, otherwise `~/.config/jjr/config.toml`. The file is
-optional; missing fields fall back to defaults.
+`$XDG_CONFIG_HOME/jjr/config.toml` (fallback: `~/.config/jjr/config.toml`):
 
 ```toml
 [ui]
-transition_screen = "auto"        # "auto" | "always" | "never" (default "never")
+transition_screen = "auto"     # "auto" | "always" | "never"
 
 [agent]
-tool = "claude"                   # CLI binary used by `jjr claude` and the C keybind
-extra_args = []                   # flags passed to the agent before the `--` separator
+tool = "claude"                # any CLI binary on PATH
+extra_args = []                # flags passed before the `--` separator
 ```
 
-To skip Claude's per-edit approval prompts, set:
+To skip Claude's per-edit approval prompts:
 
 ```toml
 [agent]
 extra_args = ["--dangerously-skip-permissions"]
 ```
 
-`tool` accepts any binary on `PATH` (e.g., `tool = "opencode"`). `jjr` spawns
-the named binary with `extra_args`, then `--`, then the prompt path.
-
-**Migration.** If you previously set config in
-`<repo_root>/.jj-review/config.toml`, move it to
-`$XDG_CONFIG_HOME/jjr/config.toml` (or `~/.config/jjr/config.toml`). Per-repo
-config files are no longer read.
+`JJR_CONTEXT_BUDGET=<n>` — override the 16k-token Claude bundle budget.
 
 ## Files
-
-Everything is local. `jjr` writes to a `.jj-review/` directory at the repo root,
-ignored by both `git` and `jj`:
 
 ```
 .jj-review/
 ├── comments/
-│   ├── <change-id>.jsonl    # line, change, and description comments per change
-│   └── _stack.jsonl         # stack-scoped comments; records carry revset hash
-├── cursor.json              # last-viewed change per resolved revset, for resume
-├── reviewed.json            # per-change file-reviewed status (the ✓ indicator)
-└── config.toml              # optional [ui] / [agent] config
+│   ├── <change-id>.jsonl    # line, change, and description comments
+│   └── _stack.jsonl         # stack-scoped comments
+├── entities/                # tree-sitter extraction cache (auto-managed)
+├── cursor.json              # last-viewed change per revset, for resume
+└── reviewed.json            # per-entity reviewed status
 ```
 
-Comments are never committed and never shared. `.jj-review/` is added to
-`.gitignore` on first run (`jj` reads `.gitignore` natively).
+Ignored by both `git` and `jj`. Never committed, never shared.
 
-## Development
+## Install
 
-Run all gates locally:
-
-```bash
-nix develop --command just validate
+```sh
+cargo install jjr
+brew install ericbmerritt/jjr/jjr
+# or from source:
+cargo install --path crates/jjr
 ```
 
-`just validate` runs `cargo build`, format checks (rustfmt + alejandra +
-prettier + trailing-whitespace), lints (clippy with strict lint posture,
-cargo-deny, statix), and the test suite under `cargo-llvm-cov` with a 90%
-line-coverage floor on the functional core. The same command runs in CI on every
-push and pull request.
-
-Other targets: `just format`, `just lint`, `just test`, `just build`. Bare
-`just` lists everything.
+Requires `jj` on `PATH`. The `claude` CLI is optional — only needed for `C` and
+`jjr claude`.
 
 ## License
 
-Dual-licensed under either [MIT](LICENSE-MIT) or [Apache 2.0](LICENSE-APACHE),
-at your option.
+MIT OR Apache-2.0

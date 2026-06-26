@@ -65,6 +65,21 @@ pub(crate) fn ensure_clone(
     if let Some(h) = hostname {
         cmd.env("GH_HOST", h);
     }
+    // Point git's OpenSSL backend at the system certificate bundle so GHE
+    // certificates are trusted without disabling verification. Homebrew git
+    // uses its own OpenSSL which doesn't read the macOS Keychain; this
+    // bridges the gap. Priority:
+    //   1. GIT_SSL_CAINFO already set by the caller — respect it.
+    //   2. macOS system root bundle at /etc/ssl/cert.pem (symlink to Keychain).
+    //   3. Linux CA bundle paths.
+    if std::env::var_os("GIT_SSL_CAINFO").is_none() {
+        if let Some(bundle) = system_ca_bundle() {
+            cmd.env("GIT_SSL_CAINFO", bundle);
+        }
+    }
+    // Suppress stderr so failed clones don't bleed error text into the
+    // reviewer's terminal. The clone is best-effort; failure returns None.
+    cmd.stderr(std::process::Stdio::null());
     let status = cmd.status().ok()?;
     if status.success() {
         Some(repo_path)
@@ -97,6 +112,29 @@ pub(crate) fn list_files(repo_path: &Path) -> Vec<PathBuf> {
         .filter(|l| !l.is_empty())
         .map(|l| PathBuf::from(local_review_core::util::strip_controls(l)))
         .collect()
+}
+
+/// Return the path to the system CA certificate bundle, or `None` if none of
+/// the standard locations are present.
+///
+/// On macOS, `/etc/ssl/cert.pem` is a symlink maintained by the OS that
+/// reflects the system root keychain — it is the same bundle that the macOS
+/// `SecureTransport` and `curl` backends use. On Linux, the bundle is typically
+/// at `/etc/ssl/certs/ca-certificates.crt` (Debian/Ubuntu) or
+/// `/etc/pki/tls/certs/ca-bundle.crt` (RHEL/Fedora).
+fn system_ca_bundle() -> Option<PathBuf> {
+    const CANDIDATES: &[&str] = &[
+        "/etc/ssl/cert.pem",                  // macOS + some BSDs
+        "/etc/ssl/certs/ca-certificates.crt", // Debian / Ubuntu
+        "/etc/pki/tls/certs/ca-bundle.crt",   // RHEL / Fedora / CentOS
+        "/etc/ssl/ca-bundle.pem",             // openSUSE
+        "/usr/share/ssl/certs/ca-bundle.crt", // older RHEL
+    ];
+    CANDIDATES
+        .iter()
+        .map(Path::new)
+        .find(|p| p.exists())
+        .map(Path::to_path_buf)
 }
 
 /// `/tmp/ggr-repos/<host>/<owner>/<repo>`

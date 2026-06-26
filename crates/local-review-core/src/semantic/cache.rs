@@ -59,12 +59,13 @@ pub struct CacheEntry {
     #[serde(default)]
     pub extraction_hash: String,
     pub entities: Vec<EntityCoreData>,
-    /// Cross-file call graph over every entity in the repo, used by jjr's
-    /// Claude bundle to surface direct dependencies and dependents of the
-    /// commented entity. `None` when graph construction was skipped or
-    /// failed (best-effort: a missing graph degrades the bundle without
-    /// blocking the reviewer). ggr never populates this — it lacks the
-    /// local repo.
+    /// Cross-file call graph over every entity in the repo. Used by jjr's
+    /// Claude bundle and by both tools' entity-list topo sort and caller
+    /// counts. `None` when graph construction was skipped or failed
+    /// (best-effort: a missing graph degrades the bundle without blocking
+    /// the reviewer). jjr always builds a graph from the local working copy;
+    /// ggr builds one when `--no-graph` is not set and a `/tmp` clone is
+    /// available.
     pub graph: Option<GraphData>,
     /// Files for which extraction failed (for display as fallback rows).
     pub failed_files: Vec<String>,
