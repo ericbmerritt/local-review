@@ -26,6 +26,7 @@ pub mod graph;
 pub mod identity;
 pub mod plugins;
 pub mod registry;
+pub mod sort;
 
 pub use cache::{GraphData, GraphEdge, GraphNode};
 pub use context::{
@@ -42,3 +43,4 @@ pub use extractor::{CallSite, ExtractError, ExtractResult, SemanticExtractor};
 pub use graph::build_graph;
 pub use plugins::create_default_registry;
 pub use registry::ExtractorRegistry;
+pub use sort::topo_sort_entities;

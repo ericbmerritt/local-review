@@ -105,6 +105,10 @@ pub(crate) struct GgrSurface {
     /// Verdict chosen in the verdict modal; executed by `poll_immediate_action`
     /// on the first draw tick after the submitting overlay is visible.
     pending_submit: Option<crate::submit::Verdict>,
+    /// When `true`, ggr may clone the PR's repository to `/tmp/ggr-repos/` to
+    /// build a cross-file dependency graph. Set to `false` via `--no-graph` or
+    /// `GGR_NO_GRAPH_CLONE=1` to suppress the network access.
+    allow_graph_clone: bool,
     /// Active pane for entry 0. Persists across `n`/`p` navigation so the
     /// reviewer's pane preference is remembered within a session.
     pr_pane: PrPane,
@@ -116,7 +120,11 @@ pub(crate) struct GgrSurface {
 }
 
 impl GgrSurface {
-    pub(crate) fn new(pr: PrDetails, initial_cursor: Option<&cursor::CursorState>) -> Self {
+    pub(crate) fn new(
+        pr: PrDetails,
+        initial_cursor: Option<&cursor::CursorState>,
+        allow_graph_clone: bool,
+    ) -> Self {
         let pending_initial_index = initial_cursor.and_then(|c| {
             pr.commits
                 .iter()
@@ -137,6 +145,7 @@ impl GgrSurface {
             last_severity: None,
             pending_stale_message: None,
             pending_submit: None,
+            allow_graph_clone,
             pr_pane: PrPane::Description,
             pr_entity_commit_indices: Vec::new(),
         }
@@ -999,17 +1008,78 @@ impl ReviewSurface for GgrSurface {
             }
         }
 
+        // Build the cross-file call graph from a local clone of the repo.
+        // Best-effort: a missing or failed clone means the graph stays None
+        // and the caller sees no topo sort / caller count — not a hard error.
+        let graph = crate::repo_cache::ensure_clone(
+            self.pr.repo_name.as_str(),
+            self.pr.hostname.as_deref(),
+            self.allow_graph_clone,
+        )
+        .map(|repo_path| {
+            let files = crate::repo_cache::list_files(&repo_path);
+            local_review_core::semantic::build_graph(&registry, &repo_path, &files)
+        });
+
         let cache_entry = local_review_core::semantic::cache::CacheEntry {
             schema_version: local_review_core::semantic::cache::SCHEMA_VERSION,
             extraction_hash: local_review_core::semantic::cache::EXTRACTION_HASH.to_owned(),
             entities,
-            graph: None,
+            graph,
             failed_files,
         };
         if let Some(ref p) = cache_path {
             let _ = local_review_core::semantic::cache::write(p, &cache_entry);
         }
         Ok(ggr_build_entity_summaries_interleaved(cache_entry, &diff))
+    }
+
+    fn caller_count(
+        &self,
+        entry_idx: usize,
+        entity_id: &local_review_core::semantic::EntityId,
+    ) -> Option<usize> {
+        if entry_idx == 0 {
+            return None;
+        }
+        let commit = self.pr.commits.get(entry_idx - 1)?;
+        let sha = commit.sha.as_str();
+        let owner_repo = self.pr.repo_name.as_str();
+        let cache_path =
+            ggr_entity_cache_base(owner_repo, self.pr.number, self.pr.hostname.as_deref())
+                .map(|base| local_review_core::semantic::cache::ggr_cache_path(&base, sha))?;
+        let entry = local_review_core::semantic::cache::read(&cache_path)
+            .ok()
+            .flatten()?;
+        let graph = entry.graph?;
+        let count = graph.edges.iter().filter(|e| &e.to == entity_id).count();
+        Some(count)
+    }
+
+    fn sort_entities_topo(
+        &self,
+        entry_idx: usize,
+        entities: &mut Vec<local_review_core::semantic::EntitySummary>,
+    ) {
+        if entry_idx == 0 {
+            return;
+        }
+        let Some(commit) = self.pr.commits.get(entry_idx - 1) else {
+            return;
+        };
+        let sha = commit.sha.as_str();
+        let owner_repo = self.pr.repo_name.as_str();
+        let Some(cache_path) =
+            ggr_entity_cache_base(owner_repo, self.pr.number, self.pr.hostname.as_deref())
+                .map(|base| local_review_core::semantic::cache::ggr_cache_path(&base, sha))
+        else {
+            return;
+        };
+        let Ok(Some(entry)) = local_review_core::semantic::cache::read(&cache_path) else {
+            return;
+        };
+        let Some(graph) = entry.graph else { return };
+        local_review_core::semantic::topo_sort_entities(entities, &graph);
     }
 
     fn has_pr_pane_toggle(&self, entry_idx: usize) -> bool {
@@ -2548,7 +2618,7 @@ fn enter_tui() -> Result<(Terminal<CrosstermBackend<Stdout>>, TuiGuard)> {
 
 // ── entry point ───────────────────────────────────────────────────────────────
 
-pub(crate) fn run(pr: PrDetails, stale_count: usize) -> Result<()> {
+pub(crate) fn run(pr: PrDetails, stale_count: usize, allow_graph_clone: bool) -> Result<()> {
     let size = crossterm::terminal::size().map_err(|source| GgrError::Io { source })?;
     if size.0 < MIN_COLS {
         return Err(GgrError::TerminalTooNarrow { cols: size.0 });
@@ -2558,7 +2628,7 @@ pub(crate) fn run(pr: PrDetails, stale_count: usize) -> Result<()> {
     }
     let cursor_path = cursor::cursor_path(&pr);
     let initial_cursor = cursor_path.as_deref().and_then(cursor::load);
-    let mut surface = GgrSurface::new(pr, initial_cursor.as_ref());
+    let mut surface = GgrSurface::new(pr, initial_cursor.as_ref(), allow_graph_clone);
     if stale_count > 0 {
         surface.pending_stale_message = Some(format!(
             "{stale_count} stale draft{} — press R to review",
@@ -2668,7 +2738,7 @@ mod tests {
 
     #[test]
     fn entry_count_includes_description_entry() {
-        let surface = GgrSurface::new(make_pr(), None);
+        let surface = GgrSurface::new(make_pr(), None, false);
         assert_eq!(surface.entry_count(), 3, "2 commits + 1 description entry");
     }
 
@@ -2676,39 +2746,39 @@ mod tests {
     fn entry_count_single_commit() {
         let mut pr = make_pr();
         pr.commits.truncate(1);
-        let surface = GgrSurface::new(pr, None);
+        let surface = GgrSurface::new(pr, None, false);
         assert_eq!(surface.entry_count(), 2);
     }
 
     #[test]
     fn entry_id_display_returns_description_for_index_0() {
-        let surface = GgrSurface::new(make_pr(), None);
+        let surface = GgrSurface::new(make_pr(), None, false);
         // Entry 0 defaults to description pane; the label reflects the pane.
         assert_eq!(surface.entry_id_display(0), "description");
     }
 
     #[test]
     fn entry_id_display_returns_short_sha_for_commits() {
-        let surface = GgrSurface::new(make_pr(), None);
+        let surface = GgrSurface::new(make_pr(), None, false);
         assert_eq!(surface.entry_id_display(1), "a3b4c5d6");
         assert_eq!(surface.entry_id_display(2), "b3b4c5d6");
     }
 
     #[test]
     fn entry_id_display_out_of_range_returns_empty() {
-        let surface = GgrSurface::new(make_pr(), None);
+        let surface = GgrSurface::new(make_pr(), None, false);
         assert_eq!(surface.entry_id_display(99), "");
     }
 
     #[test]
     fn entry_description_returns_pr_title_for_index_0() {
-        let surface = GgrSurface::new(make_pr(), None);
+        let surface = GgrSurface::new(make_pr(), None, false);
         assert_eq!(surface.entry_description(0), "PR title");
     }
 
     #[test]
     fn entry_description_returns_commit_title() {
-        let surface = GgrSurface::new(make_pr(), None);
+        let surface = GgrSurface::new(make_pr(), None, false);
         assert_eq!(surface.entry_description(1), "First commit");
     }
 
@@ -2716,7 +2786,7 @@ mod tests {
     fn entry_description_strips_control_chars_from_pr_title() {
         let mut pr = make_pr();
         pr.title = "\x1b[31mevil\x1b[0m".to_owned();
-        let surface = GgrSurface::new(pr, None);
+        let surface = GgrSurface::new(pr, None, false);
         let desc = surface.entry_description(0);
         assert!(
             !desc.chars().any(char::is_control),
@@ -2726,7 +2796,7 @@ mod tests {
 
     #[test]
     fn entry_description_out_of_range_returns_empty() {
-        let surface = GgrSurface::new(make_pr(), None);
+        let surface = GgrSurface::new(make_pr(), None, false);
         assert_eq!(surface.entry_description(99), "");
     }
 
@@ -2763,7 +2833,7 @@ mod tests {
     fn make_surface_with_thread(thread: ReviewThread) -> GgrSurface {
         let mut pr = make_pr();
         pr.review_threads.push(thread);
-        let mut surface = GgrSurface::new(pr, None);
+        let mut surface = GgrSurface::new(pr, None, false);
         surface.state = State::CommitDiff {
             index: 1,
             diff: Diff {
@@ -2778,7 +2848,7 @@ mod tests {
 
     #[test]
     fn inline_comments_for_view_returns_empty() {
-        let surface = GgrSurface::new(make_pr(), None);
+        let surface = GgrSurface::new(make_pr(), None, false);
         assert!(surface
             .inline_comments_for_view(std::time::SystemTime::UNIX_EPOCH, 0, None)
             .is_empty());
@@ -2789,7 +2859,7 @@ mod tests {
 
     #[test]
     fn threads_expanded_defaults_to_true() {
-        let surface = GgrSurface::new(make_pr(), None);
+        let surface = GgrSurface::new(make_pr(), None, false);
         assert!(
             surface.threads_expanded,
             "threads_expanded must be true after new()"
@@ -2798,7 +2868,7 @@ mod tests {
 
     #[test]
     fn handle_extra_key_t_expands_then_collapses() {
-        let mut surface = GgrSurface::new(make_pr(), None);
+        let mut surface = GgrSurface::new(make_pr(), None, false);
         assert!(surface.threads_expanded);
 
         let result = surface
@@ -2822,7 +2892,7 @@ mod tests {
 
     #[test]
     fn handle_extra_key_unknown_returns_ignored() {
-        let mut surface = GgrSurface::new(make_pr(), None);
+        let mut surface = GgrSurface::new(make_pr(), None, false);
         let result = surface
             .handle_extra_key(make_key(KeyCode::Char('x')), 0, 0, None)
             .unwrap();
@@ -2853,7 +2923,7 @@ mod tests {
 
     #[test]
     fn inline_comments_for_view_returns_empty_in_description_state() {
-        let surface = GgrSurface::new(make_pr(), None);
+        let surface = GgrSurface::new(make_pr(), None, false);
         assert!(surface
             .inline_comments_for_view(std::time::SystemTime::UNIX_EPOCH, 0, None)
             .is_empty());
@@ -2943,7 +3013,7 @@ mod tests {
         let mut pr = make_pr();
         pr.review_threads.push(thread_other);
         pr.review_threads.push(thread_match);
-        let mut surface = GgrSurface::new(pr, None);
+        let mut surface = GgrSurface::new(pr, None, false);
         surface.state = State::CommitDiff {
             index: 1,
             diff: Diff {
@@ -3223,7 +3293,7 @@ mod tests {
 
     #[test]
     fn inline_comments_for_view_empty_review_threads_returns_empty() {
-        let mut surface = GgrSurface::new(make_pr(), None);
+        let mut surface = GgrSurface::new(make_pr(), None, false);
         surface.state = State::CommitDiff {
             index: 1,
             diff: Diff {
@@ -3257,7 +3327,7 @@ mod tests {
 
     #[test]
     fn save_comment_empty_body_returns_refused() {
-        let mut surface = GgrSurface::new(make_pr(), None);
+        let mut surface = GgrSurface::new(make_pr(), None, false);
         set_commit_diff_state(&mut surface);
         let scope = ComposerScope::Change;
         let req = SaveRequest {
@@ -3275,7 +3345,7 @@ mod tests {
 
     #[test]
     fn save_comment_description_scope_returns_refused() {
-        let mut surface = GgrSurface::new(make_pr(), None);
+        let mut surface = GgrSurface::new(make_pr(), None, false);
         set_commit_diff_state(&mut surface);
         let scope = ComposerScope::Description(DescriptionContext {
             change_id: ChangeId::parse("a3b4c5d6").unwrap(),
@@ -3304,7 +3374,7 @@ mod tests {
         let prev = std::env::var("XDG_DATA_HOME").ok();
         std::env::set_var("XDG_DATA_HOME", dir.path());
 
-        let mut surface = GgrSurface::new(make_pr(), None);
+        let mut surface = GgrSurface::new(make_pr(), None, false);
         set_commit_diff_state(&mut surface);
         let scope = ComposerScope::Change;
         let req = SaveRequest {
@@ -3345,7 +3415,7 @@ mod tests {
         let prev = std::env::var("XDG_DATA_HOME").ok();
         std::env::set_var("XDG_DATA_HOME", dir.path());
 
-        let mut surface = GgrSurface::new(make_pr(), None);
+        let mut surface = GgrSurface::new(make_pr(), None, false);
         // PR scope does not require CommitDiff state.
         let stack = StackContextSnapshot {
             revset: "PR #42".to_owned(),
@@ -3388,7 +3458,7 @@ mod tests {
         let prev = std::env::var("XDG_DATA_HOME").ok();
         std::env::set_var("XDG_DATA_HOME", dir.path());
 
-        let mut surface = GgrSurface::new(make_pr(), None);
+        let mut surface = GgrSurface::new(make_pr(), None, false);
         set_commit_diff_state(&mut surface);
 
         let target = LineTarget {
@@ -3446,7 +3516,7 @@ mod tests {
         let prev = std::env::var("XDG_DATA_HOME").ok();
         std::env::set_var("XDG_DATA_HOME", dir.path());
 
-        let mut surface = GgrSurface::new(make_pr(), None);
+        let mut surface = GgrSurface::new(make_pr(), None, false);
         // Real-shape diff: one file with a hunk that contains line 42 in the
         // after-state, so `with_inline_comments` has a row to match against.
         let hunk = Hunk {
@@ -3552,7 +3622,7 @@ mod tests {
         let prev = std::env::var("XDG_DATA_HOME").ok();
         std::env::set_var("XDG_DATA_HOME", dir.path());
 
-        let mut surface = GgrSurface::new(make_pr(), None);
+        let mut surface = GgrSurface::new(make_pr(), None, false);
         set_commit_diff_state(&mut surface);
 
         let target = LineTarget {
@@ -3608,7 +3678,7 @@ mod tests {
         let prev = std::env::var("XDG_DATA_HOME").ok();
         std::env::set_var("XDG_DATA_HOME", dir.path());
 
-        let mut surface = GgrSurface::new(make_pr(), None);
+        let mut surface = GgrSurface::new(make_pr(), None, false);
         set_commit_diff_state(&mut surface);
         // Save a commit-scope draft first.
         let scope = ComposerScope::Change;
@@ -3649,7 +3719,7 @@ mod tests {
 
     #[test]
     fn update_comment_not_found_returns_refused() {
-        let mut surface = GgrSurface::new(make_pr(), None);
+        let mut surface = GgrSurface::new(make_pr(), None, false);
         set_commit_diff_state(&mut surface);
         let identity = CommentId::new(time::OffsetDateTime::UNIX_EPOCH);
         let req = UpdateRequest {
@@ -3667,7 +3737,7 @@ mod tests {
 
     #[test]
     fn update_comment_empty_body_returns_refused() {
-        let mut surface = GgrSurface::new(make_pr(), None);
+        let mut surface = GgrSurface::new(make_pr(), None, false);
         set_commit_diff_state(&mut surface);
         let identity = CommentId::new(time::OffsetDateTime::UNIX_EPOCH);
         let req = UpdateRequest {
@@ -3690,7 +3760,7 @@ mod tests {
         let prev = std::env::var("XDG_DATA_HOME").ok();
         std::env::set_var("XDG_DATA_HOME", dir.path());
 
-        let mut surface = GgrSurface::new(make_pr(), None);
+        let mut surface = GgrSurface::new(make_pr(), None, false);
         set_commit_diff_state(&mut surface);
         let scope = ComposerScope::Change;
         let req = SaveRequest {
@@ -3727,7 +3797,7 @@ mod tests {
 
     #[test]
     fn delete_comment_not_found_returns_refused() {
-        let mut surface = GgrSurface::new(make_pr(), None);
+        let mut surface = GgrSurface::new(make_pr(), None, false);
         set_commit_diff_state(&mut surface);
         let identity = CommentId::new(time::OffsetDateTime::UNIX_EPOCH);
         let req = DeleteRequest::new(identity, None);
@@ -3745,7 +3815,7 @@ mod tests {
         let prev = std::env::var("XDG_DATA_HOME").ok();
         std::env::set_var("XDG_DATA_HOME", dir.path());
 
-        let mut surface = GgrSurface::new(make_pr(), None);
+        let mut surface = GgrSurface::new(make_pr(), None, false);
         set_commit_diff_state(&mut surface);
 
         let scope = ComposerScope::Change;
@@ -3780,20 +3850,20 @@ mod tests {
 
     #[test]
     fn is_view_reviewed_returns_false() {
-        let surface = GgrSurface::new(make_pr(), None);
+        let surface = GgrSurface::new(make_pr(), None, false);
         assert!(!surface.is_view_reviewed(0));
         assert!(!surface.is_view_reviewed(1));
     }
 
     #[test]
     fn severity_histogram_returns_default_with_no_drafts() {
-        let surface = GgrSurface::new(make_pr(), None);
+        let surface = GgrSurface::new(make_pr(), None, false);
         assert_eq!(surface.severity_histogram(), SeverityHistogram::default());
     }
 
     #[test]
     fn help_screen_title_is_ggr() {
-        let surface = GgrSurface::new(make_pr(), None);
+        let surface = GgrSurface::new(make_pr(), None, false);
         assert_eq!(surface.help_screen_title(), "ggr · keybindings");
     }
 
@@ -3804,7 +3874,7 @@ mod tests {
             author: "alice".to_owned(),
             body: "great PR!".to_owned(),
         });
-        let surface = GgrSurface::new(pr, None);
+        let surface = GgrSurface::new(pr, None, false);
         let text = surface.pr_description_text();
         assert!(text.contains("PR title"), "must contain title");
         assert!(text.contains("PR body"), "must contain body");
@@ -3819,7 +3889,7 @@ mod tests {
             author: "alice".to_owned(),
             body: "\x1b[31mmalicious\x1b[0m content".to_owned(),
         });
-        let surface = GgrSurface::new(pr, None);
+        let surface = GgrSurface::new(pr, None, false);
         let text = surface.pr_description_text();
         let has_non_newline_control = text
             .chars()
@@ -3838,7 +3908,7 @@ mod tests {
             author: "alice".to_owned(),
             body: "first line\nsecond line".to_owned(),
         });
-        let surface = GgrSurface::new(pr, None);
+        let surface = GgrSurface::new(pr, None, false);
         let text = surface.pr_description_text();
         assert!(text.contains("line one"), "body line one must be present");
         assert!(text.contains("line two"), "body line two must be present");
@@ -3852,7 +3922,7 @@ mod tests {
 
     #[test]
     fn file_picker_entries_for_description_page_returns_one_entry() {
-        let surface = GgrSurface::new(make_pr(), None);
+        let surface = GgrSurface::new(make_pr(), None, false);
         let entries = surface.file_picker_entries();
         assert_eq!(
             entries.len(),
@@ -3864,7 +3934,7 @@ mod tests {
 
     #[test]
     fn fetch_views_index_zero_returns_description_view() {
-        let mut surface = GgrSurface::new(make_pr(), None);
+        let mut surface = GgrSurface::new(make_pr(), None, false);
         let views = surface.fetch_views(0).expect("fetch_views(0) must succeed");
         assert_eq!(
             views.len(),
@@ -3880,7 +3950,7 @@ mod tests {
 
     #[test]
     fn fetch_views_out_of_range_returns_err() {
-        let mut surface = GgrSurface::new(make_pr(), None);
+        let mut surface = GgrSurface::new(make_pr(), None, false);
         let count = surface.entry_count();
         let result = surface.fetch_views(count);
         assert!(result.is_err(), "out-of-range fetch_views must return Err");
@@ -3890,7 +3960,7 @@ mod tests {
     fn pr_description_text_with_empty_body_has_no_extra_newlines() {
         let mut pr = make_pr();
         pr.body = String::new();
-        let surface = GgrSurface::new(pr, None);
+        let surface = GgrSurface::new(pr, None, false);
         let text = surface.pr_description_text();
         assert_eq!(
             text, "PR title",
@@ -3908,7 +3978,7 @@ mod tests {
         let prev = std::env::var("XDG_DATA_HOME").ok();
         std::env::set_var("XDG_DATA_HOME", dir.path());
 
-        let mut surface = GgrSurface::new(make_pr(), None);
+        let mut surface = GgrSurface::new(make_pr(), None, false);
         set_commit_diff_state(&mut surface);
 
         // Save a draft so there's something to delete.
@@ -3962,7 +4032,7 @@ mod tests {
         let prev = std::env::var("XDG_DATA_HOME").ok();
         std::env::set_var("XDG_DATA_HOME", dir.path());
 
-        let mut surface = GgrSurface::new(make_pr(), None);
+        let mut surface = GgrSurface::new(make_pr(), None, false);
         set_commit_diff_state(&mut surface);
 
         let scope = ComposerScope::Change;
@@ -4124,7 +4194,7 @@ mod tests {
 
     #[test]
     fn delete_comment_returns_refused_when_no_drafts() {
-        let mut surface = GgrSurface::new(make_pr(), None);
+        let mut surface = GgrSurface::new(make_pr(), None, false);
         let identity = CommentId::new(time::OffsetDateTime::UNIX_EPOCH);
         let req = DeleteRequest::new(identity, None);
         let result = surface
@@ -4140,7 +4210,7 @@ mod tests {
     fn entry_count_zero_commits_returns_one() {
         let mut pr = make_pr();
         pr.commits.clear();
-        let surface = GgrSurface::new(pr, None);
+        let surface = GgrSurface::new(pr, None, false);
         assert_eq!(
             surface.entry_count(),
             1,
@@ -4150,7 +4220,7 @@ mod tests {
 
     #[test]
     fn fetch_views_zero_resets_to_description_page() {
-        let mut surface = GgrSurface::new(make_pr(), None);
+        let mut surface = GgrSurface::new(make_pr(), None, false);
         // Start in CommitDiff state to prove that fetch_views(0) actually resets it.
         surface.state = State::CommitDiff {
             index: 1,
@@ -4172,7 +4242,7 @@ mod tests {
 
     #[test]
     fn fetch_views_on_zero_commit_pr_returns_err() {
-        let mut surface = GgrSurface::new(make_pr_zero_commits(), None);
+        let mut surface = GgrSurface::new(make_pr_zero_commits(), None, false);
         let count = surface.entry_count();
         assert_eq!(count, 1, "zero-commit PR has one entry (description only)");
         let result = surface.fetch_views(1);
@@ -4184,7 +4254,7 @@ mod tests {
 
     #[test]
     fn fetch_views_out_of_range_leaves_state_intact() {
-        let mut surface = GgrSurface::new(make_pr(), None);
+        let mut surface = GgrSurface::new(make_pr(), None, false);
         // Pre-load a CommitDiff state to prove it is not clobbered on Err.
         surface.state = State::CommitDiff {
             index: 1,
@@ -4201,7 +4271,7 @@ mod tests {
 
     #[test]
     fn toggle_view_reviewed_returns_not_tracked() {
-        let mut surface = GgrSurface::new(make_pr(), None);
+        let mut surface = GgrSurface::new(make_pr(), None, false);
         assert_eq!(
             surface.toggle_view_reviewed(0),
             ReviewedOutcome::NotTracked,
@@ -4211,7 +4281,7 @@ mod tests {
 
     #[test]
     fn file_picker_entries_for_commit_diff_state_returns_description_plus_files() {
-        let mut surface = GgrSurface::new(make_pr(), None);
+        let mut surface = GgrSurface::new(make_pr(), None, false);
         let diff = Diff {
             files: vec![
                 DiffFile::Modified {
@@ -4246,7 +4316,7 @@ mod tests {
     fn entry_description_strips_control_chars_from_commit_title() {
         let mut pr = make_pr();
         pr.commits[0].title = "\x1b[31mevil\x1b[0m".to_owned();
-        let surface = GgrSurface::new(pr, None);
+        let surface = GgrSurface::new(pr, None, false);
         let desc = surface.entry_description(1);
         assert!(
             !desc.chars().any(char::is_control),
@@ -4258,7 +4328,7 @@ mod tests {
 
     #[test]
     fn current_cursor_state_returns_none_in_description_state() {
-        let surface = GgrSurface::new(make_pr(), None);
+        let surface = GgrSurface::new(make_pr(), None, false);
         // Default state is Description; must return None regardless of file/line.
         assert!(surface.current_cursor_state(0, 0).is_none());
         assert!(surface.current_cursor_state(1, 5).is_none());
@@ -4266,7 +4336,7 @@ mod tests {
 
     #[test]
     fn current_cursor_state_at_file_index_zero_saves_empty_file() {
-        let mut surface = GgrSurface::new(make_pr(), None);
+        let mut surface = GgrSurface::new(make_pr(), None, false);
         surface.state = State::CommitDiff {
             index: 1,
             diff: Diff {
@@ -4287,7 +4357,7 @@ mod tests {
     #[test]
     fn current_cursor_state_oob_file_index_aliases_to_description_sentinel() {
         // App-layer clamping prevents this in production; the test documents the aliasing.
-        let mut surface = GgrSurface::new(make_pr(), None);
+        let mut surface = GgrSurface::new(make_pr(), None, false);
         surface.state = State::CommitDiff {
             index: 1,
             diff: Diff {
@@ -4308,7 +4378,7 @@ mod tests {
     fn current_cursor_state_commit_diff_saves_correct_sha_and_file() {
         let pr = make_pr();
         let expected_sha = pr.commits[0].sha.as_str().to_owned();
-        let mut surface = GgrSurface::new(pr, None);
+        let mut surface = GgrSurface::new(pr, None, false);
         surface.state = State::CommitDiff {
             index: 1,
             diff: Diff {
@@ -4343,7 +4413,7 @@ mod tests {
         let pr = make_pr();
         let sha = pr.commits[0].sha.as_str().to_owned();
         let cursor = make_cursor_state(&sha, "src/lib.rs", 5);
-        let surface = GgrSurface::new(pr, Some(&cursor));
+        let surface = GgrSurface::new(pr, Some(&cursor), false);
         assert_eq!(
             surface.current_entry_index(),
             1,
@@ -4356,7 +4426,7 @@ mod tests {
         let pr = make_pr();
         let sha = pr.commits[0].sha.as_str().to_owned();
         let cursor = make_cursor_state(&sha, "src/lib.rs", 10);
-        let surface = GgrSurface::new(pr, Some(&cursor));
+        let surface = GgrSurface::new(pr, Some(&cursor), false);
         assert_eq!(
             surface.pending_cursor,
             Some(("src/lib.rs".to_owned(), 10)),
@@ -4373,7 +4443,7 @@ mod tests {
     fn new_with_cursor_unmatched_sha_sets_pending_to_none_index() {
         let pr = make_pr();
         let cursor = make_cursor_state(&"0".repeat(40), "src/lib.rs", 3);
-        let surface = GgrSurface::new(pr, Some(&cursor));
+        let surface = GgrSurface::new(pr, Some(&cursor), false);
         assert_eq!(
             surface.pending_initial_index, None,
             "unknown SHA must leave pending_initial_index as None"
@@ -4388,7 +4458,7 @@ mod tests {
 
     #[test]
     fn initial_view_position_returns_zero_zero_when_no_cursor() {
-        let mut surface = GgrSurface::new(make_pr(), None);
+        let mut surface = GgrSurface::new(make_pr(), None, false);
         assert_eq!(surface.initial_view_position(), (0, 0));
     }
 
@@ -4398,7 +4468,7 @@ mod tests {
         let pr = make_pr();
         let sha = pr.commits[0].sha.as_str().to_owned();
         let cursor = make_cursor_state(&sha, "src/foo.rs", 5);
-        let mut surface = GgrSurface::new(pr, Some(&cursor));
+        let mut surface = GgrSurface::new(pr, Some(&cursor), false);
         // state remains Description; initial_view_position must fall back to (0,0)
         assert_eq!(surface.initial_view_position(), (0, 0));
     }
@@ -4408,7 +4478,7 @@ mod tests {
         let pr = make_pr();
         let sha = pr.commits[0].sha.as_str().to_owned();
         let cursor = make_cursor_state(&sha, "src/foo.rs", 9);
-        let mut surface = GgrSurface::new(pr, Some(&cursor));
+        let mut surface = GgrSurface::new(pr, Some(&cursor), false);
         surface.state = State::CommitDiff {
             index: 1,
             diff: Diff {
@@ -4429,7 +4499,7 @@ mod tests {
             let pr = make_pr();
             let sha = pr.commits[0].sha.as_str().to_owned();
             let cursor = make_cursor_state(&sha, file, line);
-            let mut surface = GgrSurface::new(pr, Some(&cursor));
+            let mut surface = GgrSurface::new(pr, Some(&cursor), false);
             surface.state = State::CommitDiff {
                 index: 1,
                 diff: Diff {
@@ -4464,7 +4534,7 @@ mod tests {
         let pr = make_pr();
         let sha = pr.commits[0].sha.as_str().to_owned();
         let cursor = make_cursor_state(&sha, "src/foo.rs", 4);
-        let mut surface = GgrSurface::new(pr, Some(&cursor));
+        let mut surface = GgrSurface::new(pr, Some(&cursor), false);
         surface.state = State::CommitDiff {
             index: 1,
             diff: Diff {
@@ -4490,7 +4560,7 @@ mod tests {
         let sha = pr.commits[0].sha.as_str().to_owned();
         let stripped_name = "src/file.rs";
         let cursor = make_cursor_state(&sha, stripped_name, 3);
-        let mut surface = GgrSurface::new(pr, Some(&cursor));
+        let mut surface = GgrSurface::new(pr, Some(&cursor), false);
         surface.state = State::CommitDiff {
             index: 1,
             diff: Diff {
@@ -4523,7 +4593,7 @@ mod tests {
         let pr = make_pr(); // 2 commits → entry_count() == 3
         let sha = pr.commits[0].sha.as_str().to_owned();
         let cursor = make_cursor_state(&sha, "src/lib.rs", 5);
-        let mut surface = GgrSurface::new(pr, Some(&cursor));
+        let mut surface = GgrSurface::new(pr, Some(&cursor), false);
 
         // Startup: pending drives index = 1.
         assert_eq!(surface.current_entry_index(), 1);
@@ -4554,7 +4624,7 @@ mod tests {
         // load_entry and sets the real commit diff; overwriting it with an
         // empty placeholder breaks inline-comment lookup and entity counts.
         let pr = make_pr();
-        let mut surface = GgrSurface::new(pr, None);
+        let mut surface = GgrSurface::new(pr, None, false);
         // Simulate fetch_views having set CommitDiff with real data.
         surface.state = State::CommitDiff {
             index: 1,
