@@ -2,157 +2,187 @@
 
 **Review GitHub pull requests commit-by-commit in your terminal.**
 
-A PR is a stack of commits. `ggr` treats it that way: open a PR by number or
-URL, walk each commit's diff oldest-to-newest, draft inline comments locally,
-then submit everything as a single GitHub review. No browser required.
+`ggr` opens a PR, extracts changed entities (functions, methods, structs, …)
+across all commits using tree-sitter, sorts them in dependency-first order, and
+lets you draft inline comments locally. When you're done, `S` posts everything
+as a single GitHub review.
 
-`ggr` is part of the
-[local-review](https://github.com/ericbmerritt/local-review) workspace alongside
-`jjr` (pre-push stack review). Both share the same TUI, comment model, and
-anchoring engine. The difference is the source of truth (`gh` instead of `jj`)
-and the submission target (GitHub PR review API instead of Claude).
+Part of the [local-review](https://github.com/ericbmerritt/local-review)
+workspace alongside `jjr` (pre-push stack review).
 
 ## Install
 
 ```sh
 brew install ericbmerritt/jjr/ggr
-```
-
-`cargo install ggr` will work once the crate is published to crates.io; the
-binary is not on crates.io yet. To install from source meanwhile:
-
-```sh
+# or from source:
 cargo install --path crates/ggr
 ```
 
-Requires [`gh`](https://cli.github.com) authenticated to GitHub (or GitHub
-Enterprise Server).
+Requires [`gh`](https://cli.github.com) authenticated to GitHub or GitHub
+Enterprise Server.
 
 ## Usage
 
 ```sh
-# Auto-detect repo from the current directory's git remote
-ggr 42
-
-# Explicit repo — works from any directory
-ggr acme/myrepo#2429
-
-# GitHub Enterprise Server
-ggr --url https://github.example.com acme/myrepo#2429
-
-# Paste a full pull URL from the browser
-ggr https://github.com/owner/repo/pull/2429
+ggr 42                                          # auto-detect repo from git remote
+ggr acme/myrepo#2429                            # explicit repo, any directory
+ggr --url https://github.example.com owner/repo#2429   # GHE
+ggr https://github.com/owner/repo/pull/2429    # full URL
 ```
 
 ## Review workflow
 
-1. **Open a PR.** `ggr 42` fetches the PR, re-anchors any drafts from your last
-   session, and opens the description page. Existing GitHub review threads
-   render inline below their anchor lines.
+### 1. Open a PR
 
-2. **Walk the commits.** `n` / `p` move between commits (oldest first) and the
-   description page. `Tab` / `Shift-Tab` jump between files. `f` opens the file
-   picker.
+`ggr 42` fetches the PR, re-anchors any saved drafts, and opens the
+**description page** for entry 0 — the PR title, body, and PR-level comments,
+scrollable with `j`/`k`.
 
-3. **Draft comments.** With the cursor on a diff line:
-   - `c` or `Enter` — line-scoped comment
-   - `m` — commit-scoped comment (goes in the review body as an attribution
-     block)
-   - `P` — PR-scoped comment (goes in the review body verbatim)
-   - `r` — reply to an existing GitHub review thread (cursor must be on a
-     thread)
-   - `e` — edit a draft you wrote earlier
-   - In the composer, `Ctrl-X` saves, `Ctrl-D` deletes, `Esc` cancels.
-   - Severity: `M-r` required · `M-s` suggestion · `M-n` note (default)
+Press `e` to switch to the **entity pane** — an aggregated list of every entity
+changed across all commits, deduplicated and sorted dependency-first:
 
-4. **Submit.** `S` opens a verdict modal:
-   - `a` — Approve
-   - `r` — Request changes
-   - `c` or `Enter` — Comment (requires at least one non-stale draft or reply)
-   - `Esc` — Cancel
-
-   On submit, `ggr` posts one `POST /reviews` call covering all inline comments,
-   then fans out reply calls serially. Stale drafts are excluded. On full
-   success all drafts are cleared; on partial failure (a reply failed) the
-   posted drafts are cleared and the remaining stay on disk for retry.
-
-5. **Re-review after force-push.** Press `R` to re-fetch the current PR state
-   and re-anchor your drafts. Drafts whose commit SHA is gone from the PR are
-   re-anchored via commit-subject matching; if no unique successor exists they
-   go stale. The stale panel lists them with reasons; `d` deletes a stale draft,
-   `Esc` dismisses.
-
-## CLI subcommands
-
-```sh
-# List all local drafts for a PR
-ggr drafts 42
-ggr drafts acme/repo#42
-
-# Clear all local drafts (use --stale to clear only stale ones)
-ggr clear 42
-ggr clear 42 --stale
 ```
+  Δ authenticate()          src/auth/login.rs :42-78    fn · sig+body    8 callers
+  ⊕ UserToken               src/auth/token.rs :12-28    struct · added
+  Δ session_parse()         src/db/session.rs :90-115   fn · body         2 callers
+```
+
+Press `e` again to return to the description. Press `n` / `p` to walk the
+individual commits (oldest first).
+
+### 2. Read entities per commit
+
+Each per-commit screen (entries 1..N) opens on the same entity list as the PR
+overview, but scoped to that commit's changes:
+
+```
+  Δ authenticate()          src/auth/login.rs :42-78    fn · sig+body    8 callers
+  ⊕ UserToken               src/auth/token.rs :12-28    struct · added
+  Δ session_parse()         src/db/session.rs :90-115   fn · body         2 callers
+```
+
+Columns scale with terminal width: name, file path with directory context, line
+range, caller count (requires dependency graph — see below), change annotation.
+Sorted dependency-first by default; `o` toggles to file+line order. Cosmetic
+entities (whitespace / comment-only changes) are dimmed; `;` hides them.
+
+`Enter` opens a focused entity diff — the full file diff pre-scrolled to the
+entity — with a passive status bar:
+`authenticate() modified · sig+body · called from 8 places`
+
+`Tab` / `Shift-Tab` cycle entities. `F` opens the file list. `x` clips the diff
+to just the entity's lines.
+
+### 3. Draft comments
+
+With the cursor on a diff line:
+
+| Key           | Action                          |
+| ------------- | ------------------------------- |
+| `c` / `Enter` | New line-scoped comment         |
+| `m`           | New commit-scoped comment       |
+| `P`           | New PR-scoped comment           |
+| `r`           | Reply to a GitHub review thread |
+| `e`           | Edit a draft you wrote earlier  |
+
+In the composer: `Ctrl-X` saves, `Ctrl-D` deletes, `Esc` cancels.\
+Severity: `M-r` required · `M-s` suggestion · `M-n` note (default).
+
+### 4. Submit
+
+`S` opens the verdict modal from any screen:
+
+- `a` — Approve
+- `r` — Request changes
+- `c` / `Enter` — Comment (needs at least one non-stale draft or reply)
+- `Esc` — Cancel
+
+`ggr` posts one `POST /reviews` call with all inline comments, then fans out
+reply calls. Stale drafts are excluded. On success all drafts are cleared; on
+partial failure, posted drafts are cleared and failed ones remain for retry.
+
+### 5. Refresh after force-push
+
+`R` re-fetches the current PR state and re-anchors drafts. Drafts whose commit
+SHA is gone from the PR are matched by commit subject; if no unique successor
+exists they go stale.
 
 ## Keybindings
 
-### Main view
+### Entity list and description page
 
-| Key                    | Action                                            |
-| ---------------------- | ------------------------------------------------- |
-| `↑` `↓` / `j` `k`      | Scroll line                                       |
-| `PgUp` `PgDn`          | Scroll page                                       |
-| `Home` `g` / `End` `G` | Top / bottom                                      |
-| `Tab` / `Shift-Tab`    | Next / previous file                              |
-| `n` / `p`              | Next / previous commit (or description)           |
-| `c` / `Enter`          | New line-scoped comment                           |
-| `m`                    | New commit-scoped comment                         |
-| `P`                    | New PR-scoped comment                             |
-| `r`                    | Reply to thread on current line                   |
-| `e`                    | Edit draft on current line                        |
-| `T`                    | Toggle thread expand/collapse                     |
-| `S`                    | Submit (opens verdict modal)                      |
-| `R`                    | Refresh — re-fetch PR state and re-anchor drafts  |
-| `f`                    | File picker                                       |
-| `\|`                   | Cycle diff layout (auto / unified / side-by-side) |
-| `?`                    | Help                                              |
-| `q`                    | Quit                                              |
+| Key                 | Action                                          |
+| ------------------- | ----------------------------------------------- |
+| `j` `k` / `↑` `↓`   | Move cursor / scroll                            |
+| `Enter`             | Open entity diff (or PR description for row 0)  |
+| `Tab` / `Shift-Tab` | Next / previous entity (cursor)                 |
+| `e`                 | Toggle description ↔ entity pane (entry 0 only) |
+| `F`                 | File list                                       |
+| `n` / `p`           | Next / previous commit                          |
+| `1` / `2` / `3`     | Severity filter                                 |
+| `;`                 | Toggle cosmetic entity visibility               |
+| `o`                 | Toggle sort: dependency order ↔ file order      |
+| `S`                 | Submit (verdict modal)                          |
+| `R`                 | Refresh — re-fetch PR, re-anchor drafts         |
+| `?`                 | Help                                            |
+| `q`                 | Quit                                            |
 
-### Composer (when writing a comment)
+### Entity diff view
 
-| Key      | Action                                    |
-| -------- | ----------------------------------------- |
-| `M-l`    | Scope: line (default when on a diff line) |
-| `M-c`    | Scope: change / commit                    |
-| `M-k`    | Scope: PR (same as `P` from main view)    |
-| `M-r`    | Severity: required                        |
-| `M-s`    | Severity: suggestion                      |
-| `M-n`    | Severity: note (default)                  |
-| `Ctrl-X` | Save                                      |
-| `Ctrl-D` | Delete (when editing an existing draft)   |
-| `Esc`    | Cancel                                    |
+| Key                 | Action                                             |
+| ------------------- | -------------------------------------------------- |
+| `j` `k` / `↑` `↓`   | Scroll line                                        |
+| `PgUp` `PgDn`       | Scroll page                                        |
+| `g` `G`             | Top / bottom                                       |
+| `Tab` / `Shift-Tab` | Next / previous entity's diff                      |
+| `x`                 | Toggle entity-clip (entity lines only ↔ full file) |
+| `F`                 | File list                                          |
+| `n` / `p`           | Next / previous commit                             |
+| `c` / `Enter`       | New line comment                                   |
+| `m`                 | New commit-scoped comment                          |
+| `r`                 | Reply to thread                                    |
+| `e`                 | Edit draft                                         |
+| `T`                 | Toggle thread expand/collapse                      |
+| `\|`                | Cycle diff layout: auto / unified / side-by-side   |
+| `Esc` / `q`         | Return to entity list                              |
+
+## Dependency graph
+
+For richer entity ordering and caller counts in the status bar, `ggr` can clone
+the PR's repository to `/tmp/ggr-repos/<host>/<owner>/<repo>/` (shallow, reused
+across sessions) and build a cross-file call graph.
+
+The clone is read-only. Only tree-sitter parses run against it; no code is
+executed. Disable if you prefer not to download code:
+
+```sh
+ggr --no-graph 42          # disable for this invocation
+GGR_NO_GRAPH_CLONE=1 ggr 42  # disable via env
+```
 
 ## Comment scopes and severity
 
 **Scopes:**
 
-- **Line** — anchored to a specific line in a specific file in a specific
-  commit. Renders inline below the anchor line.
-- **Commit** — anchored to a whole commit. Folded into the review body as a
-  quoted attribution block: `> Commit abc1234 — "commit title"`.
-- **PR** — anchored to the whole PR. Rendered verbatim in the review body.
+- **Line** — anchored to a specific diff line; renders inline.
+- **Commit** — anchored to a whole commit; folded into the review body.
+- **PR** — anchored to the whole PR; rendered verbatim in the review body.
 
-**Severity** becomes the first line of the submitted comment body, matching
-`jjr`'s format for cross-tool consistency:
+**Severity** prefixes each submitted comment (`[REQUIRED]` / `[SUGGESTION]` /
+`[NOTE]`), matching `jjr`'s format for cross-tool consistency.
 
-- `[REQUIRED]` — must be addressed
-- `[SUGGESTION]` — should be addressed when safe
-- `[NOTE]` — informational
+## CLI subcommands
+
+```sh
+ggr drafts 42                # list local drafts for a PR
+ggr clear 42                 # clear all drafts
+ggr clear 42 --stale         # clear only stale drafts
+```
 
 ## Draft storage
 
-Drafts live in `~/.local/share/ggr/<host>/<owner>/<repo>/<pr>/` and are never
-shared or committed. Nothing reaches GitHub until you press `S`.
+`~/.local/share/ggr/<host>/<owner>/<repo>/<pr>/` — local only, never committed.
+Nothing reaches GitHub until you press `S`.
 
 ## License
 

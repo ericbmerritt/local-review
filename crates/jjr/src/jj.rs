@@ -256,21 +256,27 @@ pub fn parent_rev(change_id: &ChangeId) -> String {
     format!("{}-", change_id.as_str())
 }
 
-/// List every tracked file at the given revision, as repo-relative paths.
+/// List every tracked file at the given revision under `subtree`, as
+/// repo-relative paths.
 ///
-/// Used by the graph builder, which needs the full repo file set (not just
-/// the diff files) so cross-file `caller → callee` edges can resolve.
-/// `jj files -r REV` respects `.gitignore` / `.jjignore` and excludes the
-/// internal `.jj/` directory; nothing further to filter.
+/// `subtree` scopes the listing to a subdirectory (e.g. the common ancestor
+/// of all changed files). This is critical for monorepos: without scoping,
+/// `jj files` lists the entire repository and `build_graph` would parse
+/// every file across all stacks, making graph construction prohibitively
+/// slow.
 ///
-/// Best-effort: an empty list is returned when `jj files` fails (binary
-/// missing, revision unresolvable, etc.) so the caller can degrade
-/// gracefully — a missing file list means an empty graph, which means the
-/// Claude bundle drops its deps / dependents sections rather than blocking
-/// the reviewer.
-pub fn list_tracked_files(rev: &str, repo_root: &std::path::Path) -> Vec<std::path::PathBuf> {
+/// Pass `subtree = Path::new(".")` to list the full repo (single-project
+/// repositories where the entire tree is relevant).
+///
+/// Best-effort: an empty list is returned when `jj files` fails.
+pub fn list_tracked_files(
+    rev: &str,
+    repo_root: &std::path::Path,
+    subtree: &std::path::Path,
+) -> Vec<std::path::PathBuf> {
+    let subtree_str = subtree.to_string_lossy();
     let output = Command::new("jj")
-        .args(["files", "-r", rev])
+        .args(["files", "-r", rev, subtree_str.as_ref()])
         .current_dir(repo_root)
         .output();
     let Ok(output) = output else {

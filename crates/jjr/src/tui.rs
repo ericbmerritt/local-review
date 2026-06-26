@@ -838,14 +838,15 @@ impl ReviewSurface for JjrSurface {
         // degraded bundle, not a hard error. Inline here (no streaming) is
         // fine — the sync path is only hit when the surface skips the async
         // extraction (cache miss without a worker).
-        let graph = jj::list_tracked_files(change_id.as_str(), &self.repo_root);
-        let graph = if graph.is_empty() {
+        let subtree = diff_subtree(&diff);
+        let files = jj::list_tracked_files(change_id.as_str(), &self.repo_root, &subtree);
+        let graph = if files.is_empty() {
             None
         } else {
             Some(local_review_core::semantic::build_graph(
                 &registry,
                 &self.repo_root,
-                &graph,
+                &files,
             ))
         };
         let cache_entry = local_review_core::semantic::cache::CacheEntry {
@@ -924,6 +925,8 @@ impl ReviewSurface for JjrSurface {
         entry_idx: usize,
         entity_id: &local_review_core::semantic::EntityId,
     ) -> Option<usize> {
+        // Called by the entity diff status bar on each cursor move — not per
+        // frame, so one cache read here is acceptable.
         let change_id = self.entry_change_id(entry_idx).ok()?;
         let details = jj::show(&change_id).ok()?;
         let commit_id = details.commit_id.as_str().to_owned();
@@ -937,8 +940,7 @@ impl ReviewSurface for JjrSurface {
             .ok()
             .flatten()?;
         let graph = entry.graph?;
-        let count = graph.edges.iter().filter(|e| &e.to == entity_id).count();
-        Some(count)
+        Some(graph.edges.iter().filter(|e| &e.to == entity_id).count())
     }
 
     fn inline_comments_for_view(
@@ -5999,9 +6001,27 @@ impl local_review_core::tui::entity_list::ExtractionRunner for JjrExtractionTask
             &commit_id,
         );
 
-        // Cache hit: skip the per-file work entirely.
+        // Cache hit: skip per-file extraction but build graph if the cached
+        // entry lacks one (entries written before graph support was added).
         if let Ok(Some(entry)) = cache::read(&cache_path) {
+            let has_graph = entry.graph.is_some();
             emit_cache_hit(&tx, entry, &details.diff);
+            if !has_graph {
+                let subtree = diff_subtree(&details.diff);
+                let graph = build_graph_scoped(
+                    &local_review_core::semantic::create_default_registry(),
+                    &self.repo_root,
+                    self.change_id.as_str(),
+                    &subtree,
+                );
+                // Update the cache so the graph is present on the next open.
+                if let Some(g) = graph {
+                    if let Ok(Some(mut cached)) = cache::read(&cache_path) {
+                        cached.graph = Some(g);
+                        let _ = cache::write(&cache_path, &cached);
+                    }
+                }
+            }
             return;
         }
 
@@ -6118,10 +6138,12 @@ fn extract_and_emit(
     // triggers Claude before the cache is written, the bundle simply drops
     // its deps / dependents sections.
     let _ = tx.send(ExtractionEvent::Complete);
-    let graph = build_graph_best_effort(
+    let subtree = diff_subtree(diff);
+    let graph = build_graph_scoped(
         &local_review_core::semantic::create_default_registry(),
         &task.repo_root,
         task.change_id.as_str(),
+        &subtree,
     );
     let cache_entry = CacheEntry {
         schema_version: SCHEMA_VERSION,
@@ -6138,18 +6160,46 @@ fn extract_and_emit(
 /// it means the bundle drops deps / dependents, not that the reviewer is
 /// blocked. An empty file list (jj missing, revision unresolvable, etc.)
 /// is treated the same as graph-build failure.
-fn build_graph_best_effort(
+/// Build the graph scoped to `subtree` within the repo. Used by callers that
+/// know the relevant subdirectory (e.g. the common ancestor of the diff files)
+/// so we don't parse the entire repo in monorepo setups.
+fn build_graph_scoped(
     registry: &local_review_core::semantic::ExtractorRegistry,
     repo_root: &std::path::Path,
     change_id: &str,
+    subtree: &std::path::Path,
 ) -> Option<local_review_core::semantic::GraphData> {
-    let files = jj::list_tracked_files(change_id, repo_root);
+    let files = jj::list_tracked_files(change_id, repo_root, subtree);
     if files.is_empty() {
         return None;
     }
     Some(local_review_core::semantic::build_graph(
         registry, repo_root, &files,
     ))
+}
+
+/// Return the deepest common ancestor directory of all diff file paths, or
+/// `"."` when the diff is empty or files span the repo root.
+fn diff_subtree(diff: &local_review_core::diff::Diff) -> PathBuf {
+    let mut components: Option<Vec<std::path::Component<'_>>> = None;
+    for file in &diff.files {
+        let path = file.display_path();
+        let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+        let parts: Vec<_> = parent.components().collect();
+        components = Some(match components {
+            None => parts,
+            Some(existing) => existing
+                .into_iter()
+                .zip(parts)
+                .take_while(|(a, b)| a == b)
+                .map(|(a, _)| a)
+                .collect(),
+        });
+    }
+    match components {
+        Some(parts) if !parts.is_empty() => parts.iter().collect(),
+        _ => PathBuf::from("."),
+    }
 }
 
 fn extract_file_entities(

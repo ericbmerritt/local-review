@@ -78,10 +78,18 @@ pub trait ExtractionRunner: Send + 'static {
 
 // ── Entity list rendering ─────────────────────────────────────────────────────
 
-const SIGIL_PAD: usize = 5; // "  Δ  " — 2-char indent + 2-char sigil + space
-const NAME_MAX: usize = 28;
-const FILE_MAX: usize = 15;
-const ANNOT_MAX: usize = 20;
+const SIGIL_WIDTH: usize = 5; // "  Δ  " — 2-char indent + 2-char sigil + space
+const GAP: usize = 2;
+// Minimum column widths (used when the terminal is narrow).
+const NAME_MIN: usize = 20;
+const FILE_MIN: usize = 12;
+const ANNOT_MIN: usize = 14;
+// Maximum column widths (the column stops expanding past these even if space allows).
+const NAME_MAX: usize = 52;
+const FILE_MAX: usize = 40;
+const ANNOT_MAX: usize = 22;
+// Widths of the optional extras.
+const RANGE_WIDTH: usize = 10; // ":NNN-NNN  " e.g. ":42-78  "
 
 fn entity_sigil(e: &EntitySummary) -> (&'static str, Color) {
     match e.change {
@@ -169,8 +177,46 @@ struct EntityRowCtx<'a> {
     comment_indicator: bool,
 }
 
-/// Render one entity row at `y` into the given area.
-/// Build the text line for one entity row, suitable for Paragraph rendering.
+/// Column widths resolved for one row at a given terminal width.
+struct RowLayout {
+    name_width: usize,
+    file_width: usize,
+    annot_width: usize,
+    show_range: bool,
+}
+
+impl RowLayout {
+    fn new(width: usize, suffix_chars: usize) -> Self {
+        let fixed = SIGIL_WIDTH + GAP + GAP + ANNOT_MIN + suffix_chars;
+        let budget = width.saturating_sub(fixed);
+
+        let name_width = (budget / 2).clamp(NAME_MIN, NAME_MAX);
+        let mut remaining = budget.saturating_sub(name_width + GAP);
+
+        let file_width = (remaining / 3 * 2).clamp(FILE_MIN, FILE_MAX);
+        remaining = remaining.saturating_sub(file_width + GAP);
+
+        let show_range = remaining >= RANGE_WIDTH;
+        if show_range {
+            remaining = remaining.saturating_sub(RANGE_WIDTH);
+        }
+
+        let annot_width = (ANNOT_MIN + remaining).min(ANNOT_MAX);
+        Self {
+            name_width,
+            file_width,
+            annot_width,
+            show_range,
+        }
+    }
+}
+
+/// Build the text line for one entity row.
+///
+/// Columns expand proportionally to fill the terminal width:
+/// - Name grows first (up to `NAME_MAX`).
+/// - File path shows more directory context as width increases.
+/// - Line range (`:42-78`) appears when at least `RANGE_WIDTH` chars are free.
 fn entity_row_line(
     entity: &EntitySummary,
     focused: bool,
@@ -183,71 +229,115 @@ fn entity_row_line(
     } else {
         (base_color, false)
     };
-    let style = if focused {
+    let base_style = if focused {
         Style::default().add_modifier(Modifier::REVERSED)
     } else {
         Style::default()
     };
-    let name = truncate_to(&entity.display_name, NAME_MAX);
-    let file = {
-        let p = entity.file_path.to_string_lossy();
-        let filename = p.rsplit('/').next().unwrap_or_else(|| p.as_ref());
-        truncate_to(filename, FILE_MAX)
-    };
-    let annot_raw = annotation_text(entity);
-    let annot = truncate_to(
-        &if is_cosmetic(entity) {
-            format!("{annot_raw} [cosmetic]")
-        } else {
-            annot_raw
-        },
-        ANNOT_MAX,
-    );
-    let name_col = width.min(SIGIL_PAD + NAME_MAX + 2);
-    let file_col = name_col + FILE_MAX + 2;
-    let annot_end = file_col + ANNOT_MAX;
-    let pad_name = " ".repeat(
-        name_col
-            .saturating_sub(SIGIL_PAD)
-            .saturating_sub(name.chars().count()),
-    );
-    let pad_file = " ".repeat(
-        file_col
-            .saturating_sub(name_col + 2)
-            .saturating_sub(file.chars().count()),
-    );
-    // Reserve trailing space for the comment dot and reviewed check so the
-    // row width stays bounded at `width`. Each glyph is rendered as " ●" /
-    // " ✓" — leading space plus the glyph itself — and contributes 2
-    // display columns. Padding `trailing` to fill the full `width` before
-    // appending the suffixes (the prior shape) pushed them past the right
-    // edge: the row clipped or wrapped, and the ✓ sometimes didn't render.
+
+    // Suffix glyphs that appear at the far right.
     let dot = if comment_indicator { " ●" } else { "" };
     let check = if entity.reviewed { " ✓" } else { "" };
-    let suffix_width = dot.chars().count() + check.chars().count();
-    let trailing = if annot_end + suffix_width < width {
-        " ".repeat(width - annot_end - suffix_width)
+    let suffix_chars = dot.chars().count() + check.chars().count();
+
+    // Build the annotation string (may include "[cosmetic]" suffix).
+    let annot_raw = annotation_text(entity);
+    let annot_full = if is_cosmetic(entity) {
+        format!("{annot_raw} [cosmetic]")
+    } else {
+        annot_raw
+    };
+
+    let layout = RowLayout::new(width, suffix_chars);
+    let (name_cell, file_cell, annot_cell, range_cell) = build_cells(entity, &annot_full, &layout);
+    let dim_style = if focused {
+        base_style
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let sigil_style = if dim {
+        Style::default().fg(Color::DarkGray)
+    } else {
+        Style::default().fg(fg)
+    };
+
+    TuiLine::from(vec![
+        Span::raw("  "),
+        Span::styled(sigil_str, sigil_style),
+        Span::styled(name_cell, base_style),
+        Span::styled(file_cell, dim_style),
+        Span::styled(range_cell, dim_style),
+        Span::styled(annot_cell, dim_style),
+        Span::styled(dot, base_style),
+        Span::styled(check, Style::default().fg(Color::Green)),
+    ])
+}
+
+/// Build padded cell strings for each column.
+fn build_cells(
+    entity: &EntitySummary,
+    annot_full: &str,
+    layout: &RowLayout,
+) -> (String, String, String, String) {
+    let RowLayout {
+        name_width,
+        file_width,
+        annot_width,
+        show_range,
+    } = *layout;
+
+    let name = truncate_to(&entity.display_name, name_width);
+    let name_cell = format!(
+        "{name}{pad}  ",
+        pad = " ".repeat(name_width.saturating_sub(name.chars().count()))
+    );
+
+    let file = fit_path(&entity.file_path.to_string_lossy(), file_width);
+    let file_cell = format!(
+        "{file}{pad}  ",
+        pad = " ".repeat(file_width.saturating_sub(file.chars().count()))
+    );
+
+    let annot = truncate_to(annot_full, annot_width);
+    let annot_cell = format!(
+        "{annot}{pad}",
+        pad = " ".repeat(annot_width.saturating_sub(annot.chars().count()))
+    );
+
+    let range_cell = if show_range {
+        let raw = format!(":{}−{}", entity.line_range.0, entity.line_range.1);
+        format!(
+            "{:<width$}  ",
+            truncate_to(&raw, RANGE_WIDTH - 2),
+            width = RANGE_WIDTH - 2
+        )
     } else {
         String::new()
     };
-    TuiLine::from(vec![
-        Span::raw("  "),
-        Span::styled(
-            sigil_str,
-            if dim {
-                Style::default().fg(Color::DarkGray)
-            } else {
-                Style::default().fg(fg)
-            },
-        ),
-        Span::styled(format!("{name}{pad_name}  "), style),
-        Span::styled(
-            format!("{file}{pad_file}  "),
-            Style::default().fg(Color::DarkGray),
-        ),
-        Span::styled(format!("{annot}{trailing}{dot}"), style.fg(Color::DarkGray)),
-        Span::styled(check, Style::default().fg(Color::Green)),
-    ])
+
+    (name_cell, file_cell, annot_cell, range_cell)
+}
+
+/// Return the deepest path segments that fit within `max_chars`, falling back
+/// to a truncated filename when even the last segment is too long.
+fn fit_path(path: &str, max_chars: usize) -> String {
+    if path.chars().count() <= max_chars {
+        return path.to_owned();
+    }
+    let segs: Vec<&str> = path.split('/').collect();
+    let mut s = segs.last().copied().unwrap_or("").to_owned();
+    for seg in segs.iter().rev().skip(1) {
+        let candidate = format!("{seg}/{s}");
+        if candidate.chars().count() > max_chars {
+            break;
+        }
+        s = candidate;
+    }
+    if s.chars().count() > max_chars {
+        truncate_to(&s, max_chars)
+    } else {
+        s
+    }
 }
 
 fn render_entity_row(frame: &mut Frame<'_>, area: Rect, ctx: &EntityRowCtx<'_>) {
@@ -293,8 +383,8 @@ pub fn render_description_row(
     };
     let width = usize::from(area.width);
     let dot_chars = dot.chars().count();
-    let subj = truncate_to(subject, width.saturating_sub(SIGIL_PAD + dot_chars));
-    let pad = " ".repeat(width.saturating_sub(SIGIL_PAD + subj.chars().count() + dot_chars));
+    let subj = truncate_to(subject, width.saturating_sub(SIGIL_WIDTH + dot_chars));
+    let pad = " ".repeat(width.saturating_sub(SIGIL_WIDTH + subj.chars().count() + dot_chars));
     let line = TuiLine::from(vec![
         Span::raw("  "),
         Span::styled("≡ ", Style::default()),

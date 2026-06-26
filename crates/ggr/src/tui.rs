@@ -976,7 +976,24 @@ impl ReviewSurface for GgrSurface {
             gh::fetch_commit_diff(&self.pr.repo_name, &commit.sha, self.pr.hostname.as_deref())?;
 
         if let Some(ref p) = cache_path {
-            if let Ok(Some(entry)) = local_review_core::semantic::cache::read(p) {
+            if let Ok(Some(mut entry)) = local_review_core::semantic::cache::read(p) {
+                // Cache hit. If the graph is absent but cloning is enabled,
+                // build the graph now and update the cache — this handles
+                // entries written before graph support was added to ggr.
+                if entry.graph.is_none() && self.allow_graph_clone {
+                    if let Some(graph) = crate::repo_cache::ensure_clone(
+                        owner_repo,
+                        self.pr.hostname.as_deref(),
+                        true,
+                    )
+                    .map(|repo_path| {
+                        let files = crate::repo_cache::list_files(&repo_path);
+                        local_review_core::semantic::build_graph(&registry, &repo_path, &files)
+                    }) {
+                        entry.graph = Some(graph);
+                        let _ = local_review_core::semantic::cache::write(p, &entry);
+                    }
+                }
                 return Ok(ggr_build_entity_summaries_interleaved(entry, &diff));
             }
         }
@@ -1034,11 +1051,29 @@ impl ReviewSurface for GgrSurface {
         Ok(ggr_build_entity_summaries_interleaved(cache_entry, &diff))
     }
 
+    fn clear_entity_cache(&mut self, entry_idx: usize) {
+        if entry_idx == 0 {
+            return;
+        }
+        let Some(commit) = self.pr.commits.get(entry_idx - 1) else {
+            return;
+        };
+        let sha = commit.sha.as_str();
+        let owner_repo = self.pr.repo_name.as_str();
+        if let Some(cache_path) =
+            ggr_entity_cache_base(owner_repo, self.pr.number, self.pr.hostname.as_deref())
+                .map(|base| local_review_core::semantic::cache::ggr_cache_path(&base, sha))
+        {
+            let _ = std::fs::remove_file(&cache_path);
+        }
+    }
+
     fn caller_count(
         &self,
         entry_idx: usize,
         entity_id: &local_review_core::semantic::EntityId,
     ) -> Option<usize> {
+        // Called by the entity diff status bar on cursor move — not per frame.
         if entry_idx == 0 {
             return None;
         }
@@ -1052,8 +1087,7 @@ impl ReviewSurface for GgrSurface {
             .ok()
             .flatten()?;
         let graph = entry.graph?;
-        let count = graph.edges.iter().filter(|e| &e.to == entity_id).count();
-        Some(count)
+        Some(graph.edges.iter().filter(|e| &e.to == entity_id).count())
     }
 
     fn sort_entities_topo(
@@ -1583,7 +1617,7 @@ impl GgrSurface {
 
         // A cached aggregation entry has no `diff` to interleave fallback rows
         // against, so we store and return raw EntityCoreData and rebuild the
-        // commit-index mapping from the entity list order stored in the cache.
+        // commit-index mapping from the per-commit caches.
         if let Some(ref p) = pr_cache_path {
             if let Ok(Some(entry)) = local_review_core::semantic::cache::read(p) {
                 let summaries: Vec<_> = entry
@@ -1591,11 +1625,19 @@ impl GgrSurface {
                     .iter()
                     .map(ggr_entity_summary_from_core)
                     .collect();
-                // The cache entry stores entities in the aggregated order;
-                // commit_indices were not persisted, so fall back to sentinel 0
-                // (unknown) for cache hits. fetch_entity_diff handles 0 by
-                // scanning commits to find the one with this entity.
-                let indices = vec![0usize; summaries.len()];
+                // Rebuild commit indices by walking per-commit caches.  This is
+                // the same last-writer-wins walk used on a cache miss, but only
+                // touches EntityIds (no network, no extraction).  Without this
+                // step all indices would be 0, and Enter on an aggregated entity
+                // would try to open an entity diff on entry 0 (the PR overview)
+                // instead of navigating to the right commit.
+                let indices = rebuild_commit_indices(
+                    &summaries,
+                    &self.pr.commits,
+                    owner_repo,
+                    self.pr.number,
+                    host,
+                );
                 return (summaries, indices);
             }
         }
@@ -1657,6 +1699,44 @@ impl GgrSurface {
 
         (summaries, commit_indices)
     }
+}
+
+/// Rebuild the commit-index mapping for a cached aggregated entity list.
+///
+/// Walks per-commit caches oldest-to-newest recording the last commit that
+/// contained each `EntityId`. Returns a parallel `Vec<usize>` where each
+/// element is the 1-based entry index of the commit that last modified the
+/// corresponding entity summary.  Entities not found in any per-commit cache
+/// (shouldn't happen but defensive) get index 0 (unknown).
+fn rebuild_commit_indices(
+    summaries: &[local_review_core::semantic::EntitySummary],
+    commits: &[crate::pr::CommitEntry],
+    owner_repo: &str,
+    pr_number: u64,
+    hostname: Option<&str>,
+) -> Vec<usize> {
+    use std::collections::HashMap;
+
+    let mut last_commit: HashMap<local_review_core::semantic::EntityId, usize> = HashMap::new();
+
+    for (commit_idx, commit) in commits.iter().enumerate() {
+        let entry_idx = commit_idx + 1;
+        let sha = commit.sha.as_str();
+        if let Some(cache_path) = ggr_entity_cache_base(owner_repo, pr_number, hostname)
+            .map(|base| local_review_core::semantic::cache::ggr_cache_path(&base, sha))
+        {
+            if let Ok(Some(entry)) = local_review_core::semantic::cache::read(&cache_path) {
+                for entity in entry.entities {
+                    last_commit.insert(entity.id, entry_idx);
+                }
+            }
+        }
+    }
+
+    summaries
+        .iter()
+        .map(|s| last_commit.get(&s.id).copied().unwrap_or(0))
+        .collect()
 }
 
 /// Return the XDG-style cache base path for ggr entity extraction.

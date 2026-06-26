@@ -274,6 +274,10 @@ pub struct App<S: ReviewSurfaceExt> {
     /// Toggled by `o`; falls back to file+line order when no graph is
     /// available.
     pub(crate) topo_sort: bool,
+    /// Entry to load on the next event-loop iteration, after the current frame
+    /// has been drawn. Set by `advance_stack` / `retreat_stack` so the "loading"
+    /// status is visible before the blocking `load_entry` call runs.
+    pub(crate) pending_load: Option<(usize, bool)>,
 }
 
 impl<S: ReviewSurfaceExt> App<S> {
@@ -336,6 +340,7 @@ impl<S: ReviewSurfaceExt> App<S> {
             tick: 0,
             entity_context: None,
             topo_sort: true,
+            pending_load: None,
         }
     }
 
@@ -811,7 +816,11 @@ impl<S: ReviewSurfaceExt> App<S> {
             });
             return Ok(());
         }
-        self.load_entry(next_index, true)
+        // Defer the blocking load so the current frame (with "loading…" status)
+        // is drawn before fetch_views blocks.
+        self.status_message = Some("loading…".to_owned());
+        self.pending_load = Some((next_index, true));
+        Ok(())
     }
 
     /// Retreat to the previous entry in stack mode.
@@ -827,7 +836,9 @@ impl<S: ReviewSurfaceExt> App<S> {
             self.status_message = Some("already at the first change".to_owned());
             return Ok(());
         }
-        self.load_entry(current - 1, false)
+        self.status_message = Some("loading…".to_owned());
+        self.pending_load = Some((current - 1, false));
+        Ok(())
     }
 
     /// Navigate directly to entry `idx` in stack mode (no transition).
@@ -1136,6 +1147,15 @@ where
             }
         }
 
+        // Deferred entry load: `advance_stack` / `retreat_stack` set this
+        // instead of calling `load_entry` directly so the "loading…" status
+        // drawn above is visible before the blocking `fetch_views` call runs.
+        if let Some((idx, record_cursor)) = app.pending_load.take() {
+            app.load_entry(idx, record_cursor)
+                .map_err(AppError::Surface)?;
+            continue;
+        }
+
         // While extraction is running on a background thread, poll the
         // progress channel with a short timeout instead of blocking on
         // user input. On timeout we loop back to the top — the next
@@ -1162,20 +1182,14 @@ where
 /// entities / transition out of `Extracting`) or we time out (and the
 /// next render cycle advances the tick, animating the spinner).
 ///
-/// Returns `Ok(true)` if the caller should `continue` (skip
-/// `handle_event`) — either we made progress, the channel closed, or we
-/// timed out (we still want to re-render the spinner frame).
+/// Returns `true` if the caller should `continue` (skip `handle_event`) —
+/// either we made progress, the channel closed, or we timed out (we still
+/// want to re-render the spinner frame).
 fn drain_extraction_events<S: ReviewSurfaceExt>(app: &mut App<S>) -> bool {
     use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
     use std::time::Duration;
-    // The `ExtractionEvent` import is intentionally inside
-    // `apply_extraction_event` where it is used.
 
-    // Pull every event already in the queue without blocking. If we process
-    // a terminating event (Complete / Cancelled / Error), `app.extraction`
-    // becomes None during the loop — at that point return `true` so the
-    // caller re-renders with the final state instead of falling through to
-    // `handle_event`, which would block until a keystroke arrives.
+    // Pull every event already in the queue without blocking.
     loop {
         let Some(prog) = app.extraction.as_ref() else {
             return true;
@@ -1190,7 +1204,6 @@ fn drain_extraction_events<S: ReviewSurfaceExt>(app: &mut App<S>) -> bool {
         }
     }
 
-    // Block briefly for the next event so the frame rate is bounded.
     let Some(prog) = app.extraction.as_ref() else {
         return true;
     };
@@ -1211,8 +1224,8 @@ fn drain_extraction_events<S: ReviewSurfaceExt>(app: &mut App<S>) -> bool {
 fn end_extraction<S: ReviewSurfaceExt>(app: &mut App<S>) {
     app.extraction = None;
     // Apply topo sort now that the full entity list is accumulated.
+    let idx = app.surface.current_entry_index();
     if app.topo_sort {
-        let idx = app.surface.current_entry_index();
         app.surface.sort_entities_topo(idx, &mut app.entities);
     }
     if matches!(app.screen, Screen::Extracting) {
@@ -1644,6 +1657,11 @@ fn format_entity_context(
         if n > 0 {
             let places = if n == 1 { "place" } else { "places" };
             let _ = write!(out, " · called from {n} {places}");
+        } else {
+            // Graph is available but found no callers — show explicitly so
+            // the reviewer can distinguish "leaf node" from "no graph data"
+            // (which would be None and omit the suffix entirely).
+            out.push_str(" · no callers");
         }
     }
     out
@@ -2343,7 +2361,9 @@ fn handle_entity_list_key<S: ReviewSurfaceExt>(
             // will navigate to Screen::FileDiff for the description view.
             app.start_entity_extraction(idx);
         }
-        _ => {}
+        // Delegate everything else to the surface so surface-specific bindings
+        // (e.g. ggr's `S` for submit, `R` for refresh) work from the entity list.
+        _ => delegate_to_surface(app, key)?,
     }
     Ok(())
 }
@@ -2613,7 +2633,8 @@ fn handle_transition_key<S: ReviewSurfaceExt>(
     match key.code {
         KeyCode::Enter => {
             app.screen = Screen::Main;
-            app.load_entry(next_index, true)?;
+            app.status_message = Some("loading…".to_owned());
+            app.pending_load = Some((next_index, true));
         }
         KeyCode::Char('p') => {
             app.screen = Screen::Main;
@@ -3804,5 +3825,176 @@ mod app_tests {
             matches!(app.screen, Screen::Main),
             "cycle_file from Main must leave the screen alone"
         );
+    }
+
+    // ── Render regression guard ───────────────────────────────────────────────
+    //
+    // These tests catch the class of bug where expensive operations (IO,
+    // subprocesses, cache reads) are accidentally introduced into the render
+    // path. Each test renders one frame and either:
+    //   - asserts a spy surface method was never called (correctness), or
+    //   - asserts the frame completed within a tight time budget (timing).
+    //
+    // If either fails, something expensive crept into render(). Fix the render
+    // path, not the test.
+
+    /// A surface that delegates everything to `NoopSurface` but panics if
+    /// `caller_count` is called — guarding against re-introducing per-entity IO
+    /// in the render path.
+    struct SpySurface(NoopSurface);
+
+    impl SpySurface {
+        fn new(views: Vec<DiffView>) -> Self {
+            Self(NoopSurface::new(views))
+        }
+    }
+
+    impl ReviewSurface for SpySurface {
+        type Error = NoopError;
+        fn entry_count(&self) -> usize {
+            self.0.entry_count()
+        }
+        fn current_entry_index(&self) -> usize {
+            self.0.current_entry_index()
+        }
+        fn entry_id_display(&self, idx: usize) -> String {
+            self.0.entry_id_display(idx)
+        }
+        fn entry_description(&self, idx: usize) -> String {
+            self.0.entry_description(idx)
+        }
+        fn fetch_views(&mut self, idx: usize) -> Result<Vec<DiffView>, NoopError> {
+            self.0.fetch_views(idx)
+        }
+        fn inline_comments_for_view(
+            &self,
+            t: std::time::SystemTime,
+            v: usize,
+            f: Option<Severity>,
+        ) -> Vec<crate::tui::InlineComment> {
+            self.0.inline_comments_for_view(t, v, f)
+        }
+        fn save_comment(&mut self, r: SaveRequest<'_>) -> Result<SaveOutcome, NoopError> {
+            self.0.save_comment(r)
+        }
+        fn update_comment(&mut self, r: UpdateRequest<'_>) -> Result<SaveOutcome, NoopError> {
+            self.0.update_comment(r)
+        }
+        fn delete_comment(&mut self, r: DeleteRequest) -> Result<DeleteOutcome, NoopError> {
+            self.0.delete_comment(r)
+        }
+        fn is_view_reviewed(&self, idx: usize) -> bool {
+            self.0.is_view_reviewed(idx)
+        }
+        fn mark_view_reviewed(&mut self, idx: usize) -> MarkReviewedOutcome {
+            self.0.mark_view_reviewed(idx)
+        }
+        fn toggle_view_reviewed(&mut self, idx: usize) -> ReviewedOutcome {
+            self.0.toggle_view_reviewed(idx)
+        }
+        fn severity_histogram(&self) -> SeverityHistogram {
+            self.0.severity_histogram()
+        }
+        fn handle_extra_key(
+            &mut self,
+            k: KeyEvent,
+            fi: usize,
+            li: usize,
+            v: Option<&DiffView>,
+        ) -> Result<ExtraKeyAction, NoopError> {
+            self.0.handle_extra_key(k, fi, li, v)
+        }
+        fn render_extra_screen(&self, f: &mut Frame<'_>, s: &mut dyn ExtraScreen) {
+            self.0.render_extra_screen(f, s);
+        }
+        fn handle_extra_screen_key(
+            &mut self,
+            s: &mut dyn ExtraScreen,
+            k: KeyEvent,
+            c: &mut ExtraScreenContext<'_>,
+        ) -> Result<ExtraScreenAction, NoopError> {
+            self.0.handle_extra_screen_key(s, k, c)
+        }
+        fn file_picker_entries(&self) -> Vec<FilePickerEntry> {
+            self.0.file_picker_entries()
+        }
+        fn help_screen_title(&self) -> &'static str {
+            self.0.help_screen_title()
+        }
+        fn help_screen_body(&self) -> &'static str {
+            self.0.help_screen_body()
+        }
+        fn footer_hint(&self, w: u16, s: bool, f: Option<Severity>) -> String {
+            self.0.footer_hint(w, s, f)
+        }
+
+        fn caller_count(&self, _: usize, _: &crate::semantic::EntityId) -> Option<usize> {
+            panic!(
+                "caller_count() called during render — this is a regression. \
+                 Render functions must read pre-computed state only, never trigger IO. \
+                 See the render regression guard tests in app.rs."
+            );
+        }
+    }
+
+    impl ReviewSurfaceExt for SpySurface {
+        fn on_entry_loaded(&mut self, idx: usize, r: bool) {
+            self.0.on_entry_loaded(idx, r);
+        }
+        fn severity_histogram_for_transition(&self) -> (Option<usize>, SeverityHistogram) {
+            self.0.severity_histogram_for_transition()
+        }
+    }
+
+    fn make_entity_for_render(i: usize) -> crate::semantic::EntitySummary {
+        crate::semantic::EntitySummary {
+            id: crate::semantic::EntityId::new(
+                std::path::PathBuf::from("src/lib.rs"),
+                vec![format!("fn{i}")],
+                None,
+                u32::try_from(i).unwrap_or(0),
+            ),
+            display_name: format!("fn{i}"),
+            kind: crate::semantic::EntityKind::Function,
+            change: crate::semantic::ChangeType::Modified,
+            annotation: crate::semantic::ChangeAnnotation::BodyOnly,
+            file_path: std::path::PathBuf::from("src/lib.rs"),
+            source_file: None,
+            target_line: None,
+            line_range: (
+                u32::try_from(i * 10 + 1).unwrap_or(1),
+                u32::try_from(i * 10 + 9).unwrap_or(9),
+            ),
+            structural_change: true,
+            content_hash: 0,
+            comment_count: 0,
+            reviewed: false,
+        }
+    }
+
+    /// Rendering the entity list must never call `caller_count` on the surface.
+    ///
+    /// This guards against re-introducing the regression where per-entity IO
+    /// (cache reads, subprocess spawns) crept into the render hot path.
+    /// If this test panics with `"caller_count() called during render"`, fix the
+    /// render path — not this test.
+    #[test]
+    fn render_entity_list_does_not_call_surface_caller_count() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let view = view_with_kinds(&[RenderedLineKind::Added]);
+        let spy = SpySurface::new(vec![view.clone()]);
+        let mut app = App::new(spy, vec![view], TransitionMode::Never);
+        app.screen = Screen::Main;
+        for i in 0..20 {
+            app.entities.push(make_entity_for_render(i));
+        }
+
+        // Render a full frame — SpySurface::caller_count panics on any call.
+        let backend = TestBackend::new(200, 50);
+        let mut term = Terminal::new(backend).expect("terminal");
+        // Will panic (test fails) if caller_count is called from render.
+        term.draw(|frame| render(frame, &mut app)).expect("draw");
     }
 }

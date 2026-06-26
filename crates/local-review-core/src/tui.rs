@@ -475,8 +475,9 @@ pub trait ReviewSurface: Sized {
     /// callers are out of scope. Returns `None` (not `Some(0)`) when the graph
     /// was never built, so callers can distinguish "no callers" from "no data."
     ///
-    /// Only jjr populates the graph (it has the local repo). ggr always returns
-    /// `None` from this default implementation.
+    /// jjr always builds a graph from the local working copy. ggr builds a
+    /// graph when `--no-graph` is not set and a `/tmp` clone is available.
+    /// Surfaces without a graph return `None` from this default implementation.
     fn caller_count(
         &self,
         _entry_idx: usize,
@@ -504,9 +505,10 @@ pub trait ReviewSurface: Sized {
     /// runs fresh rather than returning the cached result.
     ///
     /// Called by the `R` (reload) handler before `reload_current_entry`. jjr
-    /// implements this by deleting the `_pr-<sha>.json` cache file; ggr and
-    /// the default implementation are no-ops (ggr uses commit SHAs as natural
-    /// cache keys, so cache invalidation is implicit on force-push).
+    /// implements this by deleting the per-change cache file (keyed by
+    /// `(change_id, commit_id)` via `jjr_cache_path`); ggr and the default
+    /// implementation are no-ops (ggr uses commit SHAs as natural cache keys,
+    /// so cache invalidation is implicit on force-push).
     fn clear_entity_cache(&mut self, _entry_idx: usize) {}
 
     /// Return `true` when `entry_idx` is a description-first entry that
