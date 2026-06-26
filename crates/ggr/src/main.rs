@@ -15,6 +15,7 @@ mod gh;
 mod pr;
 mod pr_ref;
 mod reanchor;
+mod repo_cache;
 mod submit;
 mod tui;
 mod util;
@@ -41,6 +42,16 @@ struct Cli {
     /// Required when using the owner/repo#number form against a GHE host.
     #[arg(long)]
     url: Option<String>,
+
+    /// Disable cloning the repository to /tmp for dependency-graph building.
+    ///
+    /// By default ggr clones the PR's repository to /tmp/ggr-repos/ so it can
+    /// compute a cross-file call graph (used for topo-sorted entity lists and
+    /// the Claude context bundle). The clone is shallow, read-only, and reused
+    /// across sessions. Pass this flag — or set `GGR_NO_GRAPH_CLONE=1` — if you
+    /// prefer not to download code from the internet.
+    #[arg(long = "no-graph")]
+    no_graph: bool,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -90,12 +101,12 @@ fn run() -> error::Result<()> {
             let pr_str = cli.pr.ok_or_else(|| GgrError::InvalidPrRef {
                 raw: "no PR reference given; run `ggr --help` for usage".to_owned(),
             })?;
-            cmd_review(&pr_str, cli.url.as_deref())
+            cmd_review(&pr_str, cli.url.as_deref(), !cli.no_graph)
         }
     }
 }
 
-fn cmd_review(pr_str: &str, url: Option<&str>) -> error::Result<()> {
+fn cmd_review(pr_str: &str, url: Option<&str>, allow_graph_clone: bool) -> error::Result<()> {
     let mut parsed = pr_ref::parse(pr_str, url)?;
     if parsed.hostname.is_none() {
         if let Some(host) = util::detect_remote_host(parsed.repo_flag.as_deref()) {
@@ -123,7 +134,7 @@ fn cmd_review(pr_str: &str, url: Option<&str>) -> error::Result<()> {
         .map(|base| reanchor::reanchor_all(&pr, &base))
         .unwrap_or(0);
     spinner.stop();
-    tui::run(pr, stale_count)
+    tui::run(pr, stale_count, allow_graph_clone)
 }
 
 /// Resolve a PR reference string to `(host, owner, repo, pr_number)` for

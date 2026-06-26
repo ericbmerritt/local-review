@@ -269,6 +269,11 @@ pub struct App<S: ReviewSurfaceExt> {
     /// position; `None` when the cursor is outside every entity's line range.
     /// Shown only when no transient `status_message` is active.
     pub(crate) entity_context: Option<String>,
+    /// When `true` (the default), the entity list is sorted in
+    /// dependency-first (callees-before-callers) order using the call graph.
+    /// Toggled by `o`; falls back to file+line order when no graph is
+    /// available.
+    pub(crate) topo_sort: bool,
 }
 
 impl<S: ReviewSurfaceExt> App<S> {
@@ -330,6 +335,7 @@ impl<S: ReviewSurfaceExt> App<S> {
             extraction: None,
             tick: 0,
             entity_context: None,
+            topo_sort: true,
         }
     }
 
@@ -698,7 +704,10 @@ impl<S: ReviewSurfaceExt> App<S> {
 
         // Sync fallback: surface has no async task. Block on fetch_entity_list.
         match self.surface.fetch_entity_list(idx) {
-            Ok(entities) => {
+            Ok(mut entities) => {
+                if self.topo_sort {
+                    self.surface.sort_entities_topo(idx, &mut entities);
+                }
                 self.entities = entities;
                 self.description_summary = self.surface.fetch_description_summary(idx).ok();
                 if !in_diff_view {
@@ -1201,6 +1210,11 @@ fn drain_extraction_events<S: ReviewSurfaceExt>(app: &mut App<S>) -> bool {
 /// Tear down the in-progress extraction handle and exit the loading screen.
 fn end_extraction<S: ReviewSurfaceExt>(app: &mut App<S>) {
     app.extraction = None;
+    // Apply topo sort now that the full entity list is accumulated.
+    if app.topo_sort {
+        let idx = app.surface.current_entry_index();
+        app.surface.sort_entities_topo(idx, &mut app.entities);
+    }
     if matches!(app.screen, Screen::Extracting) {
         app.screen = Screen::Main;
     }
@@ -2025,17 +2039,12 @@ fn render_rendered_line(line: &RenderedLine, focused: bool, width: u16) -> TuiLi
         | RenderedLineKind::DescriptionLine => {}
     }
 
-    if focused {
-        let (body, fg_color) = prefix_truncate_pad(line, width);
-        TuiLine::from(vec![Span::styled(body, focus_style(fg_color, true))])
-    } else {
-        let attrs = line_visual_attrs(line);
-        let content_style = focus_style(attrs.fg_color, false);
-        TuiLine::from(vec![
-            Span::raw(attrs.prefix),
-            Span::styled(line.text.as_str(), content_style),
-        ])
-    }
+    // Pad every line to the full body width so all cells in the diff area are
+    // explicitly written. Without this, trailing cells default to the terminal's
+    // own background, which breaks consistency on custom-themed terminals and
+    // means the cursor highlight doesn't extend to the right edge on focused lines.
+    let (body, fg_color) = prefix_truncate_pad(line, width);
+    TuiLine::from(vec![Span::styled(body, focus_style(fg_color, focused))])
 }
 
 fn render_footer<S: ReviewSurfaceExt>(frame: &mut Frame<'_>, area: Rect, app: &App<S>) {
@@ -2189,6 +2198,13 @@ fn render_transition_comment_summary(frame: &mut Frame<'_>, area: Rect, state: &
 
 fn handle_event<S: ReviewSurfaceExt>(app: &mut App<S>) -> Result<(), AppError<S>> {
     let evt = crossterm::event::read().map_err(AppError::Io)?;
+    if let Event::Resize(_, _) = evt {
+        // ratatui's Terminal::draw() calls autoresize() which picks up the
+        // new dimensions. Force a full clear so stale cells from the old
+        // geometry don't linger after the size change.
+        app.needs_full_redraw = true;
+        return Ok(());
+    }
     if let Event::Key(key) = evt {
         if key.kind != KeyEventKind::Press {
             return Ok(());
@@ -2216,6 +2232,25 @@ fn handle_event<S: ReviewSurfaceExt>(app: &mut App<S>) -> Result<(), AppError<S>
         }
     }
     Ok(())
+}
+
+/// Toggle the entity list sort between dependency order and file+line order.
+fn toggle_entity_sort<S: ReviewSurfaceExt>(app: &mut App<S>) {
+    app.topo_sort = !app.topo_sort;
+    let idx = app.surface.current_entry_index();
+    if app.topo_sort {
+        app.surface.sort_entities_topo(idx, &mut app.entities);
+        app.status_message = Some("sort: dependency order".to_owned());
+    } else {
+        app.entities.sort_by(|a, b| {
+            a.file_path
+                .cmp(&b.file_path)
+                .then(a.line_range.0.cmp(&b.line_range.0))
+        });
+        app.status_message = Some("sort: file order".to_owned());
+    }
+    app.entity_index = 0;
+    app.entity_scroll = 0;
 }
 
 /// Key handler for the entity list screen (`Screen::Main`).
@@ -2277,6 +2312,13 @@ fn handle_entity_list_key<S: ReviewSurfaceExt>(
         }
         KeyCode::Char('n') => app.advance_stack()?,
         KeyCode::Char('p') => app.retreat_stack()?,
+        KeyCode::Char('R') => {
+            let idx = app.surface.current_entry_index();
+            app.surface.clear_entity_cache(idx);
+            app.reload_current_entry()?;
+            app.status_message = Some("refreshed".to_owned());
+        }
+        KeyCode::Char('o') => toggle_entity_sort(app),
         KeyCode::Char('1') => app.toggle_severity_filter(Severity::Required),
         KeyCode::Char('2') => app.toggle_severity_filter(Severity::Suggestion),
         KeyCode::Char('3') => app.toggle_severity_filter(Severity::Note),
@@ -2489,6 +2531,12 @@ fn handle_file_view_key<S: ReviewSurfaceExt>(
         KeyCode::Char('F') => open_file_picker(app),
         KeyCode::Char('n') => app.advance_stack()?,
         KeyCode::Char('p') => app.retreat_stack()?,
+        KeyCode::Char('R') => {
+            let idx = app.surface.current_entry_index();
+            app.surface.clear_entity_cache(idx);
+            app.reload_current_entry()?;
+            app.status_message = Some("refreshed".to_owned());
+        }
         KeyCode::Char('1') => app.toggle_severity_filter(Severity::Required),
         KeyCode::Char('2') => app.toggle_severity_filter(Severity::Suggestion),
         KeyCode::Char('3') => app.toggle_severity_filter(Severity::Note),

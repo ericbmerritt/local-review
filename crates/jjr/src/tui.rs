@@ -877,6 +877,48 @@ impl ReviewSurface for JjrSurface {
         }))
     }
 
+    fn clear_entity_cache(&mut self, entry_idx: usize) {
+        let Ok(change_id) = self.entry_change_id(entry_idx) else {
+            return;
+        };
+        let Ok(details) = jj::show(&change_id) else {
+            return;
+        };
+        let commit_id = details.commit_id.as_str().to_owned();
+        let cache_path = entity_cache_path(
+            &self.data_home,
+            &self.repo_root,
+            change_id.as_str(),
+            &commit_id,
+        );
+        let _ = std::fs::remove_file(&cache_path);
+    }
+
+    fn sort_entities_topo(
+        &self,
+        entry_idx: usize,
+        entities: &mut Vec<local_review_core::semantic::EntitySummary>,
+    ) {
+        let Ok(change_id) = self.entry_change_id(entry_idx) else {
+            return;
+        };
+        let Ok(details) = jj::show(&change_id) else {
+            return;
+        };
+        let commit_id = details.commit_id.as_str().to_owned();
+        let cache_path = entity_cache_path(
+            &self.data_home,
+            &self.repo_root,
+            change_id.as_str(),
+            &commit_id,
+        );
+        let Ok(Some(entry)) = local_review_core::semantic::cache::read(&cache_path) else {
+            return;
+        };
+        let Some(graph) = entry.graph else { return };
+        local_review_core::semantic::topo_sort_entities(entities, &graph);
+    }
+
     fn caller_count(
         &self,
         entry_idx: usize,

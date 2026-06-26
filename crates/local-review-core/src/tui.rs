@@ -485,6 +485,30 @@ pub trait ReviewSurface: Sized {
         None
     }
 
+    /// Sort `entities` in dependency-first order (callees before callers) using
+    /// the cached call graph for `entry_idx`.
+    ///
+    /// Called immediately after entity extraction so the default entity list
+    /// view is topologically ordered. Also called when the user presses `o` to
+    /// toggle between dependency order and file+line order. Surfaces without a
+    /// graph (ggr before a clone is available, etc.) leave `entities` unchanged
+    /// so the caller falls back to the current file+line order.
+    fn sort_entities_topo(
+        &self,
+        _entry_idx: usize,
+        _entities: &mut Vec<crate::semantic::EntitySummary>,
+    ) {
+    }
+
+    /// Clear any on-disk entity cache for `entry_idx` so the next extraction
+    /// runs fresh rather than returning the cached result.
+    ///
+    /// Called by the `R` (reload) handler before `reload_current_entry`. jjr
+    /// implements this by deleting the `_pr-<sha>.json` cache file; ggr and
+    /// the default implementation are no-ops (ggr uses commit SHAs as natural
+    /// cache keys, so cache invalidation is implicit on force-push).
+    fn clear_entity_cache(&mut self, _entry_idx: usize) {}
+
     /// Return `true` when `entry_idx` is a description-first entry that
     /// supports a pane toggle — i.e., the user can press `e` to switch between
     /// a description view and an aggregated entity list.
