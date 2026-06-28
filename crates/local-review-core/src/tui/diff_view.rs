@@ -4,9 +4,19 @@
 //! inline comment annotations injected. All rendering decisions are pure
 //! (no IO, no terminal state); the caller owns the frame/buffer.
 
+use std::collections::HashMap;
+
 use crate::diff::{DiffFile, Hunk, Line, LineKind};
+use crate::highlight::TokenSpan;
 use crate::severity::Severity;
 use crate::util::strip_injection_controls;
+
+/// Key for [`DiffView::token_spans`]: `(source_line, target_line)` pair that
+/// uniquely identifies a context, added, or removed diff line.
+///
+/// Public because it names the key type of the public `token_spans` field;
+/// downstream code should use this alias rather than spelling out the tuple.
+pub type SpanKey = (Option<u32>, Option<u32>);
 
 /// Best-case rows added per inline comment when sizing the rebuilt `Vec`:
 /// 1 meta line + 1 body line. Multi-line bodies grow past this; the `Vec`
@@ -48,6 +58,12 @@ pub struct DiffView {
     /// Computed eagerly on view construction and recomputed whenever
     /// `lines` is rebuilt (e.g. after `with_inline_comments`).
     pub paired_rows: Vec<PairedRow>,
+    /// Syntax highlight spans for context, added, and removed lines, keyed by
+    /// `(source_line, target_line)`. This pair uniquely identifies each diff
+    /// line without colliding with injected comment rows (which share the
+    /// anchor line's numbers but are excluded by kind in the lookup).
+    /// Populated by `with_syntax_highlighting`; empty map means no highlighting.
+    pub token_spans: HashMap<SpanKey, Vec<TokenSpan>>,
 }
 
 /// A single rendered line within a `DiffView`.
@@ -162,6 +178,7 @@ impl DiffView {
             title,
             lines,
             paired_rows,
+            token_spans: HashMap::new(),
         }
     }
 
@@ -174,6 +191,7 @@ impl DiffView {
             title,
             lines,
             paired_rows,
+            token_spans: HashMap::new(),
         }
     }
 
@@ -195,6 +213,7 @@ impl DiffView {
                 title: "<description>".to_owned(),
                 lines,
                 paired_rows,
+                token_spans: HashMap::new(),
             };
         }
         let lines: Vec<RenderedLine> = description
@@ -214,6 +233,7 @@ impl DiffView {
             title: "<description>".to_owned(),
             lines,
             paired_rows,
+            token_spans: HashMap::new(),
         }
     }
 
@@ -222,6 +242,93 @@ impl DiffView {
     pub fn with_title(mut self, title: String) -> Self {
         self.title = title;
         self
+    }
+
+    /// Apply syntax highlighting to context, added, and removed lines using
+    /// the GitHub dark-mode colour palette. The diff prefix ("  ", "+ ", "- ")
+    /// retains its diff colour; the body text receives per-token colours.
+    ///
+    /// The after-state (context + added) and before-state (context + removed)
+    /// are reconstructed separately and parsed with tree-sitter. Only
+    /// single-line leaf tokens are coloured (v1).
+    #[must_use]
+    pub fn with_syntax_highlighting(mut self, file_path: &str) -> Self {
+        self.apply_after_highlights(file_path);
+        self.apply_removed_highlights(file_path);
+        self
+    }
+
+    fn apply_after_highlights(&mut self, file_path: &str) {
+        let mut content = String::new();
+        let mut line_map: Vec<(SpanKey, usize)> = Vec::new();
+        let mut idx = 0usize;
+        for line in &self.lines {
+            match line.kind {
+                RenderedLineKind::Context | RenderedLineKind::Added => {
+                    line_map.push(((line.source_line, line.target_line), idx));
+                    content.push_str(&line.text);
+                    content.push('\n');
+                    idx += 1;
+                }
+                RenderedLineKind::Removed
+                | RenderedLineKind::HunkHeader
+                | RenderedLineKind::HunkSeparator
+                | RenderedLineKind::Notice
+                | RenderedLineKind::InlineCommentMeta { .. }
+                | RenderedLineKind::InlineCommentBody
+                | RenderedLineKind::DescriptionLine => {}
+            }
+        }
+        let per_line = crate::highlight::highlight_file(&content, file_path);
+        if per_line.is_empty() {
+            return;
+        }
+        for (key, line_idx) in line_map {
+            if let Some(tokens) = per_line.get(line_idx) {
+                if !tokens.is_empty() {
+                    self.token_spans.insert(key, tokens.clone());
+                }
+            }
+        }
+    }
+
+    fn apply_removed_highlights(&mut self, file_path: &str) {
+        let mut content = String::new();
+        let mut line_map: Vec<(SpanKey, usize)> = Vec::new();
+        let mut idx = 0usize;
+        for line in &self.lines {
+            match line.kind {
+                RenderedLineKind::Context | RenderedLineKind::Removed => {
+                    if matches!(line.kind, RenderedLineKind::Removed) {
+                        line_map.push(((line.source_line, line.target_line), idx));
+                    }
+                    content.push_str(&line.text);
+                    content.push('\n');
+                    idx += 1;
+                }
+                RenderedLineKind::Added
+                | RenderedLineKind::HunkHeader
+                | RenderedLineKind::HunkSeparator
+                | RenderedLineKind::Notice
+                | RenderedLineKind::InlineCommentMeta { .. }
+                | RenderedLineKind::InlineCommentBody
+                | RenderedLineKind::DescriptionLine => {}
+            }
+        }
+        if line_map.is_empty() {
+            return;
+        }
+        let per_line = crate::highlight::highlight_file(&content, file_path);
+        if per_line.is_empty() {
+            return;
+        }
+        for (key, line_idx) in line_map {
+            if let Some(tokens) = per_line.get(line_idx) {
+                if !tokens.is_empty() {
+                    self.token_spans.insert(key, tokens.clone());
+                }
+            }
+        }
     }
 
     /// Return a new `DiffView` with `InlineComment` annotation lines injected
@@ -253,6 +360,7 @@ impl DiffView {
             title: self.title,
             lines: output,
             paired_rows,
+            token_spans: self.token_spans,
         }
     }
 
@@ -300,6 +408,7 @@ impl DiffView {
             title: self.title,
             lines: output,
             paired_rows,
+            token_spans: self.token_spans,
         }
     }
 }

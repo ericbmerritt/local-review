@@ -33,6 +33,7 @@ pub mod change_id;
 pub mod comment;
 pub mod diff;
 pub mod error;
+pub mod highlight;
 pub mod revset_hash;
 pub mod semantic;
 pub mod severity;

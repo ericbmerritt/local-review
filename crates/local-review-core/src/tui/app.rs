@@ -1478,7 +1478,19 @@ fn clip_diff_view_to_range(view: &DiffView, start: u32, end: u32) -> DiffView {
             }
         }
     }
-    DiffView::from_lines(view.title.clone(), lines)
+    let mut clipped = DiffView::from_lines(view.title.clone(), lines);
+    // Copy only the token spans for lines that survived the clip. Cloning the
+    // whole map would retain highlight data for every line in the file on
+    // every clip, most of which the clipped view can never render.
+    clipped.token_spans = clipped
+        .lines
+        .iter()
+        .filter_map(|l| {
+            let key = (l.source_line, l.target_line);
+            view.token_spans.get(&key).map(|v| (key, v.clone()))
+        })
+        .collect();
+    clipped
 }
 
 /// Render a focused file diff for one entity (`Screen::EntityDiff`).
@@ -1803,7 +1815,10 @@ fn render_diff<S: ReviewSurfaceExt>(frame: &mut Frame<'_>, area: Rect, app: &mut
                 .lines
                 .iter()
                 .enumerate()
-                .map(|(idx, line)| render_rendered_line(line, idx == line_index, body_width))
+                .map(|(idx, line)| {
+                    let toks = tokens_for(line, &view.token_spans);
+                    render_rendered_line(line, toks, idx == line_index, body_width)
+                })
                 .collect();
 
             let widget = Paragraph::new(lines).scroll((scroll, 0));
@@ -1831,7 +1846,10 @@ fn render_diff_side_by_side(
             .lines
             .iter()
             .enumerate()
-            .map(|(idx, line)| render_rendered_line(line, idx == cursor_row, total_width))
+            .map(|(idx, line)| {
+                let toks = tokens_for(line, &view.token_spans);
+                render_rendered_line(line, toks, idx == cursor_row, total_width)
+            })
             .collect();
         let widget = Paragraph::new(lines).scroll((scroll, 0));
         frame.render_widget(widget, area);
@@ -1932,11 +1950,21 @@ fn render_paired_row<'a>(
         }
         PairedRow::Pair { left, right, .. } => {
             let left_spans = match left.and_then(|i| view.lines.get(i)) {
-                Some(line) => side_cell_spans(line, geom.side_width, focused),
+                Some(line) => side_cell_spans(
+                    line,
+                    tokens_for(line, &view.token_spans),
+                    geom.side_width,
+                    focused,
+                ),
                 None => blank_cell_spans(geom.side_width, focused),
             };
             let right_spans = match right.and_then(|i| view.lines.get(i)) {
-                Some(line) => side_cell_spans(line, geom.side_width, focused),
+                Some(line) => side_cell_spans(
+                    line,
+                    tokens_for(line, &view.token_spans),
+                    geom.side_width,
+                    focused,
+                ),
                 None => blank_cell_spans(geom.side_width, focused),
             };
             let gutter = side_by_side_gutter_spans();
@@ -1956,7 +1984,7 @@ fn render_inline_comment_row(
     focused: bool,
     side_width: u16,
 ) -> TuiLine<'_> {
-    let comment_spans = side_cell_spans(line, side_width, focused);
+    let comment_spans = side_cell_spans(line, &[], side_width, focused);
     let blank = blank_cell_spans(side_width, focused);
     let gutter = side_by_side_gutter_spans();
     let (left, right) = match column {
@@ -1966,9 +1994,149 @@ fn render_inline_comment_row(
     TuiLine::from([left, gutter, right].concat())
 }
 
-fn side_cell_spans(line: &RenderedLine, side_width: u16, focused: bool) -> Vec<Span<'_>> {
+fn tokens_for<'a>(
+    line: &RenderedLine,
+    spans: &'a std::collections::HashMap<
+        (Option<u32>, Option<u32>),
+        Vec<crate::highlight::TokenSpan>,
+    >,
+) -> &'a [crate::highlight::TokenSpan] {
+    match line.kind {
+        RenderedLineKind::Context | RenderedLineKind::Added | RenderedLineKind::Removed => spans
+            .get(&(line.source_line, line.target_line))
+            .map(Vec::as_slice)
+            .unwrap_or_default(),
+        RenderedLineKind::HunkHeader
+        | RenderedLineKind::HunkSeparator
+        | RenderedLineKind::Notice
+        | RenderedLineKind::InlineCommentMeta { .. }
+        | RenderedLineKind::InlineCommentBody
+        | RenderedLineKind::DescriptionLine => &[],
+    }
+}
+
+fn side_cell_spans<'a>(
+    line: &'a RenderedLine,
+    tokens: &[crate::highlight::TokenSpan],
+    side_width: u16,
+    focused: bool,
+) -> Vec<Span<'a>> {
+    if !focused {
+        // Added/Removed always get the background tint even with no tokens.
+        // Context only gets syntax spans when there are tokens to show.
+        let needs_syntax = matches!(
+            line.kind,
+            RenderedLineKind::Added | RenderedLineKind::Removed
+        ) || (matches!(line.kind, RenderedLineKind::Context)
+            && !tokens.is_empty());
+        if needs_syntax {
+            return syntax_spans(line, tokens, side_width);
+        }
+    }
     let (body, fg_color) = prefix_truncate_pad(line, side_width);
     vec![Span::styled(body, focus_style(fg_color, focused))]
+}
+
+// ── GitHub dark-mode diff background palette ──────────────────────────────────
+// Background covers the whole line; gutter is used for the "+"/"-" glyph only.
+const ADDED_BG: Color = Color::Rgb(14, 68, 41); // #0e4429
+const ADDED_GUTTER: Color = Color::Rgb(63, 185, 80); // #3fb950
+const REMOVED_BG: Color = Color::Rgb(67, 12, 14); // #430c0e
+const REMOVED_GUTTER: Color = Color::Rgb(248, 81, 73); // #f85149
+
+fn diff_bg(kind: RenderedLineKind) -> Option<Color> {
+    match kind {
+        RenderedLineKind::Added => Some(ADDED_BG),
+        RenderedLineKind::Removed => Some(REMOVED_BG),
+        RenderedLineKind::Context
+        | RenderedLineKind::HunkHeader
+        | RenderedLineKind::HunkSeparator
+        | RenderedLineKind::Notice
+        | RenderedLineKind::InlineCommentMeta { .. }
+        | RenderedLineKind::InlineCommentBody
+        | RenderedLineKind::DescriptionLine => None,
+    }
+}
+
+fn diff_gutter_fg(kind: RenderedLineKind) -> Option<Color> {
+    match kind {
+        RenderedLineKind::Added => Some(ADDED_GUTTER),
+        RenderedLineKind::Removed => Some(REMOVED_GUTTER),
+        RenderedLineKind::Context
+        | RenderedLineKind::HunkHeader
+        | RenderedLineKind::HunkSeparator
+        | RenderedLineKind::Notice
+        | RenderedLineKind::InlineCommentMeta { .. }
+        | RenderedLineKind::InlineCommentBody
+        | RenderedLineKind::DescriptionLine => None,
+    }
+}
+
+/// Render a diff line with per-token syntax colours and — for added/removed
+/// lines — a GitHub dark-mode background tint. The `+`/`-` glyph uses a
+/// bright gutter colour against the tint. Focused lines (REVERSED) bypass
+/// this path entirely.
+fn syntax_spans<'a>(
+    line: &'a RenderedLine,
+    tokens: &[crate::highlight::TokenSpan],
+    width: u16,
+) -> Vec<Span<'a>> {
+    let attrs = line_visual_attrs(line);
+    let prefix = attrs.prefix;
+    let prefix_chars = prefix.chars().count();
+
+    // Background for diff lines; None (terminal default) for context.
+    let bg = diff_bg(line.kind);
+    let base = bg.map_or_else(Style::default, |c| Style::default().bg(c));
+
+    let prefix_span: Span<'a> = match diff_gutter_fg(line.kind) {
+        Some(fg) => Span::styled(prefix, base.fg(fg)),
+        None => Span::styled(prefix, base),
+    };
+
+    let max_chars = usize::from(width).saturating_sub(prefix_chars);
+    let max_bytes = byte_limit(&line.text, max_chars);
+    let text = &line.text[..max_bytes];
+
+    let mut spans: Vec<Span<'a>> = vec![prefix_span];
+    let mut pos = 0usize;
+
+    for token in tokens {
+        let start = token.start.min(max_bytes);
+        let end = token.end.min(max_bytes);
+        if end <= start || start < pos {
+            continue;
+        }
+        if start > pos {
+            if let Some(gap) = text.get(pos..start) {
+                spans.push(Span::styled(gap, base));
+            }
+        }
+        if let Some(tok_text) = text.get(start..end) {
+            spans.push(Span::styled(tok_text, base.fg(token.color)));
+        }
+        pos = end;
+    }
+
+    if pos < max_bytes {
+        if let Some(tail) = text.get(pos..) {
+            spans.push(Span::styled(tail, base));
+        }
+    }
+
+    let text_chars = text.chars().count();
+    let pad = usize::from(width).saturating_sub(prefix_chars + text_chars);
+    if pad > 0 {
+        spans.push(Span::styled(" ".repeat(pad), base));
+    }
+
+    spans
+}
+
+/// Find the byte offset of the `char_limit`-th character boundary in `s`.
+/// Returns `s.len()` if `s` has fewer than `char_limit` characters.
+fn byte_limit(s: &str, char_limit: usize) -> usize {
+    s.char_indices().nth(char_limit).map_or(s.len(), |(i, _)| i)
 }
 
 fn focus_style(fg_color: Color, focused: bool) -> Style {
@@ -2039,7 +2207,12 @@ fn line_visual_attrs(line: &RenderedLine) -> LineVisual {
     }
 }
 
-fn render_rendered_line(line: &RenderedLine, focused: bool, width: u16) -> TuiLine<'_> {
+fn render_rendered_line<'a>(
+    line: &'a RenderedLine,
+    tokens: &[crate::highlight::TokenSpan],
+    focused: bool,
+    width: u16,
+) -> TuiLine<'a> {
     match line.kind {
         RenderedLineKind::InlineCommentMeta { .. } | RenderedLineKind::InlineCommentBody => {
             let attrs = line_visual_attrs(line);
@@ -2057,6 +2230,17 @@ fn render_rendered_line(line: &RenderedLine, focused: bool, width: u16) -> TuiLi
         | RenderedLineKind::DescriptionLine => {}
     }
 
+    if !focused {
+        let needs_syntax = matches!(
+            line.kind,
+            RenderedLineKind::Added | RenderedLineKind::Removed
+        ) || (matches!(line.kind, RenderedLineKind::Context)
+            && !tokens.is_empty());
+        if needs_syntax {
+            return TuiLine::from(syntax_spans(line, tokens, width));
+        }
+    }
+
     // Pad every line to the full body width so all cells in the diff area are
     // explicitly written. Without this, trailing cells default to the terminal's
     // own background, which breaks consistency on custom-themed terminals and
@@ -2067,41 +2251,55 @@ fn render_rendered_line(line: &RenderedLine, focused: bool, width: u16) -> TuiLi
 
 fn render_footer<S: ReviewSurfaceExt>(frame: &mut Frame<'_>, area: Rect, app: &App<S>) {
     let in_entity_diff = matches!(app.screen, Screen::EntityDiff { .. });
-    let (text, style) = if let Some(msg) = app.status_message.as_deref() {
-        (msg.to_owned(), Style::default().fg(Color::Yellow))
-    } else if in_entity_diff {
+
+    if let Some(msg) = app.status_message.as_deref() {
+        let widget = Paragraph::new(msg).style(Style::default().fg(Color::Yellow));
+        frame.render_widget(widget, area);
+        return;
+    }
+
+    if in_entity_diff {
         if let Some(ctx) = app.entity_context.as_deref() {
-            (ctx.to_owned(), Style::default().fg(Color::DarkGray))
-        } else {
-            let has_stack = app.surface.entry_count() > 1;
-            let mut hint = app
-                .surface
-                .footer_hint(area.width, has_stack, app.severity_filter);
-            let x_hint = if app.entity_clip {
-                "  x full"
-            } else {
-                "  x clip"
-            };
-            hint.push_str(x_hint);
-            (hint, Style::default())
+            // Entity context and key hints are both present: context on the left
+            // (dim), compact key reminder on the right so neither is lost.
+            let line = entity_diff_footer_line(ctx, area.width, app.entity_clip);
+            frame.render_widget(Paragraph::new(line), area);
+            return;
         }
-    } else {
         let has_stack = app.surface.entry_count() > 1;
         let mut hint = app
             .surface
             .footer_hint(area.width, has_stack, app.severity_filter);
-        if in_entity_diff {
-            let x_hint = if app.entity_clip {
-                "  x full"
-            } else {
-                "  x clip"
-            };
-            hint.push_str(x_hint);
-        }
-        (hint, Style::default())
-    };
-    let widget = Paragraph::new(text).style(style);
-    frame.render_widget(widget, area);
+        hint.push_str(if app.entity_clip {
+            "  x full"
+        } else {
+            "  x clip"
+        });
+        frame.render_widget(Paragraph::new(hint), area);
+        return;
+    }
+
+    let has_stack = app.surface.entry_count() > 1;
+    let hint = app
+        .surface
+        .footer_hint(area.width, has_stack, app.severity_filter);
+    frame.render_widget(Paragraph::new(hint), area);
+}
+
+/// Build the footer `TuiLine` for the entity-diff screen when an entity is
+/// loaded. The entity context string occupies the left side (dimmed); a
+/// compact key reminder occupies the right side (default colour). The context
+/// is truncated so the hint always fits.
+fn entity_diff_footer_line(ctx: &str, width: u16, clip: bool) -> TuiLine<'static> {
+    let clip_key = if clip { "x full" } else { "x clip" };
+    let key_hints = format!("  Enter c  {clip_key}  U reviewed");
+    let hint_chars = key_hints.chars().count();
+    let ctx_budget = usize::from(width).saturating_sub(hint_chars);
+    let ctx_trimmed = truncate(ctx, ctx_budget);
+    TuiLine::from(vec![
+        Span::styled(ctx_trimmed, Style::default().fg(Color::DarkGray)),
+        Span::raw(key_hints),
+    ])
 }
 
 fn render_transition<S: ReviewSurfaceExt>(
@@ -2138,7 +2336,17 @@ fn render_transition<S: ReviewSurfaceExt>(
     let next_desc = truncate(&next_desc, TRANSITION_DESC_BUDGET);
 
     let body = format!(
-        "\n  Reviewed\n  {reviewed_pos}/{count}  {reviewed_id}\n  {reviewed_desc}\n\n  ────────────────\n\n  Next\n  {next_pos}/{count}  {next_id}\n  {next_desc}\n",
+        "
+  Reviewed
+  {reviewed_pos}/{count}  {reviewed_id}
+  {reviewed_desc}
+
+  ────────────────
+
+  Next
+  {next_pos}/{count}  {next_id}
+  {next_desc}
+",
     );
 
     let content_layout = Layout::vertical([
@@ -2271,6 +2479,21 @@ fn toggle_entity_sort<S: ReviewSurfaceExt>(app: &mut App<S>) {
     app.entity_scroll = 0;
 }
 
+/// `m` on the entity list, surface-first: ggr binds `m` to the commit-scoped
+/// composer, and an unconditional core binding would shadow it. Only when the
+/// surface ignores the key does the core open the description view (jjr).
+fn open_description_surface_first<S: ReviewSurfaceExt>(
+    app: &mut App<S>,
+    key: KeyEvent,
+) -> Result<(), S::Error> {
+    if !delegate_to_surface(app, key)? {
+        app.screen = Screen::FileDiff { file_idx: 0 };
+        app.line_index = 0;
+        app.scroll = 0;
+    }
+    Ok(())
+}
+
 /// Key handler for the entity list screen (`Screen::Main`).
 #[expect(
     clippy::wildcard_enum_match_arm,
@@ -2349,6 +2572,7 @@ fn handle_entity_list_key<S: ReviewSurfaceExt>(
             };
             app.status_message = Some(msg);
         }
+        KeyCode::Char('m') => open_description_surface_first(app, key)?,
         // PR overview pane toggle: switch from entity list back to description.
         KeyCode::Char('e')
             if app
@@ -2363,7 +2587,9 @@ fn handle_entity_list_key<S: ReviewSurfaceExt>(
         }
         // Delegate everything else to the surface so surface-specific bindings
         // (e.g. ggr's `S` for submit, `R` for refresh) work from the entity list.
-        _ => delegate_to_surface(app, key)?,
+        _ => {
+            delegate_to_surface(app, key)?;
+        }
     }
     Ok(())
 }
@@ -2402,10 +2628,13 @@ fn clip_to_file_line_index<S: ReviewSurfaceExt>(app: &App<S>) -> usize {
 
 /// Delegate an unhandled key to the surface's `handle_extra_key`, resolving
 /// the line index for side-by-side mode and applying the returned action.
+/// Forward `key` to the surface's `handle_extra_key` and apply the returned
+/// action. Returns `true` when the surface consumed the key (any action other
+/// than `Ignored`), so callers can fall back to a core binding otherwise.
 fn delegate_to_surface<S: ReviewSurfaceExt>(
     app: &mut App<S>,
     key: KeyEvent,
-) -> Result<(), S::Error> {
+) -> Result<bool, S::Error> {
     // In entity clip view the cursor is in clip-space; translate to file-space
     // so comment anchors land on the correct full-file line number.
     let raw_line_index = if matches!(app.screen, Screen::EntityDiff { .. }) && app.entity_clip {
@@ -2439,7 +2668,7 @@ fn delegate_to_surface<S: ReviewSurfaceExt>(
         app.surface
             .handle_extra_key(key, app.file_index, lines_index, annotated_clone.as_ref())?;
     match action {
-        ExtraKeyAction::Ignored => {}
+        ExtraKeyAction::Ignored => return Ok(false),
         ExtraKeyAction::OpenScreen(state) => {
             // Capture the underlying screen so `Close` can restore it.
             // Composers and other overlays only open from the diff views;
@@ -2466,7 +2695,7 @@ fn delegate_to_surface<S: ReviewSurfaceExt>(
         }
         ExtraKeyAction::Quit => app.should_quit = true,
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Copy a ±10-line diff window around the cursor to the clipboard, formatted
@@ -2587,7 +2816,9 @@ fn handle_file_view_key<S: ReviewSurfaceExt>(
                 app.status_message = Some(msg.to_owned());
             }
         }
-        _ => delegate_to_surface(app, key)?,
+        _ => {
+            delegate_to_surface(app, key)?;
+        }
     }
     Ok(())
 }
@@ -2862,6 +3093,9 @@ mod app_tests {
     struct NoopSurface {
         views: Vec<DiffView>,
         not_tracked: bool,
+        /// When `true`, `handle_extra_key` claims `m` with a status message —
+        /// models ggr, whose `m` opens the commit-scoped composer.
+        claim_m: bool,
     }
 
     impl NoopSurface {
@@ -2869,6 +3103,7 @@ mod app_tests {
             Self {
                 views,
                 not_tracked: false,
+                claim_m: false,
             }
         }
 
@@ -2876,6 +3111,15 @@ mod app_tests {
             Self {
                 views,
                 not_tracked: true,
+                claim_m: false,
+            }
+        }
+
+        fn new_claiming_m(views: Vec<DiffView>) -> Self {
+            Self {
+                views,
+                not_tracked: false,
+                claim_m: true,
             }
         }
     }
@@ -2940,11 +3184,14 @@ mod app_tests {
         }
         fn handle_extra_key(
             &mut self,
-            _: KeyEvent,
+            key: KeyEvent,
             _file_index: usize,
             _line_index: usize,
             _current_view: Option<&DiffView>,
         ) -> Result<ExtraKeyAction, NoopError> {
+            if self.claim_m && key.code == KeyCode::Char('m') {
+                return Ok(ExtraKeyAction::StatusMessage("m claimed".to_owned()));
+            }
             Ok(ExtraKeyAction::Ignored)
         }
         fn render_extra_screen(&self, _: &mut Frame<'_>, _: &mut dyn ExtraScreen) {}
@@ -2998,6 +3245,7 @@ mod app_tests {
             title: "test".to_owned(),
             lines: kinds.iter().copied().map(make_line).collect(),
             paired_rows: Vec::new(),
+            token_spans: std::collections::HashMap::new(),
         }
     }
 
@@ -3996,5 +4244,45 @@ mod app_tests {
         let mut term = Terminal::new(backend).expect("terminal");
         // Will panic (test fails) if caller_count is called from render.
         term.draw(|frame| render(frame, &mut app)).expect("draw");
+    }
+
+    /// `m` on the entity list is surface-first: a surface that claims it
+    /// (ggr's commit-scoped composer) must receive it, and the core must NOT
+    /// open the description view over it.
+    #[test]
+    fn entity_list_m_is_surface_first() {
+        let view = view_with_kinds(&[RenderedLineKind::Added]);
+        let mut app = App::new(
+            NoopSurface::new_claiming_m(vec![view.clone()]),
+            vec![view],
+            TransitionMode::Never,
+        );
+        app.screen = Screen::Main;
+        let key = KeyEvent::new(KeyCode::Char('m'), crossterm::event::KeyModifiers::NONE);
+        handle_entity_list_key(&mut app, key).expect("key handling");
+        assert!(
+            matches!(app.screen, Screen::Main),
+            "core must not open the description view when the surface claims m"
+        );
+        assert_eq!(app.status_message.as_deref(), Some("m claimed"));
+    }
+
+    /// When the surface ignores `m`, the core falls back to opening the
+    /// description view (jjr's binding).
+    #[test]
+    fn entity_list_m_falls_back_to_description_view() {
+        let view = view_with_kinds(&[RenderedLineKind::Added]);
+        let mut app = App::new(
+            NoopSurface::new(vec![view.clone()]),
+            vec![view],
+            TransitionMode::Never,
+        );
+        app.screen = Screen::Main;
+        let key = KeyEvent::new(KeyCode::Char('m'), crossterm::event::KeyModifiers::NONE);
+        handle_entity_list_key(&mut app, key).expect("key handling");
+        assert!(
+            matches!(app.screen, Screen::FileDiff { file_idx: 0 }),
+            "surface ignored m; core must open the description view"
+        );
     }
 }

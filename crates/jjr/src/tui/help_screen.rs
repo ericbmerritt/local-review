@@ -14,13 +14,14 @@ Movement
 Comments
     Enter   c             new comment on current line
                           (on a description line: opens description-scoped comment)
-    e                     edit (cursor on a comment)
-    d                     delete (cursor on a comment)
+    e                     edit (cursor must be on a comment line)
+    d                     delete (cursor must be on a comment line)
     1                     filter to required only (press again to clear)
     2                     filter to suggestion only (press again to clear)
     3                     filter to note only (press again to clear)
 
 Views
+    m                     open change description
     f                     file picker — jump to a file or the description
     r                     refresh diff and comments for current change
     s                     stack overview (stack mode only)
@@ -31,7 +32,7 @@ Views
     q                     quit
 
 Actions
-    C                     send current change to Claude
+    C                     send current change to Claude (opens preview)
     y                     yank ±10 lines around cursor (with file:line header)
                           to system clipboard — paste into Claude as context
 
@@ -41,6 +42,8 @@ Review tracking
     ✓                     reviewed indicator: file picker, stack overview
                           right edge, main-view title. Auto-marked on land;
                           U is the escape hatch.
+
+── Sub-screens (context-sensitive) ──────────────────────────────────────────
 
 Stack overview  (press s from main view)
     ↑ ↓     k j           select row
