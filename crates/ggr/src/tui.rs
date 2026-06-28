@@ -125,15 +125,22 @@ impl GgrSurface {
         initial_cursor: Option<&cursor::CursorState>,
         allow_graph_clone: bool,
     ) -> Self {
-        let pending_initial_index = initial_cursor.and_then(|c| {
+        let restored_index = initial_cursor.and_then(|c| {
             pr.commits
                 .iter()
                 .position(|commit| commit.sha.as_str() == c.commit_sha)
                 .map(|pos| pos + 1)
         });
-        let pending_cursor = pending_initial_index
+        let pending_cursor = restored_index
             .and(initial_cursor)
             .map(|c| (strip_controls(&c.file), c.line));
+        // Default landing is the first commit's entity list (entry 1), not the
+        // PR description page (entry 0), so the reviewer opens directly into
+        // per-commit entity review — consistent with jjr's entity-first entry.
+        // A restored cursor wins; a PR with no commits falls back to entry 0
+        // (the only entry that exists). Entry 0 remains reachable via `p`.
+        let pending_initial_index =
+            restored_index.or_else(|| (!pr.commits.is_empty()).then_some(1));
         Self {
             pr,
             state: State::Description,
@@ -940,7 +947,8 @@ impl ReviewSurface for GgrSurface {
         let mut views = Vec::with_capacity(diff.files.len() + 1);
         views.push(DiffView::from_description(&strip_controls(&title)));
         for file in &diff.files {
-            views.push(DiffView::from_file(file));
+            let file_path = file.display_path().to_string_lossy();
+            views.push(DiffView::from_file(file).with_syntax_highlighting(&file_path));
         }
         self.state = State::CommitDiff { index: idx, diff };
         self.reload_drafts();
@@ -1892,11 +1900,14 @@ Views
     R                     refresh — re-fetch PR state and re-anchor drafts
     y                     yank ±10 lines around cursor (with file:line header)
                           to system clipboard — paste into Claude as context
+    C                     send current commit to Claude (opens preview)
     S                     submit review (opens verdict modal)
     |                     cycle diff layout: auto / unified / side-by-side
                           (auto picks side-by-side at >=120 cols)
     ?                     this help
     q                     quit
+
+── Sub-screens (context-sensitive) ──────────────────────────────────────────
 
 Verdict modal  (press S from main view)
     a                     Approve
@@ -4087,6 +4098,7 @@ mod tests {
             title: "test".to_owned(),
             lines: vec![meta_line],
             paired_rows: vec![],
+            token_spans: std::collections::HashMap::new(),
         };
 
         let action = surface.delete_at_cursor(0, Some(&view));
@@ -4143,6 +4155,7 @@ mod tests {
             title: "test".to_owned(),
             lines: vec![meta_line],
             paired_rows: vec![],
+            token_spans: std::collections::HashMap::new(),
         };
 
         let action = surface
@@ -4196,6 +4209,7 @@ mod tests {
             title: "test".to_owned(),
             lines: vec![meta_line],
             paired_rows: vec![],
+            token_spans: std::collections::HashMap::new(),
         };
 
         let action_enter = surface
@@ -4254,6 +4268,7 @@ mod tests {
             title: "test".to_owned(),
             lines: vec![meta_line],
             paired_rows: vec![],
+            token_spans: std::collections::HashMap::new(),
         };
 
         // e is "edit local draft" — must NOT open the reply composer on a GitHub
@@ -4520,17 +4535,40 @@ mod tests {
     }
 
     #[test]
-    fn new_with_cursor_unmatched_sha_sets_pending_to_none_index() {
+    fn new_with_cursor_unmatched_sha_falls_back_to_first_commit() {
         let pr = make_pr();
         let cursor = make_cursor_state(&"0".repeat(40), "src/lib.rs", 3);
         let surface = GgrSurface::new(pr, Some(&cursor), false);
         assert_eq!(
-            surface.pending_initial_index, None,
-            "unknown SHA must leave pending_initial_index as None"
+            surface.pending_initial_index,
+            Some(1),
+            "unknown SHA must fall back to the default landing (first commit)"
         );
         assert_eq!(
             surface.pending_cursor, None,
-            "unmatched SHA must clear pending_cursor"
+            "unmatched SHA must not restore a stale cursor position"
+        );
+    }
+
+    #[test]
+    fn new_without_cursor_lands_on_first_commit() {
+        let surface = GgrSurface::new(make_pr(), None, false);
+        assert_eq!(
+            surface.current_entry_index(),
+            1,
+            "default landing is the first commit's entity list, not the PR description page"
+        );
+    }
+
+    #[test]
+    fn new_without_cursor_on_zero_commit_pr_lands_on_entry_zero() {
+        let mut pr = make_pr();
+        pr.commits.clear();
+        let surface = GgrSurface::new(pr, None, false);
+        assert_eq!(
+            surface.current_entry_index(),
+            0,
+            "a PR with no commits has only entry 0 to land on"
         );
     }
 

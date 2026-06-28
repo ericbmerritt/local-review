@@ -3857,11 +3857,21 @@ fn render_paired_row<'a>(
         }
         PairedRow::Pair { left, right, .. } => {
             let left_spans = match left.and_then(|i| view.lines.get(i)) {
-                Some(line) => side_cell_spans(line, geom.side_width, focused),
+                Some(line) => side_cell_spans(
+                    line,
+                    tokens_for(line, &view.token_spans),
+                    geom.side_width,
+                    focused,
+                ),
                 None => blank_cell_spans(geom.side_width, focused),
             };
             let right_spans = match right.and_then(|i| view.lines.get(i)) {
-                Some(line) => side_cell_spans(line, geom.side_width, focused),
+                Some(line) => side_cell_spans(
+                    line,
+                    tokens_for(line, &view.token_spans),
+                    geom.side_width,
+                    focused,
+                ),
                 None => blank_cell_spans(geom.side_width, focused),
             };
             // Gutter stays calm on focused rows — the cells carry the focus
@@ -3891,7 +3901,7 @@ fn render_inline_comment_row(
     focused: bool,
     side_width: u16,
 ) -> TuiLine<'_> {
-    let comment_spans = side_cell_spans(line, side_width, focused);
+    let comment_spans = side_cell_spans(line, &[], side_width, focused);
     let blank = blank_cell_spans(side_width, focused);
     let gutter = side_by_side_gutter_spans();
     let (left, right) = match column {
@@ -3904,9 +3914,37 @@ fn render_inline_comment_row(
 /// Render a single side cell for a paired row. Body via
 /// [`prefix_truncate_pad`]; focus rule via [`focus_style`].
 #[cfg(test)]
-fn side_cell_spans(line: &RenderedLine, side_width: u16, focused: bool) -> Vec<Span<'_>> {
+fn side_cell_spans<'a>(
+    line: &'a RenderedLine,
+    tokens: &[local_review_core::highlight::TokenSpan],
+    side_width: u16,
+    focused: bool,
+) -> Vec<Span<'a>> {
+    let _ = tokens; // syntax highlighting not exercised in the test-mirror
     let (body, fg_color) = prefix_truncate_pad(line, side_width);
     vec![Span::styled(body, focus_style(fg_color, focused))]
+}
+
+#[cfg(test)]
+fn tokens_for<'a>(
+    line: &RenderedLine,
+    spans: &'a std::collections::HashMap<
+        (Option<u32>, Option<u32>),
+        Vec<local_review_core::highlight::TokenSpan>,
+    >,
+) -> &'a [local_review_core::highlight::TokenSpan] {
+    match line.kind {
+        RenderedLineKind::Context | RenderedLineKind::Added | RenderedLineKind::Removed => spans
+            .get(&(line.source_line, line.target_line))
+            .map(Vec::as_slice)
+            .unwrap_or_default(),
+        RenderedLineKind::HunkHeader
+        | RenderedLineKind::HunkSeparator
+        | RenderedLineKind::Notice
+        | RenderedLineKind::InlineCommentMeta { .. }
+        | RenderedLineKind::InlineCommentBody
+        | RenderedLineKind::DescriptionLine => &[],
+    }
 }
 
 /// Resolve the per-line `Style` from the line's fg color and the focus flag.
@@ -6299,7 +6337,10 @@ fn build_entity_summaries_interleaved(
 fn build_rendered_views(details: &ChangeDetails) -> Vec<DiffView> {
     let mut views = Vec::with_capacity(details.diff.files.len() + 1);
     views.push(DiffView::from_description(&details.description));
-    views.extend(details.diff.files.iter().map(DiffView::from_file));
+    for file in &details.diff.files {
+        let file_path = file.display_path().to_string_lossy();
+        views.push(DiffView::from_file(file).with_syntax_highlighting(&file_path));
+    }
     views
 }
 
@@ -6365,6 +6406,7 @@ mod first_commentable_row_tests {
             title: String::new(),
             lines,
             paired_rows: Vec::new(),
+            token_spans: std::collections::HashMap::new(),
         }
     }
 
