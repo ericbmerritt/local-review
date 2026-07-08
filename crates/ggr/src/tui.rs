@@ -1059,6 +1059,28 @@ impl ReviewSurface for GgrSurface {
         Ok(ggr_build_entity_summaries_interleaved(cache_entry, &diff))
     }
 
+    fn fetch_description_summary(
+        &self,
+        entry_idx: usize,
+    ) -> std::result::Result<local_review_core::semantic::DescriptionSummary, GgrError> {
+        // Entry 0 peeks the PR body; commit entries peek the commit message
+        // body. Both are untrusted GitHub input — strip controls here.
+        let body_peek = if entry_idx == 0 {
+            local_review_core::semantic::body_peek_from_body(&self.pr.body)
+        } else {
+            self.pr
+                .commits
+                .get(entry_idx - 1)
+                .and_then(|c| local_review_core::semantic::body_peek_from_body(&c.body))
+        }
+        .map(|p| strip_controls(&p));
+        Ok(local_review_core::semantic::DescriptionSummary {
+            subject: self.entry_description(entry_idx),
+            comment_count: 0,
+            body_peek,
+        })
+    }
+
     fn clear_entity_cache(&mut self, entry_idx: usize) {
         if entry_idx == 0 {
             return;
@@ -1896,6 +1918,10 @@ Comments
     T                     toggle thread expand / collapse
 
 Views
+    (header)              entity list opens with the entry subject (PR title
+                          on the overview, commit subject on commits), a
+                          body peek, and a Σ scope line
+                          (entities · files · LOC · sig changes)
     f                     file picker
     R                     refresh — re-fetch PR state and re-anchor drafts
     y                     yank ±10 lines around cursor (with file:line header)
@@ -2816,11 +2842,13 @@ mod tests {
                     sha: CommitSha::try_from("a3b4c5d6e7f8a3b4c5d6e7f8a3b4c5d6e7f8a3b4").unwrap(),
                     short_sha: "a3b4c5d6".to_owned(),
                     title: "First commit".to_owned(),
+                    body: "Extracts validation so the sweeper can reuse it.".to_owned(),
                 },
                 CommitEntry {
                     sha: CommitSha::try_from("b3b4c5d6e7f8a3b4c5d6e7f8a3b4c5d6e7f8a3b4").unwrap(),
                     short_sha: "b3b4c5d6".to_owned(),
                     title: "Second commit".to_owned(),
+                    body: String::new(),
                 },
             ],
             review_threads: vec![],
@@ -2889,6 +2917,36 @@ mod tests {
     fn entry_description_out_of_range_returns_empty() {
         let surface = GgrSurface::new(make_pr(), None, false);
         assert_eq!(surface.entry_description(99), "");
+    }
+
+    #[test]
+    fn description_summary_peeks_pr_body_on_entry_zero() {
+        let surface = GgrSurface::new(make_pr(), None, false);
+        let s = surface.fetch_description_summary(0).unwrap();
+        assert_eq!(s.subject, "PR title");
+        assert_eq!(s.body_peek.as_deref(), Some("PR body"));
+    }
+
+    #[test]
+    fn description_summary_peeks_commit_body_and_strips_controls() {
+        let mut pr = make_pr();
+        pr.commits[0].body = "\n\x1b[31mfirst body line\x1b[0m\nmore".to_owned();
+        let surface = GgrSurface::new(pr, None, false);
+        let s = surface.fetch_description_summary(1).unwrap();
+        assert_eq!(s.subject, "First commit");
+        let peek = s.body_peek.expect("commit body must yield a peek");
+        assert!(
+            !peek.chars().any(char::is_control),
+            "peek must strip control chars; got: {peek:?}"
+        );
+        assert!(peek.contains("first body line"));
+    }
+
+    #[test]
+    fn description_summary_empty_commit_body_yields_no_peek() {
+        let surface = GgrSurface::new(make_pr(), None, false);
+        let s = surface.fetch_description_summary(2).unwrap();
+        assert_eq!(s.body_peek, None);
     }
 
     fn make_key(code: KeyCode) -> KeyEvent {

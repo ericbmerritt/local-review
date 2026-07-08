@@ -1288,6 +1288,24 @@ impl ReviewSurface for JjrSurface {
         Ok(ExtraScreenAction::StayOpen)
     }
 
+    fn fetch_description_summary(
+        &self,
+        entry_idx: usize,
+    ) -> std::result::Result<local_review_core::semantic::DescriptionSummary, JjrError> {
+        // `details` holds the full description only for the currently loaded
+        // entry; other entries carry first-line-only stack data, so the peek
+        // is available only for the current one.
+        let body_peek = (entry_idx == self.current_entry_index())
+            .then(|| local_review_core::semantic::body_peek_from(&self.details.description))
+            .flatten()
+            .map(|p| local_review_core::util::strip_controls(&p));
+        Ok(local_review_core::semantic::DescriptionSummary {
+            subject: self.entry_description(entry_idx),
+            comment_count: 0,
+            body_peek,
+        })
+    }
+
     fn file_picker_entries(&self) -> Vec<FilePickerEntry> {
         let total_views = self.details.diff.files.len() + 1;
         let reviewed_view_indices: std::collections::HashSet<usize> = (0..total_views)

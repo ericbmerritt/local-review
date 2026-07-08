@@ -35,8 +35,8 @@ pub use context::{
 };
 pub use differ::diff_entities;
 pub use entity::{
-    fallback_summary_for_file, ChangeAnnotation, ChangeType, DescriptionSummary, EntityCoreData,
-    EntityKind, EntitySummary, LineRange, RawEntity,
+    body_peek_from, body_peek_from_body, fallback_summary_for_file, ChangeAnnotation, ChangeType,
+    DescriptionSummary, EntityCoreData, EntityKind, EntitySummary, LineRange, RawEntity,
 };
 pub use entity_id::EntityId;
 pub use extractor::{CallSite, ExtractError, ExtractResult, SemanticExtractor};
