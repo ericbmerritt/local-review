@@ -119,6 +119,9 @@ pub(crate) struct CommitEntry {
     pub(crate) short_sha: String,
     /// First line of the commit message (the `messageHeadline` field from GitHub).
     pub(crate) title: String,
+    /// Commit message body (the `messageBody` field from GitHub); empty when
+    /// the commit has no body. Untrusted — strip controls before rendering.
+    pub(crate) body: String,
 }
 
 /// A general (non-inline) PR comment.

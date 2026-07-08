@@ -1,3 +1,7 @@
 # License files: SPDX-canonical text, do not reformat.
 LICENSE-MIT
 LICENSE-APACHE
+
+# Ladder files are generated and re-parsed by `pgc spec`; prettier's line
+# rewrapping corrupts bullets on the next pgc round-trip. pgc owns the format.
+specs/*.ladder.md

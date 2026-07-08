@@ -240,6 +240,10 @@ pub struct App<S: ReviewSurfaceExt> {
     // ── Entity navigation state (Phase 3) ─────────────────────────────────────
     /// Entities loaded for the current entry; empty until extraction completes.
     pub(crate) entities: Vec<crate::semantic::EntitySummary>,
+    /// Cached Σ scope line for the orientation header. Recomputed whenever
+    /// `entities` or `rendered_per_file` change (entry load, extraction
+    /// events) — never during render, which runs per frame.
+    pub(crate) header_stats: String,
     /// Pinned description row for the entity list.
     pub(crate) description_summary: Option<crate::semantic::DescriptionSummary>,
     /// Cursor row in the entity list (0 = description row, 1+ = entities).
@@ -329,6 +333,7 @@ impl<S: ReviewSurfaceExt> App<S> {
             needs_full_redraw: false,
             help_scroll: 0,
             entities: Vec::new(),
+            header_stats: String::new(),
             description_summary: None,
             entity_index: 0,
             entity_scroll: 0,
@@ -647,6 +652,13 @@ impl<S: ReviewSurfaceExt> App<S> {
     /// If extraction finishes instantly (cache hit), the entities land in
     /// `self.entities` immediately. Otherwise the screen transitions to
     /// `Screen::Extracting` and the main loop polls the channel.
+    /// Recompute the cached orientation-header Σ line. Called at every point
+    /// `entities` or `rendered_per_file` change — never from render.
+    pub(crate) fn refresh_header_stats(&mut self) {
+        self.header_stats =
+            crate::tui::entity_list::stats_line(&self.entities, &self.rendered_per_file);
+    }
+
     fn start_entity_extraction(&mut self, idx: usize) {
         // Cancel any in-flight extraction.
         if let Some(ref prev) = self.extraction {
@@ -654,6 +666,7 @@ impl<S: ReviewSurfaceExt> App<S> {
         }
         self.extraction = None;
         self.entities.clear();
+        self.refresh_header_stats();
         self.description_summary = None;
         self.entity_index = 0;
         self.entity_scroll = 0;
@@ -714,6 +727,7 @@ impl<S: ReviewSurfaceExt> App<S> {
                     self.surface.sort_entities_topo(idx, &mut entities);
                 }
                 self.entities = entities;
+                self.refresh_header_stats();
                 self.description_summary = self.surface.fetch_description_summary(idx).ok();
                 if !in_diff_view {
                     self.screen = Screen::Main;
@@ -1253,6 +1267,7 @@ fn apply_extraction_event<S: ReviewSurfaceExt>(
         }
         ExtractionEvent::FileExtracted { entities, .. } => {
             app.entities.extend(entities);
+            app.refresh_header_stats();
         }
         // Treat Complete, Cancelled, and Error identically from the
         // event-loop perspective: all three end the worker's lifetime and
@@ -1388,18 +1403,38 @@ fn render_dispatch<S: ReviewSurfaceExt>(frame: &mut Frame<'_>, app: &mut App<S>)
 /// Render the entity list screen (the new `Screen::Main`).
 fn render_entity_list_screen<S: ReviewSurfaceExt>(frame: &mut Frame<'_>, app: &mut App<S>) {
     let area = frame.area();
-    let layout = Layout::vertical([
+    // Orientation header: description row, optional body-peek row, and the
+    // Σ scope row sit between the stack bar and the divider. The peek row is
+    // omitted entirely (no blank line) when the description has no body.
+    let body_peek = app
+        .description_summary
+        .as_ref()
+        .and_then(|d| d.body_peek.as_deref())
+        .filter(|p| !p.is_empty());
+    let mut constraints = vec![
         Constraint::Length(3), // stack bar
         Constraint::Length(1), // description row
+    ];
+    if body_peek.is_some() {
+        constraints.push(Constraint::Length(1)); // body-peek row
+    }
+    constraints.extend([
+        Constraint::Length(1), // Σ scope row
         Constraint::Length(1), // divider
         Constraint::Min(1),    // entity list body
         Constraint::Length(1), // footer
-    ])
-    .split(area);
+    ]);
+    let layout = Layout::vertical(constraints).split(area);
+    let mut slot = 0usize;
+    let mut next = || {
+        let r = layout[slot];
+        slot += 1;
+        r
+    };
 
-    render_stack_bar(frame, layout[0], app);
+    render_stack_bar(frame, next(), app);
 
-    let desc_area = layout[1];
+    let desc_area = next();
     let (subject, comment_count) = app
         .description_summary
         .as_ref()
@@ -1413,9 +1448,14 @@ fn render_entity_list_screen<S: ReviewSurfaceExt>(frame: &mut Frame<'_>, app: &m
         comment_count,
         desc_focused,
     );
-    crate::tui::entity_list::render_divider(frame, layout[2]);
+    if let Some(peek) = body_peek {
+        crate::tui::entity_list::render_body_peek_row(frame, next(), peek);
+    }
+    let stats = app.header_stats.clone();
+    crate::tui::entity_list::render_stats_row(frame, next(), &stats);
+    crate::tui::entity_list::render_divider(frame, next());
 
-    let body_area = layout[3];
+    let body_area = next();
     app.viewport_rows = body_area.height;
     crate::tui::entity_list::render_entity_list_body(frame, body_area, app);
 
@@ -1438,7 +1478,7 @@ fn render_entity_list_screen<S: ReviewSurfaceExt>(frame: &mut Frame<'_>, app: &m
         );
     }
 
-    render_footer(frame, layout[4], app);
+    render_footer(frame, next(), app);
 
     // Loading overlay on top of the entity list body. Render whenever
     // `Screen::Extracting` is active, even when the async extraction worker
@@ -4283,6 +4323,52 @@ mod app_tests {
         assert!(
             matches!(app.screen, Screen::FileDiff { file_idx: 0 }),
             "surface ignored m; core must open the description view"
+        );
+    }
+
+    /// The orientation header must render subject, body peek, and Σ scope
+    /// line with visible text at the standard 80×24 size.
+    #[test]
+    fn entity_list_renders_orientation_header_text() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let view = view_with_kinds(&[RenderedLineKind::Added]);
+        let spy = SpySurface::new(vec![view.clone()]);
+        let mut app = App::new(spy, vec![view], TransitionMode::Never);
+        app.screen = Screen::Main;
+        app.entities.push(make_entity_for_render(0));
+        app.refresh_header_stats();
+        app.description_summary = Some(crate::semantic::DescriptionSummary {
+            subject: "Extract token validation".to_owned(),
+            comment_count: 0,
+            body_peek: Some("pulls validation out of Session".to_owned()),
+        });
+
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).expect("terminal");
+        term.draw(|frame| render(frame, &mut app)).expect("draw");
+
+        let buf = term.backend().buffer();
+        let rows: Vec<String> = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+        let all = rows.join("\n");
+        assert!(
+            all.contains("Extract token validation"),
+            "subject missing from header:\n{all}"
+        );
+        assert!(
+            all.contains("pulls validation out of Session"),
+            "body peek missing from header:\n{all}"
+        );
+        assert!(
+            all.contains("Σ 1 entity"),
+            "Σ scope line missing from header:\n{all}"
         );
     }
 }

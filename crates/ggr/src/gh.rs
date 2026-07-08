@@ -48,6 +48,10 @@ struct CommitJson {
     oid: String,
     #[serde(rename = "messageHeadline")]
     message_headline: String,
+    /// Absent on older GHE releases; default to empty rather than failing
+    /// the whole PR fetch.
+    #[serde(rename = "messageBody", default)]
+    message_body: String,
 }
 
 #[derive(Deserialize)]
@@ -140,6 +144,7 @@ pub(crate) fn fetch_pr_details(
                 sha,
                 short_sha,
                 title: c.message_headline,
+                body: c.message_body,
             })
         })
         .collect::<Result<Vec<_>>>()?;

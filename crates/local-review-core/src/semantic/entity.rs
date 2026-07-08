@@ -125,6 +125,29 @@ pub struct DescriptionSummary {
     pub subject: String,
     /// Number of change-scoped comments on this entry.
     pub comment_count: usize,
+    /// First non-empty body line after the subject, for the orientation
+    /// header's peek row. `None` when the description has no body.
+    pub body_peek: Option<String>,
+}
+
+/// Extract the orientation-header peek line from a full description
+/// (subject on line 1): the first non-empty line *after* the subject.
+/// Callers strip controls.
+pub fn body_peek_from(description: &str) -> Option<String> {
+    peek_line(description.lines().skip(1))
+}
+
+/// Extract the orientation-header peek line from body-only text (no
+/// subject line, e.g. GitHub's `messageBody`). Callers strip controls.
+pub fn body_peek_from_body(body: &str) -> Option<String> {
+    peek_line(body.lines())
+}
+
+fn peek_line<'a>(lines: impl Iterator<Item = &'a str> + 'a) -> Option<String> {
+    lines
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .map(str::to_owned)
 }
 
 /// Build a synthetic "whole-file" `EntitySummary` for a file with no
@@ -195,4 +218,33 @@ pub struct EntitySummary {
     pub comment_count: usize,
     /// `true` when the reviewer has visited and auto-marked this entity.
     pub reviewed: bool,
+}
+
+#[cfg(test)]
+mod peek_tests {
+    use super::{body_peek_from, body_peek_from_body};
+
+    #[test]
+    fn body_peek_skips_subject_and_blank_lines() {
+        assert_eq!(
+            body_peek_from("subject\n\n  first body line\nsecond"),
+            Some("first body line".to_owned())
+        );
+    }
+
+    #[test]
+    fn body_peek_none_for_subject_only() {
+        assert_eq!(body_peek_from("subject"), None);
+        assert_eq!(body_peek_from("subject\n\n  \n"), None);
+        assert_eq!(body_peek_from(""), None);
+    }
+
+    #[test]
+    fn body_peek_from_body_takes_first_nonempty_line() {
+        assert_eq!(
+            body_peek_from_body("\n\nwraps refresh() in backoff\nmore"),
+            Some("wraps refresh() in backoff".to_owned())
+        );
+        assert_eq!(body_peek_from_body(""), None);
+    }
 }

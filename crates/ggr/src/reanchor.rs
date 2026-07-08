@@ -391,6 +391,7 @@ mod tests {
             sha: CommitSha::try_from(sha_char.to_string().repeat(40).as_str()).unwrap(),
             short_sha: sha_char.to_string().repeat(8),
             title: title.to_owned(),
+            body: String::new(),
         }
     }
 

@@ -21,6 +21,9 @@ Comments
     3                     filter to note only (press again to clear)
 
 Views
+    (header)              entity list opens with the change subject, a
+                          description peek, and a Σ scope line
+                          (entities · files · LOC · sig changes)
     m                     open change description
     f                     file picker — jump to a file or the description
     r                     refresh diff and comments for current change

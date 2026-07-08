@@ -450,6 +450,7 @@ pub trait ReviewSurface: Sized {
         Ok(crate::semantic::DescriptionSummary {
             subject: self.entry_description(entry_idx),
             comment_count: 0,
+            body_peek: None,
         })
     }
 

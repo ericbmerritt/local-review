@@ -400,6 +400,93 @@ pub fn render_description_row(
     );
 }
 
+/// Render the orientation header's body-peek row: the first body line of
+/// the description, dimmed, indented under the `≡` sigil.
+pub fn render_body_peek_row(frame: &mut Frame<'_>, area: Rect, peek: &str) {
+    let width = usize::from(area.width);
+    let text = truncate_to(peek, width.saturating_sub(SIGIL_WIDTH + 2));
+    let line = TuiLine::from(vec![
+        Span::raw("    "),
+        Span::styled(
+            format!("\u{201c}{text}\u{201d}"),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]);
+    frame.render_widget(
+        Paragraph::new(line),
+        Rect {
+            y: area.y,
+            height: 1,
+            ..area
+        },
+    );
+}
+
+/// Compose the orientation header's scope line:
+/// `Σ N entities · M files · ~L LOC · K sig changes`.
+///
+/// LOC counts added + removed diff rows across the per-file views (view 0,
+/// the description view, is skipped). Files are distinct entity file paths.
+pub fn stats_line(entities: &[EntitySummary], views: &[crate::tui::DiffView]) -> String {
+    let n = entities.len();
+    let files: std::collections::HashSet<&std::path::Path> =
+        entities.iter().map(|e| e.file_path.as_path()).collect();
+    let loc: usize = views
+        .iter()
+        .skip(1)
+        .flat_map(|v| v.lines.iter())
+        .filter(|l| {
+            matches!(
+                l.kind,
+                crate::tui::RenderedLineKind::Added | crate::tui::RenderedLineKind::Removed
+            )
+        })
+        .count();
+    let sig = entities
+        .iter()
+        .filter(|e| {
+            matches!(
+                e.annotation,
+                ChangeAnnotation::SigChanged | ChangeAnnotation::SigAndBody
+            )
+        })
+        .count();
+    let entities_part = if n == 1 {
+        "1 entity".to_owned()
+    } else {
+        format!("{n} entities")
+    };
+    let files_part = if files.len() == 1 {
+        "1 file".to_owned()
+    } else {
+        format!("{} files", files.len())
+    };
+    let sig_part = if sig == 1 {
+        "1 sig change".to_owned()
+    } else {
+        format!("{sig} sig changes")
+    };
+    format!("\u{3a3} {entities_part} · {files_part} · ~{loc} LOC · {sig_part}")
+}
+
+/// Render the orientation header's scope row, dimmed.
+pub fn render_stats_row(frame: &mut Frame<'_>, area: Rect, text: &str) {
+    let width = usize::from(area.width);
+    let body = truncate_to(text, width.saturating_sub(2));
+    let line = TuiLine::from(vec![
+        Span::raw("  "),
+        Span::styled(body, Style::default().fg(Color::DarkGray)),
+    ]);
+    frame.render_widget(
+        Paragraph::new(line),
+        Rect {
+            y: area.y,
+            height: 1,
+            ..area
+        },
+    );
+}
+
 /// Render the divider line between description row and entity list.
 pub fn render_divider(frame: &mut Frame<'_>, area: Rect) {
     let line = "─".repeat(usize::from(area.width));
@@ -577,5 +664,89 @@ pub fn move_entity_cursor<S: ReviewSurfaceExt>(app: &mut App<S>, delta: isize) {
         app.entity_scroll = eidx;
     } else if eidx >= app.entity_scroll + viewport {
         app.entity_scroll = eidx.saturating_sub(viewport.saturating_sub(1));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::diff::DiffFile;
+    use crate::semantic::fallback_summary_for_file;
+    use crate::tui::diff_view::RenderedLine;
+    use crate::tui::{DiffView, RenderedLineKind};
+
+    fn entity(path: &str, annotation: ChangeAnnotation) -> EntitySummary {
+        let mut e = fallback_summary_for_file(&DiffFile::Modified {
+            path: std::path::PathBuf::from(path),
+            hunks: vec![],
+        });
+        e.annotation = annotation;
+        e
+    }
+
+    fn line(kind: RenderedLineKind) -> RenderedLine {
+        RenderedLine {
+            kind,
+            text: String::new(),
+            source_line: None,
+            target_line: None,
+            hunk_header: None,
+            comment_severity: None,
+        }
+    }
+
+    fn view(kinds: &[RenderedLineKind]) -> DiffView {
+        DiffView {
+            title: String::new(),
+            lines: kinds.iter().map(|k| line(*k)).collect(),
+            paired_rows: vec![],
+            token_spans: std::collections::HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn stats_line_counts_entities_files_loc_and_sig_changes() {
+        let entities = vec![
+            entity("a.rs", ChangeAnnotation::SigAndBody),
+            entity("a.rs", ChangeAnnotation::BodyOnly),
+            entity("b.rs", ChangeAnnotation::None),
+        ];
+        let views = vec![
+            view(&[RenderedLineKind::Notice]), // view 0: description, skipped
+            view(&[
+                RenderedLineKind::HunkHeader,
+                RenderedLineKind::Added,
+                RenderedLineKind::Removed,
+                RenderedLineKind::Context,
+            ]),
+            view(&[RenderedLineKind::Added]),
+        ];
+        assert_eq!(
+            stats_line(&entities, &views),
+            "Σ 3 entities · 2 files · ~3 LOC · 1 sig change"
+        );
+    }
+
+    #[test]
+    fn stats_line_singulars() {
+        let entities = vec![entity("a.rs", ChangeAnnotation::SigChanged)];
+        let views = vec![view(&[])];
+        assert_eq!(
+            stats_line(&entities, &views),
+            "Σ 1 entity · 1 file · ~0 LOC · 1 sig change"
+        );
+    }
+
+    #[test]
+    fn stats_line_zero_sig_changes_plural() {
+        let entities = vec![
+            entity("a.rs", ChangeAnnotation::BodyOnly),
+            entity("b.rs", ChangeAnnotation::BodyOnly),
+        ];
+        let views = vec![view(&[])];
+        assert_eq!(
+            stats_line(&entities, &views),
+            "Σ 2 entities · 2 files · ~0 LOC · 0 sig changes"
+        );
     }
 }
