@@ -219,6 +219,21 @@ pub mod scrollbar_test_helpers {
     }
 }
 
+/// Content of the top progress bar, supplied per entry by the surface
+/// (see [`ReviewSurface::stack_bar_spec`]). The core appends the entry
+/// description (truncated to fit) after `label`.
+pub struct StackBarSpec {
+    /// Block border title ("Stack" for jjr, "Pull Request" for ggr).
+    pub title: String,
+    /// `(position, total)` driving the graphical fill. `None` hides the
+    /// fill entirely — used for entries with no position in the walk
+    /// (ggr's PR overview).
+    pub progress: Option<(usize, usize)>,
+    /// Text between the fill and the description, e.g. `1/6  a3b4c5d6`
+    /// or `overview  PR #66`.
+    pub label: String,
+}
+
 /// The behavioural seams that distinguish review tools inside the shared TUI.
 /// Each tool implements this trait once; the core `App<S>` is parameterised
 /// over it. Only add methods here when the behaviour must differ across tools.
@@ -400,6 +415,28 @@ pub trait ReviewSurface: Sized {
     /// reflects the tool's actual keys.
     fn footer_hint(&self, width: u16, has_stack: bool, severity_filter: Option<Severity>)
         -> String;
+
+    /// Content of the top progress bar for the current entry.
+    ///
+    /// The default numbers every entry uniformly (`1/N  <id>`), which is
+    /// right for jjr's stack of peer changes. ggr overrides it because its
+    /// entries are two species — the PR overview and the commits — and
+    /// numbering the overview like a commit misreads (a 5-commit PR would
+    /// show `1/6 overview`, with every commit off-by-one).
+    fn stack_bar_spec(&self) -> StackBarSpec {
+        let count = self.entry_count();
+        let current = self.current_entry_index();
+        let (position, total) = if count > 1 {
+            (current + 1, count)
+        } else {
+            (1, 1)
+        };
+        StackBarSpec {
+            title: "Stack".to_owned(),
+            progress: Some((position, total)),
+            label: format!("{position}/{total}  {}", self.entry_id_display(current)),
+        }
+    }
 
     // ------------------------------------------------------------------
     // Entity navigation (Phase 2+)

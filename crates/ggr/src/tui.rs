@@ -897,7 +897,7 @@ impl ReviewSurface for GgrSurface {
     fn entry_id_display(&self, idx: usize) -> String {
         if idx == 0 {
             return match self.pr_pane {
-                PrPane::Description => "description".to_owned(),
+                PrPane::Description => "overview".to_owned(),
                 PrPane::Entities => {
                     let k = self.pr_entity_commit_indices.len();
                     format!("all entities ({k})")
@@ -909,6 +909,32 @@ impl ReviewSurface for GgrSurface {
             .get(idx - 1)
             .map(|c| c.short_sha.clone())
             .unwrap_or_default()
+    }
+
+    fn stack_bar_spec(&self) -> local_review_core::tui::StackBarSpec {
+        let current = self.current_entry_index();
+        let commits = self.pr.commits.len();
+        // Two entry species share the walk: the PR overview (entry 0) and
+        // the commits (1..=N). The overview has no position among the
+        // commits, so it gets a label instead of a counter — numbering it
+        // uniformly would show a 5-commit PR as "1/6 overview" with
+        // every commit off-by-one.
+        if current == 0 {
+            local_review_core::tui::StackBarSpec {
+                title: "Pull Request".to_owned(),
+                progress: None,
+                label: format!("overview  PR #{}", self.pr.number),
+            }
+        } else {
+            local_review_core::tui::StackBarSpec {
+                title: "Pull Request".to_owned(),
+                progress: Some((current, commits)),
+                label: format!(
+                    "commit {current}/{commits}  {}",
+                    self.entry_id_display(current)
+                ),
+            }
+        }
     }
 
     fn entry_description(&self, idx: usize) -> String {
@@ -1843,7 +1869,7 @@ Movement
     PgUp PgDn             page
     Home End  g G         top / bottom
     Tab     S-Tab         next / previous file
-    n       p             next / previous commit (or description)
+    n       p             next / previous commit (or PR overview)
 
 Comments
     Enter   c             new line-scoped comment
@@ -2815,10 +2841,40 @@ mod tests {
     }
 
     #[test]
-    fn entry_id_display_returns_description_for_index_0() {
+    fn entry_id_display_returns_overview_for_index_0() {
         let surface = GgrSurface::new(make_pr(), None, false);
         // Entry 0 defaults to description pane; the label reflects the pane.
-        assert_eq!(surface.entry_id_display(0), "description");
+        assert_eq!(surface.entry_id_display(0), "overview");
+    }
+
+    #[test]
+    fn stack_bar_overview_has_label_and_no_progress() {
+        let mut surface = GgrSurface::new(make_pr(), None, false);
+        // Land on the overview: clear the entity-first initial index.
+        surface.pending_initial_index = None;
+        let spec = surface.stack_bar_spec();
+        assert_eq!(spec.title, "Pull Request");
+        assert!(
+            spec.progress.is_none(),
+            "overview has no position among the commits"
+        );
+        assert_eq!(spec.label, "overview  PR #42");
+    }
+
+    #[test]
+    fn stack_bar_commits_numbered_without_the_overview() {
+        let mut surface = GgrSurface::new(make_pr(), None, false);
+        surface.pending_initial_index = None;
+        surface.state = State::CommitDiff {
+            index: 1,
+            diff: Diff { files: vec![] },
+        };
+        let spec = surface.stack_bar_spec();
+        // Entry 1 is the FIRST commit of two: `commit 1/2`, not `2/3` —
+        // the overview must not shift commit numbering.
+        assert_eq!(spec.label, "commit 1/2  a3b4c5d6");
+        assert_eq!(spec.progress, Some((1, 2)));
+        assert_eq!(spec.title, "Pull Request");
     }
 
     #[test]
