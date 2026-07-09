@@ -129,20 +129,39 @@ fn kind_label(kind: EntityKind) -> &'static str {
 }
 
 fn annotation_text(e: &EntitySummary) -> String {
+    use crate::semantic::RefactorKind;
     let kind = kind_label(e.kind);
-    let change = match e.change {
-        ChangeType::Added => "added".to_owned(),
-        ChangeType::Deleted => "deleted".to_owned(),
-        ChangeType::Moved => {
+    // Refactor tags take over the change column: the tag says more than the
+    // generic change word ("extracted ← validate()" vs "added").
+    let change = match (&e.refactor, e.change) {
+        (Some(RefactorKind::Renamed { from, .. }), _) => {
+            if e.is_behavior_preserving() {
+                format!("renamed ← {from}")
+            } else {
+                format!("renamed ← {from} +body")
+            }
+        }
+        (Some(RefactorKind::Extracted { from }), _) => {
+            format!("extracted ← {}", from.display_name())
+        }
+        (_, ChangeType::Added) => "added".to_owned(),
+        (_, ChangeType::Deleted) => "deleted".to_owned(),
+        (_, ChangeType::Moved) => {
             let src = e
                 .source_file
                 .as_ref()
                 .and_then(|p| p.file_name())
                 .and_then(|n| n.to_str())
                 .unwrap_or("?");
-            format!("moved from {src}")
+            // A move whose content also changed is not behavior-preserving;
+            // say so rather than letting the tag imply a pure move.
+            if e.is_behavior_preserving() {
+                format!("moved from {src}")
+            } else {
+                format!("moved from {src} +edits")
+            }
         }
-        ChangeType::Modified => match e.annotation {
+        (_, ChangeType::Modified) => match e.annotation {
             ChangeAnnotation::SigChanged => "sig changed".to_owned(),
             ChangeAnnotation::BodyOnly => "body".to_owned(),
             ChangeAnnotation::SigAndBody => "sig+body".to_owned(),
@@ -168,6 +187,13 @@ fn truncate_to(s: &str, max: usize) -> String {
 
 fn is_cosmetic(e: &EntitySummary) -> bool {
     !e.structural_change
+}
+
+/// Rows the `;` filter hides and the renderer dims: cosmetic changes plus
+/// behavior-preserving refactors (rename / identical move / extract). The
+/// classification is a parser heuristic — demoted, never hidden by default.
+fn is_demoted(e: &EntitySummary) -> bool {
+    is_cosmetic(e) || e.is_behavior_preserving()
 }
 
 struct EntityRowCtx<'a> {
@@ -224,7 +250,7 @@ fn entity_row_line(
     width: usize,
 ) -> TuiLine<'static> {
     let (sigil_str, base_color) = entity_sigil(entity);
-    let (fg, dim) = if is_cosmetic(entity) {
+    let (fg, dim) = if is_demoted(entity) {
         (Color::DarkGray, true)
     } else {
         (base_color, false)
@@ -240,7 +266,8 @@ fn entity_row_line(
     let check = if entity.reviewed { " ✓" } else { "" };
     let suffix_chars = dot.chars().count() + check.chars().count();
 
-    // Build the annotation string (may include "[cosmetic]" suffix).
+    // Build the annotation string (may include a "[cosmetic]" suffix; the
+    // refactor tag itself is part of annotation_text).
     let annot_raw = annotation_text(entity);
     let annot_full = if is_cosmetic(entity) {
         format!("{annot_raw} [cosmetic]")
@@ -349,7 +376,7 @@ fn render_entity_row(frame: &mut Frame<'_>, area: Rect, ctx: &EntityRowCtx<'_>) 
     } = ctx;
     let (focused, cosmetic_hidden, comment_indicator) =
         (*focused, *cosmetic_hidden, *comment_indicator);
-    if cosmetic_hidden && is_cosmetic(entity) {
+    if cosmetic_hidden && is_demoted(entity) {
         return;
     }
     let line = entity_row_line(entity, focused, comment_indicator, usize::from(area.width));
@@ -594,7 +621,7 @@ pub fn render_entity_list_body<S: ReviewSurfaceExt>(
     // still incrementing the row_offset position counter).
     let visible: Vec<usize> = (scroll..)
         .take_while(|&i| i < entities.len())
-        .filter(|&i| !app.cosmetic_filter_on || entities.get(i).is_none_or(|e| !is_cosmetic(e)))
+        .filter(|&i| !app.cosmetic_filter_on || entities.get(i).is_none_or(|e| !is_demoted(e)))
         .take(total_rows)
         .collect();
 
@@ -628,7 +655,7 @@ pub fn render_entity_list_body<S: ReviewSurfaceExt>(
 /// Total navigable rows: description row (index 0) + visible entities.
 pub fn entity_list_len<S: ReviewSurfaceExt>(app: &App<S>) -> usize {
     let entity_count = if app.cosmetic_filter_on {
-        app.entities.iter().filter(|e| !is_cosmetic(e)).count()
+        app.entities.iter().filter(|e| !is_demoted(e)).count()
     } else {
         app.entities.len()
     };

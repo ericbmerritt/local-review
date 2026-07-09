@@ -28,7 +28,7 @@ pub mod plugins;
 pub mod registry;
 pub mod sort;
 
-pub use cache::{GraphData, GraphEdge, GraphNode};
+pub use cache::{GraphData, GraphEdge, GraphNode, UnresolvedRef};
 pub use context::{
     render as render_bundle, render_with_truncation as render_bundle_with_truncation, Bundle,
     BundleEntity,
@@ -37,6 +37,7 @@ pub use differ::diff_entities;
 pub use entity::{
     body_peek_from, body_peek_from_body, fallback_summary_for_file, ChangeAnnotation, ChangeType,
     DescriptionSummary, EntityCoreData, EntityKind, EntitySummary, LineRange, RawEntity,
+    RefactorKind,
 };
 pub use entity_id::EntityId;
 pub use extractor::{CallSite, ExtractError, ExtractResult, SemanticExtractor};

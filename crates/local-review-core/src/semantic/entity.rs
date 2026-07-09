@@ -63,6 +63,28 @@ pub enum ChangeAnnotation {
     None,
 }
 
+/// Behavior-preserving refactor classification, detected by the differ.
+///
+/// A parser heuristic, not truth (spec: "the classification is a hint, not a
+/// verdict"): tags demote rows visually but never hide them by default.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum RefactorKind {
+    /// Same file, matched by content, scope-chain tail differs. `from` is the
+    /// old name (before-state scope-chain tail). `pure` is `true` only when
+    /// substituting the new name for the old in the entire before-state
+    /// content reproduces the after-state exactly — any other edit (params,
+    /// return type, visibility, body) fails the equality and stays
+    /// undemoted. Substitution artifacts fail conservatively (not pure).
+    Renamed { from: String, pure: bool },
+    /// Cross-file move (existing Jaccard match). `identical` is `true` when
+    /// the content hash survived the move unchanged — the behavior-preserving
+    /// case. Origin file lives in `EntityCoreData::source_file`.
+    Moved { identical: bool },
+    /// Added entity whose tokens are largely contained in the removed span of
+    /// a shrunken sibling from the same before-file. `from` is that sibling.
+    Extracted { from: EntityId },
+}
+
 /// Extraction output and diff classification for one entity.
 ///
 /// Cached to disk; `display_name` and `comment_count` are computed at render
@@ -73,6 +95,8 @@ pub struct EntityCoreData {
     pub kind: EntityKind,
     pub change: ChangeType,
     pub annotation: ChangeAnnotation,
+    /// Refactor classification; `None` for ordinary changes.
+    pub refactor: Option<RefactorKind>,
     /// `(start_line, end_line)` in the after-state file (1-indexed).
     pub line_range: (u32, u32),
     /// Populated only for `ChangeType::Moved`; the file the entity moved from.
@@ -83,6 +107,21 @@ pub struct EntityCoreData {
     pub structural_change: bool,
     /// First 8 bytes of the blake3 hash of the entity's after-state source text.
     pub content_hash: u64,
+}
+
+impl EntityCoreData {
+    /// `true` when this change is a behavior-preserving refactor: the row is
+    /// visually demoted and hidden by the `;` filter.
+    ///
+    /// - `Renamed` preserves behavior only when `pure` — whole-content name
+    ///   substitution reproduced the after-state exactly. A rename that also
+    ///   touches params, return type, visibility, or body is not pure and
+    ///   stays undemoted (rendered as `renamed +body`).
+    /// - `Moved` preserves behavior only when content survived identically.
+    /// - `Extracted` passed the containment threshold by construction.
+    pub fn is_behavior_preserving(&self) -> bool {
+        behavior_preserving(self.refactor.as_ref())
+    }
 }
 
 /// Internal representation produced by extractors before diff computation.
@@ -190,6 +229,7 @@ pub fn fallback_summary_for_file(file: &DiffFile) -> EntitySummary {
         line_range: (1, u32::MAX),
         structural_change: true,
         content_hash: 0,
+        refactor: None,
         comment_count: 0,
         reviewed: false,
     }
@@ -214,10 +254,52 @@ pub struct EntitySummary {
     /// `false` when the only change was formatting or comments.
     pub structural_change: bool,
     pub content_hash: u64,
+    /// Refactor classification copied from `EntityCoreData`; `None` for
+    /// ordinary changes.
+    pub refactor: Option<RefactorKind>,
     /// Number of inline comments anchored inside this entity's line range.
     pub comment_count: usize,
     /// `true` when the reviewer has visited and auto-marked this entity.
     pub reviewed: bool,
+}
+
+impl EntitySummary {
+    /// Build the render-time summary from cached core data. `comment_count`
+    /// and `reviewed` start at their defaults; callers overlay live state.
+    pub fn from_core(e: &EntityCoreData) -> Self {
+        Self {
+            id: e.id.clone(),
+            display_name: e.id.display_name(),
+            kind: e.kind,
+            change: e.change,
+            annotation: e.annotation,
+            file_path: e.id.file_path.clone(),
+            source_file: e.source_file.clone(),
+            target_line: e.target_line,
+            line_range: e.line_range,
+            structural_change: e.structural_change,
+            content_hash: e.content_hash,
+            refactor: e.refactor.clone(),
+            comment_count: 0,
+            reviewed: false,
+        }
+    }
+
+    /// Mirror of [`EntityCoreData::is_behavior_preserving`] for render-time
+    /// dimming and the `;` filter.
+    pub fn is_behavior_preserving(&self) -> bool {
+        behavior_preserving(self.refactor.as_ref())
+    }
+}
+
+/// Shared behavior-preserving rule (see [`EntityCoreData::is_behavior_preserving`]).
+fn behavior_preserving(refactor: Option<&RefactorKind>) -> bool {
+    match refactor {
+        None => false,
+        Some(RefactorKind::Renamed { pure, .. }) => *pure,
+        Some(RefactorKind::Moved { identical }) => *identical,
+        Some(RefactorKind::Extracted { .. }) => true,
+    }
 }
 
 #[cfg(test)]

@@ -29,7 +29,7 @@ Entity list gains the intent + scope block: description subject, body peek, and 
 
 | Status         | Started    | Completed  |
 | -------------- | ---------- | ---------- |
-| ⬜ not-started  |            |            |
+| ✅ complete     | 2026-07-09 | 2026-07-09 |
 
 Tags: semantic, differ, cache
 

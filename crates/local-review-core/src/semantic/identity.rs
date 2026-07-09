@@ -153,6 +153,59 @@ fn fuzzy_match<'a>(
     }
 }
 
+// ── Extract-method detection ─────────────────────────────────────────────────
+
+/// Containment threshold for extract detection: the fraction of an added
+/// entity's unique tokens that must appear in a shrunken sibling's removed
+/// token set. Tuned by the fixture tests in `differ.rs` (true-positive
+/// extract vs. coincidental similarity): declaration boilerplate (fn, name,
+/// braces) dilutes real extracts to ~0.65-0.75, while unrelated additions
+/// score well under 0.2 — 0.6 splits the distributions with margin.
+pub(crate) const EXTRACT_CONTAINMENT_THRESHOLD: f64 = 0.6;
+
+/// Added entities below this token count are not eligible for extract
+/// detection (trivial stubs match anything).
+pub(crate) const MIN_TOKENS_EXTRACT: usize = 12;
+
+/// For an Added entity, find a Modified sibling in the same before-file whose
+/// removed tokens largely contain the added entity's tokens — the
+/// extract-method shape. Returns the sibling's before-state id.
+pub(crate) fn find_extraction_source(
+    added: &RawEntity,
+    matched: &[(&RawEntity, &RawEntity)],
+) -> Option<EntityId> {
+    let at = tokenise(&added.content);
+    if at.count < MIN_TOKENS_EXTRACT {
+        return None;
+    }
+    let mut best: Option<(f64, EntityId)> = None;
+    for (be, ae) in matched {
+        if be.file_path != added.file_path {
+            continue;
+        }
+        let bt = tokenise(&be.content);
+        let after_toks = tokenise(&ae.content);
+        // The sibling must have shrunk in *tokens* — the heuristic is
+        // token-based, and byte length shifts with formatting alone.
+        if bt.count <= after_toks.count {
+            continue;
+        }
+        // Removed span approximation: tokens present before but gone after.
+        let removed: HashSet<&str> = bt.unique.difference(&after_toks.unique).copied().collect();
+        if removed.is_empty() {
+            continue;
+        }
+        let contained = at.unique.intersection(&removed).count();
+        let containment = to_f64(contained) / to_f64(at.unique.len());
+        if containment >= EXTRACT_CONTAINMENT_THRESHOLD
+            && best.as_ref().is_none_or(|(b, _)| containment > *b)
+        {
+            best = Some((containment, be.id.clone()));
+        }
+    }
+    best.map(|(_, id)| id)
+}
+
 // ── Annotation classification ────────────────────────────────────────────────
 
 pub(crate) fn annotation(be: &RawEntity, ae: &RawEntity) -> ChangeAnnotation {

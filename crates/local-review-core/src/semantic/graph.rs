@@ -71,16 +71,47 @@ pub fn build_graph(registry: &ExtractorRegistry, repo_root: &Path, files: &[Path
         }
     }
 
-    // Ambiguous matches (multiple entities with the same leaf name) all get
-    // edges — the bundle's budget handles pruning. Unresolved names (no
-    // matching entity in the repo) are silently dropped.
-    let mut seen: std::collections::HashSet<(EntityId, EntityId)> =
-        std::collections::HashSet::new();
+    let (edges, unresolved) = resolve_edges(&calls_by_file, &entities_by_file, &by_name);
+
+    GraphData {
+        nodes,
+        edges,
+        unresolved,
+    }
+}
+
+/// One unresolved reference per `(caller, callee_name)` pair, and at most
+/// this many per file. Real repos call hundreds of distinct external /
+/// library names per file; without a bound the unresolved list scales with
+/// total call sites and bloats every cache entry. The consumers tolerate
+/// the cap: deleted-entity survivor counting needs "any reference exists",
+/// and the blast-radius overlay lists one row per caller.
+const MAX_UNRESOLVED_PER_FILE: usize = 128;
+
+/// Resolve call sites into edges and unresolved references.
+///
+/// Ambiguous matches (multiple entities with the same leaf name) all get
+/// edges — the bundle's budget handles pruning. Unresolved names (no
+/// matching entity in the repo) are recorded as `UnresolvedRef`s: risk
+/// tiers count them as surviving references to deleted entities, and the
+/// blast-radius overlay lists them. Deduplicated per `(caller, callee)`
+/// (first call site wins) and capped per file — see
+/// [`MAX_UNRESOLVED_PER_FILE`].
+fn resolve_edges(
+    calls_by_file: &HashMap<PathBuf, Vec<(u32, String)>>,
+    entities_by_file: &HashMap<PathBuf, Vec<(EntityId, EntityKind, u32, u32)>>,
+    by_name: &HashMap<String, Vec<EntityId>>,
+) -> (Vec<GraphEdge>, Vec<crate::semantic::cache::UnresolvedRef>) {
+    let mut edge_idx: HashMap<(EntityId, EntityId), usize> = HashMap::new();
     let mut edges: Vec<GraphEdge> = Vec::new();
-    for (path, calls) in &calls_by_file {
+    let mut unresolved: Vec<crate::semantic::cache::UnresolvedRef> = Vec::new();
+    let mut seen_unresolved: std::collections::HashSet<(EntityId, String)> =
+        std::collections::HashSet::new();
+    for (path, calls) in calls_by_file {
         let Some(file_entities) = entities_by_file.get(path) else {
             continue;
         };
+        let mut file_unresolved = 0usize;
         for (line, callee) in calls {
             let Some(caller) = containing_entity(file_entities, *line) else {
                 // Top-level call; skip — there's no enclosing entity to
@@ -88,6 +119,16 @@ pub fn build_graph(registry: &ExtractorRegistry, repo_root: &Path, files: &[Path
                 continue;
             };
             let Some(targets) = by_name.get(callee) else {
+                if file_unresolved < MAX_UNRESOLVED_PER_FILE
+                    && seen_unresolved.insert((caller.clone(), callee.clone()))
+                {
+                    file_unresolved += 1;
+                    unresolved.push(crate::semantic::cache::UnresolvedRef {
+                        callee_name: callee.clone(),
+                        from: caller.clone(),
+                        line: *line,
+                    });
+                }
                 continue;
             };
             for target in targets {
@@ -96,19 +137,25 @@ pub fn build_graph(registry: &ExtractorRegistry, repo_root: &Path, files: &[Path
                 if target == caller {
                     continue;
                 }
-                // Deduplicate: a function that calls bar() three times only
-                // needs one edge from caller → bar in the bundle.
-                if seen.insert((caller.clone(), target.clone())) {
-                    edges.push(GraphEdge {
-                        from: caller.clone(),
-                        to: target.clone(),
-                    });
+                // One edge per caller → callee pair; each call occurrence
+                // appends its line so blast-radius renders one row per call.
+                match edge_idx.entry((caller.clone(), target.clone())) {
+                    std::collections::hash_map::Entry::Occupied(o) => {
+                        edges[*o.get()].call_sites.push(*line);
+                    }
+                    std::collections::hash_map::Entry::Vacant(v) => {
+                        v.insert(edges.len());
+                        edges.push(GraphEdge {
+                            from: caller.clone(),
+                            to: target.clone(),
+                            call_sites: vec![*line],
+                        });
+                    }
                 }
             }
         }
     }
-
-    GraphData { nodes, edges }
+    (edges, unresolved)
 }
 
 /// Return the `EntityId` of the smallest entity in `file_entities` whose
@@ -286,5 +333,52 @@ mod tests {
         let graph = build_graph(&registry, dir.path(), &[PathBuf::from("ghost.rs")]);
         assert_eq!(graph.nodes.len(), 0);
         assert_eq!(graph.edges.len(), 0);
+    }
+}
+
+#[cfg(test)]
+mod phase2_tests {
+    use super::*;
+    use crate::semantic::create_default_registry;
+
+    #[test]
+    fn call_sites_record_one_line_per_occurrence_and_unresolved_refs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let content = "fn callee() -> i32 { 1 }\n\
+                       fn caller() -> i32 {\n\
+                           let a = callee();\n\
+                           let b = callee();\n\
+                           let c = vanished_symbol();\n\
+                           let d = vanished_symbol();\n\
+                           a + b + c + d\n\
+                       }\n";
+        let path = dir.path().join("lib.rs");
+        std::fs::write(&path, content).expect("write fixture");
+        let registry = create_default_registry();
+        let graph = build_graph(&registry, dir.path(), &[PathBuf::from("lib.rs")]);
+
+        let edge = graph
+            .edges
+            .iter()
+            .find(|e| e.to.name() == "callee")
+            .expect("caller → callee edge present");
+        assert_eq!(
+            edge.call_sites,
+            vec![3, 4],
+            "two call occurrences must yield two call-site lines"
+        );
+
+        let dangling: Vec<_> = graph
+            .unresolved
+            .iter()
+            .filter(|u| u.callee_name == "vanished_symbol")
+            .collect();
+        assert_eq!(
+            dangling.len(),
+            1,
+            "repeat calls to the same missing symbol dedupe to one ref per caller"
+        );
+        assert_eq!(dangling[0].from.name(), "caller");
+        assert_eq!(dangling[0].line, 5, "first call site wins");
     }
 }

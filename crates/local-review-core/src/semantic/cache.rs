@@ -21,7 +21,7 @@ use crate::semantic::entity::EntityCoreData;
 /// History: 1 = original; 2 = added markdown + test-file plugins;
 /// 3 = added `AnchorFingerprint` / entity-reviewed fields;
 /// 4 = populated `GraphData` with real `nodes`/`edges`.
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 
 #[derive(Debug, Snafu)]
 pub enum CacheError {
@@ -78,6 +78,23 @@ pub struct CacheEntry {
 pub struct GraphData {
     pub nodes: Vec<GraphNode>,
     pub edges: Vec<GraphEdge>,
+    /// Call references whose callee could not be resolved to a known entity
+    /// at the graphed state — dangling calls. Risk tiers use these to count
+    /// surviving references to Deleted entities (spec: after-state dangling
+    /// calls are the actual breakage); blast-radius lists them.
+    #[serde(default)]
+    pub unresolved: Vec<UnresolvedRef>,
+}
+
+/// One call site naming a callee that no entity at the graphed state defines.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct UnresolvedRef {
+    /// The called name, as written at the call site.
+    pub callee_name: String,
+    /// The entity containing the call site.
+    pub from: crate::semantic::entity::EntityId,
+    /// 1-based line of the call site in `from`'s file (after state).
+    pub line: u32,
 }
 
 /// One entity in the graph. The graph indexes every entity in the repo, not
@@ -96,6 +113,11 @@ pub struct GraphEdge {
     pub from: crate::semantic::entity::EntityId,
     /// The entity being called.
     pub to: crate::semantic::entity::EntityId,
+    /// 1-based line numbers of each call occurrence in `from`'s file (after
+    /// state) — one entry per call, so five calls yield five entries. Feeds
+    /// the blast-radius overlay (one row per occurrence).
+    #[serde(default)]
+    pub call_sites: Vec<u32>,
 }
 
 // ── Read / write ─────────────────────────────────────────────────────────────
