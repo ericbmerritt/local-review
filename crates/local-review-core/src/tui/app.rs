@@ -2605,10 +2605,18 @@ fn handle_entity_list_key<S: ReviewSurfaceExt>(
         KeyCode::Char('3') => app.toggle_severity_filter(Severity::Note),
         KeyCode::Char(';') => {
             app.cosmetic_filter_on = !app.cosmetic_filter_on;
+            // `;` hides all behavior-preserving rows (cosmetic + refactor
+            // tags), not just cosmetic — keep the reviewer aware of how many
+            // rows they are not seeing.
+            let hidden = app
+                .entities
+                .iter()
+                .filter(|e| !e.structural_change || e.is_behavior_preserving())
+                .count();
             let msg = if app.cosmetic_filter_on {
-                "cosmetic filter: hidden".to_owned()
+                format!("cosmetic + refactor rows: hidden ({hidden})")
             } else {
-                "cosmetic filter: shown".to_owned()
+                format!("cosmetic + refactor rows: shown ({hidden})")
             };
             app.status_message = Some(msg);
         }
@@ -3862,6 +3870,7 @@ mod app_tests {
                 line_range: (1, 10),
                 structural_change: true,
                 content_hash: 0,
+                refactor: None,
                 comment_count: 0,
                 reviewed: false,
             });
@@ -4255,6 +4264,7 @@ mod app_tests {
             ),
             structural_change: true,
             content_hash: 0,
+            refactor: None,
             comment_count: 0,
             reviewed: false,
         }

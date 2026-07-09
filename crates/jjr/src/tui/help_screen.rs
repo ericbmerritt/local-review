@@ -19,6 +19,8 @@ Comments
     1                     filter to required only (press again to clear)
     2                     filter to suggestion only (press again to clear)
     3                     filter to note only (press again to clear)
+    ;                     hide / show behavior-preserving rows
+                          (cosmetic + renamed / moved / extracted tags)
 
 Views
     (header)              entity list opens with the change subject, a

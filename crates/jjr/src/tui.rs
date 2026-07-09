@@ -6296,26 +6296,7 @@ fn build_entity_summaries(
     entry
         .entities
         .into_iter()
-        .map(|e| {
-            let display_name = e.id.display_name();
-            let file_path = e.id.file_path.clone();
-            let source_file = e.source_file.clone();
-            local_review_core::semantic::EntitySummary {
-                id: e.id,
-                display_name,
-                kind: e.kind,
-                change: e.change,
-                annotation: e.annotation,
-                file_path,
-                source_file,
-                target_line: e.target_line,
-                line_range: e.line_range,
-                structural_change: e.structural_change,
-                content_hash: e.content_hash,
-                comment_count: 0,
-                reviewed: false,
-            }
-        })
+        .map(|e| local_review_core::semantic::EntitySummary::from_core(&e))
         .collect()
 }
 
@@ -13398,6 +13379,7 @@ mod tests {
             kind: EntityKind::Function,
             change: ChangeType::Modified,
             annotation: ChangeAnnotation::BodyOnly,
+            refactor: None,
             line_range: (start, end),
             source_file: None,
             target_line: None,
@@ -13523,16 +13505,20 @@ mod tests {
                 GraphEdge {
                     from: source.clone(),
                     to: target.clone(),
+                    call_sites: Vec::new(),
                 },
                 GraphEdge {
                     from: source.clone(),
                     to: target.clone(),
+                    call_sites: Vec::new(),
                 },
                 GraphEdge {
                     from: source.clone(),
                     to: target.clone(),
+                    call_sites: Vec::new(),
                 },
             ],
+            unresolved: Vec::new(),
         };
         let entities = vec![
             bundle_ent("src/a.rs", "caller", 1, 10),

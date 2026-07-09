@@ -1802,22 +1802,7 @@ fn ggr_entity_cache_base(
 fn ggr_entity_summary_from_core(
     e: &local_review_core::semantic::EntityCoreData,
 ) -> local_review_core::semantic::EntitySummary {
-    let display_name = e.id.display_name();
-    local_review_core::semantic::EntitySummary {
-        id: e.id.clone(),
-        display_name,
-        kind: e.kind,
-        change: e.change,
-        annotation: e.annotation,
-        file_path: e.id.file_path.clone(),
-        source_file: e.source_file.clone(),
-        target_line: e.target_line,
-        line_range: e.line_range,
-        structural_change: e.structural_change,
-        content_hash: e.content_hash,
-        comment_count: 0,
-        reviewed: false,
-    }
+    local_review_core::semantic::EntitySummary::from_core(e)
 }
 
 fn ggr_build_entity_summaries(
@@ -1826,26 +1811,7 @@ fn ggr_build_entity_summaries(
     entry
         .entities
         .into_iter()
-        .map(|e| {
-            let display_name = e.id.display_name();
-            let file_path = e.id.file_path.clone();
-            let source_file = e.source_file.clone();
-            local_review_core::semantic::EntitySummary {
-                id: e.id,
-                display_name,
-                kind: e.kind,
-                change: e.change,
-                annotation: e.annotation,
-                file_path,
-                source_file,
-                target_line: e.target_line,
-                line_range: e.line_range,
-                structural_change: e.structural_change,
-                content_hash: e.content_hash,
-                comment_count: 0,
-                reviewed: false,
-            }
-        })
+        .map(|e| local_review_core::semantic::EntitySummary::from_core(&e))
         .collect()
 }
 
@@ -1916,6 +1882,11 @@ Comments
     e                     edit draft (cursor must be on the draft line)
     d                     delete draft (cursor must be on the draft line)
     T                     toggle thread expand / collapse
+
+Filters
+    1 / 2 / 3             severity filter: required / suggestion / note
+    ;                     hide / show behavior-preserving rows
+                          (cosmetic + renamed / moved / extracted tags)
 
 Views
     (header)              entity list opens with the entry subject (PR title

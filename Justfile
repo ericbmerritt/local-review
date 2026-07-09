@@ -19,7 +19,9 @@ check-format-md:
     prettier --check '**/*.md'
 
 check-for-trailing-whitespace:
-    ! rg '\s+$' --glob '!Cargo.lock' --glob '!specs/**'
+    # Explicit path: without it, rg reads stdin when stdin is a non-tty pipe
+    # (CI, background shells) and blocks forever instead of scanning files.
+    ! rg '\s+$' --glob '!Cargo.lock' --glob '!specs/**' .
 
 [parallel]
 lint: lint-rust lint-deps lint-nix

@@ -155,6 +155,7 @@ mod tests {
             line_range: (line, line + 5),
             structural_change: true,
             content_hash: 0,
+            refactor: None,
             comment_count: 0,
             reviewed: false,
         }
@@ -168,8 +169,10 @@ mod tests {
                 .map(|(ff, fn_, tf, tn)| GraphEdge {
                     from: eid(ff, fn_),
                     to: eid(tf, tn),
+                    call_sites: Vec::new(),
                 })
                 .collect(),
+            unresolved: Vec::new(),
         }
     }
 
