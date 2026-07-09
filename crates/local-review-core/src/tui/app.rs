@@ -1771,23 +1771,18 @@ fn render_main<S: ReviewSurfaceExt>(frame: &mut Frame<'_>, app: &mut App<S>) {
 }
 
 fn render_stack_bar<S: ReviewSurfaceExt>(frame: &mut Frame<'_>, area: Rect, app: &App<S>) {
-    let count = app.surface.entry_count();
+    let spec = app.surface.stack_bar_spec();
     let current = app.surface.current_entry_index();
-    let (position, total) = if count > 1 {
-        (current + 1, count)
-    } else {
-        (1, 1)
-    };
 
     let interior_cols = area.width.saturating_sub(BLOCK_BORDER_COLS);
-    let bar_segment = if area.width >= STACK_BAR_MIN_COLS_FOR_FILL && total > 0 {
-        progress_bar_string(position, total, STACK_PROGRESS_BAR_WIDTH)
-    } else {
-        String::new()
+    let bar_segment = match spec.progress {
+        Some((position, total)) if area.width >= STACK_BAR_MIN_COLS_FOR_FILL && total > 0 => {
+            progress_bar_string(position, total, STACK_PROGRESS_BAR_WIDTH)
+        }
+        Some(_) | None => String::new(),
     };
 
-    let id_str = app.surface.entry_id_display(current);
-    let text_segment = format!("{position}/{total}  {id_str}  ");
+    let text_segment = format!("{}  ", spec.label);
     let used_width = bar_segment.chars().count() + text_segment.chars().count();
     let desc_budget = usize::from(interior_cols).saturating_sub(used_width);
     let desc = app.surface.entry_description(current);
@@ -1797,7 +1792,7 @@ fn render_stack_bar<S: ReviewSurfaceExt>(frame: &mut Frame<'_>, area: Rect, app:
         text_segment,
         truncate(&desc, desc_budget)
     );
-    let block = Block::default().borders(Borders::ALL).title("Stack");
+    let block = Block::default().borders(Borders::ALL).title(spec.title);
     let widget = Paragraph::new(label).block(block);
     frame.render_widget(widget, area);
 }
