@@ -232,6 +232,8 @@ pub fn fallback_summary_for_file(file: &DiffFile) -> EntitySummary {
         refactor: None,
         comment_count: 0,
         reviewed: false,
+        risk: None,
+        fallback: true,
     }
 }
 
@@ -261,6 +263,14 @@ pub struct EntitySummary {
     pub comment_count: usize,
     /// `true` when the reviewer has visited and auto-marked this entity.
     pub reviewed: bool,
+    /// Risk-tier assessment; `None` until tiers are computed after
+    /// extraction completes (see `semantic::risk::compute_risk_tiers`).
+    pub risk: Option<crate::semantic::risk::RiskAssessment>,
+    /// `true` for synthetic whole-file rows built by
+    /// [`fallback_summary_for_file`]. Risk classification needs this
+    /// explicitly: a fallback row's `ChangeType` mirrors the file-level
+    /// change, so it is otherwise indistinguishable from a real entity.
+    pub fallback: bool,
 }
 
 impl EntitySummary {
@@ -282,6 +292,8 @@ impl EntitySummary {
             refactor: e.refactor.clone(),
             comment_count: 0,
             reviewed: false,
+            risk: None,
+            fallback: false,
         }
     }
 

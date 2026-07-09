@@ -1,9 +1,13 @@
-//! Topological sort for entity lists.
+//! Entity-list ordering: order modes and the topological sort.
 //!
-//! `topo_sort_entities` reorders a `Vec<EntitySummary>` so that callees
-//! (dependencies) appear before their callers. The sort uses Kahn's algorithm
-//! on the reversed call graph — entities with no outgoing edges into the
-//! changed set (pure callees) go first; pure callers go last.
+//! `sort_entities` dispatches on [`OrderMode`]. The default **risk** mode
+//! front-loads High-tier entities (ordering is causal for review quality —
+//! Fregnan et al.), keeping dependency order within each tier so
+//! comprehension still builds callees-first. `topo_sort_entities` reorders
+//! a `Vec<EntitySummary>` so that callees (dependencies) appear before
+//! their callers, using Kahn's algorithm on the reversed call graph —
+//! entities with no outgoing edges into the changed set (pure callees) go
+//! first; pure callers go last.
 //!
 //! When the graph has cycles or disconnected nodes, those entities are appended
 //! in the existing file-then-line order so none are dropped.
@@ -12,6 +16,76 @@ use std::collections::{HashMap, VecDeque};
 
 use crate::semantic::cache::GraphData;
 use crate::semantic::entity::{EntityId, EntitySummary};
+use crate::semantic::risk::RiskTier;
+
+/// Entity-list order, cycled by `o`. Session-persisted (a field on the
+/// running app), never written to disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderMode {
+    /// Tier descending; dependency order within a tier; file+line as the
+    /// final tiebreak. The default.
+    Risk,
+    /// Callees before callers (topological sort over the call graph).
+    Dependency,
+    /// File path, then start line.
+    File,
+}
+
+impl OrderMode {
+    /// The next mode in the `o` cycle: risk → dependency → file → risk.
+    pub fn next(self) -> Self {
+        match self {
+            Self::Risk => Self::Dependency,
+            Self::Dependency => Self::File,
+            Self::File => Self::Risk,
+        }
+    }
+
+    /// Lowercase mode name for the footer and status messages.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Risk => "risk",
+            Self::Dependency => "dependency",
+            Self::File => "file",
+        }
+    }
+}
+
+/// Sort `entities` according to `mode`. Modes that need the call graph
+/// (dependency order, and risk's within-tier ordering) fall back to
+/// file+line order when `graph` is `None`, so cycling modes is always
+/// deterministic even on graph-less surfaces.
+///
+/// Risk mode expects tiers to be present (`compute_risk_tiers` has run);
+/// entities with no computed tier sort with Medium.
+pub fn sort_entities(
+    entities: &mut Vec<EntitySummary>,
+    mode: OrderMode,
+    graph: Option<&GraphData>,
+) {
+    let dependency_or_file = |entities: &mut Vec<EntitySummary>| match graph {
+        Some(g) => topo_sort_entities(entities, g),
+        None => file_line_sort(entities),
+    };
+    match mode {
+        OrderMode::File => file_line_sort(entities),
+        OrderMode::Dependency => dependency_or_file(entities),
+        OrderMode::Risk => {
+            dependency_or_file(entities);
+            // Stable sort: within a tier the dependency (or file) order
+            // from the pass above is preserved.
+            entities.sort_by_key(|e| e.risk.as_ref().map_or(RiskTier::Medium, |r| r.tier).rank());
+        }
+    }
+}
+
+fn file_line_sort(entities: &mut [EntitySummary]) {
+    entities.sort_by(|a, b| {
+        a.file_path
+            .cmp(&b.file_path)
+            .then(a.line_range.0.cmp(&b.line_range.0))
+    });
+}
 
 /// Sort `entities` in dependency-first (callees-before-callers) order using
 /// the call graph. Entities not connected to any other entity in the list are
@@ -158,7 +232,17 @@ mod tests {
             refactor: None,
             comment_count: 0,
             reviewed: false,
+            risk: None,
+            fallback: false,
         }
+    }
+
+    fn with_tier(mut e: EntitySummary, t: RiskTier) -> EntitySummary {
+        e.risk = Some(crate::semantic::risk::RiskAssessment {
+            tier: t,
+            clause: String::new(),
+        });
+        e
     }
 
     fn graph(edges: &[(&str, &str, &str, &str)]) -> GraphData {
@@ -225,6 +309,72 @@ mod tests {
         topo_sort_entities(&mut entities, &g);
         // Both entities present, no panic.
         assert_eq!(entities.len(), 2);
+    }
+
+    #[test]
+    fn order_mode_cycles_risk_dependency_file() {
+        assert_eq!(OrderMode::Risk.next(), OrderMode::Dependency);
+        assert_eq!(OrderMode::Dependency.next(), OrderMode::File);
+        assert_eq!(OrderMode::File.next(), OrderMode::Risk);
+    }
+
+    #[test]
+    fn risk_mode_sorts_high_before_medium_before_low() {
+        let mut entities = vec![
+            with_tier(summary("a.rs", "low_e", 1), RiskTier::Low),
+            with_tier(summary("a.rs", "med_e", 10), RiskTier::Medium),
+            with_tier(summary("a.rs", "high_e", 20), RiskTier::High),
+        ];
+        sort_entities(&mut entities, OrderMode::Risk, None);
+        let names: Vec<_> = entities.iter().map(|e| e.id.name()).collect();
+        assert_eq!(names, ["high_e", "med_e", "low_e"]);
+    }
+
+    #[test]
+    fn risk_mode_keeps_dependency_order_within_a_tier() {
+        // Both High; caller → callee, listed caller-first so only the topo
+        // pass can produce callee-first order within the tier.
+        let mut entities = vec![
+            with_tier(summary("a.rs", "caller", 10), RiskTier::High),
+            with_tier(summary("b.rs", "callee", 1), RiskTier::High),
+            with_tier(summary("a.rs", "cosmetic_e", 1), RiskTier::Low),
+        ];
+        let g = graph(&[("a.rs", "caller", "b.rs", "callee")]);
+        sort_entities(&mut entities, OrderMode::Risk, Some(&g));
+        let names: Vec<_> = entities.iter().map(|e| e.id.name()).collect();
+        assert_eq!(names, ["callee", "caller", "cosmetic_e"]);
+    }
+
+    #[test]
+    fn risk_mode_without_tiers_treats_entities_as_medium() {
+        let mut entities = vec![
+            summary("b.rs", "untiered", 1),
+            with_tier(summary("a.rs", "high_e", 1), RiskTier::High),
+            with_tier(summary("c.rs", "low_e", 1), RiskTier::Low),
+        ];
+        sort_entities(&mut entities, OrderMode::Risk, None);
+        let names: Vec<_> = entities.iter().map(|e| e.id.name()).collect();
+        assert_eq!(names, ["high_e", "untiered", "low_e"]);
+    }
+
+    #[test]
+    fn dependency_mode_without_graph_falls_back_to_file_order() {
+        let mut entities = vec![summary("z.rs", "zeta", 5), summary("a.rs", "alpha", 1)];
+        sort_entities(&mut entities, OrderMode::Dependency, None);
+        let names: Vec<_> = entities.iter().map(|e| e.id.name()).collect();
+        assert_eq!(names, ["alpha", "zeta"]);
+    }
+
+    #[test]
+    fn file_mode_sorts_by_path_then_line() {
+        let mut entities = vec![
+            summary("b.rs", "late", 30),
+            summary("b.rs", "early", 2),
+            summary("a.rs", "first", 99),
+        ];
+        sort_entities(&mut entities, OrderMode::File, None);
+        let names: Vec<_> = entities.iter().map(|e| e.id.name()).collect();
+        assert_eq!(names, ["first", "early", "late"]);
     }
 
     #[test]

@@ -469,37 +469,33 @@ pub trait ReviewSurface: Sized {
         None
     }
 
+    /// Return the dependency graph for `entry_idx`, or `None` when graph
+    /// data is unavailable. The core uses it after extraction to compute
+    /// risk tiers and apply the active entity-list order, and again when
+    /// the user cycles orders with `o` — never during render (surfaces may
+    /// pay a subprocess call plus a cache read per invocation).
+    ///
+    /// jjr always builds a graph from the local working copy. ggr builds a
+    /// graph when `--no-graph` is not set and a `/tmp` clone is available.
+    /// Surfaces without a graph return `None`; the core then falls back to
+    /// file+line order and marks risk tiers as degraded.
+    fn entry_graph(&self, _entry_idx: usize) -> Option<crate::semantic::GraphData> {
+        None
+    }
+
     /// Return the number of direct callers of `entity_id` in the entry's
     /// dependency graph, or `None` when graph data is unavailable.
     ///
     /// "Direct callers" means edges where `edge.to == entity_id` — transitive
     /// callers are out of scope. Returns `None` (not `Some(0)`) when the graph
     /// was never built, so callers can distinguish "no callers" from "no data."
-    ///
-    /// jjr always builds a graph from the local working copy. ggr builds a
-    /// graph when `--no-graph` is not set and a `/tmp` clone is available.
-    /// Surfaces without a graph return `None` from this default implementation.
     fn caller_count(
         &self,
-        _entry_idx: usize,
-        _entity_id: &crate::semantic::EntityId,
+        entry_idx: usize,
+        entity_id: &crate::semantic::EntityId,
     ) -> Option<usize> {
-        None
-    }
-
-    /// Sort `entities` in dependency-first order (callees before callers) using
-    /// the cached call graph for `entry_idx`.
-    ///
-    /// Called immediately after entity extraction so the default entity list
-    /// view is topologically ordered. Also called when the user presses `o` to
-    /// toggle between dependency order and file+line order. Surfaces without a
-    /// graph (ggr before a clone is available, etc.) leave `entities` unchanged
-    /// so the caller falls back to the current file+line order.
-    fn sort_entities_topo(
-        &self,
-        _entry_idx: usize,
-        _entities: &mut Vec<crate::semantic::EntitySummary>,
-    ) {
+        let graph = self.entry_graph(entry_idx)?;
+        Some(graph.edges.iter().filter(|e| &e.to == entity_id).count())
     }
 
     /// Clear any on-disk entity cache for `entry_idx` so the next extraction

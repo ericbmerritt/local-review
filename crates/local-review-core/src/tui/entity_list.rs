@@ -288,8 +288,22 @@ fn entity_row_line(
         Style::default().fg(fg)
     };
 
+    // High-risk badge occupies the 2-char indent so row columns stay aligned.
+    let high_risk = entity
+        .risk
+        .as_ref()
+        .is_some_and(|r| r.tier == crate::semantic::RiskTier::High);
+    let badge = if high_risk {
+        Span::styled(
+            "! ",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::raw("  ")
+    };
+
     TuiLine::from(vec![
-        Span::raw("  "),
+        badge,
         Span::styled(sigil_str, sigil_style),
         Span::styled(name_cell, base_style),
         Span::styled(file_cell, dim_style),

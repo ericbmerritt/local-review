@@ -273,11 +273,16 @@ pub struct App<S: ReviewSurfaceExt> {
     /// position; `None` when the cursor is outside every entity's line range.
     /// Shown only when no transient `status_message` is active.
     pub(crate) entity_context: Option<String>,
-    /// When `true` (the default), the entity list is sorted in
-    /// dependency-first (callees-before-callers) order using the call graph.
-    /// Toggled by `o`; falls back to file+line order when no graph is
-    /// available.
-    pub(crate) topo_sort: bool,
+    /// Active entity-list order, cycled by `o` (risk → dependency → file).
+    /// Session-persisted: survives entry navigation, never written to disk.
+    pub(crate) order_mode: crate::semantic::OrderMode,
+    /// `true` when the current entry's risk tiers were computed without a
+    /// graph — fan-out is unknown and tiers resolved upward. Surfaced in
+    /// the entity-diff status bar.
+    pub(crate) tiers_degraded: bool,
+    /// Ensures the "risk tiers degraded" status notice fires at most once
+    /// per session rather than on every entry load.
+    pub(crate) degraded_notice_shown: bool,
     /// Entry to load on the next event-loop iteration, after the current frame
     /// has been drawn. Set by `advance_stack` / `retreat_stack` so the "loading"
     /// status is visible before the blocking `load_entry` call runs.
@@ -344,7 +349,9 @@ impl<S: ReviewSurfaceExt> App<S> {
             extraction: None,
             tick: 0,
             entity_context: None,
-            topo_sort: true,
+            order_mode: crate::semantic::OrderMode::Risk,
+            tiers_degraded: false,
+            degraded_notice_shown: false,
             pending_load: None,
         }
     }
@@ -659,6 +666,22 @@ impl<S: ReviewSurfaceExt> App<S> {
             crate::tui::entity_list::stats_line(&self.entities, &self.rendered_per_file);
     }
 
+    /// Compute risk tiers for the loaded entities and apply the active
+    /// order mode. Called once per entry load, after the entity list is
+    /// complete (sync fetch or end of async extraction) — never per frame.
+    /// One `entry_graph` read serves both tiering and ordering.
+    pub(crate) fn refresh_entity_order(&mut self) {
+        let idx = self.surface.current_entry_index();
+        let graph = self.surface.entry_graph(idx);
+        crate::semantic::compute_risk_tiers(&mut self.entities, graph.as_ref());
+        self.tiers_degraded = graph.is_none();
+        crate::semantic::sort_entities(&mut self.entities, self.order_mode, graph.as_ref());
+        if self.tiers_degraded && !self.degraded_notice_shown && !self.entities.is_empty() {
+            self.degraded_notice_shown = true;
+            self.status_message = Some("graph unavailable — risk tiers degraded".to_owned());
+        }
+    }
+
     fn start_entity_extraction(&mut self, idx: usize) {
         // Cancel any in-flight extraction.
         if let Some(ref prev) = self.extraction {
@@ -722,11 +745,9 @@ impl<S: ReviewSurfaceExt> App<S> {
 
         // Sync fallback: surface has no async task. Block on fetch_entity_list.
         match self.surface.fetch_entity_list(idx) {
-            Ok(mut entities) => {
-                if self.topo_sort {
-                    self.surface.sort_entities_topo(idx, &mut entities);
-                }
+            Ok(entities) => {
                 self.entities = entities;
+                self.refresh_entity_order();
                 self.refresh_header_stats();
                 self.description_summary = self.surface.fetch_description_summary(idx).ok();
                 if !in_diff_view {
@@ -1237,11 +1258,8 @@ fn drain_extraction_events<S: ReviewSurfaceExt>(app: &mut App<S>) -> bool {
 /// Tear down the in-progress extraction handle and exit the loading screen.
 fn end_extraction<S: ReviewSurfaceExt>(app: &mut App<S>) {
     app.extraction = None;
-    // Apply topo sort now that the full entity list is accumulated.
-    let idx = app.surface.current_entry_index();
-    if app.topo_sort {
-        app.surface.sort_entities_topo(idx, &mut app.entities);
-    }
+    // Tiers and ordering apply now that the full entity list is accumulated.
+    app.refresh_entity_order();
     if matches!(app.screen, Screen::Extracting) {
         app.screen = Screen::Main;
     }
@@ -1668,19 +1686,20 @@ fn entity_context_for_cursor<S: ReviewSurfaceExt>(app: &App<S>, findex: usize) -
             && file_line <= e.line_range.1
     })?;
 
-    let entry_idx = app.surface.current_entry_index();
-    let count = app.surface.caller_count(entry_idx, &entity.id);
-    Some(format_entity_context(entity, count))
+    Some(format_entity_context(entity, app.tiers_degraded))
 }
 
 /// Format the status-bar context string for one entity.
 ///
-/// jjr example: `authenticate() modified · sig+body · called from 8 places`
-/// ggr example: `authenticate() modified · sig+body`
-fn format_entity_context(
-    entity: &crate::semantic::EntitySummary,
-    caller_count: Option<usize>,
-) -> String {
+/// With a computed tier: `validate() modified · high · sig change · 11 callers`
+/// (plus ` · tiers degraded` when the graph was unavailable). The tier clause
+/// carries fan-out where it matters, so this function needs no live
+/// `caller_count` lookup — load-bearing, because it runs inside render on
+/// every entity-diff keystroke, and a surface lookup there means a subprocess
+/// call plus a full cache read per scroll step (the historical jjr
+/// scroll-lag bug). Before tiers are computed (mid-reload window), the
+/// context falls back to name + annotation with no caller segment.
+fn format_entity_context(entity: &crate::semantic::EntitySummary, tiers_degraded: bool) -> String {
     use crate::semantic::{ChangeAnnotation, ChangeType};
     use std::fmt::Write as _;
     let name = &entity.display_name;
@@ -1690,6 +1709,19 @@ fn format_entity_context(
         ChangeType::Modified => "modified",
         ChangeType::Moved => "moved",
     };
+    let mut out = format!("{name} {change}");
+
+    // Tier + one-clause justification replaces the annotation/caller
+    // segments: the clause already names the change shape ("sig change ·
+    // 11 callers", "body change"), so repeating the annotation would dupe.
+    if let Some(risk) = &entity.risk {
+        let _ = write!(out, " · {} · {}", risk.tier.label(), risk.clause);
+        if tiers_degraded {
+            out.push_str(" · tiers degraded");
+        }
+        return out;
+    }
+
     let annotation = match entity.change {
         ChangeType::Modified => match entity.annotation {
             ChangeAnnotation::SigChanged => Some("sig changed"),
@@ -1699,22 +1731,9 @@ fn format_entity_context(
         },
         ChangeType::Added | ChangeType::Deleted | ChangeType::Moved => None,
     };
-
-    let mut out = format!("{name} {change}");
     if let Some(ann) = annotation {
         out.push_str(" · ");
         out.push_str(ann);
-    }
-    if let Some(n) = caller_count {
-        if n > 0 {
-            let places = if n == 1 { "place" } else { "places" };
-            let _ = write!(out, " · called from {n} {places}");
-        } else {
-            // Graph is available but found no callers — show explicitly so
-            // the reviewer can distinguish "leaf node" from "no graph data"
-            // (which would be None and omit the suffix entirely).
-            out.push_str(" · no callers");
-        }
     }
     out
 }
@@ -2320,9 +2339,13 @@ fn render_footer<S: ReviewSurfaceExt>(frame: &mut Frame<'_>, area: Rect, app: &A
     }
 
     let has_stack = app.surface.entry_count() > 1;
-    let hint = app
+    let mut hint = app
         .surface
         .footer_hint(area.width, has_stack, app.severity_filter);
+    if matches!(app.screen, Screen::Main) {
+        use std::fmt::Write as _;
+        let _ = write!(hint, "  o {}", app.order_mode.label());
+    }
     frame.render_widget(Paragraph::new(hint), area);
 }
 
@@ -2500,21 +2523,14 @@ fn handle_event<S: ReviewSurfaceExt>(app: &mut App<S>) -> Result<(), AppError<S>
     Ok(())
 }
 
-/// Toggle the entity list sort between dependency order and file+line order.
-fn toggle_entity_sort<S: ReviewSurfaceExt>(app: &mut App<S>) {
-    app.topo_sort = !app.topo_sort;
+/// Cycle the entity list order: risk → dependency → file. Tiers were
+/// computed at entry load; only the ordering is reapplied here.
+fn cycle_entity_sort<S: ReviewSurfaceExt>(app: &mut App<S>) {
+    app.order_mode = app.order_mode.next();
     let idx = app.surface.current_entry_index();
-    if app.topo_sort {
-        app.surface.sort_entities_topo(idx, &mut app.entities);
-        app.status_message = Some("sort: dependency order".to_owned());
-    } else {
-        app.entities.sort_by(|a, b| {
-            a.file_path
-                .cmp(&b.file_path)
-                .then(a.line_range.0.cmp(&b.line_range.0))
-        });
-        app.status_message = Some("sort: file order".to_owned());
-    }
+    let graph = app.surface.entry_graph(idx);
+    crate::semantic::sort_entities(&mut app.entities, app.order_mode, graph.as_ref());
+    app.status_message = Some(format!("order: {}", app.order_mode.label()));
     app.entity_index = 0;
     app.entity_scroll = 0;
 }
@@ -2599,7 +2615,7 @@ fn handle_entity_list_key<S: ReviewSurfaceExt>(
             app.reload_current_entry()?;
             app.status_message = Some("refreshed".to_owned());
         }
-        KeyCode::Char('o') => toggle_entity_sort(app),
+        KeyCode::Char('o') => cycle_entity_sort(app),
         KeyCode::Char('1') => app.toggle_severity_filter(Severity::Required),
         KeyCode::Char('2') => app.toggle_severity_filter(Severity::Suggestion),
         KeyCode::Char('3') => app.toggle_severity_filter(Severity::Note),
@@ -3873,6 +3889,8 @@ mod app_tests {
                 refactor: None,
                 comment_count: 0,
                 reviewed: false,
+                risk: None,
+                fallback: false,
             });
         }
         app
@@ -4232,6 +4250,15 @@ mod app_tests {
                  See the render regression guard tests in app.rs."
             );
         }
+
+        fn entry_graph(&self, _: usize) -> Option<crate::semantic::GraphData> {
+            panic!(
+                "entry_graph() called during render — this is a regression. \
+                 On jjr it spawns a subprocess and reads the full entity cache; \
+                 per-keystroke it makes scrolling unusable. Compute tiers and \
+                 ordering at entry load, never in render."
+            );
+        }
     }
 
     impl ReviewSurfaceExt for SpySurface {
@@ -4267,6 +4294,8 @@ mod app_tests {
             refactor: None,
             comment_count: 0,
             reviewed: false,
+            risk: None,
+            fallback: false,
         }
     }
 
@@ -4294,6 +4323,44 @@ mod app_tests {
         let mut term = Terminal::new(backend).expect("terminal");
         // Will panic (test fails) if caller_count is called from render.
         term.draw(|frame| render(frame, &mut app)).expect("draw");
+    }
+
+    /// Rendering the entity diff must never call `caller_count` or
+    /// `entry_graph` either — this render runs on every scroll keystroke,
+    /// and on jjr those methods spawn a subprocess and read the full entity
+    /// cache. The status-bar context (which historically did a live
+    /// `caller_count` lookup here, causing visible scroll lag) must format
+    /// from pre-computed state only. The entity deliberately has no
+    /// computed tier: that is the worst-case (legacy) formatting path.
+    #[test]
+    fn render_entity_diff_does_not_call_surface_io() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut view = view_with_kinds(&[RenderedLineKind::Added, RenderedLineKind::Context]);
+        view.title = "src/lib.rs".to_owned();
+        // Put the cursor line inside entity 0's range (1..=9) so the
+        // status-bar context actually resolves an entity.
+        view.lines[0].target_line = Some(2);
+        view.lines[1].target_line = Some(3);
+
+        let spy = SpySurface::new(vec![view.clone()]);
+        let mut app = App::new(spy, vec![view], TransitionMode::Never);
+        app.entities.push(make_entity_for_render(0));
+        app.screen = Screen::EntityDiff { entity_idx: 0 };
+        app.line_index = 0;
+
+        let backend = TestBackend::new(200, 50);
+        let mut term = Terminal::new(backend).expect("terminal");
+        // Will panic (test fails) if caller_count or entry_graph is called.
+        term.draw(|frame| render(frame, &mut app)).expect("draw");
+        assert!(
+            app.entity_context
+                .as_deref()
+                .is_some_and(|c| c.contains("fn0")),
+            "status-bar context must still resolve the entity: {:?}",
+            app.entity_context
+        );
     }
 
     /// `m` on the entity list is surface-first: a surface that claims it
@@ -4333,6 +4400,134 @@ mod app_tests {
         assert!(
             matches!(app.screen, Screen::FileDiff { file_idx: 0 }),
             "surface ignored m; core must open the description view"
+        );
+    }
+
+    /// `o` cycles risk → dependency → file → risk, and the choice is
+    /// session state: the entry-load path re-applies it, never resets it.
+    #[test]
+    fn o_cycles_three_orders_and_survives_entry_reload() {
+        use crate::semantic::OrderMode;
+        let mut app = make_app_with_entities(3);
+        app.screen = Screen::Main;
+        assert_eq!(app.order_mode, OrderMode::Risk, "risk is the default");
+
+        let key = KeyEvent::new(KeyCode::Char('o'), crossterm::event::KeyModifiers::NONE);
+        handle_entity_list_key(&mut app, key).expect("key handling");
+        assert_eq!(app.order_mode, OrderMode::Dependency);
+        assert_eq!(app.status_message.as_deref(), Some("order: dependency"));
+        handle_entity_list_key(&mut app, key).expect("key handling");
+        assert_eq!(app.order_mode, OrderMode::File);
+        handle_entity_list_key(&mut app, key).expect("key handling");
+        assert_eq!(app.order_mode, OrderMode::Risk, "cycle wraps");
+
+        handle_entity_list_key(&mut app, key).expect("key handling");
+        app.refresh_entity_order(); // what an entry load runs
+        assert_eq!(
+            app.order_mode,
+            OrderMode::Dependency,
+            "entry navigation must not reset the chosen order"
+        );
+    }
+
+    /// With a computed tier, the status bar shows `name change · tier ·
+    /// clause`, plus the degraded notice when the graph was unavailable.
+    #[test]
+    fn entity_context_shows_tier_clause_and_degraded_notice() {
+        let mut e = make_entity_for_render(0);
+        e.annotation = crate::semantic::ChangeAnnotation::SigChanged;
+        e.risk = Some(crate::semantic::RiskAssessment {
+            tier: crate::semantic::RiskTier::High,
+            clause: "sig change · unverified callers".to_owned(),
+        });
+        assert_eq!(
+            format_entity_context(&e, true),
+            "fn0 modified · high · sig change · unverified callers · tiers degraded"
+        );
+        assert_eq!(
+            format_entity_context(&e, false),
+            "fn0 modified · high · sig change · unverified callers"
+        );
+    }
+
+    /// End-to-end over the pure layer + renderer: a sig-changed entity with
+    /// callers tiers High, sorts before all Medium/Low entities in risk
+    /// order, and its row carries the `!` badge.
+    #[test]
+    fn high_risk_entity_sorts_first_and_carries_badge() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut high = make_entity_for_render(0);
+        high.display_name = "hot_fn".to_owned();
+        high.annotation = crate::semantic::ChangeAnnotation::SigChanged;
+        let mut med = make_entity_for_render(1);
+        med.display_name = "warm_fn".to_owned();
+        let mut low = make_entity_for_render(2);
+        low.display_name = "cold_fn".to_owned();
+        low.structural_change = false;
+
+        let graph = crate::semantic::GraphData {
+            nodes: Vec::new(),
+            edges: vec![crate::semantic::GraphEdge {
+                from: crate::semantic::EntityId::new(
+                    std::path::PathBuf::from("src/lib.rs"),
+                    vec!["caller".to_owned()],
+                    None,
+                    9,
+                ),
+                to: high.id.clone(),
+                call_sites: vec![7],
+            }],
+            unresolved: Vec::new(),
+        };
+
+        // Listed worst-last so only the risk sort can front-load `hot_fn`.
+        let mut entities = vec![low, med, high];
+        crate::semantic::compute_risk_tiers(&mut entities, Some(&graph));
+        crate::semantic::sort_entities(
+            &mut entities,
+            crate::semantic::OrderMode::Risk,
+            Some(&graph),
+        );
+        assert_eq!(entities[0].display_name, "hot_fn");
+        let risk = entities[0].risk.as_ref().expect("tier computed");
+        assert_eq!(risk.tier, crate::semantic::RiskTier::High);
+        assert_eq!(risk.clause, "sig change · 1 caller");
+
+        let view = view_with_kinds(&[RenderedLineKind::Added]);
+        let spy = SpySurface::new(vec![view.clone()]);
+        let mut app = App::new(spy, vec![view], TransitionMode::Never);
+        app.screen = Screen::Main;
+        app.entities = entities;
+        app.refresh_header_stats();
+
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).expect("terminal");
+        term.draw(|frame| render(frame, &mut app)).expect("draw");
+        let buf = term.backend().buffer();
+        let rows: Vec<String> = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+        let hot_row = rows
+            .iter()
+            .find(|r| r.contains("hot_fn"))
+            .expect("hot_fn row rendered");
+        assert!(
+            hot_row.starts_with("! "),
+            "High row must carry the ! badge: {hot_row:?}"
+        );
+        let warm_row = rows
+            .iter()
+            .find(|r| r.contains("warm_fn"))
+            .expect("warm_fn row rendered");
+        assert!(
+            warm_row.starts_with("  "),
+            "Medium row must not carry the badge: {warm_row:?}"
         );
     }
 

@@ -26,6 +26,9 @@ Views
     (header)              entity list opens with the change subject, a
                           description peek, and a Σ scope line
                           (entities · files · LOC · sig changes)
+    o                     cycle entity order: risk / dependency / file
+                          (risk puts ! high-tier rows first — sig changes
+                          with callers, deletions with dangling references)
     m                     open change description
     f                     file picker — jump to a file or the description
     r                     refresh diff and comments for current change

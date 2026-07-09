@@ -14,6 +14,8 @@
 //! - [`differ`] — `diff_entities`: takes before/after `RawEntity` lists and
 //!   produces `EntityCoreData` with Container Rule applied
 //! - [`identity`] — Jaccard-based entity matching (used internally by differ)
+//! - [`risk`] — total risk-tier mapping over changed entities
+//! - [`sort`] — entity-list order modes (risk / dependency / file)
 //! - [`plugins`] — `create_default_registry()` with all 13 languages
 
 pub mod cache;
@@ -26,6 +28,7 @@ pub mod graph;
 pub mod identity;
 pub mod plugins;
 pub mod registry;
+pub mod risk;
 pub mod sort;
 
 pub use cache::{GraphData, GraphEdge, GraphNode, UnresolvedRef};
@@ -44,4 +47,5 @@ pub use extractor::{CallSite, ExtractError, ExtractResult, SemanticExtractor};
 pub use graph::build_graph;
 pub use plugins::create_default_registry;
 pub use registry::ExtractorRegistry;
-pub use sort::topo_sort_entities;
+pub use risk::{compute_risk_tiers, risk_tier, RiskAssessment, RiskTier};
+pub use sort::{sort_entities, topo_sort_entities, OrderMode};

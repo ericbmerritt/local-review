@@ -60,7 +60,7 @@ differ.rs emits RefactorKind (Renamed / Moved / Extracted{from}) on EntityCoreDa
 
 | Status         | Started    | Completed  |
 | -------------- | ---------- | ---------- |
-| ⬜ not-started  |            |            |
+| ✅ complete     | 2026-07-09 | 2026-07-09 |
 
 Tags: semantic, sort, tui
 
