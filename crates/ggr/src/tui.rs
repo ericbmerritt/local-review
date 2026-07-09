@@ -1098,12 +1098,10 @@ impl ReviewSurface for GgrSurface {
         }
     }
 
-    fn caller_count(
-        &self,
-        entry_idx: usize,
-        entity_id: &local_review_core::semantic::EntityId,
-    ) -> Option<usize> {
-        // Called by the entity diff status bar on cursor move — not per frame.
+    fn entry_graph(&self, entry_idx: usize) -> Option<local_review_core::semantic::GraphData> {
+        // One cache read per invocation — at entry load and on `o`, never
+        // from render. Entry 0 is the PR overview: its entity list spans
+        // commits, so no single per-commit graph applies.
         if entry_idx == 0 {
             return None;
         }
@@ -1116,34 +1114,7 @@ impl ReviewSurface for GgrSurface {
         let entry = local_review_core::semantic::cache::read(&cache_path)
             .ok()
             .flatten()?;
-        let graph = entry.graph?;
-        Some(graph.edges.iter().filter(|e| &e.to == entity_id).count())
-    }
-
-    fn sort_entities_topo(
-        &self,
-        entry_idx: usize,
-        entities: &mut Vec<local_review_core::semantic::EntitySummary>,
-    ) {
-        if entry_idx == 0 {
-            return;
-        }
-        let Some(commit) = self.pr.commits.get(entry_idx - 1) else {
-            return;
-        };
-        let sha = commit.sha.as_str();
-        let owner_repo = self.pr.repo_name.as_str();
-        let Some(cache_path) =
-            ggr_entity_cache_base(owner_repo, self.pr.number, self.pr.hostname.as_deref())
-                .map(|base| local_review_core::semantic::cache::ggr_cache_path(&base, sha))
-        else {
-            return;
-        };
-        let Ok(Some(entry)) = local_review_core::semantic::cache::read(&cache_path) else {
-            return;
-        };
-        let Some(graph) = entry.graph else { return };
-        local_review_core::semantic::topo_sort_entities(entities, &graph);
+        entry.graph
     }
 
     fn has_pr_pane_toggle(&self, entry_idx: usize) -> bool {
@@ -1893,6 +1864,9 @@ Views
                           on the overview, commit subject on commits), a
                           body peek, and a Σ scope line
                           (entities · files · LOC · sig changes)
+    o                     cycle entity order: risk / dependency / file
+                          (risk puts ! high-tier rows first — sig changes
+                          with callers, deletions with dangling references)
     f                     file picker
     R                     refresh — re-fetch PR state and re-anchor drafts
     y                     yank ±10 lines around cursor (with file:line header)
