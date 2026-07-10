@@ -146,7 +146,7 @@ semantic/cluster.rs: connected components over changed entities via call-graph e
 
 | Status         | Started    | Completed  |
 | -------------- | ---------- | ---------- |
-| ⬜ not-started  |            |            |
+| ✅ complete     | 2026-07-10 | 2026-07-10 |
 
 Tags: tui, graph, core
 

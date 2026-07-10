@@ -268,15 +268,17 @@ pub fn parent_rev(change_id: &ChangeId) -> String {
 /// Pass `subtree = Path::new(".")` to list the full repo (single-project
 /// repositories where the entire tree is relevant).
 ///
-/// Best-effort: an empty list is returned when `jj files` fails.
+/// Best-effort: an empty list is returned when `jj file list` fails.
 pub fn list_tracked_files(
     rev: &str,
     repo_root: &std::path::Path,
     subtree: &std::path::Path,
 ) -> Vec<std::path::PathBuf> {
     let subtree_str = subtree.to_string_lossy();
+    // `jj file list` (the old `jj files` alias was removed in modern jj —
+    // 0.42 rejects it, which silently cost every graph on such hosts).
     let output = Command::new("jj")
-        .args(["files", "-r", rev, subtree_str.as_ref()])
+        .args(["file", "list", "-r", rev, subtree_str.as_ref()])
         .current_dir(repo_root)
         .output();
     let Ok(output) = output else {

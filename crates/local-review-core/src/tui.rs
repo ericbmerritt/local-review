@@ -159,6 +159,35 @@ pub fn severity_color(severity: Severity) -> Color {
 }
 
 #[cfg(test)]
+mod call_site_tests {
+    use super::{fill_context_lines, ResolvedCallSite};
+
+    fn site(file: &str, line: u32) -> ResolvedCallSite {
+        ResolvedCallSite {
+            caller: "caller".to_owned(),
+            file: std::path::PathBuf::from(file),
+            line,
+            context: String::new(),
+        }
+    }
+
+    #[test]
+    fn context_lines_read_trimmed_from_source_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("a.rs"),
+            "one\n    let x = validate();\nthree\n",
+        )
+        .expect("write fixture");
+        let mut sites = vec![site("a.rs", 2), site("a.rs", 99), site("missing.rs", 1)];
+        fill_context_lines(dir.path(), &mut sites);
+        assert_eq!(sites[0].context, "let x = validate();");
+        assert_eq!(sites[1].context, "", "out-of-range line stays empty");
+        assert_eq!(sites[2].context, "", "unreadable file stays empty");
+    }
+}
+
+#[cfg(test)]
 mod scrollbar_tests {
     use super::scrollbar_overflow_for_view;
 
@@ -216,6 +245,44 @@ pub mod scrollbar_test_helpers {
     /// Find the row of the topmost thumb (`█`) glyph in `col` of `buf`.
     pub fn scrollbar_thumb_row(buf: &ratatui::buffer::Buffer, col: u16) -> Option<u16> {
         (0..buf.area.height).find(|&row| buf[(col, row)].symbol() == "\u{2588}")
+    }
+}
+
+/// One call occurrence of a focused entity, resolved for the blast-radius
+/// overlay. One value per call site — a caller invoking the target five
+/// times yields five of these.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedCallSite {
+    /// Calling entity's display name (`Session::refresh`). For deleted
+    /// entities this is the holder of the dangling reference.
+    pub caller: String,
+    /// Repo-relative file containing the call site.
+    pub file: std::path::PathBuf,
+    /// 1-based line of the call occurrence in the after-state file.
+    pub line: u32,
+    /// Trimmed source line at the call site, read from the graph's source
+    /// checkout; empty when the checkout is unavailable.
+    pub context: String,
+}
+
+/// Fill `context` on each site by reading its file under `root` (the
+/// graph's source checkout). Files are read once each; unreadable files or
+/// out-of-range lines leave the context empty — the row still renders as
+/// `file:line`. Content passes through `strip_controls`: it is
+/// repo-controlled text headed for the terminal.
+pub(crate) fn fill_context_lines(root: &std::path::Path, sites: &mut [ResolvedCallSite]) {
+    let mut file_cache: std::collections::HashMap<std::path::PathBuf, Vec<String>> =
+        std::collections::HashMap::new();
+    for site in sites {
+        let lines = file_cache.entry(site.file.clone()).or_insert_with(|| {
+            std::fs::read_to_string(root.join(&site.file))
+                .map(|content| content.lines().map(str::to_owned).collect())
+                .unwrap_or_default()
+        });
+        let idx = usize::try_from(site.line.saturating_sub(1)).unwrap_or(usize::MAX);
+        if let Some(text) = lines.get(idx) {
+            site.context = crate::util::strip_controls(text.trim());
+        }
     }
 }
 
@@ -529,6 +596,64 @@ pub trait ReviewSurface: Sized {
     /// file+line order and marks risk tiers as degraded.
     fn entry_graph(&self, _entry_idx: usize) -> Option<crate::semantic::GraphData> {
         None
+    }
+
+    /// Root and human label of the checkout the graph's context lines come
+    /// from — jjr: the repo working copy ("working copy"); ggr: the clone
+    /// at the PR head ("@ <short-sha>"). `None` when no checkout is
+    /// available; call-site rows then render without context lines. The
+    /// label is shown in the blast-radius overlay header because per-commit
+    /// views in a multi-commit PR may see call sites slightly ahead of the
+    /// commit under review — bounded, *named* staleness.
+    fn call_site_source(&self, _entry_idx: usize) -> Option<(std::path::PathBuf, String)> {
+        None
+    }
+
+    /// Call occurrences of `entity` for the blast-radius overlay, one per
+    /// call site. `None` means the graph cannot answer (no graph for this
+    /// entry) — distinct from `Some(vec![])`, which is an authoritative
+    /// "zero callers".
+    ///
+    /// The default derives everything from [`ReviewSurface::entry_graph`]:
+    /// live entities read `GraphEdge::call_sites` on edges into the entity;
+    /// deleted entities read the unresolved-reference records (after-state
+    /// dangling calls that still name the symbol). Context lines fill from
+    /// [`ReviewSurface::call_site_source`] when available.
+    fn call_sites(
+        &self,
+        entry_idx: usize,
+        entity: &crate::semantic::EntitySummary,
+    ) -> Option<Vec<ResolvedCallSite>> {
+        let graph = self.entry_graph(entry_idx)?;
+        let mut sites: Vec<ResolvedCallSite> = Vec::new();
+        if matches!(entity.change, crate::semantic::ChangeType::Deleted) {
+            for u in &graph.unresolved {
+                if u.callee_name == entity.id.name() {
+                    sites.push(ResolvedCallSite {
+                        caller: u.from.display_name(),
+                        file: u.from.file_path.clone(),
+                        line: u.line,
+                        context: String::new(),
+                    });
+                }
+            }
+        } else {
+            for edge in graph.edges.iter().filter(|e| e.to == entity.id) {
+                for &line in &edge.call_sites {
+                    sites.push(ResolvedCallSite {
+                        caller: edge.from.display_name(),
+                        file: edge.from.file_path.clone(),
+                        line,
+                        context: String::new(),
+                    });
+                }
+            }
+        }
+        sites.sort_by(|a, b| a.file.cmp(&b.file).then(a.line.cmp(&b.line)));
+        if let Some((root, _)) = self.call_site_source(entry_idx) {
+            fill_context_lines(&root, &mut sites);
+        }
+        Some(sites)
     }
 
     /// Return the number of direct callers of `entity_id` in the entry's

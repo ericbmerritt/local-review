@@ -71,6 +71,13 @@ pub struct CacheEntry {
     /// ggr builds one when `--no-graph` is not set and a `/tmp` clone is
     /// available.
     pub graph: Option<GraphData>,
+    /// Why `graph` is `None`, when the writer knows ("jj file list returned
+    /// no files"). Surfaced verbatim in the degraded-tiers notice so a
+    /// broken graph pipeline is diagnosable at a glance instead of failing
+    /// silently. Additive: `serde(default)` keeps pre-existing entries
+    /// readable. Meaningless when `graph` is `Some`.
+    #[serde(default)]
+    pub graph_failure: Option<String>,
     /// Files for which extraction failed (for display as fallback rows).
     pub failed_files: Vec<String>,
 }
@@ -200,8 +207,32 @@ mod tests {
             extraction_hash: hash.to_owned(),
             entities: Vec::new(),
             graph: None,
+            graph_failure: None,
             failed_files: Vec::new(),
         }
+    }
+
+    #[test]
+    fn graph_failure_round_trips_and_defaults_when_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("entry.json");
+        let mut entry = make_entry(SCHEMA_VERSION, EXTRACTION_HASH);
+        entry.graph_failure = Some("jj file list returned no files".to_owned());
+        write(&path, &entry).expect("write");
+        let read_back = read(&path).expect("read").expect("hit");
+        assert_eq!(
+            read_back.graph_failure.as_deref(),
+            Some("jj file list returned no files")
+        );
+
+        // Entries written before the field existed must still deserialize.
+        let legacy = format!(
+            "{{\"schema_version\":{SCHEMA_VERSION},\"extraction_hash\":\"{EXTRACTION_HASH}\",\
+             \"entities\":[],\"graph\":null,\"failed_files\":[]}}"
+        );
+        fs::write(&path, legacy).expect("write legacy");
+        let read_back = read(&path).expect("read").expect("hit");
+        assert_eq!(read_back.graph_failure, None);
     }
 
     #[test]

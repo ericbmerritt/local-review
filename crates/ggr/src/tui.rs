@@ -1159,6 +1159,10 @@ impl ReviewSurface for GgrSurface {
             extraction_hash: local_review_core::semantic::cache::EXTRACTION_HASH.to_owned(),
             entities,
             graph,
+            // ggr's failure reason lives in the live clone state
+            // (`graph_unavailable_reason`); a cached string would go stale
+            // the moment the clone lands.
+            graph_failure: None,
             failed_files,
         };
         if let Some(ref p) = cache_path {
@@ -1215,6 +1219,19 @@ impl ReviewSurface for GgrSurface {
             },
             Err(_) => None,
         }
+    }
+
+    fn call_site_source(&self, _entry_idx: usize) -> Option<(std::path::PathBuf, String)> {
+        // Context lines come from the clone at the PR head. Naming that
+        // state matters: per-commit views in a multi-commit PR may see call
+        // sites slightly ahead of the commit under review.
+        let path = self.ready_repo_path()?;
+        let label = self
+            .pr
+            .commits
+            .last()
+            .map_or_else(|| "PR head".to_owned(), |c| format!("@ {}", c.short_sha));
+        Some((path, label))
     }
 
     fn entry_graph(&self, entry_idx: usize) -> Option<local_review_core::semantic::GraphData> {
@@ -1812,6 +1829,7 @@ impl GgrSurface {
                 extraction_hash: local_review_core::semantic::cache::EXTRACTION_HASH.to_owned(),
                 entities: pairs.into_iter().map(|(e, _)| e).collect(),
                 graph: None,
+                graph_failure: None,
                 failed_files: Vec::new(),
             };
             let _ = local_review_core::semantic::cache::write(p, &agg_entry);
@@ -1986,6 +2004,12 @@ Views
     o                     cycle entity order: risk / dependency / file
                           (risk puts ! high-tier rows first — sig changes
                           with callers, deletions with dangling references)
+    x                     blast-radius peek: list call sites of the focused
+                          entity (entity list or entity diff); Enter jumps
+                          to in-diff callers. Deleted entities list dangling
+                          references. Context lines read the clone at the
+                          PR head (header names the SHA).
+    z                     toggle entity diff: clipped range / full file
     f                     file picker
     R                     refresh — re-fetch PR state and re-anchor drafts
     y                     yank ±10 lines around cursor (with file:line header)
@@ -2982,6 +3006,24 @@ mod tests {
         }
         assert_eq!(surface.graph_unavailable_reason(), None);
         assert_eq!(surface.ready_repo_path(), Some(path));
+    }
+
+    #[test]
+    fn call_site_source_names_the_pr_head_when_clone_is_ready() {
+        let surface = GgrSurface::new(make_pr(), None, true);
+        assert!(
+            surface.call_site_source(1).is_none(),
+            "no source while the clone is in flight"
+        );
+        let path = std::path::PathBuf::from("/tmp/ggr-repos/x");
+        if let Ok(mut state) = surface.graph_clone.lock() {
+            *state = GraphCloneState::Ready(path.clone());
+        }
+        // Head = last commit; make_pr's second commit is b3b4c5d6.
+        assert_eq!(
+            surface.call_site_source(1),
+            Some((path, "@ b3b4c5d6".to_owned()))
+        );
     }
 
     #[test]

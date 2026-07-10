@@ -29,6 +29,11 @@ Views
     o                     cycle entity order: risk / dependency / file
                           (risk puts ! high-tier rows first — sig changes
                           with callers, deletions with dangling references)
+    x                     blast-radius peek: list call sites of the focused
+                          entity (entity list or entity diff); Enter jumps
+                          to in-diff callers. Deleted entities list dangling
+                          references. Context lines read the working copy.
+    z                     toggle entity diff: clipped range / full file
     m                     open change description
     f                     file picker — jump to a file or the description
     r                     refresh diff and comments for current change
