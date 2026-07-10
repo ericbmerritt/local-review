@@ -678,7 +678,10 @@ impl<S: ReviewSurfaceExt> App<S> {
         crate::semantic::sort_entities(&mut self.entities, self.order_mode, graph.as_ref());
         if self.tiers_degraded && !self.degraded_notice_shown && !self.entities.is_empty() {
             self.degraded_notice_shown = true;
-            self.status_message = Some("graph unavailable — risk tiers degraded".to_owned());
+            self.status_message = Some(match self.surface.graph_unavailable_reason() {
+                Some(reason) => format!("graph unavailable — {reason}; risk tiers degraded"),
+                None => "graph unavailable — risk tiers degraded".to_owned(),
+            });
         }
     }
 
@@ -3155,6 +3158,9 @@ mod app_tests {
         /// When `true`, `handle_extra_key` claims `m` with a status message —
         /// models ggr, whose `m` opens the commit-scoped composer.
         claim_m: bool,
+        /// Returned from `graph_unavailable_reason` — models ggr's clone
+        /// lifecycle reporting.
+        graph_reason: Option<String>,
     }
 
     impl NoopSurface {
@@ -3163,6 +3169,7 @@ mod app_tests {
                 views,
                 not_tracked: false,
                 claim_m: false,
+                graph_reason: None,
             }
         }
 
@@ -3171,6 +3178,7 @@ mod app_tests {
                 views,
                 not_tracked: true,
                 claim_m: false,
+                graph_reason: None,
             }
         }
 
@@ -3179,12 +3187,16 @@ mod app_tests {
                 views,
                 not_tracked: false,
                 claim_m: true,
+                graph_reason: None,
             }
         }
     }
 
     impl ReviewSurface for NoopSurface {
         type Error = NoopError;
+        fn graph_unavailable_reason(&self) -> Option<String> {
+            self.graph_reason.clone()
+        }
         fn entry_count(&self) -> usize {
             1
         }
@@ -4422,6 +4434,26 @@ mod app_tests {
             app.order_mode,
             OrderMode::Dependency,
             "entry navigation must not reset the chosen order"
+        );
+    }
+
+    /// The degraded-tiers notice includes the surface's reason when it has
+    /// one (ggr's clone lifecycle) and stays generic otherwise.
+    #[test]
+    fn degraded_notice_includes_surface_reason() {
+        let mut app = make_app_with_entities(1);
+        app.surface.graph_reason = Some("clone in progress".to_owned());
+        app.refresh_entity_order();
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("graph unavailable — clone in progress; risk tiers degraded")
+        );
+
+        let mut app = make_app_with_entities(1);
+        app.refresh_entity_order();
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("graph unavailable — risk tiers degraded")
         );
     }
 

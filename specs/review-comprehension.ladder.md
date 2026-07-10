@@ -90,7 +90,7 @@ Pure risk_tier() in semantic/risk.rs implementing the TOTAL mapping from the spe
 
 | Status         | Started    | Completed  |
 | -------------- | ---------- | ---------- |
-| ⬜ not-started  |            |            |
+| ✅ complete     | 2026-07-10 | 2026-07-10 |
 
 Tags: ggr, repo-cache, graph
 
