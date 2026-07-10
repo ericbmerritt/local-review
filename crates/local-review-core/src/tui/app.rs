@@ -182,8 +182,39 @@ pub enum Screen {
     Extra(Box<dyn ExtraScreen>),
     /// File picker modal.
     FilePicker(FilePickerState),
+    /// Blast-radius overlay: call sites of the focused entity.
+    CallSites(CallSitesState),
     /// Extraction in progress: showing loading overlay.
     Extracting,
+}
+
+/// Screen rendered behind the blast-radius overlay; also where Esc returns.
+#[derive(Debug, Clone, Copy)]
+pub enum CallSitesBackdrop {
+    Main,
+    EntityDiff { entity_idx: usize },
+}
+
+/// One row of the blast-radius overlay.
+#[derive(Debug)]
+pub struct CallSiteRow {
+    pub(crate) site: crate::tui::ResolvedCallSite,
+    /// `(view_idx, row_idx)` when the call site resolves to a row of the
+    /// loaded diff — those rows are navigable; external rows display only.
+    pub(crate) target: Option<(usize, usize)>,
+}
+
+/// State of the blast-radius overlay (`Screen::CallSites`).
+#[derive(Debug)]
+pub struct CallSitesState {
+    /// In-diff rows first, then external — `in_diff_count` is the boundary.
+    pub(crate) rows: Vec<CallSiteRow>,
+    pub(crate) in_diff_count: usize,
+    pub(crate) selected: usize,
+    /// Overlay title: entity name + the source-state label
+    /// (`callers of validate() — @ a3b4c5d6`).
+    pub(crate) title: String,
+    pub(crate) backdrop: CallSitesBackdrop,
 }
 
 /// Snapshot of the screen the user was on before opening a `Screen::Extra`
@@ -1397,6 +1428,9 @@ pub(crate) fn render<S: ReviewSurfaceExt>(frame: &mut Frame<'_>, app: &mut App<S
         Screen::FilePicker(state) => {
             file_picker::render(frame, state);
         }
+        Screen::CallSites(state) => {
+            render_call_sites_overlay(frame, state);
+        }
         Screen::Extra(_) => unreachable!("handled above"),
     }
 }
@@ -1411,6 +1445,17 @@ fn render_dispatch<S: ReviewSurfaceExt>(frame: &mut Frame<'_>, app: &mut App<S>)
         Screen::FileDiff { file_idx } => {
             let fidx = *file_idx;
             render_file_diff_screen(frame, app, fidx);
+        }
+        // The blast-radius overlay draws over the screen it was opened
+        // from, so a peek from the entity diff keeps the diff as backdrop.
+        Screen::CallSites(state) => {
+            let backdrop = state.backdrop;
+            match backdrop {
+                CallSitesBackdrop::Main => render_entity_list_screen(frame, app),
+                CallSitesBackdrop::EntityDiff { entity_idx } => {
+                    render_entity_diff_screen(frame, app, entity_idx);
+                }
+            }
         }
         Screen::Main
         | Screen::Extracting
@@ -2328,9 +2373,9 @@ fn render_footer<S: ReviewSurfaceExt>(frame: &mut Frame<'_>, area: Rect, app: &A
             .surface
             .footer_hint(area.width, has_stack, app.severity_filter);
         hint.push_str(if app.entity_clip {
-            "  x full"
+            "  x callers  z full"
         } else {
-            "  x clip"
+            "  x callers  z clip"
         });
         frame.render_widget(Paragraph::new(hint), area);
         return;
@@ -2352,8 +2397,8 @@ fn render_footer<S: ReviewSurfaceExt>(frame: &mut Frame<'_>, area: Rect, app: &A
 /// compact key reminder occupies the right side (default colour). The context
 /// is truncated so the hint always fits.
 fn entity_diff_footer_line(ctx: &str, width: u16, clip: bool) -> TuiLine<'static> {
-    let clip_key = if clip { "x full" } else { "x clip" };
-    let key_hints = format!("  Enter c  {clip_key}  U reviewed");
+    let clip_key = if clip { "z full" } else { "z clip" };
+    let key_hints = format!("  Enter c  x callers  {clip_key}  U reviewed");
     let hint_chars = key_hints.chars().count();
     let ctx_budget = usize::from(width).saturating_sub(hint_chars);
     let ctx_trimmed = truncate(ctx, ctx_budget);
@@ -2516,9 +2561,28 @@ fn handle_event<S: ReviewSurfaceExt>(app: &mut App<S>) -> Result<(), AppError<S>
             Screen::Transition(_) => handle_transition_key(app, key).map_err(AppError::Surface)?,
             Screen::Extra(_) => handle_extra_screen_key(app, key).map_err(AppError::Surface)?,
             Screen::FilePicker(_) => handle_file_picker_key(app, key),
+            Screen::CallSites(_) => handle_call_sites_key(app, key),
         }
     }
     Ok(())
+}
+
+/// Toggle the `;` filter hiding behavior-preserving rows (cosmetic +
+/// refactor tags) — keep the reviewer aware of how many rows they are
+/// not seeing.
+fn toggle_demoted_filter<S: ReviewSurfaceExt>(app: &mut App<S>) {
+    app.cosmetic_filter_on = !app.cosmetic_filter_on;
+    let hidden = app
+        .entities
+        .iter()
+        .filter(|e| !e.structural_change || e.is_behavior_preserving())
+        .count();
+    let msg = if app.cosmetic_filter_on {
+        format!("cosmetic + refactor rows: hidden ({hidden})")
+    } else {
+        "cosmetic + refactor rows: shown".to_owned()
+    };
+    app.status_message = Some(msg);
 }
 
 /// Cycle the entity list order: risk → dependency → file. Tiers were
@@ -2617,23 +2681,8 @@ fn handle_entity_list_key<S: ReviewSurfaceExt>(
         KeyCode::Char('1') => app.toggle_severity_filter(Severity::Required),
         KeyCode::Char('2') => app.toggle_severity_filter(Severity::Suggestion),
         KeyCode::Char('3') => app.toggle_severity_filter(Severity::Note),
-        KeyCode::Char(';') => {
-            app.cosmetic_filter_on = !app.cosmetic_filter_on;
-            // `;` hides all behavior-preserving rows (cosmetic + refactor
-            // tags), not just cosmetic — keep the reviewer aware of how many
-            // rows they are not seeing.
-            let hidden = app
-                .entities
-                .iter()
-                .filter(|e| !e.structural_change || e.is_behavior_preserving())
-                .count();
-            let msg = if app.cosmetic_filter_on {
-                format!("cosmetic + refactor rows: hidden ({hidden})")
-            } else {
-                format!("cosmetic + refactor rows: shown ({hidden})")
-            };
-            app.status_message = Some(msg);
-        }
+        KeyCode::Char('x') => open_call_sites_from_list(app),
+        KeyCode::Char(';') => toggle_demoted_filter(app),
         KeyCode::Char('m') => open_description_surface_first(app, key)?,
         // PR overview pane toggle: switch from entity list back to description.
         KeyCode::Char('e')
@@ -2746,6 +2795,7 @@ fn delegate_to_surface<S: ReviewSurfaceExt>(
                 | Screen::Transition(_)
                 | Screen::Extra(_)
                 | Screen::FilePicker(_)
+                | Screen::CallSites(_)
                 | Screen::Extracting => None,
             };
             app.screen = Screen::Extra(state);
@@ -2864,8 +2914,18 @@ fn handle_file_view_key<S: ReviewSurfaceExt>(
             app.surface.toggle_pr_pane();
             app.start_entity_extraction(idx);
         }
-        // Toggle entity-clipped view (show only entity range vs full file).
+        // Blast-radius peek: call sites of the focused entity.
         KeyCode::Char('x') => {
+            if let Screen::EntityDiff { entity_idx } = app.screen {
+                open_call_sites(
+                    app,
+                    entity_idx,
+                    CallSitesBackdrop::EntityDiff { entity_idx },
+                );
+            }
+        }
+        // Toggle entity-clipped view (show only entity range vs full file).
+        KeyCode::Char('z') => {
             if matches!(app.screen, Screen::EntityDiff { .. }) {
                 app.entity_clip = !app.entity_clip;
                 app.line_index = 0;
@@ -3126,6 +3186,229 @@ fn file_picker_enter<S: ReviewSurfaceExt>(app: &mut App<S>) {
 }
 
 // ---------------------------------------------------------------------------
+// Blast-radius overlay (Screen::CallSites)
+// ---------------------------------------------------------------------------
+
+/// Blast-radius peek on the focused entity-list row. Index 0 is the
+/// description row — no entity, no callers.
+fn open_call_sites_from_list<S: ReviewSurfaceExt>(app: &mut App<S>) {
+    if app.entity_index > 0 {
+        open_call_sites(app, app.entity_index - 1, CallSitesBackdrop::Main);
+    } else {
+        app.status_message = Some("select an entity to view its callers".to_owned());
+    }
+}
+
+/// Open the blast-radius overlay for `entities[eidx]`, or set a status
+/// message when the graph cannot answer (`x` is a visible no-op, never a
+/// dead key). Zero rows also stays a message — an empty overlay reads as
+/// broken, and "no surviving references" is itself the answer.
+fn open_call_sites<S: ReviewSurfaceExt>(
+    app: &mut App<S>,
+    eidx: usize,
+    backdrop: CallSitesBackdrop,
+) {
+    let Some(entity) = app.entities.get(eidx) else {
+        return;
+    };
+    let deleted = matches!(entity.change, crate::semantic::ChangeType::Deleted);
+    let name = entity.display_name.clone();
+    let entry_idx = app.surface.current_entry_index();
+    let Some(sites) = app.surface.call_sites(entry_idx, entity) else {
+        app.status_message = Some("caller data unavailable — no graph for this entry".to_owned());
+        return;
+    };
+    if sites.is_empty() {
+        app.status_message = Some(if deleted {
+            "no surviving references — nothing still names this symbol".to_owned()
+        } else {
+            "no callers in the graph".to_owned()
+        });
+        return;
+    }
+
+    let mut in_diff: Vec<CallSiteRow> = Vec::new();
+    let mut external: Vec<CallSiteRow> = Vec::new();
+    for site in sites {
+        let target = resolve_site_target(app, &site);
+        let row = CallSiteRow { site, target };
+        if row.target.is_some() {
+            in_diff.push(row);
+        } else {
+            external.push(row);
+        }
+    }
+    let in_diff_count = in_diff.len();
+    let mut rows = in_diff;
+    rows.extend(external);
+
+    let label = app
+        .surface
+        .call_site_source(entry_idx)
+        .map_or_else(|| "source unavailable".to_owned(), |(_, l)| l);
+    let title = if deleted {
+        format!("dangling references to {name} — {label}")
+    } else {
+        format!("callers of {name} — {label}")
+    };
+    app.screen = Screen::CallSites(CallSitesState {
+        rows,
+        in_diff_count,
+        selected: 0,
+        title,
+        backdrop,
+    });
+}
+
+/// Resolve a call site to `(view_idx, row_idx)` in the loaded diff, or
+/// `None` when the caller's file/line is outside this change. Title
+/// matching mirrors `render_entity_diff_screen`.
+fn resolve_site_target<S: ReviewSurfaceExt>(
+    app: &App<S>,
+    site: &crate::tui::ResolvedCallSite,
+) -> Option<(usize, usize)> {
+    let target = site.file.to_string_lossy();
+    let view_idx = app.rendered_per_file.iter().position(|v| {
+        let base = v
+            .title
+            .strip_suffix(" (added)")
+            .or_else(|| v.title.strip_suffix(" (removed)"))
+            .or_else(|| v.title.strip_suffix(" (binary)"))
+            .unwrap_or(&v.title);
+        base == target || v.title.ends_with(&format!(" -> {target}"))
+    })?;
+    let row_idx = app
+        .rendered_per_file
+        .get(view_idx)?
+        .lines
+        .iter()
+        .position(|l| l.target_line == Some(site.line))?;
+    Some((view_idx, row_idx))
+}
+
+fn close_call_sites<S: ReviewSurfaceExt>(app: &mut App<S>, backdrop: CallSitesBackdrop) {
+    app.screen = match backdrop {
+        CallSitesBackdrop::Main => Screen::Main,
+        CallSitesBackdrop::EntityDiff { entity_idx } => Screen::EntityDiff { entity_idx },
+    };
+}
+
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "unhandled KeyCode variants intentionally ignored in the overlay"
+)]
+fn handle_call_sites_key<S: ReviewSurfaceExt>(app: &mut App<S>, key: KeyEvent) {
+    let Screen::CallSites(ref mut state) = app.screen else {
+        return;
+    };
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q' | 'x') => {
+            let backdrop = state.backdrop;
+            close_call_sites(app, backdrop);
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            state.selected = state.selected.saturating_sub(1);
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            state.selected = (state.selected + 1).min(state.rows.len().saturating_sub(1));
+        }
+        KeyCode::Enter => {
+            let Some(row) = state.rows.get(state.selected) else {
+                return;
+            };
+            match row.target {
+                Some((view_idx, row_idx)) => {
+                    app.file_index = view_idx;
+                    app.line_index = row_idx;
+                    app.scroll = u16::try_from(row_idx.saturating_sub(3)).unwrap_or(u16::MAX);
+                    app.screen = Screen::FileDiff { file_idx: view_idx };
+                    app.mark_current_file_reviewed();
+                }
+                None => {
+                    app.status_message =
+                        Some("external caller — not part of this change".to_owned());
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Render the blast-radius overlay: centered modal, in-diff rows first,
+/// a divider before external rows, selected row reversed.
+fn render_call_sites_overlay(frame: &mut Frame<'_>, state: &CallSitesState) {
+    use ratatui::text::{Line as TuiLine, Span};
+
+    let area = frame.area();
+    // Cap at the terminal width: the 20-col floor must not push the modal
+    // out of bounds on a shrunken terminal (startup enforces MIN_COLS, but
+    // runtime resizes do not).
+    let width = area.width.saturating_sub(6).clamp(20, 100).min(area.width);
+    // Rows + optional divider + hint line, capped to the terminal.
+    let divider_rows = u16::from(state.in_diff_count < state.rows.len());
+    let body_rows = u16::try_from(state.rows.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(divider_rows)
+        .saturating_add(1);
+    let height = body_rows
+        .saturating_add(2) // borders
+        .min(area.height.saturating_sub(2));
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let overlay = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+
+    let block = Block::bordered().title(state.title.clone());
+    let inner = block.inner(overlay);
+    frame.render_widget(Clear, overlay);
+    frame.render_widget(block, overlay);
+
+    let mut lines: Vec<TuiLine<'_>> = Vec::new();
+    for (i, row) in state.rows.iter().enumerate() {
+        if i == state.in_diff_count && state.in_diff_count < state.rows.len() {
+            lines.push(TuiLine::from(Span::styled(
+                "── external callers ──",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        let loc = format!("{}:{}", row.site.file.display(), row.site.line);
+        // Caller identity always renders — the context line supplements it,
+        // never replaces it (a callers list without callers is useless).
+        let text = if row.site.context.is_empty() {
+            format!(" {} · {}", loc, row.site.caller)
+        } else {
+            format!(" {} · {} · {}", loc, row.site.caller, row.site.context)
+        };
+        let style = if i == state.selected {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else if row.target.is_none() {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            Style::default()
+        };
+        lines.push(TuiLine::from(Span::styled(text, style)));
+    }
+    lines.push(TuiLine::from(Span::styled(
+        " Enter jump (in-diff) · x/Esc close",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    // Keep the selected row visible when the list outgrows the modal.
+    let visible = usize::from(inner.height);
+    let scroll = if visible == 0 || state.selected < visible {
+        0
+    } else {
+        state.selected + 1 - visible
+    };
+    let widget = Paragraph::new(lines).scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0));
+    frame.render_widget(widget, inner);
+}
+
+// ---------------------------------------------------------------------------
 // Additional ReviewSurface methods needed by App (via a separate trait)
 // ---------------------------------------------------------------------------
 
@@ -3161,6 +3444,10 @@ mod app_tests {
         /// Returned from `graph_unavailable_reason` — models ggr's clone
         /// lifecycle reporting.
         graph_reason: Option<String>,
+        /// Served by `entry_graph` — models a surface with caller data.
+        graph: Option<crate::semantic::GraphData>,
+        /// Served by `call_site_source`.
+        call_source: Option<(std::path::PathBuf, String)>,
     }
 
     impl NoopSurface {
@@ -3170,6 +3457,8 @@ mod app_tests {
                 not_tracked: false,
                 claim_m: false,
                 graph_reason: None,
+                graph: None,
+                call_source: None,
             }
         }
 
@@ -3179,6 +3468,8 @@ mod app_tests {
                 not_tracked: true,
                 claim_m: false,
                 graph_reason: None,
+                graph: None,
+                call_source: None,
             }
         }
 
@@ -3188,6 +3479,8 @@ mod app_tests {
                 not_tracked: false,
                 claim_m: true,
                 graph_reason: None,
+                graph: None,
+                call_source: None,
             }
         }
     }
@@ -3196,6 +3489,12 @@ mod app_tests {
         type Error = NoopError;
         fn graph_unavailable_reason(&self) -> Option<String> {
             self.graph_reason.clone()
+        }
+        fn entry_graph(&self, _: usize) -> Option<crate::semantic::GraphData> {
+            self.graph.clone()
+        }
+        fn call_site_source(&self, _: usize) -> Option<(std::path::PathBuf, String)> {
+            self.call_source.clone()
         }
         fn entry_count(&self) -> usize {
             1
@@ -4009,6 +4308,7 @@ mod app_tests {
             | Screen::Transition(_)
             | Screen::Extra(_)
             | Screen::FilePicker(_)
+            | Screen::CallSites(_)
             | Screen::Extracting => None,
         };
 
@@ -4033,6 +4333,7 @@ mod app_tests {
             | Screen::Transition(_)
             | Screen::Extra(_)
             | Screen::FilePicker(_)
+            | Screen::CallSites(_)
             | Screen::Extracting => None,
         };
 
@@ -4102,6 +4403,7 @@ mod app_tests {
             | Screen::Transition(_)
             | Screen::Extra(_)
             | Screen::FilePicker(_)
+            | Screen::CallSites(_)
             | Screen::Extracting => None,
         };
 
@@ -4435,6 +4737,212 @@ mod app_tests {
             OrderMode::Dependency,
             "entry navigation must not reset the chosen order"
         );
+    }
+
+    // ── Blast-radius overlay (phase 6) ───────────────────────────────────────
+
+    /// App wired for call-site tests: one entity `validate` in src/lib.rs,
+    /// a caller with call sites at lines 3 and 40, and a loaded view that
+    /// contains line 3 (in-diff) but not line 40 (external).
+    fn make_call_sites_app() -> App<NoopSurface> {
+        let mut view = view_with_kinds(&[
+            RenderedLineKind::Context,
+            RenderedLineKind::Added,
+            RenderedLineKind::Context,
+        ]);
+        view.title = "src/lib.rs".to_owned();
+        view.lines[0].target_line = Some(2);
+        view.lines[1].target_line = Some(3);
+        view.lines[2].target_line = Some(4);
+
+        let mut surface = NoopSurface::new(vec![view.clone()]);
+        let target_id = crate::semantic::EntityId::new(
+            std::path::PathBuf::from("src/lib.rs"),
+            vec!["validate".to_owned()],
+            None,
+            0,
+        );
+        let caller_id = crate::semantic::EntityId::new(
+            std::path::PathBuf::from("src/lib.rs"),
+            vec!["caller".to_owned()],
+            None,
+            1,
+        );
+        surface.graph = Some(crate::semantic::GraphData {
+            nodes: Vec::new(),
+            edges: vec![crate::semantic::GraphEdge {
+                from: caller_id,
+                to: target_id.clone(),
+                call_sites: vec![3, 40],
+            }],
+            unresolved: Vec::new(),
+        });
+
+        let mut app = App::new(surface, vec![view], TransitionMode::Never);
+        let mut entity = make_entity_for_render(0);
+        entity.id = target_id;
+        entity.display_name = "validate".to_owned();
+        app.entities.push(entity);
+        app.screen = Screen::Main;
+        app.entity_index = 1;
+        app
+    }
+
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "test helper: screens outside the tested flow are a hard failure"
+    )]
+    fn press<S: ReviewSurfaceExt>(app: &mut App<S>, code: KeyCode) {
+        let key = KeyEvent::new(code, crossterm::event::KeyModifiers::NONE);
+        match &app.screen {
+            Screen::Main => handle_entity_list_key(app, key).expect("key handling"),
+            Screen::CallSites(_) => handle_call_sites_key(app, key),
+            Screen::EntityDiff { .. } | Screen::FileDiff { .. } => {
+                handle_file_view_key(app, key).expect("key handling");
+            }
+            _ => panic!("unexpected screen in test"),
+        }
+    }
+
+    /// `x` lists one row per call occurrence, in-diff rows first; Enter on
+    /// an in-diff row jumps to it, Enter on an external row is a notice.
+    #[test]
+    fn x_lists_call_sites_partitioned_and_jumps_to_in_diff_rows() {
+        let mut app = make_call_sites_app();
+        press(&mut app, KeyCode::Char('x'));
+        let Screen::CallSites(ref state) = app.screen else {
+            panic!(
+                "x must open the call-sites overlay, got {:?}",
+                app.status_message
+            );
+        };
+        assert_eq!(state.rows.len(), 2, "two occurrences → two rows");
+        assert_eq!(state.in_diff_count, 1);
+        assert_eq!(state.rows[0].site.line, 3);
+        assert!(state.rows[0].target.is_some(), "line 3 is in the diff");
+        assert_eq!(state.rows[1].site.line, 40);
+        assert!(state.rows[1].target.is_none(), "line 40 is external");
+        assert!(
+            state.title.contains("validate"),
+            "title names the entity: {}",
+            state.title
+        );
+
+        press(&mut app, KeyCode::Enter);
+        assert!(
+            matches!(app.screen, Screen::FileDiff { file_idx: 0 }),
+            "Enter on an in-diff row must jump into the diff"
+        );
+        assert_eq!(app.line_index, 1, "line 3 renders at row index 1");
+
+        // External row: navigate down to it and confirm Enter only notifies.
+        app.screen = Screen::Main;
+        app.entity_index = 1;
+        press(&mut app, KeyCode::Char('x'));
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Enter);
+        assert!(
+            matches!(app.screen, Screen::CallSites(_)),
+            "external rows must not navigate"
+        );
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("external caller — not part of this change")
+        );
+
+        // Esc restores the backdrop screen.
+        press(&mut app, KeyCode::Esc);
+        assert!(matches!(app.screen, Screen::Main));
+    }
+
+    /// Without a graph, `x` is a visible no-op; with a graph but zero
+    /// callers, the answer is a message rather than an empty overlay.
+    #[test]
+    fn x_without_answer_is_a_status_message_not_an_overlay() {
+        let mut app = make_call_sites_app();
+        app.surface.graph = None;
+        press(&mut app, KeyCode::Char('x'));
+        assert!(matches!(app.screen, Screen::Main));
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("caller data unavailable — no graph for this entry")
+        );
+
+        let mut app = make_call_sites_app();
+        if let Some(g) = app.surface.graph.as_mut() {
+            g.edges.clear();
+        }
+        press(&mut app, KeyCode::Char('x'));
+        assert!(matches!(app.screen, Screen::Main));
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("no callers in the graph")
+        );
+    }
+
+    /// Deleted entities answer from the unresolved-reference records:
+    /// dangling references list; zero survivors is reported in words.
+    #[test]
+    fn x_on_deleted_entity_lists_dangling_references_or_reports_none() {
+        let mut app = make_call_sites_app();
+        app.entities[0].change = crate::semantic::ChangeType::Deleted;
+        if let Some(g) = app.surface.graph.as_mut() {
+            g.edges.clear();
+            g.unresolved.push(crate::semantic::UnresolvedRef {
+                callee_name: "validate".to_owned(),
+                from: crate::semantic::EntityId::new(
+                    std::path::PathBuf::from("src/lib.rs"),
+                    vec!["survivor".to_owned()],
+                    None,
+                    2,
+                ),
+                line: 2,
+            });
+        }
+        press(&mut app, KeyCode::Char('x'));
+        let Screen::CallSites(ref state) = app.screen else {
+            panic!("dangling references must open the overlay");
+        };
+        assert_eq!(state.rows.len(), 1);
+        assert_eq!(state.rows[0].site.caller, "survivor");
+        assert!(state.title.contains("dangling references"));
+
+        let mut app = make_call_sites_app();
+        app.entities[0].change = crate::semantic::ChangeType::Deleted;
+        if let Some(g) = app.surface.graph.as_mut() {
+            g.edges.clear();
+        }
+        press(&mut app, KeyCode::Char('x'));
+        assert!(matches!(app.screen, Screen::Main));
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("no surviving references — nothing still names this symbol")
+        );
+    }
+
+    /// In the entity diff, `x` opens the overlay over the diff backdrop and
+    /// Esc returns to the diff; the clip toggle now lives on `z`.
+    #[test]
+    fn entity_diff_x_peeks_and_z_toggles_clip() {
+        let mut app = make_call_sites_app();
+        app.screen = Screen::EntityDiff { entity_idx: 0 };
+
+        let clip_before = app.entity_clip;
+        press(&mut app, KeyCode::Char('z'));
+        assert_eq!(app.entity_clip, !clip_before, "z must toggle clip");
+
+        press(&mut app, KeyCode::Char('x'));
+        let Screen::CallSites(ref state) = app.screen else {
+            panic!("x in the entity diff must open the overlay");
+        };
+        assert!(matches!(
+            state.backdrop,
+            CallSitesBackdrop::EntityDiff { entity_idx: 0 }
+        ));
+        assert_eq!(app.entity_clip, !clip_before, "x must no longer touch clip");
+
+        press(&mut app, KeyCode::Esc);
+        assert!(matches!(app.screen, Screen::EntityDiff { entity_idx: 0 }));
     }
 
     /// The degraded-tiers notice includes the surface's reason when it has

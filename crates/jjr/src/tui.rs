@@ -499,6 +499,27 @@ pub(crate) struct JjrSurface {
 }
 
 impl JjrSurface {
+    /// Read the entity cache entry for `entry_idx`. One `jj show`
+    /// subprocess call plus one cache read per invocation — acceptable at
+    /// entry load and on `o`, never called from render.
+    fn read_entry_cache(
+        &self,
+        entry_idx: usize,
+    ) -> Option<local_review_core::semantic::cache::CacheEntry> {
+        let change_id = self.entry_change_id(entry_idx).ok()?;
+        let details = jj::show(&change_id).ok()?;
+        let commit_id = details.commit_id.as_str().to_owned();
+        let cache_path = entity_cache_path(
+            &self.data_home,
+            &self.repo_root,
+            change_id.as_str(),
+            &commit_id,
+        );
+        local_review_core::semantic::cache::read(&cache_path)
+            .ok()
+            .flatten()
+    }
+
     fn new(
         details: ChangeDetails,
         ctx: JjrContext,
@@ -839,21 +860,17 @@ impl ReviewSurface for JjrSurface {
         // fine — the sync path is only hit when the surface skips the async
         // extraction (cache miss without a worker).
         let subtree = diff_subtree(&diff);
-        let files = jj::list_tracked_files(change_id.as_str(), &self.repo_root, &subtree);
-        let graph = if files.is_empty() {
-            None
-        } else {
-            Some(local_review_core::semantic::build_graph(
-                &registry,
-                &self.repo_root,
-                &files,
-            ))
-        };
+        let (graph, graph_failure) =
+            match build_graph_scoped(&registry, &self.repo_root, change_id.as_str(), &subtree) {
+                Ok(g) => (Some(g), None),
+                Err(reason) => (None, Some(reason)),
+            };
         let cache_entry = local_review_core::semantic::cache::CacheEntry {
             schema_version: local_review_core::semantic::cache::SCHEMA_VERSION,
             extraction_hash: local_review_core::semantic::cache::EXTRACTION_HASH.to_owned(),
             entities,
             graph,
+            graph_failure,
             failed_files,
         };
         let _ = local_review_core::semantic::cache::write(&cache_path, &cache_entry);
@@ -895,22 +912,21 @@ impl ReviewSurface for JjrSurface {
         let _ = std::fs::remove_file(&cache_path);
     }
 
+    fn call_site_source(&self, _entry_idx: usize) -> Option<(PathBuf, String)> {
+        // jjr's graph is built from the repo working copy; context lines
+        // read the same state.
+        Some((self.repo_root.clone(), "working copy".to_owned()))
+    }
+
     fn entry_graph(&self, entry_idx: usize) -> Option<local_review_core::semantic::GraphData> {
-        // One `jj show` subprocess call plus one cache read per invocation —
-        // acceptable at entry load and on `o`, never called from render.
-        let change_id = self.entry_change_id(entry_idx).ok()?;
-        let details = jj::show(&change_id).ok()?;
-        let commit_id = details.commit_id.as_str().to_owned();
-        let cache_path = entity_cache_path(
-            &self.data_home,
-            &self.repo_root,
-            change_id.as_str(),
-            &commit_id,
-        );
-        let entry = local_review_core::semantic::cache::read(&cache_path)
-            .ok()
-            .flatten()?;
-        entry.graph
+        self.read_entry_cache(entry_idx)?.graph
+    }
+
+    fn graph_unavailable_reason(&self) -> Option<String> {
+        // Only consulted when tiers are already degraded (once per entry
+        // load), so the cache read is not a hot path.
+        self.read_entry_cache(self.current_entry_index())?
+            .graph_failure
     }
 
     fn inline_comments_for_view(
@@ -6028,26 +6044,29 @@ impl local_review_core::tui::entity_list::ExtractionRunner for JjrExtractionTask
         );
 
         // Cache hit: skip per-file extraction but build graph if the cached
-        // entry lacks one (entries written before graph support was added).
-        if let Ok(Some(entry)) = cache::read(&cache_path) {
-            let has_graph = entry.graph.is_some();
-            emit_cache_hit(&tx, entry, &details.diff);
-            if !has_graph {
+        // entry lacks one (entries written before graph support, or while
+        // graph building was broken). Build BEFORE emitting: the core reads
+        // the cache for tiers/ordering as soon as extraction completes, so
+        // a graph written after the emit would only serve the *next* open.
+        // The loading spinner covers the wait.
+        if let Ok(Some(mut entry)) = cache::read(&cache_path) {
+            if entry.graph.is_none() {
                 let subtree = diff_subtree(&details.diff);
-                let graph = build_graph_scoped(
+                match build_graph_scoped(
                     &local_review_core::semantic::create_default_registry(),
                     &self.repo_root,
                     self.change_id.as_str(),
                     &subtree,
-                );
-                // Update the cache so the graph is present on the next open.
-                if let Some(g) = graph {
-                    if let Ok(Some(mut cached)) = cache::read(&cache_path) {
-                        cached.graph = Some(g);
-                        let _ = cache::write(&cache_path, &cached);
+                ) {
+                    Ok(g) => {
+                        entry.graph = Some(g);
+                        entry.graph_failure = None;
                     }
+                    Err(reason) => entry.graph_failure = Some(reason),
                 }
+                let _ = cache::write(&cache_path, &entry);
             }
+            emit_cache_hit(&tx, entry, &details.diff);
             return;
         }
 
@@ -6138,6 +6157,7 @@ fn extract_and_emit(
                 extraction_hash: EXTRACTION_HASH.to_owned(),
                 entities: file_entities.clone(),
                 graph: None,
+                graph_failure: None,
                 failed_files: Vec::new(),
             })
         };
@@ -6165,41 +6185,45 @@ fn extract_and_emit(
     // its deps / dependents sections.
     let _ = tx.send(ExtractionEvent::Complete);
     let subtree = diff_subtree(diff);
-    let graph = build_graph_scoped(
+    let (graph, graph_failure) = match build_graph_scoped(
         &local_review_core::semantic::create_default_registry(),
         &task.repo_root,
         task.change_id.as_str(),
         &subtree,
-    );
+    ) {
+        Ok(g) => (Some(g), None),
+        Err(reason) => (None, Some(reason)),
+    };
     let cache_entry = CacheEntry {
         schema_version: SCHEMA_VERSION,
         extraction_hash: EXTRACTION_HASH.to_owned(),
         entities: all_entities,
         graph,
+        graph_failure,
         failed_files,
     };
     let _ = cache::write(cache_path, &cache_entry);
 }
 
-/// Build the cross-file dependency graph for `change_id`, falling back to
-/// `None` on any error. The graph is a Claude-bundle convenience: missing
-/// it means the bundle drops deps / dependents, not that the reviewer is
-/// blocked. An empty file list (jj missing, revision unresolvable, etc.)
-/// is treated the same as graph-build failure.
 /// Build the graph scoped to `subtree` within the repo. Used by callers that
 /// know the relevant subdirectory (e.g. the common ancestor of the diff files)
 /// so we don't parse the entire repo in monorepo setups.
+///
+/// `Err` carries a short human-readable reason recorded as
+/// `CacheEntry::graph_failure` and surfaced in the degraded-tiers notice.
+/// A silent `None` here once hid a broken `jj file list` invocation for
+/// weeks — graph failures must name themselves.
 fn build_graph_scoped(
     registry: &local_review_core::semantic::ExtractorRegistry,
     repo_root: &std::path::Path,
     change_id: &str,
     subtree: &std::path::Path,
-) -> Option<local_review_core::semantic::GraphData> {
+) -> std::result::Result<local_review_core::semantic::GraphData, String> {
     let files = jj::list_tracked_files(change_id, repo_root, subtree);
     if files.is_empty() {
-        return None;
+        return Err("jj file list returned no files".to_owned());
     }
-    Some(local_review_core::semantic::build_graph(
+    Ok(local_review_core::semantic::build_graph(
         registry, repo_root, &files,
     ))
 }
