@@ -506,6 +506,17 @@ pub trait ReviewSurface: Sized {
         None
     }
 
+    /// Human-readable reason the dependency graph is unavailable, rendered
+    /// into the degraded-tiers notice as `graph unavailable — <reason>;
+    /// risk tiers degraded`. `None` falls back to the generic notice.
+    ///
+    /// ggr reports its clone lifecycle here ("clone in progress",
+    /// "--no-graph", "cannot reach PR head <sha>"); jjr always has a graph
+    /// and keeps the default.
+    fn graph_unavailable_reason(&self) -> Option<String> {
+        None
+    }
+
     /// Return the dependency graph for `entry_idx`, or `None` when graph
     /// data is unavailable. The core uses it after extraction to compute
     /// risk tiers and apply the active entity-list order, and again when

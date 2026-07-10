@@ -20,8 +20,12 @@ use crate::semantic::entity::EntityCoreData;
 ///
 /// History: 1 = original; 2 = added markdown + test-file plugins;
 /// 3 = added `AnchorFingerprint` / entity-reviewed fields;
-/// 4 = populated `GraphData` with real `nodes`/`edges`.
-pub const SCHEMA_VERSION: u32 = 5;
+/// 4 = populated `GraphData` with real `nodes`/`edges`;
+/// 5 = `GraphEdge.call_sites` + unresolved-reference records;
+/// 6 = ggr graphs now built at the PR head SHA — pre-6 ggr entries hold
+///     graphs built from a default-branch clone (wrong state for risk
+///     tiers), so they must not be read back as valid.
+pub const SCHEMA_VERSION: u32 = 6;
 
 #[derive(Debug, Snafu)]
 pub enum CacheError {

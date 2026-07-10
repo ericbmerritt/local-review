@@ -81,6 +81,31 @@ enum State {
 /// Entry 0 is the PR description page. Entries 1..=N correspond to PR commits
 /// 0..N−1 (oldest-first). For each commit entry, `fetch_views` fetches the
 /// per-commit diff on demand and returns the rendered view list.
+/// Lifecycle of the eager repo clone that feeds `build_graph`. Shared
+/// between the TUI thread (readers) and the background clone thread (one
+/// writer) via `Arc<Mutex<_>>`.
+#[derive(Debug)]
+pub(crate) enum GraphCloneState {
+    /// Clone thread is running (or about to). Graphs are unavailable but
+    /// may become available; tiers degrade with a "clone in progress" note.
+    InProgress,
+    /// Clone checked out at the PR head SHA; graphs build from this path.
+    Ready(std::path::PathBuf),
+    /// Clone will not happen this session — opt-out or failure. The string
+    /// is the reason rendered in the degraded-tiers notice.
+    Unavailable(String),
+}
+
+impl GraphCloneState {
+    fn from_status(status: crate::repo_cache::CloneStatus) -> Self {
+        match status {
+            crate::repo_cache::CloneStatus::Ready(p) => Self::Ready(p),
+            crate::repo_cache::CloneStatus::Disabled(r)
+            | crate::repo_cache::CloneStatus::Failed(r) => Self::Unavailable(r),
+        }
+    }
+}
+
 pub(crate) struct GgrSurface {
     pr: PrDetails,
     state: State,
@@ -105,10 +130,12 @@ pub(crate) struct GgrSurface {
     /// Verdict chosen in the verdict modal; executed by `poll_immediate_action`
     /// on the first draw tick after the submitting overlay is visible.
     pending_submit: Option<crate::submit::Verdict>,
-    /// When `true`, ggr may clone the PR's repository to `/tmp/ggr-repos/` to
-    /// build a cross-file dependency graph. Set to `false` via `--no-graph` or
-    /// `GGR_NO_GRAPH_CLONE=1` to suppress the network access.
-    allow_graph_clone: bool,
+    /// Eager clone lifecycle; written by the background thread spawned in
+    /// [`GgrSurface::start_graph_clone`], read wherever a graph is wanted.
+    /// Opt-outs (`--no-graph`, `GGR_NO_GRAPH_CLONE=1`) are folded in at
+    /// construction as `Unavailable`, so this is the single source of truth
+    /// for graph availability.
+    graph_clone: std::sync::Arc<std::sync::Mutex<GraphCloneState>>,
     /// Active pane for entry 0. Persists across `n`/`p` navigation so the
     /// reviewer's pane preference is remembered within a session.
     pr_pane: PrPane,
@@ -141,6 +168,17 @@ impl GgrSurface {
         // (the only entry that exists). Entry 0 remains reachable via `p`.
         let pending_initial_index =
             restored_index.or_else(|| (!pr.commits.is_empty()).then_some(1));
+        // Fold opt-outs and the no-commits edge into the clone state up
+        // front; `start_graph_clone` only spawns when this is InProgress.
+        let no_clone_env = std::env::var_os(crate::repo_cache::NO_CLONE_ENV_VAR);
+        let clone_state =
+            match crate::repo_cache::opt_out_reason(allow_graph_clone, no_clone_env.as_deref()) {
+                Some(reason) => GraphCloneState::Unavailable(reason),
+                None if pr.commits.is_empty() => {
+                    GraphCloneState::Unavailable("PR has no commits".to_owned())
+                }
+                None => GraphCloneState::InProgress,
+            };
         Self {
             pr,
             state: State::Description,
@@ -152,9 +190,58 @@ impl GgrSurface {
             last_severity: None,
             pending_stale_message: None,
             pending_submit: None,
-            allow_graph_clone,
+            graph_clone: std::sync::Arc::new(std::sync::Mutex::new(clone_state)),
             pr_pane: PrPane::Description,
             pr_entity_commit_indices: Vec::new(),
+        }
+    }
+
+    /// Kick off the eager background clone at the PR head SHA. Called once
+    /// at PR open; a no-op when the clone state was resolved at
+    /// construction (opt-out, zero commits). The thread is detached — its
+    /// only side effect is the state write, and abandoning it at process
+    /// exit is harmless.
+    pub(crate) fn start_graph_clone(&self) {
+        {
+            let Ok(state) = self.graph_clone.lock() else {
+                return;
+            };
+            if !matches!(*state, GraphCloneState::InProgress) {
+                return;
+            }
+        }
+        // Head = last commit (commits are oldest-first).
+        let Some(head_sha) = self.pr.commits.last().map(|c| c.sha.as_str().to_owned()) else {
+            return;
+        };
+        let owner_repo = self.pr.repo_name.as_str().to_owned();
+        let hostname = self.pr.hostname.clone();
+        let pr_number = self.pr.number;
+        let shared = std::sync::Arc::clone(&self.graph_clone);
+        std::thread::spawn(move || {
+            let status = crate::repo_cache::ensure_clone_at(&crate::repo_cache::CloneRequest {
+                owner_repo: &owner_repo,
+                hostname: hostname.as_deref(),
+                pr_number,
+                head_sha: &head_sha,
+                allow_clone: true,
+                remote_override: None,
+                cache_root: None,
+            });
+            if let Ok(mut state) = shared.lock() {
+                *state = GraphCloneState::from_status(status);
+            }
+        });
+    }
+
+    /// Clone path when (and only when) the clone is ready at the PR head.
+    fn ready_repo_path(&self) -> Option<std::path::PathBuf> {
+        match self.graph_clone.lock() {
+            Ok(state) => match &*state {
+                GraphCloneState::Ready(p) => Some(p.clone()),
+                GraphCloneState::InProgress | GraphCloneState::Unavailable(_) => None,
+            },
+            Err(_) => None,
         }
     }
 
@@ -1011,19 +1098,15 @@ impl ReviewSurface for GgrSurface {
 
         if let Some(ref p) = cache_path {
             if let Ok(Some(mut entry)) = local_review_core::semantic::cache::read(p) {
-                // Cache hit. If the graph is absent but cloning is enabled,
-                // build the graph now and update the cache — this handles
-                // entries written before graph support was added to ggr.
-                if entry.graph.is_none() && self.allow_graph_clone {
-                    if let Some(graph) = crate::repo_cache::ensure_clone(
-                        owner_repo,
-                        self.pr.hostname.as_deref(),
-                        true,
-                    )
-                    .map(|repo_path| {
+                // Cache hit. If the graph is absent but the eager clone has
+                // since become ready, build the graph now and update the
+                // cache — this upgrades entries extracted while the clone
+                // was still in flight.
+                if entry.graph.is_none() {
+                    if let Some(repo_path) = self.ready_repo_path() {
                         let files = crate::repo_cache::list_files(&repo_path);
-                        local_review_core::semantic::build_graph(&registry, &repo_path, &files)
-                    }) {
+                        let graph =
+                            local_review_core::semantic::build_graph(&registry, &repo_path, &files);
                         entry.graph = Some(graph);
                         let _ = local_review_core::semantic::cache::write(p, &entry);
                     }
@@ -1059,15 +1142,11 @@ impl ReviewSurface for GgrSurface {
             }
         }
 
-        // Build the cross-file call graph from a local clone of the repo.
-        // Best-effort: a missing or failed clone means the graph stays None
-        // and the caller sees no topo sort / caller count — not a hard error.
-        let graph = crate::repo_cache::ensure_clone(
-            self.pr.repo_name.as_str(),
-            self.pr.hostname.as_deref(),
-            self.allow_graph_clone,
-        )
-        .map(|repo_path| {
+        // Build the cross-file call graph from the eager clone (checked out
+        // at the PR head SHA). A clone still in flight or unavailable means
+        // the graph stays None — tiers degrade visibly, never a hard error;
+        // the cache-hit path above upgrades the entry once the clone lands.
+        let graph = self.ready_repo_path().map(|repo_path| {
             let files = crate::repo_cache::list_files(&repo_path);
             local_review_core::semantic::build_graph(&registry, &repo_path, &files)
         });
@@ -1121,6 +1200,17 @@ impl ReviewSurface for GgrSurface {
                 .map(|base| local_review_core::semantic::cache::ggr_cache_path(&base, sha))
         {
             let _ = std::fs::remove_file(&cache_path);
+        }
+    }
+
+    fn graph_unavailable_reason(&self) -> Option<String> {
+        match self.graph_clone.lock() {
+            Ok(state) => match &*state {
+                GraphCloneState::Ready(_) => None,
+                GraphCloneState::InProgress => Some("clone in progress".to_owned()),
+                GraphCloneState::Unavailable(reason) => Some(reason.clone()),
+            },
+            Err(_) => None,
         }
     }
 
@@ -2717,6 +2807,9 @@ pub(crate) fn run(pr: PrDetails, stale_count: usize, allow_graph_clone: bool) ->
     let cursor_path = cursor::cursor_path(&pr);
     let initial_cursor = cursor_path.as_deref().and_then(cursor::load);
     let mut surface = GgrSurface::new(pr, initial_cursor.as_ref(), allow_graph_clone);
+    // Eager clone at PR open: by the time extraction wants a graph, the
+    // clone (checked out at the PR head SHA) is usually already there.
+    surface.start_graph_clone();
     if stale_count > 0 {
         surface.pending_stale_message = Some(format!(
             "{stale_count} stale draft{} — press R to review",
@@ -2845,6 +2938,58 @@ mod tests {
         let surface = GgrSurface::new(make_pr(), None, false);
         // Entry 0 defaults to description pane; the label reflects the pane.
         assert_eq!(surface.entry_id_display(0), "overview");
+    }
+
+    // ── graph clone state (phase 4) ───────────────────────────────────────
+
+    #[test]
+    fn no_graph_flag_reports_opt_out_and_serves_no_path() {
+        let surface = GgrSurface::new(make_pr(), None, false);
+        assert_eq!(
+            surface.graph_unavailable_reason().as_deref(),
+            Some("--no-graph")
+        );
+        assert!(surface.ready_repo_path().is_none());
+    }
+
+    #[test]
+    fn zero_commit_pr_reports_no_commits_and_start_is_noop() {
+        let surface = GgrSurface::new(make_pr_zero_commits(), None, true);
+        // No head SHA exists; start must not spawn a clone thread.
+        surface.start_graph_clone();
+        assert_eq!(
+            surface.graph_unavailable_reason().as_deref(),
+            Some("PR has no commits")
+        );
+    }
+
+    #[test]
+    fn in_flight_clone_reports_progress_then_ready_serves_path() {
+        let surface = GgrSurface::new(make_pr(), None, true);
+        // Constructed InProgress; clone thread not started in this test.
+        assert_eq!(
+            surface.graph_unavailable_reason().as_deref(),
+            Some("clone in progress")
+        );
+        assert!(surface.ready_repo_path().is_none());
+
+        let path = std::path::PathBuf::from("/tmp/ggr-repos/x");
+        if let Ok(mut state) = surface.graph_clone.lock() {
+            *state = GraphCloneState::Ready(path.clone());
+        }
+        assert_eq!(surface.graph_unavailable_reason(), None);
+        assert_eq!(surface.ready_repo_path(), Some(path));
+    }
+
+    #[test]
+    fn clone_status_maps_disabled_and_failed_to_unavailable() {
+        use crate::repo_cache::CloneStatus;
+        let ready = GraphCloneState::from_status(CloneStatus::Ready("/x".into()));
+        assert!(matches!(ready, GraphCloneState::Ready(_)));
+        let disabled = GraphCloneState::from_status(CloneStatus::Disabled("--no-graph".to_owned()));
+        assert!(matches!(disabled, GraphCloneState::Unavailable(ref r) if r == "--no-graph"));
+        let failed = GraphCloneState::from_status(CloneStatus::Failed("clone failed".to_owned()));
+        assert!(matches!(failed, GraphCloneState::Unavailable(ref r) if r == "clone failed"));
     }
 
     #[test]
