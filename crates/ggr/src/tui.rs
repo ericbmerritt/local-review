@@ -255,10 +255,13 @@ impl GgrSurface {
         let State::CommitDiff { index, ref diff } = self.state else {
             return None;
         };
-        let commit_sha = match self.pr.commits.get(index.wrapping_sub(1)) {
-            Some(c) => c.sha.as_str().to_owned(),
-            None => return None,
-        };
+        let commit_sha = self
+            .pr
+            .commits
+            .get(index.wrapping_sub(1))?
+            .sha
+            .as_str()
+            .to_owned();
         let file = if file_index == 0 {
             String::new()
         } else {
