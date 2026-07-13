@@ -5,7 +5,7 @@
 //! (which is large). Display names and comment counts are computed at render
 //! time from this type and the live comment store.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub use super::entity_id::EntityId;
 use crate::diff::DiffFile;
@@ -304,6 +304,45 @@ impl EntitySummary {
     }
 }
 
+/// Locate the entity whose file and line range contains `target_line`.
+/// Prefers `entity_id` when it resolves against `entities` — `EntityId` is
+/// scope/name-based, not line-based, so a stored id still resolves correctly
+/// after a pure body edit shifts the entity's line range, which a
+/// line-range-only lookup can't do. Falls back to a line-range scan when
+/// `entity_id` is `None` or no longer resolves (entity renamed or removed).
+pub fn entity_for_line<'e>(
+    file: &Path,
+    target_line: Option<u32>,
+    entity_id: Option<&EntityId>,
+    entities: &'e [EntityCoreData],
+) -> Option<&'e EntityCoreData> {
+    if let Some(eid) = entity_id {
+        if let Some(e) = entities.iter().find(|e| &e.id == eid) {
+            return Some(e);
+        }
+    }
+    let target_line = target_line?;
+    entities.iter().find(|e| {
+        e.id.file_path.as_path() == file
+            && e.line_range.0 <= target_line
+            && target_line <= e.line_range.1
+    })
+}
+
+/// Map each entity's id to its index in `entities`. Shared by graph-walking
+/// callers (`sort::topo_sort_entities`, `cluster::initial_components`) that
+/// need to resolve a `GraphEdge`'s `EntityId` endpoints back to positions in
+/// the changed-entity slice.
+pub(crate) fn index_by_id(
+    entities: &[EntitySummary],
+) -> std::collections::HashMap<&EntityId, usize> {
+    entities
+        .iter()
+        .enumerate()
+        .map(|(i, e)| (&e.id, i))
+        .collect()
+}
+
 /// Shared behavior-preserving rule (see [`EntityCoreData::is_behavior_preserving`]).
 fn behavior_preserving(refactor: Option<&RefactorKind>) -> bool {
     match refactor {
@@ -311,6 +350,86 @@ fn behavior_preserving(refactor: Option<&RefactorKind>) -> bool {
         Some(RefactorKind::Renamed { pure, .. }) => *pure,
         Some(RefactorKind::Moved { identical }) => *identical,
         Some(RefactorKind::Extracted { .. }) => true,
+    }
+}
+
+#[cfg(test)]
+mod entity_for_line_tests {
+    use super::{
+        entity_for_line, ChangeAnnotation, ChangeType, EntityCoreData, EntityId, EntityKind,
+    };
+    use std::path::{Path, PathBuf};
+
+    fn eid(file: &str, name: &str) -> EntityId {
+        EntityId::new(PathBuf::from(file), vec![name.to_owned()], None, 0)
+    }
+
+    fn ent(file: &str, name: &str, start: u32, end: u32) -> EntityCoreData {
+        EntityCoreData {
+            id: eid(file, name),
+            kind: EntityKind::Function,
+            change: ChangeType::Modified,
+            annotation: ChangeAnnotation::BodyOnly,
+            refactor: None,
+            line_range: (start, end),
+            source_file: None,
+            target_line: None,
+            structural_change: true,
+            content_hash: 0,
+        }
+    }
+
+    #[test]
+    fn prefers_entity_id_over_line_range() {
+        let id = eid("src/foo.rs", "bar");
+        let entities = vec![
+            ent("src/foo.rs", "bar", 1, 10),
+            ent("src/foo.rs", "baz", 11, 20),
+        ];
+        // Line 15 falls in "baz", but the entity_id match wins.
+        let result = entity_for_line(Path::new("src/foo.rs"), Some(15), Some(&id), &entities);
+        assert_eq!(result.map(|e| e.id.name()), Some("bar"));
+    }
+
+    #[test]
+    fn falls_back_to_line_range_when_entity_id_is_none() {
+        let entities = vec![
+            ent("src/foo.rs", "alpha", 1, 5),
+            ent("src/foo.rs", "beta", 6, 15),
+        ];
+        let result = entity_for_line(Path::new("src/foo.rs"), Some(10), None, &entities);
+        assert_eq!(result.map(|e| e.id.name()), Some("beta"));
+    }
+
+    #[test]
+    fn falls_back_to_line_range_when_entity_id_no_longer_resolves() {
+        let stale_id = eid("src/foo.rs", "removed");
+        let entities = vec![ent("src/foo.rs", "beta", 6, 15)];
+        let result = entity_for_line(
+            Path::new("src/foo.rs"),
+            Some(10),
+            Some(&stale_id),
+            &entities,
+        );
+        assert_eq!(
+            result.map(|e| e.id.name()),
+            Some("beta"),
+            "stale entity_id (entity renamed/removed) must fall back, not return None"
+        );
+    }
+
+    #[test]
+    fn returns_none_when_neither_signal_resolves() {
+        let entities = vec![ent("src/foo.rs", "alpha", 1, 5)];
+        let result = entity_for_line(Path::new("src/foo.rs"), Some(50), None, &entities);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn returns_none_with_no_target_line_and_no_entity_id() {
+        let entities = vec![ent("src/foo.rs", "alpha", 1, 5)];
+        let result = entity_for_line(Path::new("src/foo.rs"), None, None, &entities);
+        assert!(result.is_none());
     }
 }
 

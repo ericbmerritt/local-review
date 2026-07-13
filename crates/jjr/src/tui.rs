@@ -1005,6 +1005,24 @@ impl ReviewSurface for JjrSurface {
             None
         };
 
+        // `entity_id` degrades to `None` on a cache miss (extraction still
+        // in flight, or no cache yet) — same as an old pre-entity-aware
+        // comment; the line anchor above remains the source of truth.
+        let entity_id = if let Anchor::Line { ref location, .. } = anchor {
+            self.read_entry_cache(self.current_entry_index())
+                .and_then(|cache| {
+                    local_review_core::semantic::entity_for_line(
+                        &location.file,
+                        location.new_line,
+                        None,
+                        &cache.entities,
+                    )
+                    .map(|e| e.id.clone())
+                })
+        } else {
+            None
+        };
+
         let comment = Comment {
             schema_version: SchemaVersion,
             anchor,
@@ -1017,8 +1035,7 @@ impl ReviewSurface for JjrSurface {
             updated_at: None,
             status: Some(Status::Pending),
             mismatch_reason: None,
-            // TODO: populate entity_id from entity list
-            entity_id: None,
+            entity_id,
             anchor_fingerprint,
         };
 
@@ -5885,17 +5902,12 @@ fn entity_for_comment_line<'e>(
     entity_id: Option<&local_review_core::semantic::EntityId>,
     entities: &'e [local_review_core::semantic::EntityCoreData],
 ) -> Option<&'e local_review_core::semantic::EntityCoreData> {
-    if let Some(eid) = entity_id {
-        if let Some(e) = entities.iter().find(|e| &e.id == eid) {
-            return Some(e);
-        }
-    }
-    let target_line = location.new_line?;
-    entities.iter().find(|e| {
-        e.id.file_path == location.file
-            && e.line_range.0 <= target_line
-            && target_line <= e.line_range.1
-    })
+    local_review_core::semantic::entity_for_line(
+        &location.file,
+        location.new_line,
+        entity_id,
+        entities,
+    )
 }
 
 /// Read the source lines for `entity.line_range` from disk. Returns `None`

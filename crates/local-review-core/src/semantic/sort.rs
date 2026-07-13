@@ -12,10 +12,10 @@
 //! When the graph has cycles or disconnected nodes, those entities are appended
 //! in the existing file-then-line order so none are dropped.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 
 use crate::semantic::cache::GraphData;
-use crate::semantic::entity::{EntityId, EntitySummary};
+use crate::semantic::entity::EntitySummary;
 use crate::semantic::risk::RiskTier;
 
 /// Entity-list order, cycled by `o`. Session-persisted (a field on the
@@ -97,12 +97,7 @@ pub fn topo_sort_entities(entities: &mut Vec<EntitySummary>, graph: &GraphData) 
         return;
     }
 
-    // Map EntityId → index in `entities`.
-    let id_to_pos: HashMap<&EntityId, usize> = entities
-        .iter()
-        .enumerate()
-        .map(|(i, e)| (&e.id, i))
-        .collect();
+    let id_to_pos = crate::semantic::entity::index_by_id(entities);
 
     // Build the reversed subgraph: only edges where both from and to are
     // changed entities. In the original graph A→B means "A calls B". In the

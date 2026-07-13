@@ -425,6 +425,20 @@ fn render_title(file: &DiffFile) -> String {
     }
 }
 
+/// `true` when a `DiffView.title` produced by [`render_title`] (e.g.
+/// `"foo.rs (added)"`, `"old.rs -> new.rs"`) refers to `path`. Strips the
+/// status suffix and accepts the rename-arrow form. Shared by entity-diff
+/// routing, blast-radius call-site resolution, and comment-count
+/// aggregation — all three map a bare file path onto a rendered view.
+pub(crate) fn view_title_matches_path(title: &str, path: &str) -> bool {
+    let base = title
+        .strip_suffix(" (added)")
+        .or_else(|| title.strip_suffix(" (removed)"))
+        .or_else(|| title.strip_suffix(" (binary)"))
+        .unwrap_or(title);
+    base == path || title.ends_with(&format!(" -> {path}"))
+}
+
 fn render_lines(file: &DiffFile) -> Vec<RenderedLine> {
     if let DiffFile::Binary { .. } = file {
         return vec![RenderedLine {

@@ -510,6 +510,48 @@ pub fn stats_line(entities: &[EntitySummary], views: &[crate::tui::DiffView]) ->
     format!("\u{3a3} {entities_part} · {files_part} · ~{loc} LOC · {sig_part}")
 }
 
+/// Recompute each entity's `comment_count` from already-fetched inline
+/// comments. Pure: no IO, no surface access — `views` and `comments_per_view`
+/// are parallel slices (index `i` of each belongs to the same rendered view)
+/// gathered by the caller via `ReviewSurface::inline_comments_for_view`.
+/// Drives the entity-list `●` indicator (`comment_indicator` in
+/// [`render_entity_row`]).
+///
+/// A comment matches an entity when its view's file matches the entity's
+/// file and its line (preferring `target_line`, falling back to
+/// `source_line` for comments anchored to a since-removed line) falls
+/// within the entity's `line_range`. Heuristic, not stored identity — same
+/// line-containment approach `render_entity_diff_screen` already uses to
+/// jump to an entity's first changed line.
+pub(crate) fn recompute_comment_counts(
+    entities: &mut [EntitySummary],
+    views: &[crate::tui::DiffView],
+    comments_per_view: &[Vec<crate::tui::InlineComment>],
+) {
+    for entity in &mut *entities {
+        entity.comment_count = 0;
+    }
+    for (view, comments) in views.iter().zip(comments_per_view) {
+        if comments.is_empty() {
+            continue;
+        }
+        for entity in &mut *entities {
+            let path = entity.file_path.to_string_lossy();
+            if !crate::tui::diff_view::view_title_matches_path(&view.title, &path) {
+                continue;
+            }
+            let (start, end) = entity.line_range;
+            entity.comment_count += comments
+                .iter()
+                .filter(|c| {
+                    c.target_line.is_some_and(|l| l >= start && l <= end)
+                        || c.source_line.is_some_and(|l| l >= start && l <= end)
+                })
+                .count();
+        }
+    }
+}
+
 /// Render the orientation header's scope row, dimmed.
 pub fn render_stats_row(frame: &mut Frame<'_>, area: Rect, text: &str) {
     let width = usize::from(area.width);
@@ -621,6 +663,13 @@ pub fn spinner_glyph(tick: u64) -> &'static str {
 /// and renders each entity. `entity_index` is 0-based over the full list
 /// (0 = description row, 1+ = entities); a row is focused when
 /// `app.entity_index - 1 == eidx`.
+/// One rendered row of the entity-list body: a group header (display
+/// only) or a navigable entity row.
+enum BodyRow {
+    Header(usize),
+    Entity(usize),
+}
+
 pub fn render_entity_list_body<S: ReviewSurfaceExt>(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -629,39 +678,99 @@ pub fn render_entity_list_body<S: ReviewSurfaceExt>(
     let total_rows = usize::from(area.height);
     let entities = &app.entities;
     let scroll = app.entity_scroll;
+    let visible_pred =
+        |i: usize| !app.cosmetic_filter_on || entities.get(i).is_none_or(|e| !is_demoted(e));
 
-    // Pre-compute visible entity indices so cosmetic-filtered entities don't
-    // produce blank rows (they were previously reached via `continue` while
-    // still incrementing the row_offset position counter).
-    let visible: Vec<usize> = (scroll..)
-        .take_while(|&i| i < entities.len())
-        .filter(|&i| !app.cosmetic_filter_on || entities.get(i).is_none_or(|e| !is_demoted(e)))
-        .take(total_rows)
+    // Concern-group headers render before their first *visible* member —
+    // a group whose members are all filtered out contributes no header,
+    // so the `;` filter composes with grouping without empty sections.
+    // Inverted (entity index -> group index) for O(1) lookup per row below.
+    let header_before: std::collections::HashMap<usize, usize> = app
+        .group_spans
+        .iter()
+        .enumerate()
+        .filter_map(|(gidx, g)| {
+            (g.start..g.start + g.len)
+                .find(|&i| visible_pred(i))
+                .map(|first| (first, gidx))
+        })
         .collect();
 
-    for (row_offset, eidx) in visible.into_iter().enumerate() {
-        let Some(entity) = entities.get(eidx) else {
-            break;
-        };
+    // Interleave header and entity rows from the scroll offset. Headers
+    // are display-only: they consume a body row but are never focusable,
+    // so `entity_index`/`entity_scroll` stay in entity space. Scrolling
+    // into the middle of a group drops its header (accepted v1 tradeoff).
+    let mut rows: Vec<BodyRow> = Vec::new();
+    let mut i = scroll;
+    while rows.len() < total_rows && i < entities.len() {
+        if !visible_pred(i) {
+            i += 1;
+            continue;
+        }
+        if let Some(&gidx) = header_before.get(&i) {
+            rows.push(BodyRow::Header(gidx));
+            if rows.len() == total_rows {
+                break;
+            }
+        }
+        rows.push(BodyRow::Entity(i));
+        i += 1;
+    }
+
+    for (row_offset, row) in rows.into_iter().enumerate() {
         let y = area.y + u16::try_from(row_offset).unwrap_or(u16::MAX);
         let row_area = Rect {
             y,
             height: 1,
             ..area
         };
-        // entity_index 0 = description, 1 = entity[0], 2 = entity[1], ...
-        let focused = app.entity_index.saturating_sub(1) == eidx && app.entity_index > 0;
-        render_entity_row(
-            frame,
-            row_area,
-            &EntityRowCtx {
-                entity,
-                focused,
-                cosmetic_hidden: app.cosmetic_filter_on,
-                comment_indicator: entity.comment_count > 0,
-            },
-        );
+        match row {
+            BodyRow::Header(gidx) => {
+                if let Some(span) = app.group_spans.get(gidx) {
+                    render_group_header(frame, row_area, span);
+                }
+            }
+            BodyRow::Entity(eidx) => {
+                let Some(entity) = entities.get(eidx) else {
+                    break;
+                };
+                // entity_index 0 = description, 1 = entity[0], 2 = entity[1], ...
+                let focused = app.entity_index.saturating_sub(1) == eidx && app.entity_index > 0;
+                render_entity_row(
+                    frame,
+                    row_area,
+                    &EntityRowCtx {
+                        entity,
+                        focused,
+                        cosmetic_hidden: app.cosmetic_filter_on,
+                        comment_indicator: entity.comment_count > 0,
+                    },
+                );
+            }
+        }
     }
+}
+
+/// Render one concern-group header: `── <label> ───── <tier> ──`, dimmed.
+fn render_group_header(frame: &mut Frame<'_>, area: Rect, span: &crate::semantic::GroupSpan) {
+    let width = usize::from(area.width);
+    let tier_part = format!(" {} ──", span.max_tier.label());
+    let label_budget = width.saturating_sub(tier_part.chars().count() + 6);
+    let label = truncate_to(&span.label, label_budget);
+    let prefix = format!("── {label} ");
+    let fill = width.saturating_sub(prefix.chars().count() + tier_part.chars().count());
+    let line = TuiLine::from(Span::styled(
+        format!("{prefix}{}{tier_part}", "─".repeat(fill)),
+        Style::default().fg(Color::DarkGray),
+    ));
+    frame.render_widget(
+        Paragraph::new(line),
+        Rect {
+            y: area.y,
+            height: 1,
+            ..area
+        },
+    );
 }
 
 // ── Row count (accounting for cosmetic filter) ────────────────────────────────
@@ -699,8 +808,21 @@ pub fn move_entity_cursor<S: ReviewSurfaceExt>(app: &mut App<S>, delta: isize) {
     if new_idx == 0 {
         return; // description row — no body scroll needed
     }
-    let eidx = new_idx - 1; // index into app.entities
-    let viewport = usize::from(app.viewport_rows).saturating_sub(4); // approx body rows
+    let eidx = new_idx - 1;
+    // Approx body rows: chrome takes ~4; group headers consume one row each.
+    // Reserve the full group count (never capped) — a window can never hold
+    // more headers than exist, so this is always a safe upper bound. Capping
+    // it would undercount on changes with many small concern groups, which
+    // could let the render loop hit `total_rows` on a header row and drop
+    // the focused entity's row for that frame. `.max(1)` is the only floor,
+    // for the pathological case where header count alone exceeds the
+    // viewport — degraded scrolling (one row at a time), never a hidden
+    // cursor.
+    let headers = app.group_spans.len();
+    let viewport = usize::from(app.viewport_rows)
+        .saturating_sub(4)
+        .saturating_sub(headers)
+        .max(1);
     if eidx < app.entity_scroll {
         app.entity_scroll = eidx;
     } else if eidx >= app.entity_scroll + viewport {
@@ -743,6 +865,107 @@ mod tests {
             paired_rows: vec![],
             token_spans: std::collections::HashMap::new(),
         }
+    }
+
+    fn entity_with_range(path: &str, start: u32, end: u32) -> EntitySummary {
+        let mut e = entity(path, ChangeAnnotation::None);
+        e.line_range = (start, end);
+        e
+    }
+
+    fn comment_on(line: u32) -> crate::tui::InlineComment {
+        crate::tui::InlineComment {
+            source_line: None,
+            target_line: Some(line),
+            severity: crate::severity::Severity::Note,
+            age: "just now".to_owned(),
+            body_lines: vec!["nit".to_owned()],
+            comment_index: crate::tui::CommentIndex::Local(0),
+        }
+    }
+
+    #[test]
+    fn recompute_comment_counts_matches_by_file_and_line_range() {
+        let views = vec![DiffView {
+            title: "src/lib.rs".to_owned(),
+            ..view(&[])
+        }];
+        let mut entities = vec![
+            entity_with_range("src/lib.rs", 1, 9),
+            entity_with_range("src/lib.rs", 11, 19),
+        ];
+        let comments_per_view = vec![vec![comment_on(5)]];
+
+        recompute_comment_counts(&mut entities, &views, &comments_per_view);
+
+        assert_eq!(
+            entities[0].comment_count, 1,
+            "line 5 falls in entity 0's (1,9) range"
+        );
+        assert_eq!(
+            entities[1].comment_count, 0,
+            "entity 1's (11,19) range excludes line 5"
+        );
+    }
+
+    #[test]
+    fn recompute_comment_counts_matches_neither_entity_when_line_falls_in_gap() {
+        let views = vec![DiffView {
+            title: "src/lib.rs".to_owned(),
+            ..view(&[])
+        }];
+        let mut entities = vec![
+            entity_with_range("src/lib.rs", 1, 9),
+            entity_with_range("src/lib.rs", 11, 19),
+        ];
+        let comments_per_view = vec![vec![comment_on(10)]]; // between the two ranges
+
+        recompute_comment_counts(&mut entities, &views, &comments_per_view);
+
+        assert_eq!(entities[0].comment_count, 0);
+        assert_eq!(entities[1].comment_count, 0);
+    }
+
+    #[test]
+    fn recompute_comment_counts_resets_stale_counts_with_no_current_match() {
+        let views = vec![DiffView {
+            title: "src/lib.rs".to_owned(),
+            ..view(&[])
+        }];
+        let mut entities = vec![entity_with_range("src/lib.rs", 1, 9)];
+        entities[0].comment_count = 3; // stale count from a prior comment set
+        let comments_per_view = vec![Vec::new()];
+
+        recompute_comment_counts(&mut entities, &views, &comments_per_view);
+
+        assert_eq!(
+            entities[0].comment_count, 0,
+            "no current comments — must reset, not accumulate"
+        );
+    }
+
+    #[test]
+    fn recompute_comment_counts_matches_status_suffixed_title_and_source_line_fallback() {
+        let views = vec![DiffView {
+            title: "src/lib.rs (removed)".to_owned(),
+            ..view(&[])
+        }];
+        let mut entities = vec![entity_with_range("src/lib.rs", 1, 9)];
+        let comments_per_view = vec![vec![crate::tui::InlineComment {
+            source_line: Some(5),
+            target_line: None, // deleted file: no after-state line
+            severity: crate::severity::Severity::Note,
+            age: "just now".to_owned(),
+            body_lines: vec!["nit".to_owned()],
+            comment_index: crate::tui::CommentIndex::Local(0),
+        }]];
+
+        recompute_comment_counts(&mut entities, &views, &comments_per_view);
+
+        assert_eq!(
+            entities[0].comment_count, 1,
+            "\" (removed)\" suffix must strip for title matching; source_line must fall back"
+        );
     }
 
     #[test]

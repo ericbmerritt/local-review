@@ -111,21 +111,23 @@ exists they go stale.
 
 ### Entity list and description page
 
-| Key                 | Action                                          |
-| ------------------- | ----------------------------------------------- |
-| `j` `k` / `↑` `↓`   | Move cursor / scroll                            |
-| `Enter`             | Open entity diff (or PR description for row 0)  |
-| `Tab` / `Shift-Tab` | Next / previous entity (cursor)                 |
-| `e`                 | Toggle description ↔ entity pane (entry 0 only) |
-| `F`                 | File list                                       |
-| `n` / `p`           | Next / previous commit                          |
-| `1` / `2` / `3`     | Severity filter                                 |
-| `;`                 | Toggle cosmetic entity visibility               |
-| `o`                 | Toggle sort: dependency order ↔ file order      |
-| `S`                 | Submit (verdict modal)                          |
-| `R`                 | Refresh — re-fetch PR, re-anchor drafts         |
-| `?`                 | Help                                            |
-| `q`                 | Quit                                            |
+| Key                 | Action                                            |
+| ------------------- | ------------------------------------------------- |
+| `j` `k` / `↑` `↓`   | Move cursor / scroll                              |
+| `Enter`             | Open entity diff (or PR description for row 0)    |
+| `Tab` / `Shift-Tab` | Next / previous entity (cursor)                   |
+| `e`                 | Toggle description ↔ entity pane (entry 0 only)   |
+| `F`                 | File list                                         |
+| `n` / `p`           | Next / previous commit                            |
+| `1` / `2` / `3`     | Severity filter                                   |
+| `;`                 | Toggle cosmetic entity visibility                 |
+| `o`                 | Cycle entity order: risk / dependency / file      |
+| `g`                 | Toggle concern grouping: clustered / flat         |
+| `x`                 | Blast-radius peek: list callers of focused entity |
+| `S`                 | Submit (verdict modal)                            |
+| `R`                 | Refresh — re-fetch PR, re-anchor drafts           |
+| `?`                 | Help                                              |
+| `q`                 | Quit                                              |
 
 ### Entity diff view
 

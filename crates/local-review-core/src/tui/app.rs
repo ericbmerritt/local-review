@@ -17,6 +17,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
 use crate::severity::Severity;
+use crate::tui::diff_view::view_title_matches_path;
 use crate::tui::{
     composer_overlay, file_picker, help_screen, render_view_scrollbar, scrollbar_layout_for_view,
     severity_color, DiffView, ExtraKeyAction, ExtraScreen, ExtraScreenAction, FilePickerState,
@@ -307,6 +308,18 @@ pub struct App<S: ReviewSurfaceExt> {
     /// Active entity-list order, cycled by `o` (risk → dependency → file).
     /// Session-persisted: survives entry navigation, never written to disk.
     pub(crate) order_mode: crate::semantic::OrderMode,
+    /// `true` (default): the entity list groups by concern cluster with
+    /// header rows; `g` dissolves to a flat list. Session state.
+    pub(crate) grouped: bool,
+    /// Concern-group spans over the current `entities` order; empty when
+    /// grouping is off or adds nothing (no graph, single cluster). Headers
+    /// render from these; they are not navigable rows.
+    pub(crate) group_spans: Vec<crate::semantic::GroupSpan>,
+    /// Σ-header fragment naming the concern verdict (`1 concern
+    /// (validate)`, `3 concerns`); `None` when clustering has no
+    /// answer. Computed with tiers at entry load, independent of the `g`
+    /// toggle — the verdict holds whether or not grouping renders.
+    pub(crate) concern_note: Option<String>,
     /// `true` when the current entry's risk tiers were computed without a
     /// graph — fan-out is unknown and tiers resolved upward. Surfaced in
     /// the entity-diff status bar.
@@ -381,6 +394,9 @@ impl<S: ReviewSurfaceExt> App<S> {
             tick: 0,
             entity_context: None,
             order_mode: crate::semantic::OrderMode::Risk,
+            grouped: true,
+            group_spans: Vec::new(),
+            concern_note: None,
             tiers_degraded: false,
             degraded_notice_shown: false,
             pending_load: None,
@@ -521,6 +537,19 @@ impl<S: ReviewSurfaceExt> App<S> {
         if self.is_skip_row(self.line_index) {
             self.move_line(nudge);
         }
+        if matches!(end, Edge::Bottom) {
+            // A trailing skip-row block (an inline comment's body rows
+            // anchored at true EOF, with no non-skip row past them) has no
+            // row for the cursor to land on, so `ensure_cursor_visible`
+            // would otherwise cap scroll just before the comment and it
+            // would never become visible — the comment appears to vanish
+            // and "G" appears to not reach the bottom. Reveal the true tail
+            // directly; the cursor (wherever `move_line` capped it) still
+            // falls inside this window, so `ensure_cursor_visible` leaves
+            // it alone on the next frame instead of scrolling back up.
+            let total = u16::try_from(count).unwrap_or(u16::MAX);
+            self.scroll = total.saturating_sub(self.viewport_rows);
+        }
     }
 
     /// Cycle to the next/previous file view.
@@ -653,6 +682,41 @@ impl<S: ReviewSurfaceExt> App<S> {
                 })
                 .collect(),
         );
+        self.refresh_comment_counts();
+    }
+
+    /// Gather each view's inline comments from the surface and recompute
+    /// entity comment counts from them. Drives the entity-list `●` indicator
+    /// ([`comment_indicator`]); called from [`refresh_inline_comments`]
+    /// (comment state changed) and from [`refresh_entity_order`] (entities
+    /// just (re)loaded) so the indicator never goes stale. A no-op while
+    /// `entities` is still empty (extraction in flight) — the follow-up call
+    /// from [`refresh_entity_order`] fills it in once entities land.
+    ///
+    /// IO only: the matching logic itself is
+    /// [`entity_list::recompute_comment_counts`], pure and unit-tested in
+    /// isolation.
+    ///
+    /// [`comment_indicator`]: crate::tui::entity_list::render_entity_list_body
+    /// [`refresh_inline_comments`]: Self::refresh_inline_comments
+    /// [`refresh_entity_order`]: Self::refresh_entity_order
+    pub(crate) fn refresh_comment_counts(&mut self) {
+        if self.entities.is_empty() {
+            return;
+        }
+        let now = std::time::SystemTime::now();
+        let comments_per_view: Vec<Vec<crate::tui::InlineComment>> =
+            (0..self.rendered_per_file.len())
+                .map(|view_idx| {
+                    self.surface
+                        .inline_comments_for_view(now, view_idx, self.severity_filter)
+                })
+                .collect();
+        crate::tui::entity_list::recompute_comment_counts(
+            &mut self.entities,
+            &self.rendered_per_file,
+            &comments_per_view,
+        );
     }
 
     /// Reload views for the currently loaded entry from the surface.
@@ -695,6 +759,10 @@ impl<S: ReviewSurfaceExt> App<S> {
     pub(crate) fn refresh_header_stats(&mut self) {
         self.header_stats =
             crate::tui::entity_list::stats_line(&self.entities, &self.rendered_per_file);
+        if let Some(note) = &self.concern_note {
+            use std::fmt::Write as _;
+            let _ = write!(self.header_stats, " · {note}");
+        }
     }
 
     /// Compute risk tiers for the loaded entities and apply the active
@@ -706,7 +774,8 @@ impl<S: ReviewSurfaceExt> App<S> {
         let graph = self.surface.entry_graph(idx);
         crate::semantic::compute_risk_tiers(&mut self.entities, graph.as_ref());
         self.tiers_degraded = graph.is_none();
-        crate::semantic::sort_entities(&mut self.entities, self.order_mode, graph.as_ref());
+        self.apply_order_and_grouping(graph.as_ref());
+        self.refresh_comment_counts();
         if self.tiers_degraded && !self.degraded_notice_shown && !self.entities.is_empty() {
             self.degraded_notice_shown = true;
             self.status_message = Some(match self.surface.graph_unavailable_reason() {
@@ -716,6 +785,29 @@ impl<S: ReviewSurfaceExt> App<S> {
         }
     }
 
+    /// Sort by the active order mode, then (when grouping is on) permute
+    /// into concern-cluster order and record the group spans. Shared by
+    /// entry load, the `o` order cycle, and the `g` grouping toggle.
+    /// Clustering that adds nothing (no graph, all singletons, one
+    /// cluster) leaves the list flat — visible degradation, no error.
+    pub(crate) fn apply_order_and_grouping(&mut self, graph: Option<&crate::semantic::GraphData>) {
+        crate::semantic::sort_entities(&mut self.entities, self.order_mode, graph);
+        self.group_spans.clear();
+        let clustering = crate::semantic::cluster_entities(&self.entities, graph);
+        self.concern_note = match (clustering.concern_count, &clustering.single_concern) {
+            (0, _) => None,
+            (1, Some(label)) => Some(format!("1 concern ({label})")),
+            (1, None) => Some("1 concern".to_owned()),
+            (n, _) => Some(format!("{n} concerns")),
+        };
+        if self.grouped && !clustering.groups.is_empty() {
+            let old = std::mem::take(&mut self.entities);
+            self.entities = clustering.order.iter().map(|&i| old[i].clone()).collect();
+            self.group_spans = clustering.groups;
+        }
+        self.refresh_header_stats();
+    }
+
     fn start_entity_extraction(&mut self, idx: usize) {
         // Cancel any in-flight extraction.
         if let Some(ref prev) = self.extraction {
@@ -723,6 +815,7 @@ impl<S: ReviewSurfaceExt> App<S> {
         }
         self.extraction = None;
         self.entities.clear();
+        self.concern_note = None;
         self.refresh_header_stats();
         self.description_summary = None;
         self.entity_index = 0;
@@ -1617,21 +1710,10 @@ fn render_entity_diff_screen<S: ReviewSurfaceExt>(
         let (rs, re) = entity.line_range;
         (entity.file_path.to_string_lossy().into_owned(), rs, re)
     };
-    // Strip status suffixes that render_title appends for Added/Removed/Binary
-    // files; without this, entity.file_path ("foo.rs") would never match the
-    // DiffView title ("foo.rs (added)").
     let findex = app
         .rendered_per_file
         .iter()
-        .position(|v| {
-            let base = v
-                .title
-                .strip_suffix(" (added)")
-                .or_else(|| v.title.strip_suffix(" (removed)"))
-                .or_else(|| v.title.strip_suffix(" (binary)"))
-                .unwrap_or(&v.title);
-            base == target || v.title.ends_with(&format!(" -> {target}"))
-        })
+        .position(|v| view_title_matches_path(&v.title, &target))
         .unwrap_or(app.file_index);
     app.file_index = findex;
 
@@ -2591,8 +2673,28 @@ fn cycle_entity_sort<S: ReviewSurfaceExt>(app: &mut App<S>) {
     app.order_mode = app.order_mode.next();
     let idx = app.surface.current_entry_index();
     let graph = app.surface.entry_graph(idx);
-    crate::semantic::sort_entities(&mut app.entities, app.order_mode, graph.as_ref());
+    app.apply_order_and_grouping(graph.as_ref());
     app.status_message = Some(format!("order: {}", app.order_mode.label()));
+    app.entity_index = 0;
+    app.entity_scroll = 0;
+}
+
+/// Toggle concern grouping. Flat restores the active order mode exactly;
+/// grouped re-clusters over it.
+fn toggle_entity_grouping<S: ReviewSurfaceExt>(app: &mut App<S>) {
+    app.grouped = !app.grouped;
+    let idx = app.surface.current_entry_index();
+    let graph = app.surface.entry_graph(idx);
+    app.apply_order_and_grouping(graph.as_ref());
+    app.status_message = Some(if app.grouped {
+        if app.group_spans.is_empty() {
+            "grouped by concern (single concern — shown flat)".to_owned()
+        } else {
+            "grouped by concern".to_owned()
+        }
+    } else {
+        format!("flat list ({} order)", app.order_mode.label())
+    });
     app.entity_index = 0;
     app.entity_scroll = 0;
 }
@@ -2682,6 +2784,7 @@ fn handle_entity_list_key<S: ReviewSurfaceExt>(
         KeyCode::Char('2') => app.toggle_severity_filter(Severity::Suggestion),
         KeyCode::Char('3') => app.toggle_severity_filter(Severity::Note),
         KeyCode::Char('x') => open_call_sites_from_list(app),
+        KeyCode::Char('g') => toggle_entity_grouping(app),
         KeyCode::Char(';') => toggle_demoted_filter(app),
         KeyCode::Char('m') => open_description_surface_first(app, key)?,
         // PR overview pane toggle: switch from entity list back to description.
@@ -3268,15 +3371,10 @@ fn resolve_site_target<S: ReviewSurfaceExt>(
     site: &crate::tui::ResolvedCallSite,
 ) -> Option<(usize, usize)> {
     let target = site.file.to_string_lossy();
-    let view_idx = app.rendered_per_file.iter().position(|v| {
-        let base = v
-            .title
-            .strip_suffix(" (added)")
-            .or_else(|| v.title.strip_suffix(" (removed)"))
-            .or_else(|| v.title.strip_suffix(" (binary)"))
-            .unwrap_or(&v.title);
-        base == target || v.title.ends_with(&format!(" -> {target}"))
-    })?;
+    let view_idx = app
+        .rendered_per_file
+        .iter()
+        .position(|v| view_title_matches_path(&v.title, &target))?;
     let row_idx = app
         .rendered_per_file
         .get(view_idx)?
@@ -3416,10 +3514,10 @@ fn render_call_sites_overlay(frame: &mut Frame<'_>, state: &CallSitesState) {
 mod app_tests {
     use super::*;
     use crate::tui::{
-        DeleteOutcome, DeleteRequest, DiffView, ExtraKeyAction, ExtraScreenAction,
-        ExtraScreenContext, FilePickerEntry, FilePickerState, MarkReviewedOutcome, RenderedLine,
-        RenderedLineKind, ReviewSurface, ReviewedOutcome, SaveOutcome, SaveRequest,
-        SeverityHistogram, UpdateRequest,
+        CommentIndex, DeleteOutcome, DeleteRequest, DiffView, ExtraKeyAction, ExtraScreen,
+        ExtraScreenAction, ExtraScreenContext, FilePickerEntry, FilePickerState, InlineComment,
+        MarkReviewedOutcome, RenderedLine, RenderedLineKind, ReviewSurface, ReviewedOutcome,
+        SaveOutcome, SaveRequest, SeverityHistogram, UpdateRequest,
     };
 
     // -----------------------------------------------------------------------
@@ -3448,6 +3546,14 @@ mod app_tests {
         graph: Option<crate::semantic::GraphData>,
         /// Served by `call_site_source`.
         call_source: Option<(std::path::PathBuf, String)>,
+        /// Served by `inline_comments_for_view`, keyed by `view_idx`.
+        comments: Vec<(usize, InlineComment)>,
+        /// When `true`, `handle_extra_screen_key` returns `Close` instead of
+        /// the default `StayOpen` — models a composer save/delete closing
+        /// its overlay, for tests that need the real `Close` path (which
+        /// triggers `refresh_inline_comments`/`refresh_comment_counts`)
+        /// rather than calling those refreshes directly.
+        close_on_extra_key: bool,
     }
 
     impl NoopSurface {
@@ -3459,6 +3565,8 @@ mod app_tests {
                 graph_reason: None,
                 graph: None,
                 call_source: None,
+                comments: Vec::new(),
+                close_on_extra_key: false,
             }
         }
 
@@ -3470,6 +3578,8 @@ mod app_tests {
                 graph_reason: None,
                 graph: None,
                 call_source: None,
+                comments: Vec::new(),
+                close_on_extra_key: false,
             }
         }
 
@@ -3481,6 +3591,8 @@ mod app_tests {
                 graph_reason: None,
                 graph: None,
                 call_source: None,
+                comments: Vec::new(),
+                close_on_extra_key: false,
             }
         }
     }
@@ -3514,10 +3626,15 @@ mod app_tests {
         fn inline_comments_for_view(
             &self,
             _: std::time::SystemTime,
-            _: usize,
-            _: Option<Severity>,
-        ) -> Vec<crate::tui::InlineComment> {
-            Vec::new()
+            view_idx: usize,
+            severity_filter: Option<Severity>,
+        ) -> Vec<InlineComment> {
+            self.comments
+                .iter()
+                .filter(|(idx, _)| *idx == view_idx)
+                .map(|(_, c)| c.clone())
+                .filter(|c| severity_filter.is_none_or(|f| c.severity == f))
+                .collect()
         }
         fn save_comment(&mut self, _: SaveRequest<'_>) -> Result<SaveOutcome, NoopError> {
             Ok(SaveOutcome::Refused {
@@ -3571,7 +3688,11 @@ mod app_tests {
             _: KeyEvent,
             _: &mut ExtraScreenContext<'_>,
         ) -> Result<ExtraScreenAction, NoopError> {
-            Ok(ExtraScreenAction::StayOpen)
+            Ok(if self.close_on_extra_key {
+                ExtraScreenAction::Close
+            } else {
+                ExtraScreenAction::StayOpen
+            })
         }
         fn file_picker_entries(&self) -> Vec<FilePickerEntry> {
             Vec::new()
@@ -3596,6 +3717,19 @@ mod app_tests {
         fn on_entry_loaded(&mut self, _: usize, _: bool) {}
         fn severity_histogram_for_transition(&self) -> (Option<usize>, SeverityHistogram) {
             (Some(0), SeverityHistogram::default())
+        }
+    }
+
+    /// Minimal `ExtraScreen` for tests that need `Screen::Extra(_)` to be
+    /// occupied (e.g. to exercise `handle_extra_screen_key`) but don't care
+    /// about the screen's own state.
+    struct DummyExtraScreen;
+    impl ExtraScreen for DummyExtraScreen {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
         }
     }
 
@@ -3788,6 +3922,67 @@ mod app_tests {
         app.line_index = 0;
         app.move_line(1);
         assert_eq!(app.line_index, 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // jump_to
+    // -----------------------------------------------------------------------
+
+    /// A trailing inline-comment block at true EOF (no non-skip row past it)
+    /// must still become fully visible via `jump_to(Edge::Bottom)`.
+    /// Regression test: previously `ensure_cursor_visible` only ever scrolled
+    /// relative to the cursor, which `move_line` caps at the comment's
+    /// `InlineCommentMeta` row (the nearest non-skip row) — the body rows
+    /// past it, and "G", were permanently unreachable.
+    #[test]
+    fn jump_to_bottom_reveals_trailing_comment_block_at_eof() {
+        let mut kinds = vec![RenderedLineKind::Added; 30];
+        kinds.push(RenderedLineKind::InlineCommentMeta {
+            comment_index: CommentIndex::Local(0),
+        });
+        kinds.push(RenderedLineKind::InlineCommentBody);
+        kinds.push(RenderedLineKind::InlineCommentBody);
+        let view = view_with_kinds(&kinds);
+        let mut app = make_app(view);
+        app.viewport_rows = 20;
+        app.line_index = 0;
+        app.scroll = 0;
+
+        app.jump_to(Edge::Bottom);
+
+        assert_eq!(
+            app.line_index, 30,
+            "cursor lands on the comment's Meta row — the nearest non-skip row"
+        );
+        assert_eq!(
+            app.scroll, 13,
+            "scroll must reveal the true tail (rows 13..=32), not just up to the cursor"
+        );
+        let last_visible = app.scroll + app.viewport_rows - 1;
+        assert_eq!(
+            usize::from(last_visible),
+            32,
+            "the final comment body row (index 32) must be within the visible window"
+        );
+    }
+
+    /// A short view with no trailing skip block: `jump_to(Edge::Bottom)`'s
+    /// new scroll calculation must still land exactly where the pre-existing
+    /// cursor-relative behavior already put it — no regression for the
+    /// common case.
+    #[test]
+    fn jump_to_bottom_matches_prior_behavior_when_last_row_is_navigable() {
+        let view = view_with_kinds(&[RenderedLineKind::Added, RenderedLineKind::Context]);
+        let mut app = make_app(view);
+        app.viewport_rows = 20;
+
+        app.jump_to(Edge::Bottom);
+
+        assert_eq!(app.line_index, 1);
+        assert_eq!(
+            app.scroll, 0,
+            "content shorter than viewport needs no scroll"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -4495,7 +4690,7 @@ mod app_tests {
             t: std::time::SystemTime,
             v: usize,
             f: Option<Severity>,
-        ) -> Vec<crate::tui::InlineComment> {
+        ) -> Vec<InlineComment> {
             self.0.inline_comments_for_view(t, v, f)
         }
         fn save_comment(&mut self, r: SaveRequest<'_>) -> Result<SaveOutcome, NoopError> {
@@ -4606,6 +4801,151 @@ mod app_tests {
             risk: None,
             fallback: false,
         }
+    }
+
+    /// `App::refresh_comment_counts` gathers inline comments from every
+    /// loaded view (not just the first) and hands them to
+    /// `entity_list::recompute_comment_counts` — the matching logic itself
+    /// is covered by that function's own unit tests.
+    #[test]
+    fn refresh_comment_counts_gathers_every_view_before_matching() {
+        let view0 = DiffView {
+            title: "src/lib.rs".to_owned(),
+            ..view_with_kinds(&[RenderedLineKind::Added])
+        };
+        let view1 = DiffView {
+            title: "src/other.rs".to_owned(),
+            ..view_with_kinds(&[RenderedLineKind::Added])
+        };
+        let mut surface = NoopSurface::new(vec![view0.clone(), view1.clone()]);
+        surface.comments = vec![
+            (
+                0,
+                InlineComment {
+                    source_line: None,
+                    target_line: Some(5),
+                    severity: Severity::Note,
+                    age: "just now".to_owned(),
+                    body_lines: vec!["nit".to_owned()],
+                    comment_index: CommentIndex::Local(0),
+                },
+            ),
+            (
+                1,
+                InlineComment {
+                    source_line: None,
+                    target_line: Some(12),
+                    severity: Severity::Note,
+                    age: "just now".to_owned(),
+                    body_lines: vec!["nit".to_owned()],
+                    comment_index: CommentIndex::Local(1),
+                },
+            ),
+        ];
+        let mut entity1 = make_entity_for_render(1);
+        entity1.file_path = std::path::PathBuf::from("src/other.rs");
+        let mut app = App::new(
+            surface,
+            vec![view0.clone(), view1.clone()],
+            TransitionMode::Never,
+        );
+        app.entities = vec![make_entity_for_render(0), entity1];
+
+        app.refresh_comment_counts();
+
+        assert_eq!(
+            app.entities[0].comment_count, 1,
+            "view 0's comment on line 5 matches entity 0 (src/lib.rs, range 1-9)"
+        );
+        assert_eq!(
+            app.entities[1].comment_count, 1,
+            "view 1's comment on line 12 matches entity 1 (src/other.rs, range 11-19)"
+        );
+    }
+
+    /// A severity filter narrows which comments `inline_comments_for_view`
+    /// returns (surface-side), so an active filter can drop the entity-list
+    /// `●` indicator even though a (differently-severity) comment still
+    /// exists on that entity.
+    #[test]
+    fn refresh_comment_counts_respects_active_severity_filter() {
+        let view = DiffView {
+            title: "src/lib.rs".to_owned(),
+            ..view_with_kinds(&[RenderedLineKind::Added])
+        };
+        let mut surface = NoopSurface::new(vec![view.clone()]);
+        surface.comments = vec![(
+            0,
+            InlineComment {
+                source_line: None,
+                target_line: Some(5),
+                severity: Severity::Note,
+                age: "just now".to_owned(),
+                body_lines: vec!["nit".to_owned()],
+                comment_index: CommentIndex::Local(0),
+            },
+        )];
+        let mut app = App::new(surface, vec![view], TransitionMode::Never);
+        app.entities = vec![make_entity_for_render(0)];
+
+        app.refresh_comment_counts();
+        assert_eq!(
+            app.entities[0].comment_count, 1,
+            "no filter active — the Note comment counts"
+        );
+
+        app.toggle_severity_filter(Severity::Required);
+        assert_eq!(
+            app.entities[0].comment_count, 0,
+            "Required filter active — the Note-severity comment is hidden, so is the dot"
+        );
+
+        app.toggle_severity_filter(Severity::Required);
+        assert_eq!(
+            app.entities[0].comment_count, 1,
+            "filter cleared — the comment counts again"
+        );
+    }
+
+    /// The real save/close path — not a direct `refresh_comment_counts` call
+    /// — must update the entity-list `●` indicator. `ExtraScreenAction::Close`
+    /// from the surface (modeling a composer save closing its overlay) drives
+    /// `handle_extra_screen_key`'s unconditional `refresh_inline_comments()`
+    /// call, which now also refreshes comment counts.
+    #[test]
+    fn composer_close_action_refreshes_comment_counts_end_to_end() {
+        let view = DiffView {
+            title: "src/lib.rs".to_owned(),
+            ..view_with_kinds(&[RenderedLineKind::Added])
+        };
+        let mut surface = NoopSurface::new(vec![view.clone()]);
+        surface.close_on_extra_key = true;
+        let mut app = App::new(surface, vec![view], TransitionMode::Never);
+        app.entities = vec![make_entity_for_render(0)];
+        app.screen = Screen::Extra(Box::new(DummyExtraScreen));
+        assert_eq!(app.entities[0].comment_count, 0, "no comment saved yet");
+
+        // Mirrors ggr/jjr: save_comment mutates the surface's own comment
+        // state synchronously, before the key handler returns Close.
+        app.surface.comments.push((
+            0,
+            InlineComment {
+                source_line: None,
+                target_line: Some(5),
+                severity: Severity::Note,
+                age: "just now".to_owned(),
+                body_lines: vec!["nit".to_owned()],
+                comment_index: CommentIndex::Local(0),
+            },
+        ));
+
+        let key = KeyEvent::new(KeyCode::Char('x'), crossterm::event::KeyModifiers::NONE);
+        handle_extra_screen_key(&mut app, key).expect("key handling");
+
+        assert_eq!(
+            app.entities[0].comment_count, 1,
+            "Close action must trigger refresh_inline_comments -> refresh_comment_counts"
+        );
     }
 
     /// Rendering the entity list must never call `caller_count` on the surface.
@@ -4943,6 +5283,192 @@ mod app_tests {
 
         press(&mut app, KeyCode::Esc);
         assert!(matches!(app.screen, Screen::EntityDiff { entity_idx: 0 }));
+    }
+
+    // ── Concern clustering (phase 5) ─────────────────────────────────────────
+
+    /// App with two call-linked concerns (a0→a1 in a.rs, b0→b1 in b.rs)
+    /// plus the graph that links them.
+    fn make_grouping_app() -> App<NoopSurface> {
+        let view = view_with_kinds(&[RenderedLineKind::Added]);
+        let mut surface = NoopSurface::new(vec![view.clone()]);
+
+        let make_id = |file: &str, name: &str| {
+            crate::semantic::EntityId::new(
+                std::path::PathBuf::from(file),
+                vec![name.to_owned()],
+                None,
+                0,
+            )
+        };
+        let make_entity = |file: &str, name: &str, line: u32| {
+            let mut e = make_entity_for_render(0);
+            e.id = make_id(file, name);
+            e.display_name = name.to_owned();
+            e.file_path = std::path::PathBuf::from(file);
+            e.line_range = (line, line + 5);
+            e
+        };
+        let edge = |from: &crate::semantic::EntityId, to: &crate::semantic::EntityId| {
+            crate::semantic::GraphEdge {
+                from: from.clone(),
+                to: to.clone(),
+                call_sites: vec![1],
+            }
+        };
+
+        let a0 = make_entity("a.rs", "a0", 1);
+        let a1 = make_entity("a.rs", "a1", 20);
+        let b0 = make_entity("b.rs", "b0", 1);
+        let b1 = make_entity("b.rs", "b1", 20);
+        surface.graph = Some(crate::semantic::GraphData {
+            nodes: Vec::new(),
+            edges: vec![edge(&a0.id, &a1.id), edge(&b0.id, &b1.id)],
+            unresolved: Vec::new(),
+        });
+
+        let mut app = App::new(surface, vec![view], TransitionMode::Never);
+        app.entities = vec![a0, a1, b0, b1];
+        app.screen = Screen::Main;
+        app
+    }
+
+    fn buffer_text<S: ReviewSurfaceExt>(app: &mut App<S>) -> String {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let backend = TestBackend::new(90, 24);
+        let mut term = Terminal::new(backend).expect("terminal");
+        term.draw(|frame| render(frame, app)).expect("draw");
+        let buf = term.backend().buffer();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Two concerns render two labeled group headers with tier badges;
+    /// `g` flattens back to the active order (no headers) and re-groups.
+    #[test]
+    fn two_concerns_render_group_headers_and_g_toggles_flat() {
+        let mut app = make_grouping_app();
+        app.refresh_entity_order();
+        assert_eq!(app.group_spans.len(), 2, "two concerns → two groups");
+
+        let text = buffer_text(&mut app);
+        assert!(
+            text.contains("── a0 ") || text.contains("── a1 "),
+            "a-cluster header with fanout label must render:\n{text}"
+        );
+        assert!(text.contains(" medium ──"), "tier badge in header:\n{text}");
+
+        let key = KeyEvent::new(KeyCode::Char('g'), crossterm::event::KeyModifiers::NONE);
+        handle_entity_list_key(&mut app, key).expect("key handling");
+        assert!(!app.grouped);
+        assert!(app.group_spans.is_empty(), "flat list has no spans");
+        let text = buffer_text(&mut app);
+        assert!(
+            !text.lines().any(|l| l.trim_start().starts_with("── ")),
+            "flat list must render no headers:\n{text}"
+        );
+        // Flat restores file order (active mode fallback without... the
+        // NoopSurface HAS a graph, so risk order with topo applies): all
+        // four entities still render.
+        for name in ["a0", "a1", "b0", "b1"] {
+            assert!(text.contains(name), "{name} missing after flatten");
+        }
+
+        handle_entity_list_key(&mut app, key).expect("key handling");
+        assert!(app.grouped);
+        assert_eq!(app.group_spans.len(), 2, "re-grouping restores spans");
+    }
+
+    /// The Σ header names the concern verdict: count when grouped-worthy,
+    /// label when the whole change is one connected concern.
+    #[test]
+    fn sigma_header_names_the_concern_verdict() {
+        // Two concerns → "2 concerns".
+        let mut app = make_grouping_app();
+        app.refresh_entity_order();
+        assert!(
+            app.header_stats.ends_with("· 2 concerns"),
+            "count fragment missing: {}",
+            app.header_stats
+        );
+
+        // One connected concern → "1 concern (<label>)", even though the
+        // list renders flat.
+        let mut app = make_grouping_app();
+        if let Some(g) = app.surface.graph.as_mut() {
+            // Link the two clusters into one component: a1 → b0.
+            let a1 = g.edges[0].to.clone();
+            let b0 = g.edges[1].from.clone();
+            g.edges.push(crate::semantic::GraphEdge {
+                from: a1,
+                to: b0,
+                call_sites: vec![2],
+            });
+        }
+        app.refresh_entity_order();
+        assert!(app.group_spans.is_empty(), "single concern renders flat");
+        assert!(
+            app.header_stats.contains("· 1 concern ("),
+            "single-concern label missing: {}",
+            app.header_stats
+        );
+
+        // No graph → no fragment.
+        let mut app = make_grouping_app();
+        app.surface.graph = None;
+        app.refresh_entity_order();
+        assert!(
+            !app.header_stats.contains("concern"),
+            "no verdict without a graph: {}",
+            app.header_stats
+        );
+    }
+
+    /// Without a graph the list renders flat — no headers, no error.
+    #[test]
+    fn grouping_without_graph_renders_flat() {
+        let mut app = make_grouping_app();
+        app.surface.graph = None;
+        app.refresh_entity_order();
+        assert!(app.grouped, "grouping stays enabled");
+        assert!(app.group_spans.is_empty(), "no graph → no spans");
+        let text = buffer_text(&mut app);
+        assert!(
+            !text.lines().any(|l| l.trim_start().starts_with("── ")),
+            "no headers without a graph"
+        );
+        assert!(text.contains("a0"), "entities still render:\n{text}");
+    }
+
+    /// A group whose members are all hidden by the `;` filter contributes
+    /// no header row.
+    #[test]
+    fn fully_hidden_group_renders_no_header() {
+        let mut app = make_grouping_app();
+        // Make the a-cluster cosmetic so `;` hides both members.
+        for e in &mut app.entities {
+            if e.file_path.as_path() == std::path::Path::new("a.rs") {
+                e.structural_change = false;
+            }
+        }
+        app.refresh_entity_order();
+        assert_eq!(app.group_spans.len(), 2);
+        app.cosmetic_filter_on = true;
+        let text = buffer_text(&mut app);
+        assert!(!text.contains("a0"), "hidden members must not render");
+        // Exactly one header remains (the b cluster).
+        let headers = text
+            .lines()
+            .filter(|l| l.trim_start().starts_with("── "))
+            .count();
+        assert_eq!(headers, 1, "one visible group → one header:\n{text}");
     }
 
     /// The degraded-tiers notice includes the surface's reason when it has

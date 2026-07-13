@@ -210,7 +210,10 @@ impl GgrDraft {
                     .map(|s| strip_controls(s))
                     .unwrap_or_default(),
             )),
-            // TODO: populate entity_id from entity list
+            // Populated by the caller (`GgrSurface::build_draft_from_scope`,
+            // via `entity_id_for_line`) once the entity cache is available;
+            // this constructor has no entity data in scope. Defaults to
+            // `None` on a cache miss, matching a pre-entity-aware draft.
             entity_id: None,
         })
     }
