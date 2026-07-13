@@ -29,6 +29,8 @@ Views
     o                     cycle entity order: risk / dependency / file
                           (risk puts ! high-tier rows first — sig changes
                           with callers, deletions with dangling references)
+    g                     toggle concern grouping: clustered (call-graph
+                          components, headers show label + max tier) / flat
     x                     blast-radius peek: list call sites of the focused
                           entity (entity list or entity diff); Enter jumps
                           to in-diff callers. Deleted entities list dangling

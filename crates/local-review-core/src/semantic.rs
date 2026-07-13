@@ -15,10 +15,12 @@
 //!   produces `EntityCoreData` with Container Rule applied
 //! - [`identity`] — Jaccard-based entity matching (used internally by differ)
 //! - [`risk`] — total risk-tier mapping over changed entities
+//! - [`cluster`] — concern clustering (connected components + affinity)
 //! - [`sort`] — entity-list order modes (risk / dependency / file)
 //! - [`plugins`] — `create_default_registry()` with all 13 languages
 
 pub mod cache;
+pub mod cluster;
 pub mod context;
 pub mod differ;
 pub mod entity;
@@ -32,15 +34,16 @@ pub mod risk;
 pub mod sort;
 
 pub use cache::{GraphData, GraphEdge, GraphNode, UnresolvedRef};
+pub use cluster::{cluster_entities, Clustering, GroupSpan};
 pub use context::{
     render as render_bundle, render_with_truncation as render_bundle_with_truncation, Bundle,
     BundleEntity,
 };
 pub use differ::diff_entities;
 pub use entity::{
-    body_peek_from, body_peek_from_body, fallback_summary_for_file, ChangeAnnotation, ChangeType,
-    DescriptionSummary, EntityCoreData, EntityKind, EntitySummary, LineRange, RawEntity,
-    RefactorKind,
+    body_peek_from, body_peek_from_body, entity_for_line, fallback_summary_for_file,
+    ChangeAnnotation, ChangeType, DescriptionSummary, EntityCoreData, EntityKind, EntitySummary,
+    LineRange, RawEntity, RefactorKind,
 };
 pub use entity_id::EntityId;
 pub use extractor::{CallSite, ExtractError, ExtractResult, SemanticExtractor};

@@ -805,6 +805,8 @@ impl GgrSurface {
                 } else {
                     Side::Old
                 };
+                let entity_id =
+                    self.entity_id_for_line(sha.as_str(), &file_str, line_target.target_line);
                 let anchor = crate::draft::LineAnchorParams {
                     commit_sha: sha,
                     file: file_str,
@@ -827,11 +829,13 @@ impl GgrSurface {
                     context_before: line_target.context_before.clone(),
                     context_after: line_target.context_after.clone(),
                 };
-                crate::draft::GgrDraft::new_line(common, &anchor).map_err(|e| {
+                let mut draft = crate::draft::GgrDraft::new_line(common, &anchor).map_err(|e| {
                     SaveOutcome::Errored {
                         message: e.to_string(),
                     }
-                })
+                })?;
+                draft.entity_id = entity_id;
+                Ok(draft)
             }
             ComposerScope::Change => {
                 let sha = match self.current_commit_sha() {
@@ -857,6 +861,34 @@ impl GgrSurface {
                 reason: "description scope not supported in ggr".to_owned(),
             }),
         }
+    }
+
+    /// Look up the entity containing `line` in `file`, from `sha`'s entity
+    /// cache. `None` on any cache miss (extraction still in flight, or no
+    /// cache yet) — `entity_id` degrades gracefully, same as a pre-Phase-4
+    /// draft with no entity data at all.
+    fn entity_id_for_line(
+        &self,
+        sha: &str,
+        file: &str,
+        line: Option<u32>,
+    ) -> Option<local_review_core::semantic::EntityId> {
+        let base = ggr_entity_cache_base(
+            self.pr.repo_name.as_str(),
+            self.pr.number,
+            self.pr.hostname.as_deref(),
+        )?;
+        let path = local_review_core::semantic::cache::ggr_cache_path(&base, sha);
+        let cache = local_review_core::semantic::cache::read(&path)
+            .ok()
+            .flatten()?;
+        local_review_core::semantic::entity_for_line(
+            std::path::Path::new(file),
+            line,
+            None,
+            &cache.entities,
+        )
+        .map(|e| e.id.clone())
     }
 }
 
@@ -2004,6 +2036,8 @@ Views
     o                     cycle entity order: risk / dependency / file
                           (risk puts ! high-tier rows first — sig changes
                           with callers, deletions with dangling references)
+    g                     toggle concern grouping: clustered (call-graph
+                          components, headers show label + max tier) / flat
     x                     blast-radius peek: list call sites of the focused
                           entity (entity list or entity diff); Enter jumps
                           to in-diff callers. Deleted entities list dangling
@@ -3831,6 +3865,130 @@ mod tests {
                 if file == "src/foo.rs"
             ),
             "draft anchor must be Line with correct file and line"
+        );
+
+        if let Some(p) = prev {
+            std::env::set_var("XDG_DATA_HOME", p);
+        } else {
+            std::env::remove_var("XDG_DATA_HOME");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn save_comment_line_scope_populates_entity_id_from_cache() {
+        use local_review_core::semantic::cache::{ggr_cache_path, CacheEntry};
+        use local_review_core::semantic::{
+            ChangeAnnotation, ChangeType, EntityCoreData, EntityId, EntityKind,
+        };
+        use local_review_core::tui::composer::LineTarget;
+
+        let dir = tempfile::tempdir().unwrap();
+        let prev = std::env::var("XDG_DATA_HOME").ok();
+        std::env::set_var("XDG_DATA_HOME", dir.path());
+
+        let mut surface = GgrSurface::new(make_pr(), None, false);
+        set_commit_diff_state(&mut surface);
+
+        // Pre-populate the entity cache for the commit `set_commit_diff_state`
+        // selects (index 1 -> commits[0], sha "a3b4c5d6..."), with an entity
+        // covering the line the composer will save a comment on.
+        let entity_id = EntityId::new(
+            std::path::PathBuf::from("src/foo.rs"),
+            vec!["foo".to_owned()],
+            None,
+            0,
+        );
+        let cache_entry = CacheEntry {
+            schema_version: local_review_core::semantic::cache::SCHEMA_VERSION,
+            extraction_hash: local_review_core::semantic::cache::EXTRACTION_HASH.to_owned(),
+            entities: vec![EntityCoreData {
+                id: entity_id.clone(),
+                kind: EntityKind::Function,
+                change: ChangeType::Modified,
+                annotation: ChangeAnnotation::BodyOnly,
+                refactor: None,
+                line_range: (40, 50),
+                source_file: None,
+                target_line: None,
+                structural_change: true,
+                content_hash: 0,
+            }],
+            graph: None,
+            graph_failure: None,
+            failed_files: Vec::new(),
+        };
+        let base = ggr_entity_cache_base("owner/repo", 42, None).unwrap();
+        let cache_path = ggr_cache_path(&base, "a3b4c5d6e7f8a3b4c5d6e7f8a3b4c5d6e7f8a3b4");
+        local_review_core::semantic::cache::write(&cache_path, &cache_entry).unwrap();
+
+        let target = LineTarget {
+            file: std::path::PathBuf::from("src/foo.rs"),
+            rendered_index: 3,
+            source_line: None,
+            target_line: Some(42),
+            target_text: "let x = 1;".to_owned(),
+            hunk_header: "@@ -40,6 +40,7 @@".to_owned(),
+            context_before: vec!["fn foo() {".to_owned()],
+            context_after: vec!["}".to_owned()],
+        };
+        let scope = ComposerScope::Line(target);
+        let req = SaveRequest {
+            scope: &scope,
+            severity: Severity::Required,
+            body: "fix this",
+            entry_idx: 0,
+        };
+        let outcome = surface.save_comment(req).unwrap();
+        assert!(matches!(outcome, SaveOutcome::Saved { .. }));
+        assert_eq!(
+            surface.loaded_drafts[0].entity_id,
+            Some(entity_id),
+            "entity_id must be populated from the cache entry covering line 42"
+        );
+
+        if let Some(p) = prev {
+            std::env::set_var("XDG_DATA_HOME", p);
+        } else {
+            std::env::remove_var("XDG_DATA_HOME");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn save_comment_line_scope_entity_id_none_on_cache_miss() {
+        use local_review_core::tui::composer::LineTarget;
+
+        let dir = tempfile::tempdir().unwrap();
+        let prev = std::env::var("XDG_DATA_HOME").ok();
+        std::env::set_var("XDG_DATA_HOME", dir.path());
+
+        let mut surface = GgrSurface::new(make_pr(), None, false);
+        set_commit_diff_state(&mut surface);
+        // No cache written — extraction has not run yet for this commit.
+
+        let target = LineTarget {
+            file: std::path::PathBuf::from("src/foo.rs"),
+            rendered_index: 3,
+            source_line: None,
+            target_line: Some(42),
+            target_text: "let x = 1;".to_owned(),
+            hunk_header: "@@ -40,6 +40,7 @@".to_owned(),
+            context_before: vec!["fn foo() {".to_owned()],
+            context_after: vec!["}".to_owned()],
+        };
+        let scope = ComposerScope::Line(target);
+        let req = SaveRequest {
+            scope: &scope,
+            severity: Severity::Required,
+            body: "fix this",
+            entry_idx: 0,
+        };
+        let outcome = surface.save_comment(req).unwrap();
+        assert!(matches!(outcome, SaveOutcome::Saved { .. }));
+        assert_eq!(
+            surface.loaded_drafts[0].entity_id, None,
+            "cache miss must degrade to entity_id: None, not error the save"
         );
 
         if let Some(p) = prev {

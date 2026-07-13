@@ -117,7 +117,7 @@ repo_cache clone promoted from best-effort to first-class: eager at PR open on a
 
 | Status         | Started    | Completed  |
 | -------------- | ---------- | ---------- |
-| ⬜ not-started  |            |            |
+| ✅ complete     | 2026-07-13 | 2026-07-13 |
 
 Tags: semantic, cluster, tui
 

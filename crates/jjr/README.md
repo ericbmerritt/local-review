@@ -104,7 +104,9 @@ Three severities, set with `M-r` / `M-s` / `M-n`:
 | `c`                 | New comment (scope follows cursor position)       |
 | `1` / `2` / `3`     | Filter by required / suggestion / note            |
 | `;`                 | Toggle cosmetic entity visibility                 |
-| `o`                 | Toggle sort: dependency order ↔ file order        |
+| `o`                 | Cycle entity order: risk / dependency / file      |
+| `g`                 | Toggle concern grouping: clustered / flat         |
+| `x`                 | Blast-radius peek: list callers of focused entity |
 | `R`                 | Clear entity cache and re-extract                 |
 | `s`                 | Stack overview                                    |
 | `S`                 | Stale comments view                               |
