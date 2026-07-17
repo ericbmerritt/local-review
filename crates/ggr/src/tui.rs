@@ -2011,7 +2011,12 @@ Movement
     ↑ ↓     k j           line
     PgUp PgDn             page
     Home End  g G         top / bottom
-    Tab     S-Tab         next / previous file
+    Tab                   next UNREVIEWED entity (entity list and entity
+                          diff; wraps; notice when everything is reviewed)
+    S-Tab                 previous entity, reviewed or not — deliberately
+                          not Tab's mirror: entering a diff auto-marks it,
+                          so everything behind you is already reviewed
+    Tab     S-Tab         next / previous file (file diff view)
     n       p             next / previous commit (or PR overview)
 
 Comments

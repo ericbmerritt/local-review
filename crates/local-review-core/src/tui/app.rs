@@ -70,6 +70,8 @@ const REVIEWED_TITLE_GLYPH: &str = "\u{2713}";
 const STATUS_REVIEWED_RESET: &str = "change amended; reviewed state reset";
 const STATUS_MARKED_REVIEWED: &str = "file marked as reviewed";
 const STATUS_MARKED_UNREVIEWED: &str = "file marked as unreviewed";
+const STATUS_ALL_REVIEWED: &str = "all entities reviewed";
+const STATUS_NO_OTHER_UNREVIEWED: &str = "no other unreviewed entities";
 const STATUS_RESET_AND_MARKED_REVIEWED: &str = "reviewed state reset; marked reviewed";
 
 /// Wrapper type for the base (un-annotated) diff views held in
@@ -898,7 +900,11 @@ impl<S: ReviewSurfaceExt> App<S> {
         self.scroll = u16::try_from(line.saturating_sub(3)).unwrap_or(0);
     }
 
-    /// Advance to the next entity in `Screen::EntityDiff` (clamps at last).
+    /// Guided path: advance to the next **unreviewed** entity in
+    /// `Screen::EntityDiff`, wrapping. Entering a diff auto-marks its
+    /// entity, so this naturally seeks the next unseen one; the wrap
+    /// covers entities skipped by jumping into the middle of the list.
+    /// Nothing unreviewed left → status notice, screen unchanged.
     pub(crate) fn next_entity(&mut self) {
         if self.entities.is_empty() {
             return;
@@ -908,9 +914,19 @@ impl<S: ReviewSurfaceExt> App<S> {
         } else {
             0
         };
-        let next = (current + 1).min(self.entities.len() - 1);
-        self.screen = Screen::EntityDiff { entity_idx: next };
-        self.mark_current_entity_reviewed();
+        if let Some(next) = crate::tui::entity_list::next_unreviewed_entity(
+            &self.entities,
+            Some(current),
+            self.cosmetic_filter_on,
+        ) {
+            self.screen = Screen::EntityDiff { entity_idx: next };
+            self.mark_current_entity_reviewed();
+        } else {
+            self.status_message = Some(guided_exhausted_notice(
+                &self.entities,
+                self.cosmetic_filter_on,
+            ));
+        }
     }
 
     /// Retreat to the previous entity in `Screen::EntityDiff` (clamps at first).
@@ -2442,11 +2458,29 @@ fn render_footer<S: ReviewSurfaceExt>(frame: &mut Frame<'_>, area: Rect, app: &A
         return;
     }
 
+    // Guided-path progress. `n` counts the cosmetic-visible set — the same
+    // denominator Tab traverses — so the fraction always matches what the
+    // list shows under the `;` filter. Empty when no entities are loaded.
+    let reviewed_kn = {
+        let (k, n) =
+            crate::tui::entity_list::reviewed_counts(&app.entities, app.cosmetic_filter_on);
+        if n == 0 {
+            String::new()
+        } else {
+            format!("reviewed {k}/{n}")
+        }
+    };
+
     if in_entity_diff {
         if let Some(ctx) = app.entity_context.as_deref() {
             // Entity context and key hints are both present: context on the left
             // (dim), compact key reminder on the right so neither is lost.
-            let line = entity_diff_footer_line(ctx, area.width, app.entity_clip);
+            let ctx_with_kn = if reviewed_kn.is_empty() {
+                ctx.to_owned()
+            } else {
+                format!("{ctx} · {reviewed_kn}")
+            };
+            let line = entity_diff_footer_line(&ctx_with_kn, area.width, app.entity_clip);
             frame.render_widget(Paragraph::new(line), area);
             return;
         }
@@ -2459,6 +2493,10 @@ fn render_footer<S: ReviewSurfaceExt>(frame: &mut Frame<'_>, area: Rect, app: &A
         } else {
             "  x callers  z clip"
         });
+        if !reviewed_kn.is_empty() {
+            use std::fmt::Write as _;
+            let _ = write!(hint, "  {reviewed_kn}");
+        }
         frame.render_widget(Paragraph::new(hint), area);
         return;
     }
@@ -2470,6 +2508,9 @@ fn render_footer<S: ReviewSurfaceExt>(frame: &mut Frame<'_>, area: Rect, app: &A
     if matches!(app.screen, Screen::Main) {
         use std::fmt::Write as _;
         let _ = write!(hint, "  o {}", app.order_mode.label());
+        if !reviewed_kn.is_empty() {
+            let _ = write!(hint, "  {reviewed_kn}");
+        }
     }
     frame.render_widget(Paragraph::new(hint), area);
 }
@@ -2699,6 +2740,42 @@ fn toggle_entity_grouping<S: ReviewSurfaceExt>(app: &mut App<S>) {
     app.entity_scroll = 0;
 }
 
+/// Guided path, list screen: move the cursor to the next unreviewed
+/// visible entity, wrapping. Nothing to move to → status notice, cursor
+/// stays. The cursor on the description row (`entity_index` 0) starts
+/// the scan before entity 0.
+fn tab_to_next_unreviewed_in_list<S: ReviewSurfaceExt>(app: &mut App<S>) {
+    let current = app.entity_index.checked_sub(1);
+    if let Some(eidx) = crate::tui::entity_list::next_unreviewed_entity(
+        &app.entities,
+        current,
+        app.cosmetic_filter_on,
+    ) {
+        app.entity_index = eidx + 1;
+        crate::tui::entity_list::scroll_entity_into_view(app, eidx);
+    } else {
+        app.status_message = Some(guided_exhausted_notice(
+            &app.entities,
+            app.cosmetic_filter_on,
+        ));
+    }
+}
+
+/// Notice for a guided Tab with nowhere to go: distinguishes "everything
+/// reviewed" from "the only unreviewed entity is the one you're on".
+fn guided_exhausted_notice(
+    entities: &[crate::semantic::EntitySummary],
+    cosmetic_filter_on: bool,
+) -> String {
+    let (k, n) = crate::tui::entity_list::reviewed_counts(entities, cosmetic_filter_on);
+    if k == n {
+        STATUS_ALL_REVIEWED
+    } else {
+        STATUS_NO_OTHER_UNREVIEWED
+    }
+    .to_owned()
+}
+
 /// `m` on the entity list, surface-first: ggr binds `m` to the commit-scoped
 /// composer, and an unconditional core binding would shadow it. Only when the
 /// surface ignores the key does the core open the description view (jjr).
@@ -2762,10 +2839,11 @@ fn handle_entity_list_key<S: ReviewSurfaceExt>(
                 }
             }
         }
-        // Tab/Shift-Tab on the entity list moves cursor selection (same as j/k).
-        // Cycling *into* entity diffs happens in handle_file_view_key where
-        // Tab/Shift-Tab navigate between Screen::EntityDiff views.
-        KeyCode::Tab => crate::tui::entity_list::move_entity_cursor(app, 1),
+        // Guided path: Tab advances the cursor to the next UNREVIEWED
+        // entity (wrapping). Shift-Tab stays plain previous-row — mirroring
+        // Tab would near-always no-op, since auto-mark-on-entry makes
+        // everything behind the reviewer reviewed by construction.
+        KeyCode::Tab => tab_to_next_unreviewed_in_list(app),
         KeyCode::BackTab => crate::tui::entity_list::move_entity_cursor(app, -1),
         KeyCode::Char('F') => {
             let fidx = app.file_index;
@@ -5076,6 +5154,125 @@ mod app_tests {
             app.order_mode,
             OrderMode::Dependency,
             "entry navigation must not reset the chosen order"
+        );
+    }
+
+    // ── Guided review path (phase 7) ─────────────────────────────────────────
+
+    /// Tab on the list skips reviewed entities and wraps; Shift-Tab stays a
+    /// plain previous-row move regardless of reviewed state.
+    #[test]
+    fn list_tab_skips_reviewed_wraps_and_backtab_stays_plain() {
+        let mut app = make_app_with_entities(4);
+        app.screen = Screen::Main;
+        app.entities[0].reviewed = true;
+        app.entities[2].reviewed = true;
+        app.entity_index = 2; // cursor on entity 1 (unreviewed)
+
+        let tab = KeyEvent::new(KeyCode::Tab, crossterm::event::KeyModifiers::NONE);
+        handle_entity_list_key(&mut app, tab).expect("key handling");
+        assert_eq!(app.entity_index, 4, "skips reviewed entity 2, lands on 3");
+
+        handle_entity_list_key(&mut app, tab).expect("key handling");
+        assert_eq!(app.entity_index, 2, "wraps past the end back to entity 1");
+
+        let backtab = KeyEvent::new(KeyCode::BackTab, crossterm::event::KeyModifiers::NONE);
+        handle_entity_list_key(&mut app, backtab).expect("key handling");
+        assert_eq!(
+            app.entity_index, 1,
+            "Shift-Tab is a plain -1 move onto reviewed entity 0"
+        );
+    }
+
+    /// Tab with nothing left to visit is a notice, never silence: cursor
+    /// stays put and the message distinguishes all-reviewed from
+    /// only-the-current-one-unreviewed.
+    #[test]
+    fn list_tab_exhausted_shows_notice_and_stays() {
+        let mut app = make_app_with_entities(2);
+        app.screen = Screen::Main;
+        for e in &mut app.entities {
+            e.reviewed = true;
+        }
+        app.entity_index = 1;
+        let tab = KeyEvent::new(KeyCode::Tab, crossterm::event::KeyModifiers::NONE);
+        handle_entity_list_key(&mut app, tab).expect("key handling");
+        assert_eq!(app.entity_index, 1, "cursor must not move");
+        assert_eq!(app.status_message.as_deref(), Some(STATUS_ALL_REVIEWED));
+
+        // Cursor sitting on the only unreviewed entity: still a notice,
+        // but not "all reviewed" — the current one isn't.
+        app.entities[0].reviewed = false;
+        handle_entity_list_key(&mut app, tab).expect("key handling");
+        assert_eq!(app.entity_index, 1);
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some(STATUS_NO_OTHER_UNREVIEWED)
+        );
+    }
+
+    /// In the entity diff, Tab seeks unreviewed entities (wrapping), each
+    /// landing auto-marks, and exhaustion leaves the screen unchanged with
+    /// the all-reviewed notice.
+    #[test]
+    fn diff_next_entity_walks_all_unreviewed_then_notices() {
+        let mut app = make_app_with_entities(4);
+        app.entities[2].reviewed = true;
+        app.screen = Screen::EntityDiff { entity_idx: 1 };
+
+        app.next_entity();
+        assert!(matches!(app.screen, Screen::EntityDiff { entity_idx: 3 }));
+        assert!(app.entities[3].reviewed, "landing auto-marks");
+
+        app.next_entity();
+        assert!(
+            matches!(app.screen, Screen::EntityDiff { entity_idx: 0 }),
+            "wraps to the earliest unreviewed entity"
+        );
+
+        app.next_entity();
+        assert!(matches!(app.screen, Screen::EntityDiff { entity_idx: 1 }));
+
+        // 2 was pre-reviewed; 3, 0, 1 were marked on landing. Exhausted.
+        app.next_entity();
+        assert!(
+            matches!(app.screen, Screen::EntityDiff { entity_idx: 1 }),
+            "screen unchanged when nothing is left"
+        );
+        assert_eq!(app.status_message.as_deref(), Some(STATUS_ALL_REVIEWED));
+    }
+
+    /// Shift-Tab in the diff is plain previous-entity, reviewed or not.
+    #[test]
+    fn diff_prev_entity_stays_plain() {
+        let mut app = make_app_with_entities(3);
+        app.entities[1].reviewed = true;
+        app.screen = Screen::EntityDiff { entity_idx: 2 };
+        app.prev_entity();
+        assert!(
+            matches!(app.screen, Screen::EntityDiff { entity_idx: 1 }),
+            "previous entity regardless of reviewed state"
+        );
+    }
+
+    /// The list footer shows guided-path progress over the visible set.
+    #[test]
+    fn footer_shows_reviewed_kn_on_list_and_diff() {
+        let mut app = make_app_with_entities(3);
+        app.screen = Screen::Main;
+        app.entities[1].reviewed = true;
+        let text = buffer_text(&mut app);
+        assert!(
+            text.contains("reviewed 1/3"),
+            "list footer must carry the fraction:\n{text}"
+        );
+
+        app.screen = Screen::EntityDiff { entity_idx: 0 };
+        let text = buffer_text(&mut app);
+        // Rendering the diff auto-marks entity 0, so the count advances.
+        assert!(
+            text.contains("reviewed 2/3"),
+            "diff footer must carry the fraction:\n{text}"
         );
     }
 

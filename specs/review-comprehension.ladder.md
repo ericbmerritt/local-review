@@ -173,9 +173,9 @@ Tags: tui, graph, core
 
 ## Phase 7: Guided review path
 
-| Status         | Started    | Completed  |
-| -------------- | ---------- | ---------- |
-| ⬜ not-started  |            |            |
+| Status      | Started    | Completed  |
+| ----------- | ---------- | ---------- |
+| ✅ complete | 2026-07-18 | 2026-07-18 |
 
 Tags: tui, reviewed-bit
 
