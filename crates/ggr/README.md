@@ -70,8 +70,9 @@ entities (whitespace / comment-only changes) are dimmed; `;` hides them.
 entity — with a passive status bar:
 `authenticate() modified · sig+body · called from 8 places`
 
-`Tab` / `Shift-Tab` cycle entities. `F` opens the file list. `x` clips the diff
-to just the entity's lines.
+`Tab` advances to the next unreviewed entity (wrapping); `Shift-Tab` steps back
+one entity. `F` opens the file list. `x` clips the diff to just the entity's
+lines.
 
 ### 3. Draft comments
 
@@ -111,42 +112,44 @@ exists they go stale.
 
 ### Entity list and description page
 
-| Key                 | Action                                            |
-| ------------------- | ------------------------------------------------- |
-| `j` `k` / `↑` `↓`   | Move cursor / scroll                              |
-| `Enter`             | Open entity diff (or PR description for row 0)    |
-| `Tab` / `Shift-Tab` | Next / previous entity (cursor)                   |
-| `e`                 | Toggle description ↔ entity pane (entry 0 only)   |
-| `F`                 | File list                                         |
-| `n` / `p`           | Next / previous commit                            |
-| `1` / `2` / `3`     | Severity filter                                   |
-| `;`                 | Toggle cosmetic entity visibility                 |
-| `o`                 | Cycle entity order: risk / dependency / file      |
-| `g`                 | Toggle concern grouping: clustered / flat         |
-| `x`                 | Blast-radius peek: list callers of focused entity |
-| `S`                 | Submit (verdict modal)                            |
-| `R`                 | Refresh — re-fetch PR, re-anchor drafts           |
-| `?`                 | Help                                              |
-| `q`                 | Quit                                              |
+| Key               | Action                                            |
+| ----------------- | ------------------------------------------------- |
+| `j` `k` / `↑` `↓` | Move cursor / scroll                              |
+| `Enter`           | Open entity diff (or PR description for row 0)    |
+| `Tab`             | Next **unreviewed** entity (wraps)                |
+| `Shift-Tab`       | Previous entity (reviewed or not)                 |
+| `e`               | Toggle description ↔ entity pane (entry 0 only)   |
+| `F`               | File list                                         |
+| `n` / `p`         | Next / previous commit                            |
+| `1` / `2` / `3`   | Severity filter                                   |
+| `;`               | Toggle cosmetic entity visibility                 |
+| `o`               | Cycle entity order: risk / dependency / file      |
+| `g`               | Toggle concern grouping: clustered / flat         |
+| `x`               | Blast-radius peek: list callers of focused entity |
+| `S`               | Submit (verdict modal)                            |
+| `R`               | Refresh — re-fetch PR, re-anchor drafts           |
+| `?`               | Help                                              |
+| `q`               | Quit                                              |
 
 ### Entity diff view
 
-| Key                 | Action                                             |
-| ------------------- | -------------------------------------------------- |
-| `j` `k` / `↑` `↓`   | Scroll line                                        |
-| `PgUp` `PgDn`       | Scroll page                                        |
-| `g` `G`             | Top / bottom                                       |
-| `Tab` / `Shift-Tab` | Next / previous entity's diff                      |
-| `x`                 | Toggle entity-clip (entity lines only ↔ full file) |
-| `F`                 | File list                                          |
-| `n` / `p`           | Next / previous commit                             |
-| `c` / `Enter`       | New line comment                                   |
-| `m`                 | New commit-scoped comment                          |
-| `r`                 | Reply to thread                                    |
-| `e`                 | Edit draft                                         |
-| `T`                 | Toggle thread expand/collapse                      |
-| `\|`                | Cycle diff layout: auto / unified / side-by-side   |
-| `Esc` / `q`         | Return to entity list                              |
+| Key               | Action                                             |
+| ----------------- | -------------------------------------------------- |
+| `j` `k` / `↑` `↓` | Scroll line                                        |
+| `PgUp` `PgDn`     | Scroll page                                        |
+| `g` `G`           | Top / bottom                                       |
+| `Tab`             | Next **unreviewed** entity's diff (wraps)          |
+| `Shift-Tab`       | Previous entity's diff (reviewed or not)           |
+| `x`               | Toggle entity-clip (entity lines only ↔ full file) |
+| `F`               | File list                                          |
+| `n` / `p`         | Next / previous commit                             |
+| `c` / `Enter`     | New line comment                                   |
+| `m`               | New commit-scoped comment                          |
+| `r`               | Reply to thread                                    |
+| `e`               | Edit draft                                         |
+| `T`               | Toggle thread expand/collapse                      |
+| `\|`              | Cycle diff layout: auto / unified / side-by-side   |
+| `Esc` / `q`       | Return to entity list                              |
 
 ## Dependency graph
 

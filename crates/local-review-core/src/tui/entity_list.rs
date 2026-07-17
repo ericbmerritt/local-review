@@ -801,14 +801,17 @@ pub fn move_entity_cursor<S: ReviewSurfaceExt>(app: &mut App<S>, delta: isize) {
     };
     app.entity_index = new_idx;
 
-    // The body area shows entities (indices 1..N). entity_scroll is an offset
-    // into app.entities (so entity at index I is at entity_scroll position when
-    // entity_index - 1 == entity_scroll + row_offset). Adjust scroll so the
-    // focused entity is visible. Description row (index 0) is fixed.
+    // The body area shows entities (indices 1..N). Description row (index 0)
+    // is fixed and never scrolled into the body.
     if new_idx == 0 {
-        return; // description row — no body scroll needed
+        return;
     }
-    let eidx = new_idx - 1;
+    scroll_entity_into_view(app, new_idx - 1);
+}
+
+/// Adjust `entity_scroll` so `entities[eidx]` is inside the visible body
+/// window. Shared by plain cursor movement and the guided Tab traversal.
+pub(crate) fn scroll_entity_into_view<S: ReviewSurfaceExt>(app: &mut App<S>, eidx: usize) {
     // Approx body rows: chrome takes ~4; group headers consume one row each.
     // Reserve the full group count (never capped) — a window can never hold
     // more headers than exist, so this is always a safe upper bound. Capping
@@ -828,6 +831,57 @@ pub fn move_entity_cursor<S: ReviewSurfaceExt>(app: &mut App<S>, delta: isize) {
     } else if eidx >= app.entity_scroll + viewport {
         app.entity_scroll = eidx.saturating_sub(viewport.saturating_sub(1));
     }
+}
+
+// ── Guided review path (Tab skips reviewed) ───────────────────────────────────
+
+/// Index of the next unreviewed, filter-visible entity strictly after
+/// `current` (`None` = start before entity 0), wrapping past the end.
+/// Excludes `current` itself — Tab always *moves* or reports why not.
+/// `None` when no other unreviewed visible entity exists.
+pub(crate) fn next_unreviewed_entity(
+    entities: &[EntitySummary],
+    current: Option<usize>,
+    cosmetic_filter_on: bool,
+) -> Option<usize> {
+    let n = entities.len();
+    if n == 0 {
+        return None;
+    }
+    // A stale `current` can exceed `n`: on reload-during-diff-view the
+    // screen keeps its old `entity_idx` while extraction repopulates a
+    // possibly-shorter list. Treat out-of-bounds as "no position" (scan
+    // from the start) — otherwise `(0..cur)` would index past the end.
+    let current = current.filter(|&c| c < n);
+    let candidate = |i: &usize| {
+        let e = &entities[*i];
+        (!cosmetic_filter_on || !is_demoted(e)) && !e.reviewed
+    };
+    match current {
+        None => (0..n).find(candidate),
+        Some(cur) => (cur + 1..n).chain(0..cur).find(candidate),
+    }
+}
+
+/// `(reviewed, total)` over the cosmetic-visible entity set — the guided
+/// path's denominator. Severity filters never hide list rows, so they do
+/// not participate.
+pub(crate) fn reviewed_counts(
+    entities: &[EntitySummary],
+    cosmetic_filter_on: bool,
+) -> (usize, usize) {
+    let visible = entities
+        .iter()
+        .filter(|e| !cosmetic_filter_on || !is_demoted(e));
+    let mut total = 0;
+    let mut reviewed = 0;
+    for e in visible {
+        total += 1;
+        if e.reviewed {
+            reviewed += 1;
+        }
+    }
+    (reviewed, total)
 }
 
 #[cfg(test)]
@@ -966,6 +1020,93 @@ mod tests {
             entities[0].comment_count, 1,
             "\" (removed)\" suffix must strip for title matching; source_line must fall back"
         );
+    }
+
+    fn reviewed_entity(path: &str) -> EntitySummary {
+        let mut e = entity(path, ChangeAnnotation::None);
+        e.reviewed = true;
+        e
+    }
+
+    fn cosmetic_entity(path: &str) -> EntitySummary {
+        let mut e = entity(path, ChangeAnnotation::None);
+        e.structural_change = false;
+        e
+    }
+
+    #[test]
+    fn next_unreviewed_skips_reviewed_and_wraps() {
+        let entities = vec![
+            reviewed_entity("a.rs"),
+            entity("b.rs", ChangeAnnotation::None),
+            reviewed_entity("c.rs"),
+            entity("d.rs", ChangeAnnotation::None),
+        ];
+        // From entity 1 (unreviewed): next unreviewed strictly after is 3.
+        assert_eq!(next_unreviewed_entity(&entities, Some(1), false), Some(3));
+        // From entity 3: wraps past the end, lands on 1.
+        assert_eq!(next_unreviewed_entity(&entities, Some(3), false), Some(1));
+        // From before the list (description row): first unreviewed is 1.
+        assert_eq!(next_unreviewed_entity(&entities, None, false), Some(1));
+    }
+
+    #[test]
+    fn next_unreviewed_excludes_current_and_reports_none() {
+        let entities = vec![
+            reviewed_entity("a.rs"),
+            entity("b.rs", ChangeAnnotation::None),
+            reviewed_entity("c.rs"),
+        ];
+        // Entity 1 is the only unreviewed one; from it, no OTHER candidate.
+        assert_eq!(next_unreviewed_entity(&entities, Some(1), false), None);
+        // All reviewed → None from anywhere.
+        let all_reviewed: Vec<_> = (0..3).map(|_| reviewed_entity("x.rs")).collect();
+        assert_eq!(next_unreviewed_entity(&all_reviewed, Some(0), false), None);
+        assert_eq!(next_unreviewed_entity(&all_reviewed, None, false), None);
+        // Empty list → None.
+        assert_eq!(next_unreviewed_entity(&[], None, false), None);
+    }
+
+    /// Regression (PR #77 review): a stale `current` past the end of the
+    /// list (screen kept its old `entity_idx` across a reload that shrank
+    /// `entities`) must degrade to a start-of-list scan, not index out of
+    /// bounds inside the wrap range.
+    #[test]
+    fn next_unreviewed_out_of_bounds_current_scans_from_start() {
+        let entities = vec![
+            reviewed_entity("a.rs"),
+            entity("b.rs", ChangeAnnotation::None),
+            reviewed_entity("c.rs"),
+        ];
+        assert_eq!(next_unreviewed_entity(&entities, Some(5), false), Some(1));
+        // Exactly at the boundary (== len) is equally out of bounds.
+        assert_eq!(next_unreviewed_entity(&entities, Some(3), false), Some(1));
+    }
+
+    #[test]
+    fn next_unreviewed_respects_cosmetic_filter() {
+        let entities = vec![
+            reviewed_entity("a.rs"),
+            cosmetic_entity("b.rs"), // unreviewed but demoted
+            entity("c.rs", ChangeAnnotation::None),
+        ];
+        // Filter on: the demoted entity is invisible, so Tab skips to 2.
+        assert_eq!(next_unreviewed_entity(&entities, Some(0), true), Some(2));
+        // Filter off: the demoted entity is visible and unreviewed.
+        assert_eq!(next_unreviewed_entity(&entities, Some(0), false), Some(1));
+    }
+
+    #[test]
+    fn reviewed_counts_follow_cosmetic_filter() {
+        let entities = vec![
+            reviewed_entity("a.rs"),
+            cosmetic_entity("b.rs"),
+            entity("c.rs", ChangeAnnotation::None),
+        ];
+        assert_eq!(reviewed_counts(&entities, false), (1, 3));
+        // Filter on: the cosmetic entity drops out of both k and n.
+        assert_eq!(reviewed_counts(&entities, true), (1, 2));
+        assert_eq!(reviewed_counts(&[], false), (0, 0));
     }
 
     #[test]

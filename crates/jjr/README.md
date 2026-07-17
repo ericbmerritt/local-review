@@ -53,9 +53,10 @@ and annotated `[cosmetic]`; press `;` to hide them entirely.
 ## Entity diff view
 
 `Enter` on an entity opens a focused diff: the full file diff, pre-scrolled to
-the entity's start line, with the entity's range highlighted. `Tab` /
-`Shift-Tab` cycles between entities. `F` opens the file list if you want to
-browse by file instead. `x` clips the view to just the entity's lines.
+the entity's start line, with the entity's range highlighted. `Tab` advances to
+the next unreviewed entity (wrapping); `Shift-Tab` steps back one entity. `F`
+opens the file list if you want to browse by file instead. `x` clips the view to
+just the entity's lines.
 
 The status bar shows passive context:
 `authenticate() modified · sig+body · called from 8 places`
@@ -94,44 +95,46 @@ Three severities, set with `M-r` / `M-s` / `M-n`:
 
 ### Entity list (`Screen::Main`)
 
-| Key                 | Action                                            |
-| ------------------- | ------------------------------------------------- |
-| `j` `k` / `↑` `↓`   | Move cursor                                       |
-| `Enter`             | Open entity diff (or description for row 0)       |
-| `Tab` / `Shift-Tab` | Next / previous entity (cursor only, on the list) |
-| `F`                 | Open file list (escape hatch)                     |
-| `n` / `p`           | Next / previous change in stack                   |
-| `c`                 | New comment (scope follows cursor position)       |
-| `1` / `2` / `3`     | Filter by required / suggestion / note            |
-| `;`                 | Toggle cosmetic entity visibility                 |
-| `o`                 | Cycle entity order: risk / dependency / file      |
-| `g`                 | Toggle concern grouping: clustered / flat         |
-| `x`                 | Blast-radius peek: list callers of focused entity |
-| `R`                 | Clear entity cache and re-extract                 |
-| `s`                 | Stack overview                                    |
-| `S`                 | Stale comments view                               |
-| `?`                 | Help                                              |
-| `q`                 | Quit                                              |
+| Key               | Action                                            |
+| ----------------- | ------------------------------------------------- |
+| `j` `k` / `↑` `↓` | Move cursor                                       |
+| `Enter`           | Open entity diff (or description for row 0)       |
+| `Tab`             | Next **unreviewed** entity (wraps)                |
+| `Shift-Tab`       | Previous entity (reviewed or not)                 |
+| `F`               | Open file list (escape hatch)                     |
+| `n` / `p`         | Next / previous change in stack                   |
+| `c`               | New comment (scope follows cursor position)       |
+| `1` / `2` / `3`   | Filter by required / suggestion / note            |
+| `;`               | Toggle cosmetic entity visibility                 |
+| `o`               | Cycle entity order: risk / dependency / file      |
+| `g`               | Toggle concern grouping: clustered / flat         |
+| `x`               | Blast-radius peek: list callers of focused entity |
+| `R`               | Clear entity cache and re-extract                 |
+| `s`               | Stack overview                                    |
+| `S`               | Stale comments view                               |
+| `?`               | Help                                              |
+| `q`               | Quit                                              |
 
 ### Entity diff view
 
-| Key                 | Action                                             |
-| ------------------- | -------------------------------------------------- |
-| `j` `k` / `↑` `↓`   | Scroll line                                        |
-| `PgUp` `PgDn`       | Scroll page                                        |
-| `g` `G`             | Top / bottom                                       |
-| `Tab` / `Shift-Tab` | Next / previous entity's diff                      |
-| `x`                 | Toggle entity-clip (entity lines only ↔ full file) |
-| `F`                 | Open file list                                     |
-| `n` / `p`           | Next / previous change                             |
-| `c` / `Enter`       | New comment on current line                        |
-| `e`                 | Edit existing comment                              |
-| `d`                 | Delete existing comment                            |
-| `1` / `2` / `3`     | Severity filter                                    |
-| `\|`                | Cycle diff layout: auto / unified / side-by-side   |
-| `U`                 | Toggle file reviewed                               |
-| `C`                 | Send to Claude                                     |
-| `Esc` / `q`         | Return to entity list                              |
+| Key               | Action                                             |
+| ----------------- | -------------------------------------------------- |
+| `j` `k` / `↑` `↓` | Scroll line                                        |
+| `PgUp` `PgDn`     | Scroll page                                        |
+| `g` `G`           | Top / bottom                                       |
+| `Tab`             | Next **unreviewed** entity's diff (wraps)          |
+| `Shift-Tab`       | Previous entity's diff (reviewed or not)           |
+| `x`               | Toggle entity-clip (entity lines only ↔ full file) |
+| `F`               | Open file list                                     |
+| `n` / `p`         | Next / previous change                             |
+| `c` / `Enter`     | New comment on current line                        |
+| `e`               | Edit existing comment                              |
+| `d`               | Delete existing comment                            |
+| `1` / `2` / `3`   | Severity filter                                    |
+| `\|`              | Cycle diff layout: auto / unified / side-by-side   |
+| `U`               | Toggle file reviewed                               |
+| `C`               | Send to Claude                                     |
+| `Esc` / `q`       | Return to entity list                              |
 
 ### Composer
 
