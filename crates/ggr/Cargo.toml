@@ -33,5 +33,5 @@ snafu.workspace = true
 time.workspace = true
 
 [dev-dependencies]
-serial_test = "3"
+serial_test = "4"
 tempfile.workspace = true
