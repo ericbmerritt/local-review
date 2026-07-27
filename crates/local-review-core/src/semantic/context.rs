@@ -334,6 +334,7 @@ fn plural(n: usize, singular: &'static str, multiple: &'static str) -> &'static 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     fn bundle_entity(name: &str, path: &str, lo: u32, hi: u32, body: &str) -> BundleEntity {
         BundleEntity {
@@ -493,6 +494,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn budget_from_env_returns_default_when_unset() {
         // The env var name is exposed via BUDGET_ENV_VAR; remove it first
         // so the test is hermetic.
@@ -501,6 +503,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn budget_from_env_parses_integer_value() {
         std::env::set_var(BUDGET_ENV_VAR, "8000");
         assert_eq!(budget_from_env(), 8000);
@@ -508,6 +511,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn budget_from_env_falls_back_on_unparseable_value() {
         std::env::set_var(BUDGET_ENV_VAR, "not-a-number");
         assert_eq!(budget_from_env(), DEFAULT_BUDGET_TOKENS);
