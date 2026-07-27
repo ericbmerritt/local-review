@@ -1044,6 +1044,7 @@ dependencies = [
  "ratatui",
  "serde",
  "serde_json",
+ "serial_test",
  "snafu",
  "tempfile",
  "time",
