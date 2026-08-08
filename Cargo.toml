@@ -90,7 +90,7 @@ tempfile = "3"
 # which triggers a coherence conflict with ratatui-widgets 0.3.1's blanket
 # `impl<T: Into<Text>> From<T> for ListItem`. Unpin once ratatui-widgets fixes
 # that blanket impl.
-time = { version = "=0.3.54", features = ["serde", "formatting", "parsing", "macros"] }
+time = { version = "=0.3.55", features = ["serde", "formatting", "parsing", "macros"] }
 toml = "1.1"
 assert_cmd = "2"
 predicates = "3"
