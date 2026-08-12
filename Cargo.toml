@@ -90,13 +90,13 @@ tempfile = "3"
 # which triggers a coherence conflict with ratatui-widgets 0.3.1's blanket
 # `impl<T: Into<Text>> From<T> for ListItem`. Unpin once ratatui-widgets fixes
 # that blanket impl.
-time = { version = "=0.3.54", features = ["serde", "formatting", "parsing", "macros"] }
+time = { version = "=0.3.55", features = ["serde", "formatting", "parsing", "macros"] }
 toml = "1.1"
 assert_cmd = "2"
 predicates = "3"
 expectrl = "0.9"
 arboard = "3"
-tree-sitter = "=0.26.11"
+tree-sitter = "=0.26.12"
 tree-sitter-bash = "=0.25.1"
 tree-sitter-go = "=0.25.0"
 tree-sitter-java = "=0.23.5"
@@ -106,7 +106,7 @@ tree-sitter-kotlin-ng = "=1.1.0"
 tree-sitter-postgres = "=1.2.4"
 tree-sitter-python = "=0.25.0"
 tree-sitter-rust = "=0.24.2"
-tree-sitter-scala = "=0.26.0"
+tree-sitter-scala = "=0.26.2"
 tree-sitter-toml-ng = "=0.7.0"
 tree-sitter-typescript = "=0.23.2"
 tree-sitter-yaml = "=0.7.2"
